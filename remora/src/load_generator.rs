@@ -100,9 +100,9 @@ impl LoadGenerator {
         let mut interval = interval(burst_duration);
         interval.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
-        let mut counter = 0;
-        let chunks_size = self.load / precision;
-        for chunk in &transactions.into_iter().chunks(chunks_size as usize) {
+        let chunks_size = (self.load / precision) as usize;
+        let chunks = &transactions.into_iter().chunks(chunks_size);
+        for (counter, chunk) in chunks.into_iter().enumerate() {
             if counter % 1000 == 0 && counter != 0 {
                 tracing::debug!("Submitted {} txs", counter * chunks_size);
             }
@@ -118,8 +118,7 @@ impl LoadGenerator {
                     timestamp,
                 };
                 let bytes = bincode::serialize(&full_tx).expect("serialization failed");
-                let address = self.target.clone();
-                self.network.send(address, Bytes::from(bytes)).await;
+                self.network.send(self.target, Bytes::from(bytes)).await;
             }
 
             if now.elapsed() > burst_duration {
@@ -128,7 +127,6 @@ impl LoadGenerator {
                     .register_error(ErrorType::TransactionRateTooHigh);
             }
 
-            counter += 1;
             interval.tick().await;
         }
     }
