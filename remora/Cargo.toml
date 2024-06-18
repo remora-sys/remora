@@ -27,6 +27,7 @@ reqwest = "0.11.22"
 sha3 = "0.10.8"
 better_any = "0.2.0"
 itertools = "0.13.0"
+tracing-subscriber = "0.3.18"
 
 prometheus-parse = { git = "https://github.com/asonnino/prometheus-parser.git", rev = "75334db" }
 
@@ -40,6 +41,8 @@ sui-protocol-config = { path = "../sui-protocol-config" }
 sui-adapter-latest = { path = "../../sui-execution/latest/sui-adapter", package = "sui-adapter-latest" }
 sui-move-natives = { path = "../../sui-execution/latest/sui-move-natives", package = "sui-move-natives-latest" }
 move-vm-runtime = { path = "../../external-crates/move/crates/move-vm-runtime" }
+mysten-metrics = { path = "../mysten-metrics" }
+
 network = { path = "network" }
 
 typed-store.workspace = true
