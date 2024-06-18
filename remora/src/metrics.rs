@@ -5,9 +5,11 @@ use std::{cmp::max, collections::HashMap, io::BufRead, time::Duration};
 
 use prometheus::{
     register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry,
     register_int_counter_with_registry,
     HistogramVec,
     IntCounter,
+    IntCounterVec,
     Registry,
 };
 use prometheus_parse::Scrape;
@@ -22,6 +24,13 @@ pub const START_TIME_S: &str = "start_time_s";
 pub const LAST_UPDATE_S: &str = "last_update_s";
 pub const BENCHMARK_DURATION: &str = "benchmark_duration";
 pub const LATENCY_SQUARED_SUM: &str = "latency_squared_s";
+
+/// Error types.
+#[derive(Debug)]
+pub enum ErrorType {
+    /// Emitted by the load generator when instructed to submit transactions at a rate that is too high.
+    TransactionRateTooHigh,
+}
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -38,6 +47,8 @@ pub struct Metrics {
     pub benchmark_duration: IntCounter,
     /// Sum of squared latencies (in seconds).
     pub latency_squared_sum: IntCounter,
+    /// Number of errors.
+    pub errors: IntCounterVec,
 }
 
 impl Metrics {
@@ -78,6 +89,13 @@ impl Metrics {
             latency_squared_sum: register_int_counter_with_registry!(
                 LATENCY_SQUARED_SUM,
                 "Sum of squared latencies",
+                registry
+            )
+            .unwrap(),
+            errors: register_int_counter_vec_with_registry!(
+                "errors",
+                "Number of errors",
+                &["error_type"],
                 registry
             )
             .unwrap(),
@@ -133,6 +151,13 @@ impl Metrics {
             self.benchmark_duration.inc_by(delta);
         }
     }
+
+    /// Register an error.
+    pub fn register_error(&self, error_type: ErrorType) {
+        self.errors
+            .with_label_values(&[&format!("{error_type:?}")])
+            .inc();
+    }
 }
 
 #[derive(Default, Debug)]
@@ -160,7 +185,7 @@ impl Measurement {
                 .collect::<Vec<_>>()
                 .join(",");
 
-            if sample.metric == format!("{LATENCY_S}") {
+            if sample.metric == LATENCY_S.to_string() {
                 let measurement = measurements.entry(label).or_insert_with(Self::default);
                 match &sample.value {
                     prometheus_parse::Value::Histogram(values) => {
