@@ -1,11 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use bytes::Bytes;
+use clap::Parser;
 use itertools::Itertools;
 use network::SimpleSender;
+use remora::{
+    metrics::{ErrorType, Metrics},
+    types::TransactionWithEffects,
+};
 use sui_single_node_benchmark::{
     benchmark_context::BenchmarkContext,
     command::{Component, WorkloadKind},
@@ -13,11 +18,6 @@ use sui_single_node_benchmark::{
 };
 use sui_types::transaction::CertifiedTransaction;
 use tokio::time::{interval, Instant, MissedTickBehavior};
-
-use crate::{
-    metrics::{ErrorType, Metrics},
-    types::TransactionWithEffects,
-};
 
 /// Default workload for the load generator.
 const DEFAULT_WORKLOAD: WorkloadKind = WorkloadKind::PTB {
@@ -132,6 +132,46 @@ impl LoadGenerator {
     }
 }
 
+#[derive(Parser, Debug, Clone)]
+#[clap(rename_all = "kebab-case")]
+#[command(author, version, about = "Remora load generator", long_about = None)]
+struct Args {
+    /// The number of transactions per second to submit to the system.
+    #[clap(long, default_value = "2")]
+    load: NonZeroU64,
+    /// The duration of the load test.
+    #[clap(long, value_parser = parse_duration,  default_value = "10")]
+    duration: Duration,
+    /// The target address to send transactions to.
+    #[clap(long)]
+    target: SocketAddr,
+    /// The address to expose metrics on.
+    #[clap(long)]
+    metrics_address: SocketAddr,
+}
+
+fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(Duration::from_secs(seconds))
+}
+
+/// The main function for the load generator.
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    let _ = tracing_subscriber::fmt::try_init();
+    let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
+    let metrics = Metrics::new(&registry.default_registry());
+
+    // Create genesis and generate transactions.
+    let load = args.load.get();
+    let mut load_generator = LoadGenerator::new(load, args.duration, args.target, metrics);
+    let transactions = load_generator.initialize().await;
+
+    // Submit transactions to the server.
+    load_generator.run(transactions).await;
+}
+
 #[cfg(test)]
 mod test {
     use std::{net::SocketAddr, time::Duration};
@@ -139,10 +179,11 @@ mod test {
     use bytes::Bytes;
     use futures::{sink::SinkExt, stream::StreamExt};
     use prometheus::Registry;
+    use remora::{metrics::Metrics, types::TransactionWithEffects};
     use tokio::{net::TcpListener, task::JoinHandle};
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-    use crate::{load_generator::LoadGenerator, metrics::Metrics, types::TransactionWithEffects};
+    use crate::LoadGenerator;
 
     /// Create a network listener that will receive a single message and return it.
     fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
