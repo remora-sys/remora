@@ -20,10 +20,25 @@ use super::types::*;
  *****************************************************************************************/
 pub const PRI_ID: u16 = 1;
 pub const INTERVAL: u64 = 2;
+pub const RES_BATCH_SIZE: usize = 10;
 
 pub struct PreExecWorkerState {
     pub memory_store: Arc<InMemoryObjectStore>,
     pub context: Arc<BenchmarkContext>,
+}
+
+async fn send_pre_exec_res(
+    my_id: UniqueId,
+    buffer: &[TransactionWithResults],
+    out_channel: &mpsc::Sender<NetworkMessage>,
+) {
+    out_channel.send(NetworkMessage {
+        src: my_id,
+        dst: vec![PRI_ID], // Primary worker ID
+        payload: RemoraMessage::PreExecResult(buffer.to_owned()), // Clone to avoid ownership issues
+    })
+    .await
+    .expect("sending failed");
 }
 
 impl PreExecWorkerState {
@@ -143,16 +158,20 @@ impl PreExecWorkerState {
 
                 _ = consensus_interval.tick() => {
                     // drain the exec results and send it out
+                    let mut message_buffer = Vec::with_capacity(RES_BATCH_SIZE);
+                
                     while let Ok(msg) = out_buffer.try_recv() {
-                        out_channel.send(NetworkMessage {
-                        src: my_id,
-                        dst: vec![PRI_ID], // Primary worker ID
-                        payload: RemoraMessage::PreExecResult(msg),
-                        })
-                        .await
-                        .expect("sending failed");
+                        message_buffer.push(msg);
+                
+                        if message_buffer.len() == RES_BATCH_SIZE {
+                            send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
+                            message_buffer.clear();
+                        }
                     }
-
+                
+                    if !message_buffer.is_empty() {
+                        send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
+                    }
                 },
             }
         }

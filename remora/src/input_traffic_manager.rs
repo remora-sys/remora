@@ -16,11 +16,11 @@ pub async fn input_traffic_manager_run(
         tokio::select! {
             Some(msg) = in_channel.recv() => {
                 let msg = msg.payload;
-                if let RemoraMessage::ProposeExec(ref _full_tx) = msg {
+                if let RemoraMessage::ProposeExec(..) = msg {
                     if let Err(e) = out_consensus.send(msg) {
                         eprintln!("Failed to forward to consensus engine: {:?}", e);
                     };
-                } else if let RemoraMessage::PreExecResult(ref _full_tx) = msg {
+                } else if let RemoraMessage::PreExecResult{..} = msg {
                     println!("PRI receive a result from PRE");
                     if let Err(e) = out_executor.send(msg) {
                         eprintln!("Failed to forward to executor engine: {:?}", e);

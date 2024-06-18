@@ -158,7 +158,7 @@ pub enum RemoraMessage {
         written: BTreeMap<ObjectID, (ObjectRef, Object, WriteKind)>,
     },
 
-    PreExecResult(TransactionWithResults),
+    PreExecResult(Vec<TransactionWithResults>),
 
     // Execution Worker <-> Storage Engine
     StateUpdate(TransactionEffects),
@@ -281,7 +281,7 @@ impl TransactionWithEffects {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TransactionWithResults {
     // pub full_tx: TransactionWithEffects,
     pub tx_effects: TransactionEffects, // determined after execution
