@@ -221,7 +221,9 @@ impl PrimaryWorkerState {
                 // Merge pre-exec results
                 Some(msg) = in_traffic_manager.recv() => {
                     if let RemoraMessage::PreExecResult(tx_res) = msg {
-                        pre_exec_res.insert(*tx_res.tx_effects.transaction_digest(), tx_res);
+                        for res in tx_res {
+                            pre_exec_res.insert(*res.tx_effects.transaction_digest(), res);
+                        }
                     }
                 }
             }
