@@ -3,8 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use sui_protocol_config::ProtocolConfig;
 use sui_single_node_benchmark::{
-    benchmark_context::BenchmarkContext,
-    mock_storage::InMemoryObjectStore,
+    benchmark_context::BenchmarkContext, mock_storage::InMemoryObjectStore,
 };
 use sui_types::{
     effects::TransactionEffectsAPI,
@@ -32,13 +31,14 @@ async fn send_pre_exec_res(
     buffer: &[TransactionWithResults],
     out_channel: &mpsc::Sender<NetworkMessage>,
 ) {
-    out_channel.send(NetworkMessage {
-        src: my_id,
-        dst: vec![PRI_ID], // Primary worker ID
-        payload: RemoraMessage::PreExecResult(buffer.to_owned()), // Clone to avoid ownership issues
-    })
-    .await
-    .expect("sending failed");
+    out_channel
+        .send(NetworkMessage {
+            src: my_id,
+            dst: vec![PRI_ID], // Primary worker ID
+            payload: RemoraMessage::PreExecResult(buffer.to_owned()), // Clone to avoid ownership issues
+        })
+        .await
+        .expect("sending failed");
 }
 
 impl PreExecWorkerState {
@@ -120,6 +120,35 @@ impl PreExecWorkerState {
         }
     }
 
+    async fn run_timer(
+        my_id: u16,
+        out_buffer: &mut mpsc::UnboundedReceiver<TransactionWithResults>,
+        out_channel: &mpsc::Sender<NetworkMessage>,
+    ) {
+        let mut timer = tokio::time::interval(Duration::from_millis(INTERVAL));
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    // drain the exec results and send it out
+                    let mut message_buffer = Vec::with_capacity(RES_BATCH_SIZE);
+
+                    while let Ok(msg) = out_buffer.try_recv() {
+                        message_buffer.push(msg);
+
+                        if message_buffer.len() == RES_BATCH_SIZE {
+                            send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
+                            message_buffer.clear();
+                        }
+                    }
+
+                    if !message_buffer.is_empty() {
+                        send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn run(
         &mut self,
         _tx_count: u64,
@@ -128,13 +157,15 @@ impl PreExecWorkerState {
         out_channel: &mpsc::Sender<NetworkMessage>,
         my_id: u16,
     ) {
-        let mut consensus_interval = tokio::time::interval(Duration::from_millis(INTERVAL));
         let (in_buffer, mut out_buffer) = mpsc::unbounded_channel::<TransactionWithResults>();
+
+        let out_channel = out_channel.clone();
+        tokio::spawn(async move { Self::run_timer(my_id, &mut out_buffer, &out_channel).await });
 
         loop {
             tokio::select! {
                 Some(msg) = in_channel.recv() => {
-                    println!("PRE {} receive a txn", my_id);
+                    // println!("PRE {} receive a txn", my_id);
                     let msg = msg.payload;
                     if let RemoraMessage::ProposeExec(full_tx) = msg {
                         let memstore = self.memory_store.clone();
@@ -154,25 +185,7 @@ impl PreExecWorkerState {
                         eprintln!("EW {} received unexpected message from: {:?}", my_id, msg);
                         panic!("unexpected message");
                     };
-                },
-
-                _ = consensus_interval.tick() => {
-                    // drain the exec results and send it out
-                    let mut message_buffer = Vec::with_capacity(RES_BATCH_SIZE);
-                
-                    while let Ok(msg) = out_buffer.try_recv() {
-                        message_buffer.push(msg);
-                
-                        if message_buffer.len() == RES_BATCH_SIZE {
-                            send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
-                            message_buffer.clear();
-                        }
-                    }
-                
-                    if !message_buffer.is_empty() {
-                        send_pre_exec_res(my_id, &message_buffer, &out_channel.clone()).await;
-                    }
-                },
+                }
             }
         }
     }

@@ -2,9 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sui_single_node_benchmark::{
-    benchmark_context::BenchmarkContext,
-    command::Component,
-    workload::Workload,
+    benchmark_context::BenchmarkContext, command::Component, workload::Workload,
 };
 use tokio::sync::mpsc;
 

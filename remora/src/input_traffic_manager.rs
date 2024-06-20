@@ -21,7 +21,7 @@ pub async fn input_traffic_manager_run(
                         eprintln!("Failed to forward to consensus engine: {:?}", e);
                     };
                 } else if let RemoraMessage::PreExecResult{..} = msg {
-                    println!("PRI receive a result from PRE");
+                    // println!("PRI receive a result from PRE");
                     if let Err(e) = out_executor.send(msg) {
                         eprintln!("Failed to forward to executor engine: {:?}", e);
                     };

@@ -2,9 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sui_single_node_benchmark::{
-    benchmark_context::BenchmarkContext,
-    command::Component,
-    workload::Workload,
+    benchmark_context::BenchmarkContext, command::Component, workload::Workload,
 };
 use tokio::sync::mpsc;
 
@@ -71,7 +69,7 @@ impl Agent for PrimaryAgent {
         let mut primary_worker_state =
             primary_worker::PrimaryWorkerState::new(store, context.clone());
 
-        let id = self.id.clone();
+        let id = self.id;
         let out_channel = self.out_channel.clone();
 
         tokio::spawn(async move {

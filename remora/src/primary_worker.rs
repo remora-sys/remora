@@ -7,8 +7,7 @@ use std::{
 use dashmap::DashMap;
 use sui_protocol_config::ProtocolConfig;
 use sui_single_node_benchmark::{
-    benchmark_context::BenchmarkContext,
-    mock_storage::InMemoryObjectStore,
+    benchmark_context::BenchmarkContext, mock_storage::InMemoryObjectStore,
 };
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
@@ -115,7 +114,7 @@ impl PrimaryWorkerState {
                 InputObjectKind::MovePackage(id)
                 | InputObjectKind::SharedMoveObject { id, .. }
                 | InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => {
-                    memory_store.get_object(&id).unwrap().unwrap()
+                    memory_store.get_object(id).unwrap().unwrap()
                 }
             };
             input_object_data.push(obj);
@@ -135,6 +134,9 @@ impl PrimaryWorkerState {
         pending_txns: Vec<TransactionWithEffects>,
         pre_exec_res: Arc<PreResType>,
     ) {
+        let mut non_skip = 0;
+        let all_txn_cnt = pending_txns.len();
+
         for full_tx in pending_txns {
             let txid = full_tx.tx.digest();
             let mut skip = true;
@@ -162,7 +164,6 @@ impl PrimaryWorkerState {
                             tx_result.tx_effects.clone(),
                             tx_result.written.clone(),
                         );
-                        println!("PRI Applied the PRE effect");
                     }
                 }
                 None => skip = false,
@@ -180,9 +181,16 @@ impl PrimaryWorkerState {
                     context.validator().get_epoch_store().reference_gas_price(),
                     context.clone(),
                 )
-                .await
+                .await;
+                non_skip += 1;
             }
         }
+
+        println!(
+            "{:.2}% of txns have been skipped for execution",
+            (1.00 - (non_skip as f64 / all_txn_cnt as f64)) * 100.0
+        );
+
         // TODO: update to PRE
     }
 
@@ -205,17 +213,21 @@ impl PrimaryWorkerState {
 
                     // receive a stream of sequenced txn from consensus until the channel is empty
                     self.pending_transactions = msg;
-                    println!("PRI recv from consensus channel done");
 
                     // trigger a main execution
                     let context = self.context.clone();
                     let memstore = self.memory_store.clone();
                     let pending_txns = self.pending_transactions.clone();
-                    Self::main_run_inner(
-                        memstore,
-                        context,
-                        pending_txns,
-                        pre_exec_res.clone()).await;
+                    let pre_exec_res = pre_exec_res.clone();
+
+                    tokio::spawn(async move {
+                        Self::main_run_inner(
+                            memstore,
+                            context,
+                            pending_txns,
+                            pre_exec_res).await;
+                        }
+                    );
                 },
 
                 // Merge pre-exec results
