@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use super::agents::*;
 use crate::{
     input_traffic_manager::input_traffic_manager_run,
+    metrics::Metrics,
     mock_consensus_worker::mock_consensus_worker_run,
     primary_worker::{self},
     tx_gen_agent::WORKLOAD,
@@ -20,7 +21,7 @@ pub struct PrimaryAgent {
     in_channel: mpsc::Receiver<NetworkMessage>,
     out_channel: mpsc::Sender<NetworkMessage>,
     attrs: GlobalConfig,
-    // metrics: Arc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 pub const COMPONENT: Component = Component::Baseline;
@@ -32,13 +33,14 @@ impl Agent for PrimaryAgent {
         in_channel: mpsc::Receiver<NetworkMessage>,
         out_channel: mpsc::Sender<NetworkMessage>,
         attrs: GlobalConfig,
-        // _metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         PrimaryAgent {
             id,
             in_channel,
             out_channel,
             attrs,
+            metrics,
         }
     }
 
@@ -71,6 +73,7 @@ impl Agent for PrimaryAgent {
 
         let id = self.id;
         let out_channel = self.out_channel.clone();
+        let metrics = self.metrics.clone();
 
         tokio::spawn(async move {
             primary_worker_state
@@ -81,6 +84,7 @@ impl Agent for PrimaryAgent {
                     &mut consensus_executor_receiver,
                     &out_channel,
                     id,
+                    metrics,
                 )
                 .await;
         });
@@ -100,6 +104,7 @@ impl Agent for PrimaryAgent {
                 &input_consensus_sender,
                 &input_executor_sender,
                 id,
+                self.metrics.clone(),
             )
             .await;
         }

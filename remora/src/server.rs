@@ -3,6 +3,7 @@ use std::{
     error::Error,
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+use crate::metrics::Metrics;
 use super::{agents::*, types::*};
 
 pub struct Server<T: Agent> {
@@ -36,7 +38,7 @@ impl<T: Agent> Server<T> {
     fn init_agent(
         id: UniqueId,
         conf: GlobalConfig,
-        //metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> (
         T,
         mpsc::Sender<NetworkMessage>,
@@ -44,12 +46,12 @@ impl<T: Agent> Server<T> {
     ) {
         let (in_send, in_recv) = mpsc::channel(1_000);
         let (out_send, out_recv) = mpsc::channel(1_000);
-        let agent = T::new(id, in_recv, out_send, conf /*metrics*/);
+        let agent = T::new(id, in_recv, out_send, conf, metrics);
         return (agent, in_send, out_recv);
     }
 
     // Server main function
-    pub async fn run(&mut self /*metrics: Arc<Metrics>*/) {
+    pub async fn run(&mut self , metrics: Arc<Metrics>) {
         // Initialize map from id to address
         let mut addr_table: HashMap<UniqueId, SocketAddr> = HashMap::new();
         for (id, entry) in self.global_config.iter() {
@@ -62,7 +64,7 @@ impl<T: Agent> Server<T> {
         // Network manager connects to agent through channels
         // initialize agent with global_config
         let (mut agent, in_sender, out_receiver) =
-            Self::init_agent(self.my_id, self.global_config.clone() /*metrics*/);
+            Self::init_agent(self.my_id, self.global_config.clone(), metrics);
 
         let network_manager = NetworkManager::new(self.my_id, addr_table, in_sender, out_receiver);
 

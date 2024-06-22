@@ -1,6 +1,11 @@
-use super::types::*;
 use core::panic;
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
+
+use crate::metrics::Metrics;
+
+use super::types::*;
 
 /*****************************************************************************************
  *                              Input Traffic Manager in Primary                         *
@@ -11,12 +16,19 @@ pub async fn input_traffic_manager_run(
     out_consensus: &mpsc::UnboundedSender<RemoraMessage>,
     out_executor: &mpsc::UnboundedSender<RemoraMessage>,
     my_id: u16,
+    metrics: Arc<Metrics>,
 ) {
+    let mut num_txn = 0;
     loop {
         tokio::select! {
             Some(msg) = in_channel.recv() => {
                 let msg = msg.payload;
                 if let RemoraMessage::ProposeExec(..) = msg {
+                    num_txn += 1;
+                    if num_txn == 1 {
+                        metrics.register_start_time();
+                    }
+                    
                     if let Err(e) = out_consensus.send(msg) {
                         eprintln!("Failed to forward to consensus engine: {:?}", e);
                     };

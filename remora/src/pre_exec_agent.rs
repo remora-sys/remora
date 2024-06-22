@@ -11,6 +11,7 @@ use crate::{
     pre_exec_worker::{self},
     tx_gen_agent::WORKLOAD,
     types::*,
+    metrics::Metrics,
 };
 
 pub struct PreExecAgent {
@@ -18,7 +19,7 @@ pub struct PreExecAgent {
     in_channel: mpsc::Receiver<NetworkMessage>,
     out_channel: mpsc::Sender<NetworkMessage>,
     attrs: GlobalConfig,
-    // metrics: Arc<Metrics>,
+     metrics: Arc<Metrics>,
 }
 
 pub const COMPONENT: Component = Component::Baseline;
@@ -30,13 +31,14 @@ impl Agent for PreExecAgent {
         in_channel: mpsc::Receiver<NetworkMessage>,
         out_channel: mpsc::Sender<NetworkMessage>,
         attrs: GlobalConfig,
-        // _metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         PreExecAgent {
             id,
             in_channel,
             out_channel,
             attrs,
+            metrics,
         }
     }
 
@@ -65,6 +67,7 @@ impl Agent for PreExecAgent {
                 &mut self.in_channel,
                 &self.out_channel,
                 self.id,
+                self.metrics.clone(),
             )
             .await;
     }

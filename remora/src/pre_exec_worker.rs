@@ -12,6 +12,8 @@ use sui_types::{
 };
 use tokio::{sync::mpsc, time::Duration};
 
+use crate::metrics::Metrics;
+
 use super::types::*;
 
 /*****************************************************************************************
@@ -56,6 +58,7 @@ impl PreExecWorkerState {
         reference_gas_price: u64,
         ctx: Arc<BenchmarkContext>,
         in_buffer: &mpsc::UnboundedSender<TransactionWithResults>,
+        metrics: Arc<Metrics>,
     ) {
         let tx = full_tx.tx.clone();
 
@@ -113,7 +116,8 @@ impl PreExecWorkerState {
         };
 
         memstore.commit_objects(inner_temp_store);
-        // println!("PRE finish exec a txn");
+
+        Metrics::update_metrics(&full_tx.clone(), &metrics);
 
         if let Err(e) = in_buffer.send(tx_res) {
             eprintln!("PRE failed to forward in-channel exec res: {:?}", e);
@@ -156,21 +160,29 @@ impl PreExecWorkerState {
         in_channel: &mut mpsc::Receiver<NetworkMessage>,
         out_channel: &mpsc::Sender<NetworkMessage>,
         my_id: u16,
+        metrics: Arc<Metrics>,
     ) {
         let (in_buffer, mut out_buffer) = mpsc::unbounded_channel::<TransactionWithResults>();
 
         let out_channel = out_channel.clone();
         tokio::spawn(async move { Self::run_timer(my_id, &mut out_buffer, &out_channel).await });
 
+        let mut num_txn = 0;
         loop {
             tokio::select! {
                 Some(msg) = in_channel.recv() => {
-                    // println!("PRE {} receive a txn", my_id);
+                    
                     let msg = msg.payload;
                     if let RemoraMessage::ProposeExec(full_tx) = msg {
+                        num_txn += 1;
+                        if num_txn == 1 {
+                            metrics.register_start_time();
+                        }
+
                         let memstore = self.memory_store.clone();
                         let context = self.context.clone();
                         let in_buffer = in_buffer.clone();
+                        let metrics = metrics.clone();
                         tokio::spawn(async move {
                             Self::async_exec(
                                 full_tx.clone(),
@@ -179,6 +191,7 @@ impl PreExecWorkerState {
                                 context.validator().get_epoch_store().reference_gas_price(),
                                 context,
                                 &in_buffer,
+                                metrics,
                             ).await
                         });
                     } else {

@@ -1,12 +1,14 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
 use clap::Parser;
 use futures::future;
 use remora::{
+    metrics::Metrics,
     pre_exec_agent::PreExecAgent,
     primary_agent::PrimaryAgent,
     server::Server,
@@ -25,17 +27,21 @@ impl ExecutorShard {
     pub fn start(global_configs: GlobalConfig, id: UniqueId) -> Self {
         let configs = global_configs.get(&id).expect("Unknown agent id");
 
+        let registry = mysten_metrics::start_prometheus_server(configs.metrics_address);
+        let metrics = Metrics::new(&registry.default_registry());
+
         // Initialize and run the worker server.
         let kind = configs.kind.as_str();
+        let cloned_metrics = Arc::new(metrics.clone());
         let main_handle = if kind == "GEN" {
             let mut server = Server::<TxnGenAgent>::new(global_configs, id);
-            tokio::spawn(async move { server.run().await })
+            tokio::spawn(async move { server.run(cloned_metrics).await })
         } else if kind == "PRI" {
             let mut server = Server::<PrimaryAgent>::new(global_configs, id);
-            tokio::spawn(async move { server.run().await })
+            tokio::spawn(async move { server.run(cloned_metrics).await })
         } else if kind == "PRE" {
             let mut server = Server::<PreExecAgent>::new(global_configs, id);
-            tokio::spawn(async move { server.run().await })
+            tokio::spawn(async move { server.run(cloned_metrics).await })
         } else {
             panic!("Unexpected agent kind: {kind}");
         };

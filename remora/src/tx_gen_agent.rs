@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{time::Duration, sync::Arc};
 
 use async_trait::async_trait;
 use sui_single_node_benchmark::{
@@ -137,7 +137,7 @@ impl Agent for TxnGenAgent {
         _in_channel: mpsc::Receiver<NetworkMessage>,
         out_channel: mpsc::Sender<NetworkMessage>,
         attrs: GlobalConfig,
-        // _metrics: Arc<Metrics>,
+        _metrics: Arc<Metrics>,
     ) -> Self {
         TxnGenAgent {
             id,

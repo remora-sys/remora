@@ -18,6 +18,8 @@ use sui_types::{
 };
 use tokio::{sync::mpsc, time::Duration};
 
+use crate::metrics::Metrics;
+
 use super::types::*;
 
 /*****************************************************************************************
@@ -133,6 +135,7 @@ impl PrimaryWorkerState {
         context: Arc<BenchmarkContext>,
         pending_txns: Vec<TransactionWithEffects>,
         pre_exec_res: Arc<PreResType>,
+        metrics: Arc<Metrics>,
     ) {
         let mut non_skip = 0;
         let all_txn_cnt = pending_txns.len();
@@ -184,6 +187,8 @@ impl PrimaryWorkerState {
                 .await;
                 non_skip += 1;
             }
+
+            Metrics::update_metrics(&full_tx.clone(), &metrics);
         }
 
         println!(
@@ -202,6 +207,7 @@ impl PrimaryWorkerState {
         in_consensus: &mut mpsc::UnboundedReceiver<Vec<TransactionWithEffects>>,
         _out_channel: &mpsc::Sender<NetworkMessage>,
         _my_id: u16,
+        metrics: Arc<Metrics>,
     ) {
         let pre_exec_res: Arc<PreResType> = Arc::new(DashMap::new());
 
@@ -219,13 +225,15 @@ impl PrimaryWorkerState {
                     let memstore = self.memory_store.clone();
                     let pending_txns = self.pending_transactions.clone();
                     let pre_exec_res = pre_exec_res.clone();
+                    let metrics = metrics.clone();
 
                     tokio::spawn(async move {
                         Self::main_run_inner(
                             memstore,
                             context,
                             pending_txns,
-                            pre_exec_res).await;
+                            pre_exec_res,
+                            metrics).await;
                         }
                     );
                 },

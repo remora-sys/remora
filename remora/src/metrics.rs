@@ -1,13 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{cmp::max, collections::HashMap, io::BufRead, time::Duration};
+use std::{cmp::max, collections::HashMap, io::BufRead, sync::Arc, time::Duration};
 
 use prometheus::{
     register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
     register_int_counter_with_registry, HistogramVec, IntCounter, IntCounterVec, Registry,
 };
 use prometheus_parse::Scrape;
+
+use crate::types::TransactionWithEffects;
 
 pub const LATENCY_S: &str = "latency_s";
 const LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -152,6 +154,11 @@ impl Metrics {
         self.errors
             .with_label_values(&[&format!("{error_type:?}")])
             .inc();
+    }
+
+    pub fn update_metrics(tx: &TransactionWithEffects, metrics: &Arc<Metrics>) {
+        const WORKLOAD: &str = "default";
+        metrics.register_transaction(tx.timestamp, WORKLOAD);
     }
 }
 
