@@ -182,7 +182,7 @@ impl NetworkManager {
                 tokio::select! {
                     Some(message) = application_out.recv() => {
                         let mut message = message;
-                        let serialized_message= Bytes::from(bincode::serialize(&message).unwrap());
+                        let serialized_message = Bytes::from(bincode::serialize(&message).unwrap());
                         message.src = self.my_id; // set source to self
                         for dst in message.dst.iter() {
                             let address = self.addr_table.get(&dst).unwrap();

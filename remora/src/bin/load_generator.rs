@@ -9,7 +9,7 @@ use itertools::Itertools;
 use network::SimpleSender;
 use remora::{
     metrics::{ErrorType, Metrics},
-    types::TransactionWithEffects,
+    types::{TransactionWithEffects, NetworkMessage, RemoraMessage},
 };
 use sui_single_node_benchmark::{
     benchmark_context::BenchmarkContext,
@@ -64,7 +64,7 @@ impl LoadGenerator {
         let pre_generation = self.load * self.duration.as_secs();
 
         // Create genesis.
-        tracing::debug!("Creating genesis for {pre_generation} transactions...");
+        println!("Creating genesis for {pre_generation} transactions...");
         let start_time = Instant::now();
         let workload = Workload::new(pre_generation, DEFAULT_WORKLOAD);
         let component = Component::PipeTxsToChannel;
@@ -83,7 +83,7 @@ impl LoadGenerator {
         let transactions = ctx.generate_transactions(tx_generator).await;
         let transactions = ctx.certify_transactions(transactions, false).await;
         let elapsed = start_time.elapsed();
-        tracing::debug!(
+        println!(
             "Generated {} txs in {} ms",
             transactions.len(),
             elapsed.as_millis(),
@@ -117,7 +117,12 @@ impl LoadGenerator {
                     checkpoint_seq: None,
                     timestamp,
                 };
-                let bytes = bincode::serialize(&full_tx).expect("serialization failed");
+                let msg = NetworkMessage {
+                    src: 0,
+                    dst: vec![1], // placeholder, not used
+                    payload: RemoraMessage::ProposeExec(full_tx.clone()),
+                };
+                let bytes = bincode::serialize(&msg).expect("serialization failed");
                 self.network.send(self.target, Bytes::from(bytes)).await;
             }
 

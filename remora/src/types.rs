@@ -48,7 +48,7 @@ impl GlobalConfig {
 
     /// Create a new global config for benchmarking.
     /// 1 txn generator, 1 primary worker, and variable pre-executor
-    pub fn new_for_benchmark(ips: Vec<IpAddr>, pre_exec_workers: usize) -> Self {
+    pub fn new_for_testbed(ips: Vec<IpAddr>, pre_exec_workers: usize) -> Self {
         assert!(ips.len() - 2 >= pre_exec_workers && pre_exec_workers > 0);
         let benchmark_port_offset = ips.len() as u16;
         let mut global_config = HashMap::new();
@@ -58,6 +58,41 @@ impl GlobalConfig {
             let kind = match i {
                 0 => "GEN",
                 1 => "PRI",
+                _ => "PRE",
+            }
+            .to_string();
+            let metrics_address = SocketAddr::new(ip, metrics_port);
+            let legacy_metrics = SocketAddr::new(ip, benchmark_port_offset + metrics_port);
+            let config = ServerConfig {
+                kind,
+                ip_addr: ip,
+                port: network_port,
+                metrics_address,
+                attrs: [
+                    ("metrics-address".to_string(), legacy_metrics.to_string()),
+                    ("execute".to_string(), 100.to_string()),
+                    ("mode".to_string(), "channel".to_string()),
+                    // ("duration".to_string(), 60.to_string()),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+            };
+            let id = i as UniqueId;
+            global_config.insert(id, config);
+        }
+        Self(global_config)
+    }
+
+    pub fn new_for_benchmark(ips: Vec<IpAddr>, pre_exec_workers: usize) -> Self {
+        assert!(ips.len() - 1 >= pre_exec_workers);
+        let benchmark_port_offset = ips.len() as u16;
+        let mut global_config = HashMap::new();
+        for (i, ip) in ips.into_iter().enumerate() {
+            let network_port = Self::BENCHMARK_BASE_PORT + i as u16;
+            let metrics_port = benchmark_port_offset + network_port;
+            let kind = match i {
+                0 => "PRI",
                 _ => "PRE",
             }
             .to_string();

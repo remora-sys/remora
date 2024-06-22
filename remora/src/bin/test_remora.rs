@@ -86,18 +86,25 @@ fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
 }
 #[derive(Parser)]
 enum Operation {
-    /// Deploy a local testbed
+    /// Deploy a local testbed with load generator
     Testbed {
         /// Number of pre_exec workers.
         #[clap(long, default_value_t = 1)]
         pre_exec_workers: usize,
     },
+
+    /// Deploy a local testbed with only executors
+    Executor {
+        /// Number of pre_exec workers.
+        #[clap(long, default_value_t = 0)]
+        pre_exec_workers: usize,
+    },
 }
 
-/// Deploy a local testbed of executor shards.
-async fn deploy_testbed(tx_count: u64, duration: u64, pre_exec_workers: usize) -> GlobalConfig {
+/// Deploy an example local testbed with one generator, one primary and N pre-executors.
+async fn deploy_example_testbed(tx_count: u64, duration: u64, pre_exec_workers: usize) -> GlobalConfig {
     let ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST); pre_exec_workers + 2];
-    let mut global_configs = GlobalConfig::new_for_benchmark(ips, pre_exec_workers);
+    let mut global_configs = GlobalConfig::new_for_testbed(ips, pre_exec_workers);
 
     // Insert workload.
     for id in 0..pre_exec_workers + 2 {
@@ -113,10 +120,34 @@ async fn deploy_testbed(tx_count: u64, duration: u64, pre_exec_workers: usize) -
     let configs = global_configs.clone();
     let id = 0;
     let _txn_generator = ExecutorShard::start(configs, id);
-    // txn_generator.await_completion().await.unwrap();
 
-    // FIXME: testing
     let handles = (1..pre_exec_workers + 2).map(|id| {
+        let configs = global_configs.clone();
+        async move {
+            let worker = ExecutorShard::start(configs, id as UniqueId);
+            worker.await_completion().await.unwrap()
+        }
+    });
+    future::join_all(handles).await;
+    global_configs
+}
+
+/// Deploy an example local testbed with one generator, one primary and N pre-executors.
+async fn deploy_executors(tx_count: u64, duration: u64, pre_exec_workers: usize) -> GlobalConfig {
+    let ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST); pre_exec_workers + 1];
+    let mut global_configs = GlobalConfig::new_for_benchmark(ips, pre_exec_workers);
+
+    // Insert workload.
+    for id in 0..pre_exec_workers + 1 {
+        global_configs.0.entry(id as UniqueId).and_modify(|e| {
+            e.attrs.insert("tx_count".to_string(), tx_count.to_string());
+            e.attrs.insert("duration".to_string(), duration.to_string());
+        });
+    }
+
+    println!("Global configs: {:?}", global_configs);
+
+    let handles = (0..pre_exec_workers + 1).map(|id| {
         let configs = global_configs.clone();
         async move {
             let worker = ExecutorShard::start(configs, id as UniqueId);
@@ -135,7 +166,10 @@ async fn main() {
 
     match args.operation {
         Operation::Testbed { pre_exec_workers } => {
-            deploy_testbed(tx_count, duration.as_secs(), pre_exec_workers).await;
+            deploy_example_testbed(tx_count, duration.as_secs(), pre_exec_workers).await;
+        }
+        Operation::Executor { pre_exec_workers } => {
+            deploy_executors(tx_count, duration.as_secs(), pre_exec_workers).await;
         }
     }
 }

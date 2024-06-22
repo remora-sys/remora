@@ -70,6 +70,7 @@ impl Agent for PrimaryAgent {
 
         let mut primary_worker_state =
             primary_worker::PrimaryWorkerState::new(store, context.clone());
+        println!("Finish init primary worker");
 
         let id = self.id;
         let out_channel = self.out_channel.clone();
