@@ -1,4 +1,4 @@
-use std::{time::Duration, sync::Arc};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sui_single_node_benchmark::{

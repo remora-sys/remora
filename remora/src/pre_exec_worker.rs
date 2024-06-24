@@ -19,7 +19,7 @@ use super::types::*;
 /*****************************************************************************************
  *                                    PreExec Worker                                     *
  *****************************************************************************************/
-pub const PRI_ID: u16 = 1;
+pub const PRI_ID: u16 = 0; // FIXME
 pub const INTERVAL: u64 = 2;
 pub const RES_BATCH_SIZE: usize = 10;
 

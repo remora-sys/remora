@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::metrics::Metrics;
 use super::types::*;
+use crate::metrics::Metrics;
 
 #[async_trait]
 pub trait Agent {

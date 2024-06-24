@@ -8,10 +8,10 @@ use tokio::sync::mpsc;
 
 use super::agents::*;
 use crate::{
+    metrics::Metrics,
     pre_exec_worker::{self},
     tx_gen_agent::WORKLOAD,
     types::*,
-    metrics::Metrics,
 };
 
 pub struct PreExecAgent {
@@ -19,7 +19,7 @@ pub struct PreExecAgent {
     in_channel: mpsc::Receiver<NetworkMessage>,
     out_channel: mpsc::Sender<NetworkMessage>,
     attrs: GlobalConfig,
-     metrics: Arc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 pub const COMPONENT: Component = Component::Baseline;

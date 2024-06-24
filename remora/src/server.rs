@@ -15,8 +15,8 @@ use tokio::{
     time::{sleep, Duration},
 };
 
-use crate::metrics::Metrics;
 use super::{agents::*, types::*};
+use crate::metrics::Metrics;
 
 pub struct Server<T: Agent> {
     global_config: GlobalConfig, // global configuration from parsing json
@@ -51,7 +51,7 @@ impl<T: Agent> Server<T> {
     }
 
     // Server main function
-    pub async fn run(&mut self , metrics: Arc<Metrics>) {
+    pub async fn run(&mut self, metrics: Arc<Metrics>) {
         // Initialize map from id to address
         let mut addr_table: HashMap<UniqueId, SocketAddr> = HashMap::new();
         for (id, entry) in self.global_config.iter() {

@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU64, path::PathBuf, time::Duration, collections::HashMap};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -9,7 +9,7 @@ use itertools::Itertools;
 use network::SimpleSender;
 use remora::{
     metrics::{ErrorType, Metrics},
-    types::{TransactionWithEffects, NetworkMessage, RemoraMessage},
+    types::{TransactionWithEffects, NetworkMessage, RemoraMessage, GlobalConfig, UniqueId},
 };
 use sui_single_node_benchmark::{
     benchmark_context::BenchmarkContext,
@@ -38,22 +38,41 @@ pub struct LoadGenerator {
     /// Duration of the load test.
     duration: Duration,
     /// The network target to send transactions to.
-    target: SocketAddr,
+    targets: HashMap<UniqueId, SocketAddr>,
     /// A best effort network sender.
     network: SimpleSender,
     /// Metrics for the load generator.
     metrics: Metrics,
+    /// Forwarding policy to executors.
+    policy: ForwardingPolicy,
+}
+
+const DEFAULT_CONFIG_PATH: &str = "src/configs/1pri1pre.json";
+
+#[derive(Clone, Debug, Parser)]
+pub enum ForwardingPolicy {
+    /// Directly forward to a single target machine.
+    SingleTarget {
+        #[arg(long)]
+        target: SocketAddr,
+    },
+    /// Forward to primary and one of pre-executors (round-robin).
+    RoundRobin {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config_path: PathBuf,
+    }
 }
 
 impl LoadGenerator {
     /// Create a new load generator.
-    pub fn new(load: u64, duration: Duration, target: SocketAddr, metrics: Metrics) -> Self {
+    pub fn new(load: u64, duration: Duration, targets: HashMap<UniqueId, SocketAddr>, metrics: Metrics, policy: ForwardingPolicy) -> Self {
         LoadGenerator {
             load,
             duration,
-            target,
+            targets,
             network: SimpleSender::new(),
             metrics,
+            policy,
         }
     }
 
@@ -99,6 +118,7 @@ impl LoadGenerator {
         let burst_duration = Duration::from_millis(1000 / precision);
         let mut interval = interval(burst_duration);
         interval.set_missed_tick_behavior(MissedTickBehavior::Burst);
+        let mut pre_id = 1;
 
         let chunks_size = (self.load / precision) as usize;
         let chunks = &transactions.into_iter().chunks(chunks_size);
@@ -123,7 +143,23 @@ impl LoadGenerator {
                     payload: RemoraMessage::ProposeExec(full_tx.clone()),
                 };
                 let bytes = bincode::serialize(&msg).expect("serialization failed");
-                self.network.send(self.target, Bytes::from(bytes)).await;
+                match self.policy {
+                    ForwardingPolicy::SingleTarget{target} => {
+                        self.network.send(target, Bytes::from(bytes.clone())).await;
+                    },
+                    ForwardingPolicy::RoundRobin{..} => {
+                        // send to PRI
+                        let primary_addr = self.targets.get(&0).unwrap();
+                        self.network.send(*primary_addr, Bytes::from(bytes.clone())).await;
+                        // send to one of PRE
+                        let pre_addr = self.targets.get(&pre_id).unwrap();
+                        self.network.send(*pre_addr, Bytes::from(bytes.clone())).await;
+                        pre_id += 1;
+                        if pre_id as usize >= self.targets.len() {
+                            pre_id = 1; // Reset to the first PRE
+                        }
+                    }
+                }
             }
 
             if now.elapsed() > burst_duration {
@@ -145,14 +181,14 @@ struct Args {
     #[clap(long, default_value = "2")]
     load: NonZeroU64,
     /// The duration of the load test.
-    #[clap(long, value_parser = parse_duration,  default_value = "10")]
+    #[clap(long, value_parser = parse_duration, default_value = "10")]
     duration: Duration,
-    /// The target address to send transactions to.
-    #[clap(long)]
-    target: SocketAddr,
     /// The address to expose metrics on.
     #[clap(long)]
     metrics_address: SocketAddr,
+    /// Forwarding policy to executors.
+    #[clap(subcommand)]
+    policy: ForwardingPolicy,
 }
 
 fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
@@ -170,7 +206,23 @@ async fn main() {
 
     // Create genesis and generate transactions.
     let load = args.load.get();
-    let mut load_generator = LoadGenerator::new(load, args.duration, args.target, metrics);
+    let mut load_generator: LoadGenerator;
+
+    match args.policy {
+        ForwardingPolicy::SingleTarget { target: _ } => {
+            load_generator = LoadGenerator::new(load, args.duration, HashMap::new(), metrics, args.policy.clone());
+        },
+        ForwardingPolicy::RoundRobin { ref config_path } => {
+            let global_config = GlobalConfig::from_path(config_path);
+            let mut target_vec = HashMap::new();
+            for (id, entry) in global_config.iter() {
+                target_vec.insert(*id, SocketAddr::new(entry.ip_addr, entry.port));
+            }
+            assert!(target_vec.len() > 1, "Need at least two targets.");
+            load_generator = LoadGenerator::new(load, args.duration, target_vec, metrics, args.policy.clone());
+        }
+    }
+
     let transactions = load_generator.initialize().await;
 
     // Submit transactions to the server.
@@ -188,7 +240,7 @@ mod test {
     use tokio::{net::TcpListener, task::JoinHandle};
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-    use crate::LoadGenerator;
+    use crate::{LoadGenerator, ForwardingPolicy};
 
     /// Create a network listener that will receive a single message and return it.
     fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
@@ -217,7 +269,7 @@ mod test {
 
         // Create genesis and generate transactions.
         let metrics = Metrics::new(&Registry::new());
-        let mut load_generator = LoadGenerator::new(1, Duration::from_secs(1), target, metrics);
+        let mut load_generator = LoadGenerator::new(1, Duration::from_secs(1), target, metrics, ForwardingPolicy::SingleTarget);
         let transactions = load_generator.initialize().await;
 
         // Submit transactions to the server.

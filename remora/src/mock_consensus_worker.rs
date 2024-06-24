@@ -12,7 +12,7 @@ use super::types::*;
  *****************************************************************************************/
 const CONSENSUS_DURATION: u64 = 300;
 const TIMEOUT: u64 = 10000;
-const BLOCK_SIZE: usize = 100;
+const BLOCK_SIZE: usize = 1000;
 
 async fn send_transactions(
     tx_vec: Vec<TransactionWithEffects>,

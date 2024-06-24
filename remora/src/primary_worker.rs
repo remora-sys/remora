@@ -97,7 +97,7 @@ impl PrimaryWorkerState {
             );
         assert!(effects.status().is_ok());
         memstore.commit_objects(inner_temp_store);
-        println!("PRI finish re-exec a txn");
+        // println!("PRI finish re-exec a txn");
     }
 
     // Helper: Returns Input objects by reading from the memory_store
