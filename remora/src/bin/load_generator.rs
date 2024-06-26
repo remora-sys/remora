@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, num::NonZeroU64, path::PathBuf, time::Duration, collections::HashMap};
+use std::{collections::HashMap, net::SocketAddr, num::NonZeroU64, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -9,7 +9,7 @@ use itertools::Itertools;
 use network::SimpleSender;
 use remora::{
     metrics::{ErrorType, Metrics},
-    types::{TransactionWithEffects, NetworkMessage, RemoraMessage, GlobalConfig, UniqueId},
+    types::{GlobalConfig, NetworkMessage, RemoraMessage, TransactionWithEffects, UniqueId},
 };
 use sui_single_node_benchmark::{
     benchmark_context::BenchmarkContext,
@@ -60,12 +60,18 @@ pub enum ForwardingPolicy {
     RoundRobin {
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
         config_path: PathBuf,
-    }
+    },
 }
 
 impl LoadGenerator {
     /// Create a new load generator.
-    pub fn new(load: u64, duration: Duration, targets: HashMap<UniqueId, SocketAddr>, metrics: Metrics, policy: ForwardingPolicy) -> Self {
+    pub fn new(
+        load: u64,
+        duration: Duration,
+        targets: HashMap<UniqueId, SocketAddr>,
+        metrics: Metrics,
+        policy: ForwardingPolicy,
+    ) -> Self {
         LoadGenerator {
             load,
             duration,
@@ -144,16 +150,20 @@ impl LoadGenerator {
                 };
                 let bytes = bincode::serialize(&msg).expect("serialization failed");
                 match self.policy {
-                    ForwardingPolicy::SingleTarget{target} => {
+                    ForwardingPolicy::SingleTarget { target } => {
                         self.network.send(target, Bytes::from(bytes.clone())).await;
-                    },
-                    ForwardingPolicy::RoundRobin{..} => {
+                    }
+                    ForwardingPolicy::RoundRobin { .. } => {
                         // send to PRI
                         let primary_addr = self.targets.get(&0).unwrap();
-                        self.network.send(*primary_addr, Bytes::from(bytes.clone())).await;
+                        self.network
+                            .send(*primary_addr, Bytes::from(bytes.clone()))
+                            .await;
                         // send to one of PRE
                         let pre_addr = self.targets.get(&pre_id).unwrap();
-                        self.network.send(*pre_addr, Bytes::from(bytes.clone())).await;
+                        self.network
+                            .send(*pre_addr, Bytes::from(bytes.clone()))
+                            .await;
                         pre_id += 1;
                         if pre_id as usize >= self.targets.len() {
                             pre_id = 1; // Reset to the first PRE
@@ -210,8 +220,14 @@ async fn main() {
 
     match args.policy {
         ForwardingPolicy::SingleTarget { target: _ } => {
-            load_generator = LoadGenerator::new(load, args.duration, HashMap::new(), metrics, args.policy.clone());
-        },
+            load_generator = LoadGenerator::new(
+                load,
+                args.duration,
+                HashMap::new(),
+                metrics,
+                args.policy.clone(),
+            );
+        }
         ForwardingPolicy::RoundRobin { ref config_path } => {
             let global_config = GlobalConfig::from_path(config_path);
             let mut target_vec = HashMap::new();
@@ -219,7 +235,13 @@ async fn main() {
                 target_vec.insert(*id, SocketAddr::new(entry.ip_addr, entry.port));
             }
             assert!(target_vec.len() > 1, "Need at least two targets.");
-            load_generator = LoadGenerator::new(load, args.duration, target_vec, metrics, args.policy.clone());
+            load_generator = LoadGenerator::new(
+                load,
+                args.duration,
+                target_vec,
+                metrics,
+                args.policy.clone(),
+            );
         }
     }
 
@@ -231,16 +253,19 @@ async fn main() {
 
 #[cfg(test)]
 mod test {
-    use std::{net::SocketAddr, time::Duration};
+    use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
     use bytes::Bytes;
     use futures::{sink::SinkExt, stream::StreamExt};
     use prometheus::Registry;
-    use remora::{metrics::Metrics, types::TransactionWithEffects};
+    use remora::{
+        metrics::Metrics,
+        types::{NetworkMessage, RemoraMessage},
+    };
     use tokio::{net::TcpListener, task::JoinHandle};
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-    use crate::{LoadGenerator, ForwardingPolicy};
+    use crate::{ForwardingPolicy, LoadGenerator};
 
     /// Create a network listener that will receive a single message and return it.
     fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
@@ -269,7 +294,13 @@ mod test {
 
         // Create genesis and generate transactions.
         let metrics = Metrics::new(&Registry::new());
-        let mut load_generator = LoadGenerator::new(1, Duration::from_secs(1), target, metrics, ForwardingPolicy::SingleTarget);
+        let mut load_generator = LoadGenerator::new(
+            1,
+            Duration::from_secs(1),
+            HashMap::new(),
+            metrics,
+            ForwardingPolicy::SingleTarget { target },
+        );
         let transactions = load_generator.initialize().await;
 
         // Submit transactions to the server.
@@ -278,8 +309,14 @@ mod test {
 
         // Check that the transactions were received.
         let received = handle.await.unwrap();
-        let transaction: TransactionWithEffects = bincode::deserialize(&received).unwrap();
-        let timestamp = transaction.timestamp;
-        assert!(timestamp > now);
+        let msg: NetworkMessage = bincode::deserialize(&received).unwrap();
+        match msg.payload {
+            RemoraMessage::ProposeExec(txn) => {
+                assert!(txn.timestamp > now);
+            }
+            _ => {
+                panic!("Unexpected message type");
+            }
+        };
     }
 }
