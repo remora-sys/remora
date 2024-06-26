@@ -1,10 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroUsize;
+
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::mpsc::{error::SendError, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
@@ -17,19 +19,19 @@ pub type ConsensusCommit<T> = Vec<T>;
 #[cfg_attr(test, derive(Clone))]
 pub struct MockConsensusParameters {
     /// The preferred batch size (in number of transactions).
-    batch_size: usize,
+    batch_size: NonZeroUsize,
     /// The maximum delay after which to seal the batch.
     max_batch_delay: Duration,
     /// The maximum number of batches that can be in-flight at the same time.
-    max_inflight_batches: usize,
+    max_inflight_batches: NonZeroUsize,
 }
 
 impl Default for MockConsensusParameters {
     fn default() -> Self {
         Self {
-            batch_size: 1000,
+            batch_size: NonZeroUsize::new(1000).unwrap(),
             max_batch_delay: Duration::from_millis(100),
-            max_inflight_batches: 10_000,
+            max_inflight_batches: NonZeroUsize::new(10_000).unwrap(),
         }
     }
 }
@@ -70,7 +72,7 @@ impl<M, T> MockConsensus<M, T> {
         rx_load_balancer: UnboundedReceiver<T>,
         tx_primary_executor: UnboundedSender<ConsensusCommit<T>>,
     ) -> Self {
-        let batch_size = parameters.batch_size;
+        let batch_size = parameters.batch_size.get();
         Self {
             model,
             parameters,
@@ -84,26 +86,29 @@ impl<M, T> MockConsensus<M, T> {
 
 impl<M: DelayModel<T> + Send + 'static, T: Send + 'static> MockConsensus<M, T> {
     /// Spawn the mock consensus engine in a separate task.
-    pub fn spawn(mut self) -> JoinHandle<Result<(), SendError<ConsensusCommit<T>>>> {
+    pub fn spawn(mut self) -> JoinHandle<()> {
         tokio::spawn(async move { self.run().await })
     }
 
     /// Run the mock consensus engine.
-    pub async fn run(&mut self) -> Result<(), SendError<ConsensusCommit<T>>> {
+    pub async fn run(&mut self) {
         let timer = sleep(self.parameters.max_batch_delay);
         tokio::pin!(timer);
 
+        // Holds the futures of the in-flight batches waiting to be committed.
         let mut waiter = FuturesUnordered::new();
 
+        let max_inflight_batches = self.parameters.max_inflight_batches.get();
+        let batch_size = self.parameters.batch_size.get();
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size. If there are too many
                 // in-flight batches, wait for some to complete before accepting new transactions.
                 Some(transaction) = self.rx_load_balancer.recv(),
-                    if self.current_inflight_batches < self.parameters.max_inflight_batches => {
+                    if self.current_inflight_batches < max_inflight_batches => {
 
                     self.current_batch.push(transaction);
-                    if self.current_batch.len() >= self.parameters.batch_size {
+                    if self.current_batch.len() >= batch_size {
                         self.current_inflight_batches += 1;
                         let batch = self.current_batch.drain(..).collect();
                         waiter.push(self.model.consensus_delay(batch));
@@ -124,7 +129,10 @@ impl<M: DelayModel<T> + Send + 'static, T: Send + 'static> MockConsensus<M, T> {
                 // Deliver the consensus commit to the primary executor.
                 Some(commit) = waiter.next() => {
                     self.current_inflight_batches -= 1;
-                    self.tx_primary_executor.send(commit)?
+                    if self.tx_primary_executor.send(commit).is_err() {
+                        tracing::warn!("terminating consensus task: primary executor dropped the channel");
+                        break
+                    }
                 }
             }
 
@@ -197,7 +205,7 @@ pub mod models {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{num::NonZeroUsize, time::Duration};
 
     use tokio::time::Instant;
 
@@ -211,9 +219,9 @@ mod test {
     async fn fixed_delay() {
         let model = FixedDelay::default();
         let parameters = MockConsensusParameters {
-            batch_size: 3,
-            max_batch_delay: std::time::Duration::from_millis(100),
-            max_inflight_batches: 10,
+            batch_size: NonZeroUsize::new(3).unwrap(),
+            max_inflight_batches: NonZeroUsize::new(10).unwrap(),
+            ..MockConsensusParameters::default()
         };
 
         let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
@@ -229,7 +237,7 @@ mod test {
 
         // Send enough transactions to fill two batches.
         let start = Instant::now();
-        for i in 0..parameters.batch_size * 2 {
+        for i in 0..parameters.batch_size.get() * 2 {
             tx_load_balancer.send(i).unwrap();
         }
 
@@ -247,9 +255,9 @@ mod test {
     async fn uniform_delay() {
         let model = UniformDelay::default();
         let parameters = MockConsensusParameters {
-            batch_size: 3,
-            max_batch_delay: Duration::from_millis(100),
-            max_inflight_batches: 10,
+            batch_size: NonZeroUsize::new(3).unwrap(),
+            max_inflight_batches: NonZeroUsize::new(10).unwrap(),
+            ..MockConsensusParameters::default()
         };
 
         let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
@@ -265,7 +273,7 @@ mod test {
 
         // Send enough transactions to fill two batches.
         let start = Instant::now();
-        for i in 0..parameters.batch_size * 2 {
+        for i in 0..parameters.batch_size.get() * 2 {
             tx_load_balancer.send(i).unwrap();
         }
 
@@ -276,19 +284,18 @@ mod test {
         let end = start.elapsed();
 
         assert!(end >= model.min_delay);
-        assert!(end < model.max_delay);
-        assert!(
-            (0..parameters.batch_size * 2).all(|x| commit_1.contains(&x) || commit_2.contains(&x))
-        );
+        assert!(end <= model.max_delay);
+        assert!((0..parameters.batch_size.get() * 2)
+            .all(|x| commit_1.contains(&x) || commit_2.contains(&x)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn early_batch_seal() {
         let model = FixedDelay::default();
         let parameters = MockConsensusParameters {
-            batch_size: 3,
+            batch_size: NonZeroUsize::new(3).unwrap(),
             max_batch_delay: Duration::from_millis(100),
-            max_inflight_batches: 10,
+            ..MockConsensusParameters::default()
         };
 
         let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
@@ -310,5 +317,100 @@ mod test {
         let commit = rx_primary_executor.recv().await.unwrap();
         assert_eq!(commit, vec![0]);
         assert_eq!(start.elapsed(), model.delay + parameters.max_batch_delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hit_max_inflight_batches() {
+        let model = FixedDelay::default();
+        let parameters = MockConsensusParameters {
+            batch_size: NonZeroUsize::new(3).unwrap(),
+            max_batch_delay: Duration::from_secs(100), // Ensure it is never hit.
+            max_inflight_batches: NonZeroUsize::new(1).unwrap(),
+            ..MockConsensusParameters::default()
+        };
+
+        let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_primary_executor, mut rx_primary_executor) = tokio::sync::mpsc::unbounded_channel();
+
+        MockConsensus::new(
+            model.clone(),
+            parameters.clone(),
+            rx_load_balancer,
+            tx_primary_executor,
+        )
+        .spawn();
+
+        // Send enough transactions to fill two batches.
+        let start = Instant::now();
+        for i in 0..parameters.batch_size.get() * 2 {
+            tx_load_balancer.send(i).unwrap();
+        }
+
+        // Wait for the consensus to first commit.
+        let commit_1 = rx_primary_executor.recv().await.unwrap();
+        assert_eq!(commit_1, vec![0, 1, 2]);
+        assert_eq!(start.elapsed(), model.delay);
+
+        // The second commit should only happen after the first one completes.
+        let commit_2 = rx_primary_executor.recv().await.unwrap();
+        assert_eq!(commit_2, vec![3, 4, 5]);
+        assert_eq!(start.elapsed(), model.delay * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminate_consensus() {
+        let model = FixedDelay::default();
+        let parameters = MockConsensusParameters::default();
+
+        let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_primary_executor, rx_primary_executor) = tokio::sync::mpsc::unbounded_channel();
+
+        let consensus_handle = MockConsensus::new(
+            model.clone(),
+            parameters.clone(),
+            rx_load_balancer,
+            tx_primary_executor,
+        )
+        .spawn();
+
+        // Close the mock consensus engine.
+        drop(rx_primary_executor);
+        tx_load_balancer.send(0).unwrap();
+        consensus_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn smoke_test() {
+        let model = FixedDelay {
+            delay: Duration::from_millis(1),
+        };
+        let parameters = MockConsensusParameters::default();
+
+        let (tx_load_balancer, rx_load_balancer) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_primary_executor, mut rx_primary_executor) = tokio::sync::mpsc::unbounded_channel();
+
+        MockConsensus::new(
+            model.clone(),
+            parameters.clone(),
+            rx_load_balancer,
+            tx_primary_executor,
+        )
+        .spawn();
+
+        // Send many transactions to the mock consensus engine.
+        let total_batches = 100;
+        let sender_handle = tokio::spawn(async move {
+            for i in 0..parameters.batch_size.get() * total_batches {
+                tx_load_balancer.send(i).unwrap();
+            }
+        });
+
+        // Wait for the consensus to commit the batches.
+        for _ in 0..total_batches {
+            let _ = rx_primary_executor.recv().await.unwrap();
+        }
+
+        // Ensure the sender task completes.
+        sender_handle.await.unwrap();
     }
 }
