@@ -1,7 +1,7 @@
 use core::panic;
 
 use tokio::{
-    sync::mpsc,
+    sync::mpsc::{self},
     time::{interval, sleep, Duration, Interval},
 };
 
