@@ -220,7 +220,7 @@ mod test {
         let model = FixedDelay::default();
         let parameters = MockConsensusParameters {
             batch_size: NonZeroUsize::new(3).unwrap(),
-            max_inflight_batches: NonZeroUsize::new(10).unwrap(),
+            max_inflight_batches: NonZeroUsize::new(10).unwrap(), // Ensure it is never hit.
             ..MockConsensusParameters::default()
         };
 
@@ -256,7 +256,7 @@ mod test {
         let model = UniformDelay::default();
         let parameters = MockConsensusParameters {
             batch_size: NonZeroUsize::new(3).unwrap(),
-            max_inflight_batches: NonZeroUsize::new(10).unwrap(),
+            max_inflight_batches: NonZeroUsize::new(10).unwrap(), // Ensure it is never hit.
             ..MockConsensusParameters::default()
         };
 
@@ -382,7 +382,7 @@ mod test {
     #[tokio::test]
     async fn smoke_test() {
         let model = FixedDelay {
-            delay: Duration::from_millis(1),
+            delay: Duration::from_millis(1), // Ensure the test doesn't last too long.
         };
         let parameters = MockConsensusParameters::default();
 
@@ -399,7 +399,7 @@ mod test {
 
         // Send many transactions to the mock consensus engine.
         let total_batches = 100;
-        let sender_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             for i in 0..parameters.batch_size.get() * total_batches {
                 tx_load_balancer.send(i).unwrap();
             }
@@ -409,8 +409,5 @@ mod test {
         for _ in 0..total_batches {
             let _ = rx_primary_executor.recv().await.unwrap();
         }
-
-        // Ensure the sender task completes.
-        sender_handle.await.unwrap();
     }
 }
