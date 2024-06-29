@@ -2,7 +2,6 @@ pub mod agents;
 pub mod input_traffic_manager;
 pub mod metrics;
 pub mod mock_consensus;
-pub mod mock_consensus_worker;
 pub mod pre_exec_agent;
 pub mod pre_exec_worker;
 pub mod primary_agent;
