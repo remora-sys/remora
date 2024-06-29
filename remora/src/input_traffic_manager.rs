@@ -13,8 +13,8 @@ use super::types::*;
 
 pub async fn input_traffic_manager_run(
     in_channel: &mut mpsc::Receiver<NetworkMessage>,
-    out_consensus: &mpsc::UnboundedSender<RemoraMessage>,
-    out_executor: &mpsc::UnboundedSender<RemoraMessage>,
+    out_consensus: &mpsc::UnboundedSender<TransactionWithEffects>,
+    out_executor: &mpsc::UnboundedSender<Vec<TransactionWithResults>>,
     my_id: u16,
     metrics: Arc<Metrics>,
 ) {
@@ -23,18 +23,18 @@ pub async fn input_traffic_manager_run(
         tokio::select! {
             Some(msg) = in_channel.recv() => {
                 let msg = msg.payload;
-                if let RemoraMessage::ProposeExec(..) = msg {
+                if let RemoraMessage::ProposeExec(full_tx) = msg {
                     num_txn += 1;
                     if num_txn == 1 {
                         metrics.register_start_time();
                     }
                     
-                    if let Err(e) = out_consensus.send(msg) {
+                    if let Err(e) = out_consensus.send(full_tx) {
                         eprintln!("Failed to forward to consensus engine: {:?}", e);
                     };
-                } else if let RemoraMessage::PreExecResult{..} = msg {
+                } else if let RemoraMessage::PreExecResult(tx_res) = msg {
                     // println!("PRI receive a result from PRE");
-                    if let Err(e) = out_executor.send(msg) {
+                    if let Err(e) = out_executor.send(tx_res) {
                         eprintln!("Failed to forward to executor engine: {:?}", e);
                     };
                 } else {

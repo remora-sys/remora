@@ -203,7 +203,7 @@ impl PrimaryWorkerState {
         &mut self,
         _tx_count: u64,
         _duration: Duration,
-        in_traffic_manager: &mut mpsc::UnboundedReceiver<RemoraMessage>,
+        in_traffic_manager: &mut mpsc::UnboundedReceiver<Vec<TransactionWithResults>>,
         in_consensus: &mut mpsc::UnboundedReceiver<Vec<TransactionWithEffects>>,
         _out_channel: &mpsc::Sender<NetworkMessage>,
         _my_id: u16,
@@ -239,11 +239,9 @@ impl PrimaryWorkerState {
                 },
 
                 // Merge pre-exec results
-                Some(msg) = in_traffic_manager.recv() => {
-                    if let RemoraMessage::PreExecResult(tx_res) = msg {
-                        for res in tx_res {
-                            pre_exec_res.insert(*res.tx_effects.transaction_digest(), res);
-                        }
+                Some(tx_res) = in_traffic_manager.recv() => {
+                    for res in tx_res {
+                        pre_exec_res.insert(*res.tx_effects.transaction_digest(), res);
                     }
                 }
             }

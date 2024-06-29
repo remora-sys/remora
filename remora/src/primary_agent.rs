@@ -10,10 +10,15 @@ use super::agents::*;
 use crate::{
     input_traffic_manager::input_traffic_manager_run,
     metrics::Metrics,
-    mock_consensus_worker::mock_consensus_worker_run,
+    mock_consensus::{
+        models::FixedDelay,
+        MockConsensus,
+        MockConsensusParameters,
+    },
     primary_worker::{self},
     tx_gen_agent::WORKLOAD,
     types::*,
+
 };
 
 pub struct PrimaryAgent {
@@ -61,10 +66,10 @@ impl Agent for PrimaryAgent {
 
         let store = context.validator().create_in_memory_store();
 
-        let (input_consensus_sender, mut input_consensus_receiver) =
-            mpsc::unbounded_channel::<RemoraMessage>();
+        let (input_consensus_sender, input_consensus_receiver) =
+            mpsc::unbounded_channel::<TransactionWithEffects>();
         let (input_executor_sender, mut input_executor_receiver) =
-            mpsc::unbounded_channel::<RemoraMessage>();
+            mpsc::unbounded_channel::<Vec<TransactionWithResults>>();
         let (consensus_executor_sender, mut consensus_executor_receiver) =
             mpsc::unbounded_channel::<Vec<TransactionWithEffects>>();
 
@@ -90,14 +95,16 @@ impl Agent for PrimaryAgent {
                 .await;
         });
 
-        tokio::spawn(async move {
-            mock_consensus_worker_run(
-                &mut input_consensus_receiver,
-                &consensus_executor_sender,
-                id,
-            )
-            .await;
-        });
+        let model = FixedDelay::default();
+        let parameters = MockConsensusParameters::default();
+
+        MockConsensus::new(
+            model,
+            parameters,
+            input_consensus_receiver,
+            consensus_executor_sender,
+        )
+        .spawn();
 
         {
             input_traffic_manager_run(
