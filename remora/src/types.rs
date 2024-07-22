@@ -12,12 +12,12 @@ use sui_protocol_config::ProtocolVersion;
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SequenceNumber},
     digests::TransactionDigest,
-    effects::TransactionEffects,
+    effects::{TransactionEffects, TransactionEffectsAPI},
     epoch_data::EpochData,
     object::Object,
     storage::{DeleteKind, WriteKind},
     sui_system_state::epoch_start_sui_system_state::EpochStartSystemState,
-    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, TransactionKind},
+    transaction::CertifiedTransaction, // transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, TransactionKind},
 };
 
 pub type UniqueId = u16;
@@ -213,107 +213,111 @@ pub struct TransactionWithEffects {
 }
 
 impl TransactionWithEffects {
-    pub fn is_epoch_change(&self) -> bool {
-        match self.tx.transaction_data().kind() {
-            TransactionKind::ChangeEpoch(_) => true,
-            _ => false,
-        }
+    pub fn certified_transaction(&self) -> &CertifiedTransaction {
+        &self.tx
     }
 
-    /// Returns the read set of a transaction.
-    /// Specifically, this is the set of input objects to the transaction.
-    /// It excludes child objects that are determined at runtime,
-    /// but includes all owned objects inputs that must have their version numbers bumped.
-    pub fn get_read_set(&self) -> HashSet<ObjectID> {
-        let tx_data = self.tx.transaction_data();
-        let input_object_kinds = tx_data
-            .input_objects()
-            .expect("Cannot get input object kinds");
+    // pub fn is_epoch_change(&self) -> bool {
+    //     match self.tx.transaction_data().kind() {
+    //         TransactionKind::ChangeEpoch(_) => true,
+    //         _ => false,
+    //     }
+    // }
 
-        let mut read_set = HashSet::new();
-        for kind in &input_object_kinds {
-            match kind {
-                // InputObjectKind::MovePackage(id) |
-                InputObjectKind::SharedMoveObject { id, .. }
-                | InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => read_set.insert(*id),
-                _ => false,
-            };
-        }
+    // /// Returns the read set of a transaction.
+    // /// Specifically, this is the set of input objects to the transaction.
+    // /// It excludes child objects that are determined at runtime,
+    // /// but includes all owned objects inputs that must have their version numbers bumped.
+    // pub fn get_read_set(&self) -> HashSet<ObjectID> {
+    //     let tx_data = self.tx.transaction_data();
+    //     let input_object_kinds = tx_data
+    //         .input_objects()
+    //         .expect("Cannot get input object kinds");
 
-        for (gas_obj_id, _, _) in tx_data.gas().iter() {
-            // skip genesis gas objects
-            if *gas_obj_id != ObjectID::from_single_byte(0) {
-                read_set.insert(*gas_obj_id);
-            }
-        }
+    //     let mut read_set = HashSet::new();
+    //     for kind in &input_object_kinds {
+    //         match kind {
+    //             // InputObjectKind::MovePackage(id) |
+    //             InputObjectKind::SharedMoveObject { id, .. }
+    //             | InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => read_set.insert(*id),
+    //             _ => false,
+    //         };
+    //     }
 
-        // for (&package_obj_id, _, _) in tx_data.move_calls() {
-        //     read_set.insert(package_obj_id);
-        // }
+    //     for (gas_obj_id, _, _) in tx_data.gas().iter() {
+    //         // skip genesis gas objects
+    //         if *gas_obj_id != ObjectID::from_single_byte(0) {
+    //             read_set.insert(*gas_obj_id);
+    //         }
+    //     }
 
-        return read_set;
-    }
+    //     // for (&package_obj_id, _, _) in tx_data.move_calls() {
+    //     //     read_set.insert(package_obj_id);
+    //     // }
 
-    /// TODO: This makes use of ground_truth_effects, which is illegal for validators;
-    /// it is not something that is known a-priori before execution.
-    /// Returns the write set of a transaction.
-    pub fn get_write_set(&self) -> HashSet<ObjectID> {
-        match &self.ground_truth_effects {
-            Some(fx) => {
-                let TransactionEffects::V1(tx_effects) = fx else {
-                    todo!()
-                };
-                let total_writes = tx_effects.created.len()
-                    + tx_effects.mutated.len()
-                    + tx_effects.unwrapped.len()
-                    + tx_effects.deleted.len()
-                    + tx_effects.unwrapped_then_deleted.len()
-                    + tx_effects.wrapped.len();
-                let mut write_set: HashSet<ObjectID> = HashSet::with_capacity(total_writes);
+    //     return read_set;
+    // }
 
-                write_set.extend(
-                    tx_effects
-                        .created
-                        .iter()
-                        .chain(tx_effects.mutated.iter())
-                        .chain(tx_effects.unwrapped.iter())
-                        .map(|(object_ref, _)| object_ref.0),
-                );
-                write_set.extend(
-                    tx_effects
-                        .deleted
-                        .iter()
-                        .chain(tx_effects.unwrapped_then_deleted.iter())
-                        .chain(tx_effects.wrapped.iter())
-                        .map(|object_ref| object_ref.0),
-                );
+    // /// TODO: This makes use of ground_truth_effects, which is illegal for validators;
+    // /// it is not something that is known a-priori before execution.
+    // /// Returns the write set of a transaction.
+    // pub fn get_write_set(&self) -> HashSet<ObjectID> {
+    //     match &self.ground_truth_effects {
+    //         Some(fx) => {
+    //             let TransactionEffects::V1(tx_effects) = fx else {
+    //                 todo!()
+    //             };
+    //             let total_writes = tx_effects.created.len()
+    //                 + tx_effects.mutated.len()
+    //                 + tx_effects.unwrapped.len()
+    //                 + tx_effects.deleted.len()
+    //                 + tx_effects.unwrapped_then_deleted.len()
+    //                 + tx_effects.wrapped.len();
+    //             let mut write_set: HashSet<ObjectID> = HashSet::with_capacity(total_writes);
 
-                write_set
-            }
-            None => self.get_read_set(),
-        }
-        // assert!(self.ground_truth_effects.is_some());
-    }
+    //             write_set.extend(
+    //                 tx_effects
+    //                     .created
+    //                     .iter()
+    //                     .chain(tx_effects.mutated.iter())
+    //                     .chain(tx_effects.unwrapped.iter())
+    //                     .map(|(object_ref, _)| object_ref.0),
+    //             );
+    //             write_set.extend(
+    //                 tx_effects
+    //                     .deleted
+    //                     .iter()
+    //                     .chain(tx_effects.unwrapped_then_deleted.iter())
+    //                     .chain(tx_effects.wrapped.iter())
+    //                     .map(|object_ref| object_ref.0),
+    //             );
 
-    /// Returns the read-write set of the transaction.
-    pub fn get_read_write_set(&self) -> HashSet<ObjectID> {
-        self.get_read_set()
-            .union(&self.get_write_set())
-            .copied()
-            .collect()
-    }
+    //             write_set
+    //         }
+    //         None => self.get_read_set(),
+    //     }
+    //     // assert!(self.ground_truth_effects.is_some());
+    // }
 
-    pub fn get_relevant_ews(&self, num_ews: u8) -> HashSet<u8> {
-        let rw_set = self.get_read_write_set();
-        if rw_set.contains(&ObjectID::from_single_byte(5)) || self.is_epoch_change() {
-            (0..num_ews).collect()
-        } else {
-            rw_set
-                .into_iter()
-                .map(|obj_id| obj_id[0] % num_ews)
-                .collect()
-        }
-    }
+    // /// Returns the read-write set of the transaction.
+    // pub fn get_read_write_set(&self) -> HashSet<ObjectID> {
+    //     self.get_read_set()
+    //         .union(&self.get_write_set())
+    //         .copied()
+    //         .collect()
+    // }
+
+    // pub fn get_relevant_ews(&self, num_ews: u8) -> HashSet<u8> {
+    //     let rw_set = self.get_read_write_set();
+    //     if rw_set.contains(&ObjectID::from_single_byte(5)) || self.is_epoch_change() {
+    //         (0..num_ews).collect()
+    //     } else {
+    //         rw_set
+    //             .into_iter()
+    //             .map(|obj_id| obj_id[0] % num_ews)
+    //             .collect()
+    //     }
+    // }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -325,37 +329,43 @@ pub struct TransactionWithResults {
     // pub missing_objs: HashSet<ObjectID>,
 }
 
+impl TransactionWithResults {
+    pub fn success(&self) -> bool {
+        self.tx_effects.status().is_ok()
+    }
+}
+
 #[derive(PartialEq)]
 pub enum ExecutionMode {
     Channel,
     Database,
 }
 
-pub fn get_designated_executor_for_tx(
-    txid: TransactionDigest,
-    tx: &TransactionWithEffects,
-    ew_ids: &Vec<UniqueId>,
-) -> UniqueId {
-    if tx.is_epoch_change() || tx.get_read_set().contains(&ObjectID::from_single_byte(5)) {
-        ew_ids[0]
-    } else {
-        ew_ids[(txid.inner()[0] % ew_ids.len() as u8) as usize]
-    }
-}
+// pub fn get_designated_executor_for_tx(
+//     txid: TransactionDigest,
+//     tx: &TransactionWithEffects,
+//     ew_ids: &Vec<UniqueId>,
+// ) -> UniqueId {
+//     if tx.is_epoch_change() || tx.get_read_set().contains(&ObjectID::from_single_byte(5)) {
+//         ew_ids[0]
+//     } else {
+//         ew_ids[(txid.inner()[0] % ew_ids.len() as u8) as usize]
+//     }
+// }
 
-pub fn get_ew_owner_for_object(_obj_id: ObjectID, ew_ids: &Vec<UniqueId>) -> UniqueId {
-    // ew_ids[0]
-    ew_ids[(_obj_id[0] % ew_ids.len() as u8) as usize]
-}
+// pub fn get_ew_owner_for_object(_obj_id: ObjectID, ew_ids: &Vec<UniqueId>) -> UniqueId {
+//     // ew_ids[0]
+//     ew_ids[(_obj_id[0] % ew_ids.len() as u8) as usize]
+// }
 
-pub fn get_ews_for_tx(tx: &TransactionWithEffects, ew_ids: &Vec<UniqueId>) -> HashSet<UniqueId> {
-    let rw_set = tx.get_read_write_set();
+// pub fn get_ews_for_tx(tx: &TransactionWithEffects, ew_ids: &Vec<UniqueId>) -> HashSet<UniqueId> {
+//     let rw_set = tx.get_read_write_set();
 
-    rw_set
-        .into_iter()
-        .map(|obj_id| get_ew_owner_for_object(obj_id, ew_ids))
-        .collect()
-}
+//     rw_set
+//         .into_iter()
+//         .map(|obj_id| get_ew_owner_for_object(obj_id, ew_ids))
+//         .collect()
+// }
 
 // pub fn get_ews_for_tx_results(
 //     tx_results: &TransactionWithResults,
@@ -375,18 +385,18 @@ pub fn get_ews_for_tx(tx: &TransactionWithEffects, ew_ids: &Vec<UniqueId>) -> Ha
 //         .collect()
 // }
 
-pub fn get_ews_for_deleted_written(
-    deleted: &BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
-    written: &BTreeMap<ObjectID, (ObjectRef, Object, WriteKind)>,
-    ew_ids: &Vec<UniqueId>,
-) -> HashSet<UniqueId> {
-    let rw_set: Vec<_> = deleted.keys().chain(written.keys()).cloned().collect();
+// pub fn get_ews_for_deleted_written(
+//     deleted: &BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
+//     written: &BTreeMap<ObjectID, (ObjectRef, Object, WriteKind)>,
+//     ew_ids: &Vec<UniqueId>,
+// ) -> HashSet<UniqueId> {
+//     let rw_set: Vec<_> = deleted.keys().chain(written.keys()).cloned().collect();
 
-    rw_set
-        .into_iter()
-        .map(|obj_id| get_ew_owner_for_object(obj_id, ew_ids))
-        .collect()
-}
+//     rw_set
+//         .into_iter()
+//         .map(|obj_id| get_ew_owner_for_object(obj_id, ew_ids))
+//         .collect()
+// }
 
 pub trait WritableObjectStore {
     fn insert(&self, k: ObjectID, v: (ObjectRef, Object)) -> Option<(ObjectRef, Object)>;

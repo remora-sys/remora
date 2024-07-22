@@ -1,15 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{cmp::max, collections::HashMap, io::BufRead, sync::Arc, time::Duration};
+use std::{cmp::max, collections::HashMap, io::BufRead, time::Duration};
 
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, HistogramVec, IntCounter, IntCounterVec, Registry,
+    register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry,
+    register_int_counter_with_registry,
+    HistogramVec,
+    IntCounter,
+    IntCounterVec,
+    Registry,
 };
 use prometheus_parse::Scrape;
-
-use crate::types::TransactionWithEffects;
 
 pub const LATENCY_S: &str = "latency_s";
 const LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -99,6 +102,11 @@ impl Metrics {
         }
     }
 
+    /// Create a new `Metrics` instance for tests.
+    pub fn new_for_tests() -> Self {
+        Self::new(&Registry::new())
+    }
+
     /// Get the current time since the UNIX epoch in seconds.
     pub fn now() -> Duration {
         std::time::SystemTime::now()
@@ -115,7 +123,7 @@ impl Metrics {
 
     /// Register a transaction. The parameter `tx_submission_timestamp` is the time since the UNIX
     /// epoch in seconds when the transaction was submitted.
-    pub fn register_transaction(&self, tx_submission_timestamp: f64, workload: &str) {
+    fn register_transaction(&self, tx_submission_timestamp: f64, workload: &str) {
         let now = Self::now();
 
         // Record last metrics updates.
@@ -156,9 +164,9 @@ impl Metrics {
             .inc();
     }
 
-    pub fn update_metrics(tx: &TransactionWithEffects, metrics: &Arc<Metrics>) {
+    pub fn update_metrics(&self, submit_timestamp: f64) {
         const WORKLOAD: &str = "default";
-        metrics.register_transaction(tx.timestamp, WORKLOAD);
+        self.register_transaction(submit_timestamp, WORKLOAD);
     }
 }
 

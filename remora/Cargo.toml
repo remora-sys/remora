@@ -29,6 +29,7 @@ better_any = "0.2.0"
 itertools = "0.13.0"
 tracing-subscriber = "0.3.18"
 rand = "0.8.4"
+serde_yaml = "0.9.21"
 
 prometheus-parse = { git = "https://github.com/asonnino/prometheus-parser.git", rev = "75334db" }
 
@@ -52,3 +53,6 @@ move-binary-format.workspace = true
 move-core-types.workspace = true
 move-bytecode-utils.workspace = true
 sui-archival.workspace = true
+
+[dev-dependencies]
+tracing-test = "0.2.5"
