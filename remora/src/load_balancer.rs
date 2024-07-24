@@ -8,13 +8,18 @@ use tokio::{
 
 use crate::{executor::SuiTransactionWithTimestamp, proxy::ProxyId};
 
+/// A load balancer is responsible for distributing transactions to the consensus and proxies.
 pub struct LoadBalancer {
+    /// The receiver for transactions.
     rx_transactions: Receiver<SuiTransactionWithTimestamp>,
+    /// The sender to forward transactions to the consensus.
     tx_consensus: Sender<SuiTransactionWithTimestamp>,
+    /// The senders to forward transactions to proxies.
     tx_proxies: Vec<Sender<SuiTransactionWithTimestamp>>,
 }
 
 impl LoadBalancer {
+    /// Create a new load balancer.
     pub fn new(
         rx_transactions: Receiver<SuiTransactionWithTimestamp>,
         tx_consensus: Sender<SuiTransactionWithTimestamp>,
@@ -27,6 +32,7 @@ impl LoadBalancer {
         }
     }
 
+    /// Try other proxies if the target proxy fails to send the transaction.
     async fn try_other_proxies(&self, failed: ProxyId, transaction: SuiTransactionWithTimestamp) {
         let mut j = (failed + 1) % self.tx_proxies.len();
         loop {
@@ -45,6 +51,7 @@ impl LoadBalancer {
         }
     }
 
+    /// Run the load balancer.
     pub async fn run(&mut self) {
         tracing::info!("Load balancer started");
 
@@ -73,6 +80,7 @@ impl LoadBalancer {
         }
     }
 
+    /// Spawn the load balancer in a new task.
     pub fn spawn(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             self.run().await;
