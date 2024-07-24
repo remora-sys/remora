@@ -35,7 +35,8 @@ impl SingleMachineValidator {
         let mut proxy_senders = Vec::new();
         for i in 0..config.num_proxies {
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let proxy = Proxy::new(i, executor.clone(), rx, tx_proxy_results.clone());
+            let store = executor.create_in_memory_store();
+            let proxy = Proxy::new(i, executor.clone(), store, rx, tx_proxy_results.clone());
             handles.push(proxy.spawn());
             proxy_senders.push(tx);
         }
@@ -49,9 +50,16 @@ impl SingleMachineValidator {
         .spawn();
         handles.push(consensus_handle);
 
-        let primary_handle =
-            PrimaryExecutor::new(executor, rx_commits, rx_proxy_results, tx_output, metrics)
-                .spawn();
+        let store = executor.create_in_memory_store();
+        let primary_handle = PrimaryExecutor::new(
+            executor,
+            store,
+            rx_commits,
+            rx_proxy_results,
+            tx_output,
+            metrics,
+        )
+        .spawn();
         handles.push(primary_handle);
 
         let load_balancer_handle =

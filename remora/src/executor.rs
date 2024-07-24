@@ -13,6 +13,7 @@ use sui_single_node_benchmark::{
 use sui_types::{
     effects::TransactionEffectsAPI,
     executable_transaction::VerifiedExecutableTransaction,
+    storage::BackingStore,
     transaction::{CertifiedTransaction, TransactionDataAPI, VerifiedCertificate},
 };
 use tokio::time::Instant;
@@ -52,10 +53,12 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
 pub trait Executor {
     type Transaction: Clone;
     type TransactionResults;
+    type Store: BackingStore;
 
     fn execute(
         &mut self,
-        transaction: TransactionWithTimestamp<Self::Transaction>,
+        store: &Self::Store,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = Self::TransactionResults> + Send;
 
     fn generate_transactions(&mut self) -> impl Future<Output = Vec<Self::Transaction>> + Send;
@@ -65,7 +68,6 @@ pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransac
 
 #[derive(Clone)]
 pub struct SuiExecutor {
-    store: InMemoryObjectStore,
     ctx: BenchmarkContext,
     workload: Workload,
 }
@@ -101,34 +103,28 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
-        // Create the data store.
-        let store = ctx.validator().create_in_memory_store();
-
-        Self {
-            store,
-            ctx,
-            workload,
-        }
+        Self { ctx, workload }
     }
 
-    pub fn store(&self) -> &InMemoryObjectStore {
-        &self.store
+    pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
+        self.ctx.validator().create_in_memory_store()
     }
 }
 
 impl Executor for SuiExecutor {
     type Transaction = CertifiedTransaction;
     type TransactionResults = TransactionWithResults;
+    type Store = InMemoryObjectStore;
 
     async fn execute(
         &mut self,
-        transaction: SuiTransactionWithTimestamp,
+        store: &InMemoryObjectStore,
+        transaction: &SuiTransactionWithTimestamp,
     ) -> TransactionWithResults {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
 
         // FIXME: ugly deref
-        let objects = self
-            .store
+        let objects = store
             .read_objects_for_execution(
                 &**(self.ctx.validator().get_epoch_store()),
                 &transaction.key(),
@@ -141,7 +137,7 @@ impl Executor for SuiExecutor {
         let reference_gas_price = validator.get_epoch_store().reference_gas_price();
 
         let executable = VerifiedExecutableTransaction::new_from_certificate(
-            VerifiedCertificate::new_unchecked((&*transaction).clone()),
+            VerifiedCertificate::new_unchecked(transaction.deref().clone()),
         );
 
         let _validator = self.ctx.validator();
@@ -159,7 +155,7 @@ impl Executor for SuiExecutor {
             .get_epoch_store()
             .executor()
             .execute_transaction_to_effects(
-                &self.store,
+                store,
                 protocol_config,
                 self.ctx
                     .validator()
@@ -181,7 +177,9 @@ impl Executor for SuiExecutor {
         debug_assert!(effects.status().is_ok());
 
         let written = inner_temp_store.written.clone();
-        // self.store.commit_objects(inner_temp_store);
+
+        // Commit the objects to the store.
+        store.commit_objects(inner_temp_store);
 
         TransactionWithResults {
             tx_effects: effects,
@@ -222,13 +220,14 @@ mod tests {
         };
 
         let mut executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
 
         let transactions = executor.generate_transactions().await;
         assert!(transactions.len() > 10);
 
         for tx in transactions {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
-            let results = executor.execute(transaction).await;
+            let results = executor.execute(&store, &transaction).await;
             assert!(results.tx_effects.status().is_ok());
         }
     }

@@ -7,9 +7,10 @@ use dashmap::DashMap;
 use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
+    digests::TransactionDigest,
     effects::TransactionEffectsAPI,
     storage::ObjectStore,
-    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI},
+    transaction::{CertifiedTransaction, TransactionDataAPI},
 };
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -20,7 +21,7 @@ use crate::{
     executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::Metrics,
     mock_consensus::ConsensusCommit,
-    types::{PreResType, TransactionWithResults},
+    types::TransactionWithResults,
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
@@ -28,6 +29,8 @@ use crate::{
 pub struct PrimaryExecutor {
     /// The executor for the transactions.
     executor: SuiExecutor,
+    /// The object store.
+    store: InMemoryObjectStore,
     /// The receiver for consensus commits.
     rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
     /// The receiver for proxy results.
@@ -42,6 +45,7 @@ impl PrimaryExecutor {
     /// Create a new primary executor.
     pub fn new(
         executor: SuiExecutor,
+        store: InMemoryObjectStore,
         rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
         rx_proxies: Receiver<TransactionWithResults>,
         tx_output: Sender<TransactionWithResults>,
@@ -49,6 +53,7 @@ impl PrimaryExecutor {
     ) -> Self {
         Self {
             executor,
+            store,
             rx_commits,
             rx_proxies,
             tx_output,
@@ -57,66 +62,61 @@ impl PrimaryExecutor {
     }
 
     /// Get the input objects for a transaction.
+    // TODO: This function should return an error when the input object is not found
+    // or the input objects are malformed instead of panicking.
     fn get_input_objects(
         store: &InMemoryObjectStore,
-        tx: &CertifiedTransaction,
+        transaction: &CertifiedTransaction,
     ) -> HashMap<ObjectID, ObjectRef> {
-        let tx_data = tx.transaction_data();
-        let input_object_kinds = tx_data
+        transaction
+            .transaction_data()
             .input_objects()
-            .expect("Cannot get input object kinds");
-
-        let mut input_object_data = Vec::new();
-        for kind in &input_object_kinds {
-            let obj = match kind {
-                InputObjectKind::MovePackage(id)
-                | InputObjectKind::SharedMoveObject { id, .. }
-                | InputObjectKind::ImmOrOwnedMoveObject((id, _, _)) => {
-                    store.get_object(id).unwrap().unwrap()
-                }
-            };
-            input_object_data.push(obj);
-        }
-
-        let mut res = HashMap::new();
-        for obj in input_object_data {
-            res.insert(obj.id(), obj.compute_object_reference());
-        }
-        res
+            .expect("Cannot get input object kinds") // TODO: Return error instead of panic
+            .iter()
+            .map(|kind| {
+                store
+                    .get_object(&kind.object_id())
+                    .expect("Failed to read objects from store")
+                    .map(|object| (object.id(), object.compute_object_reference()))
+                    .expect("Input object not found") // TODO: Return error instead of panic
+            })
+            .collect()
     }
 
     /// Merge the results from the proxies and re-execute the transaction if necessary.
     // TODO: Naive merging strategy for now.
     pub async fn merge_results(
         &mut self,
-        proxy_results: &PreResType,
-        tx: SuiTransactionWithTimestamp,
+        proxy_results: &DashMap<TransactionDigest, TransactionWithResults>,
+        transaction: &SuiTransactionWithTimestamp,
     ) -> TransactionWithResults {
-        let store = self.executor.store();
         let mut skip = true;
 
-        if let Some(proxy_result) = proxy_results.get(tx.digest()) {
+        if let Some((_, proxy_result)) = proxy_results.remove(transaction.digest()) {
             let effects = &proxy_result.tx_effects;
-            let init_state = Self::get_input_objects(store, &*tx);
-            for (id, vid) in effects.modified_at_versions() {
-                let (_, v, _) = *init_state.get(&id).unwrap();
+            let initial_state = Self::get_input_objects(&self.store, &*transaction);
+            for (id, vid) in &effects.modified_at_versions() {
+                let (_, v, _) = initial_state
+                    .get(id)
+                    .expect("Transaction's inputs already checked");
                 if v != vid {
                     skip = false;
                 }
             }
             if skip {
-                store.commit_effects(effects.clone(), proxy_result.written.clone());
-                return proxy_result.clone();
+                self.store
+                    .commit_effects(effects.clone(), proxy_result.written.clone());
+                return proxy_result;
             }
         }
 
         tracing::trace!("Re-executing transaction");
-        self.executor.execute(tx).await
+        self.executor.execute(&self.store, &transaction).await
     }
 
     /// Run the primary executor.
     pub async fn run(&mut self) {
-        let proxy_results: PreResType = DashMap::new();
+        let proxy_results = DashMap::new();
 
         loop {
             tokio::select! {
@@ -125,7 +125,7 @@ impl PrimaryExecutor {
                     tracing::debug!("Received commit");
                     for tx in commit {
                         let submit_timestamp = tx.timestamp();
-                        let results = self.merge_results(&proxy_results, tx).await;
+                        let results = self.merge_results(&proxy_results, &tx).await;
                         self.metrics.update_metrics(submit_timestamp);
                         if self.tx_output.send(results).await.is_err() {
                             tracing::warn!("Failed to output execution result, stopping primary executor");
@@ -183,20 +183,22 @@ mod tests {
             .into_iter()
             .map(|tx| SuiTransactionWithTimestamp::new_for_tests(tx))
             .collect();
-        let num_transactions = transactions.len();
+        let total_transactions = transactions.len();
 
         // Pre-execute the transactions.
-        let mut pre_execution_results = Vec::new();
+        let mut proxy_results = Vec::new();
+        let proxy_store = executor.create_in_memory_store();
         for tx in transactions.clone() {
-            pre_execution_results.push(executor.execute(tx).await);
+            proxy_results.push(executor.execute(&proxy_store, &tx).await);
         }
 
         // Boot the primary executor.
         let metrics = Arc::new(Metrics::new_for_tests());
-        PrimaryExecutor::new(executor, rx_commit, rx_results, tx_output, metrics).spawn();
+        let store = executor.create_in_memory_store();
+        PrimaryExecutor::new(executor, store, rx_commit, rx_results, tx_output, metrics).spawn();
 
-        // Merge the results.
-        for r in pre_execution_results {
+        // Merge the proxy results into the primary.
+        for r in proxy_results {
             tx_results.send(r).await.unwrap();
         }
         tokio::task::yield_now().await;
@@ -205,7 +207,7 @@ mod tests {
         tx_commit.send(transactions).await.unwrap();
 
         // Check the results.
-        for _ in 0..num_transactions {
+        for _ in 0..total_transactions {
             let result = rx_output.recv().await.unwrap();
             assert!(result.success());
         }

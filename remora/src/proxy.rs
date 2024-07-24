@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -19,6 +20,8 @@ pub struct Proxy {
     id: ProxyId,
     /// The executor for the transactions.
     executor: SuiExecutor,
+    /// The object store.
+    store: InMemoryObjectStore,
     /// The receiver for transactions.
     rx_transactions: Receiver<SuiTransactionWithTimestamp>,
     /// The sender for transactions with results.
@@ -30,12 +33,14 @@ impl Proxy {
     pub fn new(
         id: ProxyId,
         executor: SuiExecutor,
+        store: InMemoryObjectStore,
         rx_transactions: Receiver<SuiTransactionWithTimestamp>,
         tx_results: Sender<TransactionWithResults>,
     ) -> Self {
         Self {
             id,
             executor,
+            store,
             rx_transactions,
             tx_results,
         }
@@ -45,9 +50,9 @@ impl Proxy {
     // TODO: Naive single-threaded execution.
     async fn pre_execute(
         &mut self,
-        transaction: SuiTransactionWithTimestamp,
+        transaction: &SuiTransactionWithTimestamp,
     ) -> TransactionWithResults {
-        self.executor.execute(transaction).await
+        self.executor.execute(&self.store, transaction).await
     }
 
     /// Run the proxy.
@@ -55,7 +60,7 @@ impl Proxy {
         tracing::info!("Proxy {} started", self.id);
 
         while let Some(transaction) = self.rx_transactions.recv().await {
-            let execution_result = self.pre_execute(transaction).await;
+            let execution_result = self.pre_execute(&transaction).await;
             if self.tx_results.send(execution_result).await.is_err() {
                 tracing::warn!(
                     "Failed to send execution result, stopping proxy {}",
@@ -89,8 +94,9 @@ mod tests {
 
         let config = BenchmarkConfig::new_for_tests();
         let mut executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
         let transactions = executor.generate_transactions().await;
-        let proxy = Proxy::new(0, executor, rx_proxy, tx_results);
+        let proxy = Proxy::new(0, executor, store, rx_proxy, tx_results);
 
         // Send transactions to the proxy.
         for tx in transactions {
