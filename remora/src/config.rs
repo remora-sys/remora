@@ -5,7 +5,7 @@ use std::{fs, io, net::SocketAddr, path::Path, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::mock_consensus::MockConsensusParameters;
+use crate::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
 pub trait ImportExport: Serialize + DeserializeOwned {
     fn load<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
@@ -46,11 +46,12 @@ impl BenchmarkConfig {
 
 impl ImportExport for BenchmarkConfig {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ValidatorConfig {
     pub address: SocketAddr,
     pub metrics_address: SocketAddr,
     pub num_proxies: usize,
+    pub consensus_delay_model: FixedDelay,
     pub consensus_parameters: MockConsensusParameters,
 }
 

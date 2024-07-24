@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use dashmap::DashMap;
 use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
@@ -19,7 +19,6 @@ use tokio::{
 
 use crate::{
     executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
-    metrics::Metrics,
     mock_consensus::ConsensusCommit,
     types::TransactionWithResults,
 };
@@ -36,9 +35,7 @@ pub struct PrimaryExecutor {
     /// The receiver for proxy results.
     rx_proxies: Receiver<TransactionWithResults>,
     /// Output channel for the final results.
-    tx_output: Sender<TransactionWithResults>,
-    /// The metrics.
-    metrics: Arc<Metrics>,
+    tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
 }
 
 impl PrimaryExecutor {
@@ -48,8 +45,7 @@ impl PrimaryExecutor {
         store: InMemoryObjectStore,
         rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
         rx_proxies: Receiver<TransactionWithResults>,
-        tx_output: Sender<TransactionWithResults>,
-        metrics: Arc<Metrics>,
+        tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
     ) -> Self {
         Self {
             executor,
@@ -57,7 +53,6 @@ impl PrimaryExecutor {
             rx_commits,
             rx_proxies,
             tx_output,
-            metrics,
         }
     }
 
@@ -124,10 +119,8 @@ impl PrimaryExecutor {
                 Some(commit) = self.rx_commits.recv() => {
                     tracing::debug!("Received commit");
                     for tx in commit {
-                        let submit_timestamp = tx.timestamp();
                         let results = self.merge_results(&proxy_results, &tx).await;
-                        self.metrics.update_metrics(submit_timestamp);
-                        if self.tx_output.send(results).await.is_err() {
+                        if self.tx_output.send((tx,results)).await.is_err() {
                             tracing::warn!("Failed to output execution result, stopping primary executor");
                             break;
                         }
@@ -156,14 +149,12 @@ impl PrimaryExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use tokio::sync::mpsc;
 
     use crate::{
         config::BenchmarkConfig,
         executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
-        metrics::Metrics,
         primary::PrimaryExecutor,
     };
 
@@ -193,9 +184,8 @@ mod tests {
         }
 
         // Boot the primary executor.
-        let metrics = Arc::new(Metrics::new_for_tests());
         let store = executor.create_in_memory_store();
-        PrimaryExecutor::new(executor, store, rx_commit, rx_results, tx_output, metrics).spawn();
+        PrimaryExecutor::new(executor, store, rx_commit, rx_results, tx_output).spawn();
 
         // Merge the proxy results into the primary.
         for r in proxy_results {
@@ -208,7 +198,7 @@ mod tests {
 
         // Check the results.
         for _ in 0..total_transactions {
-            let result = rx_output.recv().await.unwrap();
+            let (_, result) = rx_output.recv().await.unwrap();
             assert!(result.success());
         }
     }

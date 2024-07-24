@@ -155,8 +155,7 @@ pub mod models {
     use super::{ConsensusCommit, DelayModel};
 
     /// A fixed delay model that applies a constant delay to each batch.
-    #[derive(Serialize, Deserialize)]
-    #[cfg_attr(test, derive(Clone))]
+    #[derive(Serialize, Deserialize, Clone)]
     pub struct FixedDelay {
         /// The delay to apply to each batch.
         pub delay: Duration,
