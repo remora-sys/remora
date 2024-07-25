@@ -11,32 +11,27 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
+    executor::{Executor, TransactionWithTimestamp},
     metrics::{ErrorType, Metrics},
 };
 
 /// The load generator generates transactions at a specified rate and submits them to the system.
-pub struct LoadGenerator {
+pub struct LoadGenerator<E> {
     /// The benchmark configurations.
     config: BenchmarkConfig,
     /// The network target to send transactions to.
     target: SocketAddr,
     /// The executor for generating transactions.
-    executor: SuiExecutor,
+    executor: E,
     /// A best effort network sender.
     network: SimpleSender,
     /// Metrics for the load generator.
     metrics: Metrics,
 }
 
-impl LoadGenerator {
+impl<E: Executor> LoadGenerator<E> {
     /// Create a new load generator.
-    pub fn new(
-        config: BenchmarkConfig,
-        target: SocketAddr,
-        executor: SuiExecutor,
-        metrics: Metrics,
-    ) -> Self {
+    pub fn new(config: BenchmarkConfig, target: SocketAddr, executor: E, metrics: Metrics) -> Self {
         LoadGenerator {
             config,
             target,
@@ -47,7 +42,7 @@ impl LoadGenerator {
     }
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
-    pub async fn initialize(&mut self) -> Vec<CertifiedTransaction> {
+    pub async fn initialize(&mut self) -> Vec<E::Transaction> {
         self.executor.generate_transactions().await
     }
 
@@ -70,7 +65,7 @@ impl LoadGenerator {
             let now = Instant::now();
             let timestamp = Metrics::now().as_secs_f64();
             for tx in chunk {
-                let full_tx = SuiTransactionWithTimestamp::new(tx, timestamp);
+                let full_tx = TransactionWithTimestamp::new(tx, timestamp);
                 let serialized = bincode::serialize(&full_tx).expect("serialization failed");
                 let bytes = Bytes::from(serialized);
                 self.network.send(self.target, bytes).await;

@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt::Debug,
     future::Future,
     ops::Deref,
 };
@@ -15,12 +16,13 @@ use sui_single_node_benchmark::{
     workload::Workload,
 };
 use sui_types::{
-    base_types::ObjectID,
+    base_types::{ObjectID, SequenceNumber},
+    digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
     executable_transaction::VerifiedExecutableTransaction,
     object::Object,
     storage::BackingStore,
-    transaction::{CertifiedTransaction, TransactionDataAPI, VerifiedCertificate},
+    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, VerifiedCertificate},
 };
 use tokio::time::Instant;
 
@@ -60,34 +62,80 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
     }
 }
 
-pub trait Executor {
-    type Transaction: Clone;
-    type TransactionResults;
-    type Store: BackingStore;
+#[derive(Clone, Debug)]
+pub struct ExecutionEffects<C: Clone + Debug> {
+    pub changes: C,
+    pub new_state: BTreeMap<ObjectID, Object>,
+}
 
+impl<C: TransactionEffectsAPI + Clone + Debug> ExecutionEffects<C> {
+    pub fn new(changes: C, new_state: BTreeMap<ObjectID, Object>) -> Self {
+        Self { changes, new_state }
+    }
+
+    pub fn success(&self) -> bool {
+        self.changes.status().is_ok()
+    }
+
+    pub fn transaction_digest(&self) -> &TransactionDigest {
+        self.changes.transaction_digest()
+    }
+
+    pub fn modified_at_versions(&self) -> Vec<(ObjectID, SequenceNumber)> {
+        self.changes.modified_at_versions()
+    }
+}
+
+pub trait ExecutableTransaction {
+    fn digest(&self) -> &TransactionDigest;
+
+    fn input_objects(&self) -> Vec<InputObjectKind>;
+}
+
+pub trait StateStore<C>: BackingStore {
+    /// Commit the objects to the store.
+    fn commit_objects(&self, changes: C, new_state: BTreeMap<ObjectID, Object>);
+}
+
+/// The executor is responsible for executing transactions and generating new transactions.
+pub trait Executor {
+    /// The type of transaction to execute.
+    type Transaction: Clone + ExecutableTransaction;
+    /// The type of results from executing a transaction.
+    type StateChanges: Clone + TransactionEffectsAPI + Debug;
+    /// The type of store to store objects.
+    type Store: StateStore<Self::StateChanges>;
+
+    /// Execute a transaction and return the results.
     fn execute(
         &mut self,
         store: &Self::Store,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = Self::TransactionResults> + Send;
+    ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
 
+    /// Generate transactions to execute.
     fn generate_transactions(&mut self) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 }
 
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
+pub type SuiExecutionEffects = ExecutionEffects<TransactionEffects>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransactionWithResults {
-    // pub full_tx: TransactionWithEffects,
-    pub tx_effects: TransactionEffects, // determined after execution
-    // pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
-    pub written: BTreeMap<ObjectID, Object>,
-    // pub missing_objs: HashSet<ObjectID>,
+impl ExecutableTransaction for CertifiedTransaction {
+    fn digest(&self) -> &TransactionDigest {
+        self.digest()
+    }
+
+    fn input_objects(&self) -> Vec<InputObjectKind> {
+        // TODO: Return error instead of panic
+        self.transaction_data()
+            .input_objects()
+            .expect("Cannot get input object kinds")
+    }
 }
 
-impl TransactionWithResults {
-    pub fn success(&self) -> bool {
-        self.tx_effects.status().is_ok()
+impl StateStore<TransactionEffects> for InMemoryObjectStore {
+    fn commit_objects(&self, changes: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
+        self.commit_effects(changes, new_state);
     }
 }
 
@@ -138,14 +186,14 @@ impl SuiExecutor {
 
 impl Executor for SuiExecutor {
     type Transaction = CertifiedTransaction;
-    type TransactionResults = TransactionWithResults;
+    type StateChanges = TransactionEffects;
     type Store = InMemoryObjectStore;
 
     async fn execute(
         &mut self,
         store: &InMemoryObjectStore,
         transaction: &SuiTransactionWithTimestamp,
-    ) -> TransactionWithResults {
+    ) -> SuiExecutionEffects {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
 
         // FIXME: ugly deref
@@ -206,10 +254,7 @@ impl Executor for SuiExecutor {
         // Commit the objects to the store.
         store.commit_objects(inner_temp_store);
 
-        TransactionWithResults {
-            tx_effects: effects,
-            written,
-        }
+        SuiExecutionEffects::new(effects, written)
     }
 
     async fn generate_transactions(&mut self) -> Vec<CertifiedTransaction> {
@@ -253,7 +298,7 @@ mod tests {
         for tx in transactions {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
             let results = executor.execute(&store, &transaction).await;
-            assert!(results.tx_effects.status().is_ok());
+            assert!(results.success());
         }
     }
 }

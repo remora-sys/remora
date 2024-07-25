@@ -1,16 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 
 use dashmap::DashMap;
-use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
     digests::TransactionDigest,
-    effects::TransactionEffectsAPI,
     storage::ObjectStore,
-    transaction::{CertifiedTransaction, TransactionDataAPI},
 };
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -18,33 +15,45 @@ use tokio::{
 };
 
 use crate::{
-    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults},
+    executor::{
+        ExecutableTransaction,
+        ExecutionEffects,
+        Executor,
+        StateStore,
+        TransactionWithTimestamp,
+    },
     mock_consensus::ConsensusCommit,
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
 /// from the proxies.
-pub struct PrimaryExecutor {
+pub struct PrimaryExecutor<E: Executor> {
     /// The executor for the transactions.
-    executor: SuiExecutor,
+    executor: E,
     /// The object store.
-    store: InMemoryObjectStore,
+    store: E::Store,
     /// The receiver for consensus commits.
-    rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
+    rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
     /// The receiver for proxy results.
-    rx_proxies: Receiver<TransactionWithResults>,
+    rx_proxies: Receiver<ExecutionEffects<E::StateChanges>>,
     /// Output channel for the final results.
-    tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
+    tx_output: Sender<(
+        TransactionWithTimestamp<E::Transaction>,
+        ExecutionEffects<E::StateChanges>,
+    )>,
 }
 
-impl PrimaryExecutor {
+impl<E: Executor> PrimaryExecutor<E> {
     /// Create a new primary executor.
     pub fn new(
-        executor: SuiExecutor,
-        store: InMemoryObjectStore,
-        rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
-        rx_proxies: Receiver<TransactionWithResults>,
-        tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
+        executor: E,
+        store: E::Store,
+        rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
+        rx_proxies: Receiver<ExecutionEffects<E::StateChanges>>,
+        tx_output: Sender<(
+            TransactionWithTimestamp<E::Transaction>,
+            ExecutionEffects<E::StateChanges>,
+        )>,
     ) -> Self {
         Self {
             executor,
@@ -58,17 +67,12 @@ impl PrimaryExecutor {
     /// Get the input objects for a transaction.
     // TODO: This function should return an error when the input object is not found
     // or the input objects are malformed instead of panicking.
-    fn get_input_objects(
-        store: &InMemoryObjectStore,
-        transaction: &CertifiedTransaction,
-    ) -> HashMap<ObjectID, ObjectRef> {
+    fn get_input_objects(&self, transaction: &E::Transaction) -> HashMap<ObjectID, ObjectRef> {
         transaction
-            .transaction_data()
             .input_objects()
-            .expect("Cannot get input object kinds") // TODO: Return error instead of panic
             .iter()
             .map(|kind| {
-                store
+                self.store
                     .get_object(&kind.object_id())
                     .expect("Failed to read objects from store")
                     .map(|object| (object.id(), object.compute_object_reference()))
@@ -81,15 +85,14 @@ impl PrimaryExecutor {
     // TODO: Naive merging strategy for now.
     pub async fn merge_results(
         &mut self,
-        proxy_results: &DashMap<TransactionDigest, TransactionWithResults>,
-        transaction: &SuiTransactionWithTimestamp,
-    ) -> TransactionWithResults {
+        proxy_results: &DashMap<TransactionDigest, ExecutionEffects<E::StateChanges>>,
+        transaction: &TransactionWithTimestamp<E::Transaction>,
+    ) -> ExecutionEffects<E::StateChanges> {
         let mut skip = true;
 
-        if let Some((_, proxy_result)) = proxy_results.remove(transaction.digest()) {
-            let effects = &proxy_result.tx_effects;
-            let initial_state = Self::get_input_objects(&self.store, &*transaction);
-            for (id, vid) in &effects.modified_at_versions() {
+        if let Some((_, proxy_result)) = proxy_results.remove(transaction.deref().digest()) {
+            let initial_state = self.get_input_objects(&*transaction);
+            for (id, vid) in &proxy_result.modified_at_versions() {
                 let (_, v, _) = initial_state
                     .get(id)
                     .expect("Transaction's inputs already checked");
@@ -98,8 +101,9 @@ impl PrimaryExecutor {
                 }
             }
             if skip {
+                let effects = proxy_result.clone();
                 self.store
-                    .commit_effects(effects.clone(), proxy_result.written.clone());
+                    .commit_objects(effects.changes, effects.new_state);
                 return proxy_result;
             }
         }
@@ -129,7 +133,7 @@ impl PrimaryExecutor {
                 // Receive a execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     proxy_results.insert(
-                        *proxy_result.tx_effects.transaction_digest(),
+                        *proxy_result.transaction_digest(),
                         proxy_result
                     );
                     tracing::debug!("Received proxy result");
@@ -139,7 +143,13 @@ impl PrimaryExecutor {
     }
 
     /// Spawn the primary executor in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()> {
+    pub fn spawn(mut self) -> JoinHandle<()>
+    where
+        E: Send + 'static,
+        <E as Executor>::Store: Send,
+        <E as Executor>::Transaction: Send + Sync,
+        <E as Executor>::StateChanges: Send + Sync,
+    {
         tokio::spawn(async move {
             self.run().await;
         })

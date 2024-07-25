@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     config::ValidatorConfig,
-    executor::{SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults},
+    executor::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     load_balancer::LoadBalancer,
     metrics::Metrics,
     mock_consensus::MockConsensus,
@@ -29,7 +29,7 @@ pub struct SingleMachineValidator {
     /// The handles for all components.
     pub handles: Vec<JoinHandle<()>>,
     /// The receiver for the final execution results.
-    pub rx_output: Receiver<(SuiTransactionWithTimestamp, TransactionWithResults)>,
+    pub rx_output: Receiver<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
     /// The metrics for the validator.
     pub metrics: Arc<Metrics>,
 }
@@ -75,8 +75,12 @@ impl SingleMachineValidator {
         handles.push(primary_handle);
 
         // Boot the load balancer.
-        let load_balancer_handle =
-            LoadBalancer::new(rx_client_transactions, tx_load_balancer_load, proxy_senders).spawn();
+        let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
+            rx_client_transactions,
+            tx_load_balancer_load,
+            proxy_senders,
+        )
+        .spawn();
         handles.push(load_balancer_handle);
 
         let network_handler = SingleMachineValidatorHandler {
