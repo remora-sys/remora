@@ -11,9 +11,8 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::{Executor, SuiExecutor},
+    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::{ErrorType, Metrics},
-    types::TransactionWithEffects,
 };
 
 /// The load generator generates transactions at a specified rate and submits them to the system.
@@ -62,6 +61,7 @@ impl LoadGenerator {
 
         let chunks_size = (self.config.load / precision) as usize;
         let chunks = &transactions.into_iter().chunks(chunks_size);
+        tracing::info!("Submitting transactions...");
         for (counter, chunk) in chunks.into_iter().enumerate() {
             if counter % 1000 == 0 && counter != 0 {
                 tracing::debug!("Submitted {} txs", counter * chunks_size);
@@ -70,13 +70,7 @@ impl LoadGenerator {
             let now = Instant::now();
             let timestamp = Metrics::now().as_secs_f64();
             for tx in chunk {
-                let full_tx = TransactionWithEffects {
-                    tx,
-                    ground_truth_effects: None,
-                    child_inputs: None,
-                    checkpoint_seq: None,
-                    timestamp,
-                };
+                let full_tx = SuiTransactionWithTimestamp::new(tx, timestamp);
                 let serialized = bincode::serialize(&full_tx).expect("serialization failed");
                 let bytes = Bytes::from(serialized);
                 self.network.send(self.target, bytes).await;

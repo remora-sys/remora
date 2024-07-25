@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Default channel size for communication between components.
-const DEFAULT_CHANNEL_SIZE: usize = 100;
+const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct SingleMachineValidator {
@@ -83,7 +83,7 @@ impl SingleMachineValidator {
         let network_handler = SingleMachineValidatorHandler {
             deliver: tx_client_transactions,
         };
-        network::Receiver::spawn(config.address, network_handler);
+        network::Receiver::spawn(config.validator_address, network_handler);
 
         Self {
             handles,
@@ -134,10 +134,11 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn execute_transactions() {
-        let address = SocketAddr::from(([127, 0, 0, 1], 18588));
+        // TODO: Implement a better way to get a port for tests
+        let validator_address = SocketAddr::from(([127, 0, 0, 1], 18588));
         let metrics_address = SocketAddr::from(([127, 0, 0, 1], 18589));
         let config = ValidatorConfig {
-            address,
+            validator_address,
             metrics_address,
             num_proxies: 1,
             consensus_delay_model: FixedDelay::default(),
@@ -149,15 +150,19 @@ mod tests {
         let executor = SuiExecutor::new(&benchmark_config).await;
 
         // Start the validator.
-        let metrics = Arc::new(Metrics::new_for_tests());
-        let _m = metrics.clone();
-        let _e = executor.clone();
-        let mut validator = SingleMachineValidator::start(_e, &config, _m).await;
+        let validator_metrics = Arc::new(Metrics::new_for_tests());
+        let mut validator =
+            SingleMachineValidator::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let metrics_2 = Metrics::new_for_tests();
-        let mut load_generator = LoadGenerator::new(benchmark_config, address, executor, metrics_2);
+        let load_generator_metrics = Metrics::new_for_tests();
+        let mut load_generator = LoadGenerator::new(
+            benchmark_config,
+            validator_address,
+            executor,
+            load_generator_metrics,
+        );
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
         load_generator.run(transactions).await;

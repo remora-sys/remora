@@ -30,6 +30,13 @@ pub struct TransactionWithTimestamp<T: Clone> {
 }
 
 impl<T: Clone> TransactionWithTimestamp<T> {
+    pub fn new(transaction: T, timestamp: f64) -> Self {
+        Self {
+            transaction,
+            timestamp,
+        }
+    }
+
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
