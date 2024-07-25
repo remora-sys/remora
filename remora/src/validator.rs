@@ -13,13 +13,12 @@ use tokio::{
 
 use crate::{
     config::ValidatorConfig,
-    executor::{SuiExecutor, SuiTransactionWithTimestamp},
+    executor::{SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults},
     load_balancer::LoadBalancer,
     metrics::Metrics,
     mock_consensus::MockConsensus,
     primary::PrimaryExecutor,
     proxy::Proxy,
-    types::TransactionWithResults,
 };
 
 /// Default channel size for communication between components.

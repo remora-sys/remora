@@ -320,21 +320,6 @@ impl TransactionWithEffects {
     // }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransactionWithResults {
-    // pub full_tx: TransactionWithEffects,
-    pub tx_effects: TransactionEffects, // determined after execution
-    // pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
-    pub written: BTreeMap<ObjectID, Object>,
-    // pub missing_objs: HashSet<ObjectID>,
-}
-
-impl TransactionWithResults {
-    pub fn success(&self) -> bool {
-        self.tx_effects.status().is_ok()
-    }
-}
-
 #[derive(PartialEq)]
 pub enum ExecutionMode {
     Channel,

@@ -1,7 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, future::Future, ops::Deref};
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    ops::Deref,
+};
 
 use serde::{Deserialize, Serialize};
 use sui_single_node_benchmark::{
@@ -11,17 +15,16 @@ use sui_single_node_benchmark::{
     workload::Workload,
 };
 use sui_types::{
-    effects::TransactionEffectsAPI,
+    base_types::ObjectID,
+    effects::{TransactionEffects, TransactionEffectsAPI},
     executable_transaction::VerifiedExecutableTransaction,
+    object::Object,
     storage::BackingStore,
     transaction::{CertifiedTransaction, TransactionDataAPI, VerifiedCertificate},
 };
 use tokio::time::Instant;
 
-use crate::{
-    config::{BenchmarkConfig, WorkloadType},
-    types::TransactionWithResults,
-};
+use crate::config::{BenchmarkConfig, WorkloadType};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: Clone> {
@@ -72,6 +75,21 @@ pub trait Executor {
 }
 
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TransactionWithResults {
+    // pub full_tx: TransactionWithEffects,
+    pub tx_effects: TransactionEffects, // determined after execution
+    // pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
+    pub written: BTreeMap<ObjectID, Object>,
+    // pub missing_objs: HashSet<ObjectID>,
+}
+
+impl TransactionWithResults {
+    pub fn success(&self) -> bool {
+        self.tx_effects.status().is_ok()
+    }
+}
 
 #[derive(Clone)]
 pub struct SuiExecutor {

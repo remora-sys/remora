@@ -7,10 +7,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
-    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
-    types::TransactionWithResults,
-};
+use crate::executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults};
 
 pub type ProxyId = usize;
 

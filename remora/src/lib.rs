@@ -1,18 +1,9 @@
-pub mod agents;
 pub mod config;
 pub mod executor;
-pub mod input_traffic_manager;
 pub mod load_balancer;
 pub mod load_generator;
 pub mod metrics;
 pub mod mock_consensus;
-// pub mod pre_exec_agent;
-// pub mod pre_exec_worker;
 pub mod primary;
-// pub mod primary_agent;
-// pub mod primary_worker;
 pub mod proxy;
-pub mod server;
-pub mod tx_gen_agent;
-pub mod types;
 pub mod validator;

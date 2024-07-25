@@ -18,9 +18,8 @@ use tokio::{
 };
 
 use crate::{
-    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
+    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults},
     mock_consensus::ConsensusCommit,
-    types::TransactionWithResults,
 };
 
 /// The primary executor is responsible for executing transactions and merging the results

@@ -98,10 +98,9 @@ pub mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::SuiExecutor,
+        executor::{SuiExecutor, SuiTransactionWithTimestamp},
         load_generator::LoadGenerator,
         metrics::Metrics,
-        types::TransactionWithEffects,
     };
 
     /// Create a network listener that will receive a single message and return it.
@@ -142,7 +141,7 @@ pub mod tests {
 
         // Check that the transactions were received.
         let received = handle.await.unwrap();
-        let tx: TransactionWithEffects = bincode::deserialize(&received).unwrap();
-        assert!(tx.timestamp > now);
+        let tx: SuiTransactionWithTimestamp = bincode::deserialize(&received).unwrap();
+        assert!(tx.timestamp() > now);
     }
 }
