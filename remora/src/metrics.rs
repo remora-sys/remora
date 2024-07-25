@@ -1,21 +1,24 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{cmp::max, collections::HashMap, io::BufRead, sync::Arc, time::Duration};
+use std::{cmp::max, collections::HashMap, io::BufRead, time::Duration};
 
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, HistogramVec, IntCounter, IntCounterVec, Registry,
+    register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry,
+    register_int_counter_with_registry,
+    HistogramVec,
+    IntCounter,
+    IntCounterVec,
+    Registry,
 };
 use prometheus_parse::Scrape;
-
-use crate::types::TransactionWithEffects;
 
 pub const LATENCY_S: &str = "latency_s";
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.011, 0.012, 0.013,
     0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.02, 0.021, 0.022, 0.023, 0.024, 0.025, 0.026,
-    0.027, 0.028, 0.029, 0.050, 0.1, 0.15, 0.2, 0.5, 1.0, 10.0,
+    0.027, 0.028, 0.029, 0.050, 0.1, 0.15, 0.2, 0.3, 0.35, 0.4, 0.5, 1.0, 10.0,
 ];
 pub const START_TIME_S: &str = "start_time_s";
 pub const LAST_UPDATE_S: &str = "last_update_s";
@@ -31,8 +34,6 @@ pub enum ErrorType {
 
 #[derive(Clone)]
 pub struct Metrics {
-    /// Indicates that the server is up.
-    pub up: IntCounter,
     /// End-to-end latency of a workload in seconds.
     pub latency_s: HistogramVec,
     /// Benchmark start time (time since UNIX epoch in seconds).
@@ -51,12 +52,6 @@ pub struct Metrics {
 impl Metrics {
     pub fn new(registry: &Registry) -> Self {
         Self {
-            up: register_int_counter_with_registry!(
-                "up",
-                "Indicates that the server is up",
-                registry
-            )
-            .unwrap(),
             latency_s: register_histogram_vec_with_registry!(
                 LATENCY_S,
                 "Buckets measuring the end-to-end latency of a workload in seconds",
@@ -99,6 +94,11 @@ impl Metrics {
         }
     }
 
+    /// Create a new `Metrics` instance for tests.
+    pub fn new_for_tests() -> Self {
+        Self::new(&Registry::new())
+    }
+
     /// Get the current time since the UNIX epoch in seconds.
     pub fn now() -> Duration {
         std::time::SystemTime::now()
@@ -115,7 +115,7 @@ impl Metrics {
 
     /// Register a transaction. The parameter `tx_submission_timestamp` is the time since the UNIX
     /// epoch in seconds when the transaction was submitted.
-    pub fn register_transaction(&self, tx_submission_timestamp: f64, workload: &str) {
+    fn register_transaction(&self, tx_submission_timestamp: f64, workload: &str) {
         let now = Self::now();
 
         // Record last metrics updates.
@@ -156,9 +156,9 @@ impl Metrics {
             .inc();
     }
 
-    pub fn update_metrics(tx: &TransactionWithEffects, metrics: &Arc<Metrics>) {
+    pub fn update_metrics(&self, submit_timestamp: f64) {
         const WORKLOAD: &str = "default";
-        metrics.register_transaction(tx.timestamp, WORKLOAD);
+        self.register_transaction(submit_timestamp, WORKLOAD);
     }
 }
 

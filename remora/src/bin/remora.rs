@@ -1,15 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
     executor::SuiExecutor,
-    load_generator::LoadGenerator,
     metrics::Metrics,
+    validator::SingleMachineValidator,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -22,9 +22,6 @@ struct Args {
     /// The configuration for the validator.
     #[clap(long, value_name = "FILE")]
     validator_config: Option<PathBuf>,
-    /// The address to expose metrics on.
-    #[clap(long, value_name = "ADDRESS", default_value = "127.0.0.1:18600")]
-    metrics_address: SocketAddr,
 }
 
 /// The main function for the load generator.
@@ -41,23 +38,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let _ = tracing_subscriber::fmt::try_init();
-    let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
-    let metrics = Metrics::new(&registry.default_registry());
+    let registry = mysten_metrics::start_prometheus_server(validator_config.metrics_address);
+    let metrics = Arc::new(Metrics::new(&registry.default_registry()));
 
     //
+    tracing::info!("Loading executor");
     let executor = SuiExecutor::new(&benchmark_config).await;
 
-    // Create genesis and generate transactions.
-    let mut load_generator = LoadGenerator::new(
-        benchmark_config,
-        validator_config.validator_address,
-        executor,
-        metrics,
+    //
+    tracing::info!(
+        "Starting validator on {}",
+        validator_config.validator_address
     );
-    let transactions = load_generator.initialize().await;
-
-    // Submit transactions to the server.
-    load_generator.run(transactions).await;
+    tracing::info!("Exposing metrics on {}", validator_config.metrics_address);
+    SingleMachineValidator::start(executor, &validator_config, metrics)
+        .await
+        .collect_results()
+        .await;
 
     Ok(())
 }
