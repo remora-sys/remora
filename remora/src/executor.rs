@@ -15,7 +15,8 @@ use sui_single_node_benchmark::{
     workload::Workload,
 };
 use sui_types::{
-    base_types::ObjectID,
+    base_types::{ObjectID, SequenceNumber},
+    digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
     executable_transaction::VerifiedExecutableTransaction,
     object::Object,
@@ -60,40 +61,65 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
     }
 }
 
+pub struct ExecutionEffects<C> {
+    pub changes: C,
+    pub new_state: BTreeMap<ObjectID, Object>,
+}
+
+impl<C: TransactionEffectsAPI> ExecutionEffects<C> {
+    pub fn new(changes: C, new_state: BTreeMap<ObjectID, Object>) -> Self {
+        Self { changes, new_state }
+    }
+
+    pub fn success(&self) -> bool {
+        self.changes.status().is_ok()
+    }
+
+    pub fn transaction_digest(&self) -> &TransactionDigest {
+        self.changes.transaction_digest()
+    }
+
+    pub fn modified_at_versions(&self) -> Vec<(ObjectID, SequenceNumber)> {
+        self.changes.modified_at_versions()
+    }
+}
+
+pub trait StateStore: BackingStore {
+    /// A summary fo state changes.
+    type StateChanges;
+
+    /// Commit the objects to the store.
+    fn commit_objects(&self, changes: Self::StateChanges, new_state: BTreeMap<ObjectID, Object>);
+}
+
 /// The executor is responsible for executing transactions and generating new transactions.
 pub trait Executor {
     /// The type of transaction to execute.
     type Transaction: Clone;
     /// The type of results from executing a transaction.
-    type TransactionResults;
+    type StateChanges: TransactionEffectsAPI;
     /// The type of store to store objects.
-    type Store: BackingStore;
+    type Store: StateStore;
 
     /// Execute a transaction and return the results.
     fn execute(
         &mut self,
         store: &Self::Store,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = Self::TransactionResults> + Send;
+    ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
 
     /// Generate transactions to execute.
     fn generate_transactions(&mut self) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 }
 
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
+pub type SuiExecutionEffects = ExecutionEffects<TransactionEffects>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SuiTransactionResults {
-    // pub full_tx: TransactionWithEffects,
-    pub tx_effects: TransactionEffects, // determined after execution
-    // pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
-    pub written: BTreeMap<ObjectID, Object>,
-    // pub missing_objs: HashSet<ObjectID>,
-}
+impl StateStore for InMemoryObjectStore {
+    type StateChanges = TransactionEffects;
 
-impl SuiTransactionResults {
-    pub fn success(&self) -> bool {
-        self.tx_effects.status().is_ok()
+    fn commit_objects(&self, changes: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
+        self.commit_effects(changes, new_state);
     }
 }
 
@@ -144,14 +170,14 @@ impl SuiExecutor {
 
 impl Executor for SuiExecutor {
     type Transaction = CertifiedTransaction;
-    type TransactionResults = SuiTransactionResults;
+    type StateChanges = TransactionEffects;
     type Store = InMemoryObjectStore;
 
     async fn execute(
         &mut self,
         store: &InMemoryObjectStore,
         transaction: &SuiTransactionWithTimestamp,
-    ) -> SuiTransactionResults {
+    ) -> SuiExecutionEffects {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
 
         // FIXME: ugly deref
@@ -212,10 +238,7 @@ impl Executor for SuiExecutor {
         // Commit the objects to the store.
         store.commit_objects(inner_temp_store);
 
-        SuiTransactionResults {
-            tx_effects: effects,
-            written,
-        }
+        SuiExecutionEffects::new(effects, written)
     }
 
     async fn generate_transactions(&mut self) -> Vec<CertifiedTransaction> {
@@ -259,7 +282,7 @@ mod tests {
         for tx in transactions {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
             let results = executor.execute(&store, &transaction).await;
-            assert!(results.tx_effects.status().is_ok());
+            assert!(results.success());
         }
     }
 }

@@ -6,7 +6,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::executor::{Executor, TransactionWithTimestamp};
+use crate::executor::{ExecutionEffects, Executor, TransactionWithTimestamp};
 
 pub type ProxyId = usize;
 
@@ -21,7 +21,7 @@ pub struct Proxy<E: Executor> {
     /// The receiver for transactions.
     rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
     /// The sender for transactions with results.
-    tx_results: Sender<E::TransactionResults>,
+    tx_results: Sender<ExecutionEffects<E::StateChanges>>,
 }
 
 impl<E: Executor> Proxy<E> {
@@ -31,7 +31,7 @@ impl<E: Executor> Proxy<E> {
         executor: E,
         store: E::Store,
         rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
-        tx_results: Sender<E::TransactionResults>,
+        tx_results: Sender<ExecutionEffects<E::StateChanges>>,
     ) -> Self {
         Self {
             id,
@@ -47,7 +47,7 @@ impl<E: Executor> Proxy<E> {
     async fn pre_execute(
         &mut self,
         transaction: &TransactionWithTimestamp<E::Transaction>,
-    ) -> E::TransactionResults {
+    ) -> ExecutionEffects<E::StateChanges> {
         self.executor.execute(&self.store, transaction).await
     }
 
@@ -71,9 +71,9 @@ impl<E: Executor> Proxy<E> {
     pub fn spawn(mut self) -> JoinHandle<()>
     where
         E: Executor + Send + Sync + 'static,
-        <E as Executor>::TransactionResults: Send,
         <E as Executor>::Store: Send,
         TransactionWithTimestamp<<E as Executor>::Transaction>: Send + Sync,
+        ExecutionEffects<<E as Executor>::StateChanges>: Send,
     {
         tokio::spawn(async move {
             self.run().await;

@@ -8,7 +8,6 @@ use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
     digests::TransactionDigest,
-    effects::TransactionEffectsAPI,
     storage::ObjectStore,
     transaction::{CertifiedTransaction, TransactionDataAPI},
 };
@@ -18,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    executor::{Executor, SuiExecutor, SuiTransactionResults, SuiTransactionWithTimestamp},
+    executor::{Executor, SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     mock_consensus::ConsensusCommit,
 };
 
@@ -32,9 +31,9 @@ pub struct PrimaryExecutor {
     /// The receiver for consensus commits.
     rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
     /// The receiver for proxy results.
-    rx_proxies: Receiver<SuiTransactionResults>,
+    rx_proxies: Receiver<SuiExecutionEffects>,
     /// Output channel for the final results.
-    tx_output: Sender<(SuiTransactionWithTimestamp, SuiTransactionResults)>,
+    tx_output: Sender<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
 }
 
 impl PrimaryExecutor {
@@ -43,8 +42,8 @@ impl PrimaryExecutor {
         executor: SuiExecutor,
         store: InMemoryObjectStore,
         rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
-        rx_proxies: Receiver<SuiTransactionResults>,
-        tx_output: Sender<(SuiTransactionWithTimestamp, SuiTransactionResults)>,
+        rx_proxies: Receiver<SuiExecutionEffects>,
+        tx_output: Sender<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
     ) -> Self {
         Self {
             executor,
@@ -81,15 +80,14 @@ impl PrimaryExecutor {
     // TODO: Naive merging strategy for now.
     pub async fn merge_results(
         &mut self,
-        proxy_results: &DashMap<TransactionDigest, SuiTransactionResults>,
+        proxy_results: &DashMap<TransactionDigest, SuiExecutionEffects>,
         transaction: &SuiTransactionWithTimestamp,
-    ) -> SuiTransactionResults {
+    ) -> SuiExecutionEffects {
         let mut skip = true;
 
         if let Some((_, proxy_result)) = proxy_results.remove(transaction.digest()) {
-            let effects = &proxy_result.tx_effects;
             let initial_state = Self::get_input_objects(&self.store, &*transaction);
-            for (id, vid) in &effects.modified_at_versions() {
+            for (id, vid) in &proxy_result.modified_at_versions() {
                 let (_, v, _) = initial_state
                     .get(id)
                     .expect("Transaction's inputs already checked");
@@ -99,7 +97,7 @@ impl PrimaryExecutor {
             }
             if skip {
                 self.store
-                    .commit_effects(effects.clone(), proxy_result.written.clone());
+                    .commit_effects(proxy_result.changes.clone(), proxy_result.new_state.clone());
                 return proxy_result;
             }
         }
@@ -129,7 +127,7 @@ impl PrimaryExecutor {
                 // Receive a execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     proxy_results.insert(
-                        *proxy_result.tx_effects.transaction_digest(),
+                        *proxy_result.transaction_digest(),
                         proxy_result
                     );
                     tracing::debug!("Received proxy result");
