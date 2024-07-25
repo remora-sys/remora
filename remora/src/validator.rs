@@ -75,8 +75,12 @@ impl SingleMachineValidator {
         handles.push(primary_handle);
 
         // Boot the load balancer.
-        let load_balancer_handle =
-            LoadBalancer::new(rx_client_transactions, tx_load_balancer_load, proxy_senders).spawn();
+        let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
+            rx_client_transactions,
+            tx_load_balancer_load,
+            proxy_senders,
+        )
+        .spawn();
         handles.push(load_balancer_handle);
 
         let network_handler = SingleMachineValidatorHandler {

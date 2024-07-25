@@ -6,24 +6,27 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{executor::SuiTransactionWithTimestamp, proxy::ProxyId};
+use crate::{
+    executor::{Executor, TransactionWithTimestamp},
+    proxy::ProxyId,
+};
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
-pub struct LoadBalancer {
+pub struct LoadBalancer<E: Executor> {
     /// The receiver for transactions.
-    rx_transactions: Receiver<SuiTransactionWithTimestamp>,
+    rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
     /// The sender to forward transactions to the consensus.
-    tx_consensus: Sender<SuiTransactionWithTimestamp>,
+    tx_consensus: Sender<TransactionWithTimestamp<E::Transaction>>,
     /// The senders to forward transactions to proxies.
-    tx_proxies: Vec<Sender<SuiTransactionWithTimestamp>>,
+    tx_proxies: Vec<Sender<TransactionWithTimestamp<E::Transaction>>>,
 }
 
-impl LoadBalancer {
+impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
     pub fn new(
-        rx_transactions: Receiver<SuiTransactionWithTimestamp>,
-        tx_consensus: Sender<SuiTransactionWithTimestamp>,
-        tx_proxies: Vec<Sender<SuiTransactionWithTimestamp>>,
+        rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
+        tx_consensus: Sender<TransactionWithTimestamp<E::Transaction>>,
+        tx_proxies: Vec<Sender<TransactionWithTimestamp<E::Transaction>>>,
     ) -> Self {
         Self {
             rx_transactions,
@@ -33,7 +36,11 @@ impl LoadBalancer {
     }
 
     /// Try other proxies if the target proxy fails to send the transaction.
-    async fn try_other_proxies(&self, failed: ProxyId, transaction: SuiTransactionWithTimestamp) {
+    async fn try_other_proxies(
+        &self,
+        failed: ProxyId,
+        transaction: TransactionWithTimestamp<E::Transaction>,
+    ) {
         let mut j = (failed + 1) % self.tx_proxies.len();
         loop {
             if j == failed {
@@ -81,7 +88,11 @@ impl LoadBalancer {
     }
 
     /// Spawn the load balancer in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()> {
+    pub fn spawn(mut self) -> JoinHandle<()>
+    where
+        E: 'static,
+        <E as Executor>::Transaction: Send,
+    {
         tokio::spawn(async move {
             self.run().await;
         })

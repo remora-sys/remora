@@ -70,10 +70,10 @@ impl<E: Executor> Proxy<E> {
     /// Spawn the proxy in a new task.
     pub fn spawn(mut self) -> JoinHandle<()>
     where
-        E: Executor + Send + Sync + 'static,
+        E: Send + 'static,
         <E as Executor>::Store: Send,
-        TransactionWithTimestamp<<E as Executor>::Transaction>: Send + Sync,
-        ExecutionEffects<<E as Executor>::StateChanges>: Send,
+        <E as Executor>::Transaction: Send + Sync,
+        <E as Executor>::StateChanges: Send,
     {
         tokio::spawn(async move {
             self.run().await;
