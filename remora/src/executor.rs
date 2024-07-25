@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt::Debug,
     future::Future,
     ops::Deref,
 };
@@ -21,7 +22,7 @@ use sui_types::{
     executable_transaction::VerifiedExecutableTransaction,
     object::Object,
     storage::BackingStore,
-    transaction::{CertifiedTransaction, TransactionDataAPI, VerifiedCertificate},
+    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, VerifiedCertificate},
 };
 use tokio::time::Instant;
 
@@ -61,12 +62,13 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
     }
 }
 
-pub struct ExecutionEffects<C> {
+#[derive(Clone, Debug)]
+pub struct ExecutionEffects<C: Clone + Debug> {
     pub changes: C,
     pub new_state: BTreeMap<ObjectID, Object>,
 }
 
-impl<C: TransactionEffectsAPI> ExecutionEffects<C> {
+impl<C: TransactionEffectsAPI + Clone + Debug> ExecutionEffects<C> {
     pub fn new(changes: C, new_state: BTreeMap<ObjectID, Object>) -> Self {
         Self { changes, new_state }
     }
@@ -84,22 +86,25 @@ impl<C: TransactionEffectsAPI> ExecutionEffects<C> {
     }
 }
 
-pub trait StateStore: BackingStore {
-    /// A summary fo state changes.
-    type StateChanges;
+pub trait ExecutableTransaction {
+    fn digest(&self) -> &TransactionDigest;
 
+    fn input_objects(&self) -> Vec<InputObjectKind>;
+}
+
+pub trait StateStore<C>: BackingStore {
     /// Commit the objects to the store.
-    fn commit_objects(&self, changes: Self::StateChanges, new_state: BTreeMap<ObjectID, Object>);
+    fn commit_objects(&self, changes: C, new_state: BTreeMap<ObjectID, Object>);
 }
 
 /// The executor is responsible for executing transactions and generating new transactions.
 pub trait Executor {
     /// The type of transaction to execute.
-    type Transaction: Clone;
+    type Transaction: Clone + ExecutableTransaction;
     /// The type of results from executing a transaction.
-    type StateChanges: TransactionEffectsAPI;
+    type StateChanges: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
-    type Store: StateStore;
+    type Store: StateStore<Self::StateChanges>;
 
     /// Execute a transaction and return the results.
     fn execute(
@@ -115,9 +120,20 @@ pub trait Executor {
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
 pub type SuiExecutionEffects = ExecutionEffects<TransactionEffects>;
 
-impl StateStore for InMemoryObjectStore {
-    type StateChanges = TransactionEffects;
+impl ExecutableTransaction for CertifiedTransaction {
+    fn digest(&self) -> &TransactionDigest {
+        self.digest()
+    }
 
+    fn input_objects(&self) -> Vec<InputObjectKind> {
+        // TODO: Return error instead of panic
+        self.transaction_data()
+            .input_objects()
+            .expect("Cannot get input object kinds")
+    }
+}
+
+impl StateStore<TransactionEffects> for InMemoryObjectStore {
     fn commit_objects(&self, changes: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
         self.commit_effects(changes, new_state);
     }
