@@ -1,38 +1,37 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use sui_single_node_benchmark::mock_storage::InMemoryObjectStore;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
 };
 
-use crate::executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults};
+use crate::executor::{Executor, TransactionWithTimestamp};
 
 pub type ProxyId = usize;
 
 /// A proxy is responsible for pre-executing transactions.
-pub struct Proxy {
+pub struct Proxy<E: Executor> {
     /// The ID of the proxy.
     id: ProxyId,
     /// The executor for the transactions.
-    executor: SuiExecutor,
+    executor: E,
     /// The object store.
-    store: InMemoryObjectStore,
+    store: E::Store,
     /// The receiver for transactions.
-    rx_transactions: Receiver<SuiTransactionWithTimestamp>,
+    rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
     /// The sender for transactions with results.
-    tx_results: Sender<TransactionWithResults>,
+    tx_results: Sender<E::TransactionResults>,
 }
 
-impl Proxy {
+impl<E: Executor> Proxy<E> {
     /// Create a new proxy.
     pub fn new(
         id: ProxyId,
-        executor: SuiExecutor,
-        store: InMemoryObjectStore,
-        rx_transactions: Receiver<SuiTransactionWithTimestamp>,
-        tx_results: Sender<TransactionWithResults>,
+        executor: E,
+        store: E::Store,
+        rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
+        tx_results: Sender<E::TransactionResults>,
     ) -> Self {
         Self {
             id,
@@ -47,8 +46,8 @@ impl Proxy {
     // TODO: Naive single-threaded execution.
     async fn pre_execute(
         &mut self,
-        transaction: &SuiTransactionWithTimestamp,
-    ) -> TransactionWithResults {
+        transaction: &TransactionWithTimestamp<E::Transaction>,
+    ) -> E::TransactionResults {
         self.executor.execute(&self.store, transaction).await
     }
 
@@ -69,7 +68,13 @@ impl Proxy {
     }
 
     /// Spawn the proxy in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()> {
+    pub fn spawn(mut self) -> JoinHandle<()>
+    where
+        E: Executor + Send + Sync + 'static,
+        <E as Executor>::TransactionResults: Send,
+        <E as Executor>::Store: Send,
+        TransactionWithTimestamp<<E as Executor>::Transaction>: Send + Sync,
+    {
         tokio::spawn(async move {
             self.run().await;
         })
@@ -81,8 +86,11 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::*;
-    use crate::config::BenchmarkConfig;
+    use crate::{
+        config::BenchmarkConfig,
+        executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
+        proxy::Proxy,
+    };
 
     #[tokio::test]
     async fn pre_execute() {

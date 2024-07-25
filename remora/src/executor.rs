@@ -60,24 +60,30 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
     }
 }
 
+/// The executor is responsible for executing transactions and generating new transactions.
 pub trait Executor {
+    /// The type of transaction to execute.
     type Transaction: Clone;
+    /// The type of results from executing a transaction.
     type TransactionResults;
+    /// The type of store to store objects.
     type Store: BackingStore;
 
+    /// Execute a transaction and return the results.
     fn execute(
         &mut self,
         store: &Self::Store,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = Self::TransactionResults> + Send;
 
+    /// Generate transactions to execute.
     fn generate_transactions(&mut self) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 }
 
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransactionWithResults {
+pub struct SuiTransactionResults {
     // pub full_tx: TransactionWithEffects,
     pub tx_effects: TransactionEffects, // determined after execution
     // pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
@@ -85,7 +91,7 @@ pub struct TransactionWithResults {
     // pub missing_objs: HashSet<ObjectID>,
 }
 
-impl TransactionWithResults {
+impl SuiTransactionResults {
     pub fn success(&self) -> bool {
         self.tx_effects.status().is_ok()
     }
@@ -138,14 +144,14 @@ impl SuiExecutor {
 
 impl Executor for SuiExecutor {
     type Transaction = CertifiedTransaction;
-    type TransactionResults = TransactionWithResults;
+    type TransactionResults = SuiTransactionResults;
     type Store = InMemoryObjectStore;
 
     async fn execute(
         &mut self,
         store: &InMemoryObjectStore,
         transaction: &SuiTransactionWithTimestamp,
-    ) -> TransactionWithResults {
+    ) -> SuiTransactionResults {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
 
         // FIXME: ugly deref
@@ -206,7 +212,7 @@ impl Executor for SuiExecutor {
         // Commit the objects to the store.
         store.commit_objects(inner_temp_store);
 
-        TransactionWithResults {
+        SuiTransactionResults {
             tx_effects: effects,
             written,
         }

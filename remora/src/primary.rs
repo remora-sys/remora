@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp, TransactionWithResults},
+    executor::{Executor, SuiExecutor, SuiTransactionResults, SuiTransactionWithTimestamp},
     mock_consensus::ConsensusCommit,
 };
 
@@ -32,9 +32,9 @@ pub struct PrimaryExecutor {
     /// The receiver for consensus commits.
     rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
     /// The receiver for proxy results.
-    rx_proxies: Receiver<TransactionWithResults>,
+    rx_proxies: Receiver<SuiTransactionResults>,
     /// Output channel for the final results.
-    tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
+    tx_output: Sender<(SuiTransactionWithTimestamp, SuiTransactionResults)>,
 }
 
 impl PrimaryExecutor {
@@ -43,8 +43,8 @@ impl PrimaryExecutor {
         executor: SuiExecutor,
         store: InMemoryObjectStore,
         rx_commits: Receiver<ConsensusCommit<SuiTransactionWithTimestamp>>,
-        rx_proxies: Receiver<TransactionWithResults>,
-        tx_output: Sender<(SuiTransactionWithTimestamp, TransactionWithResults)>,
+        rx_proxies: Receiver<SuiTransactionResults>,
+        tx_output: Sender<(SuiTransactionWithTimestamp, SuiTransactionResults)>,
     ) -> Self {
         Self {
             executor,
@@ -81,9 +81,9 @@ impl PrimaryExecutor {
     // TODO: Naive merging strategy for now.
     pub async fn merge_results(
         &mut self,
-        proxy_results: &DashMap<TransactionDigest, TransactionWithResults>,
+        proxy_results: &DashMap<TransactionDigest, SuiTransactionResults>,
         transaction: &SuiTransactionWithTimestamp,
-    ) -> TransactionWithResults {
+    ) -> SuiTransactionResults {
         let mut skip = true;
 
         if let Some((_, proxy_result)) = proxy_results.remove(transaction.digest()) {
