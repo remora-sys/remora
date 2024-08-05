@@ -80,7 +80,7 @@ impl SingleMachineValidator {
             tx_load_balancer_load,
             proxy_senders,
         )
-        .spawn();
+        .spawn(metrics.clone());
         handles.push(load_balancer_handle);
 
         let network_handler = SingleMachineValidatorHandler {

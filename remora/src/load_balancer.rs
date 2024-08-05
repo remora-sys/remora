@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -8,6 +10,7 @@ use tokio::{
 
 use crate::{
     executor::{Executor, TransactionWithTimestamp},
+    metrics::Metrics,
     proxy::ProxyId,
 };
 
@@ -59,11 +62,15 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Run the load balancer.
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, metrics: Arc<Metrics>) {
         tracing::info!("Load balancer started");
 
         let mut i = 0;
         while let Some(transaction) = self.rx_transactions.recv().await {
+            if i == 0 {
+                metrics.register_start_time();
+            }
+
             if self.tx_consensus.send(transaction.clone()).await.is_err() {
                 tracing::warn!("Failed to send transaction to primary, stopping load balancer");
                 break;
@@ -88,13 +95,13 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Spawn the load balancer in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()>
+    pub fn spawn(mut self, metrics: Arc<Metrics>) -> JoinHandle<()>
     where
         E: 'static,
         <E as Executor>::Transaction: Send,
     {
         tokio::spawn(async move {
-            self.run().await;
+            self.run(metrics).await;
         })
     }
 }

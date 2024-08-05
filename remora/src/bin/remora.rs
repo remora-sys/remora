@@ -1,14 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
     executor::SuiExecutor,
-    metrics::Metrics,
+    metrics::{periodically_print_metrics, Metrics},
     validator::SingleMachineValidator,
 };
 
@@ -24,7 +24,7 @@ struct Args {
     validator_config: Option<PathBuf>,
 }
 
-/// The main function for the load generator.
+/// The main function for remora testbed.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -40,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let registry = mysten_metrics::start_prometheus_server(validator_config.metrics_address);
     let metrics = Arc::new(Metrics::new(&registry.default_registry()));
+
+    let workload = "default".to_string();
+    let print_period = Duration::from_secs(5);
+    let _ = periodically_print_metrics(validator_config.metrics_address, workload, print_period);
 
     //
     tracing::info!("Loading executor");

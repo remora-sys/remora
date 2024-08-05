@@ -1,18 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{cmp::max, collections::HashMap, io::BufRead, time::Duration};
+use std::{cmp::max, collections::HashMap, io::BufRead, net::SocketAddr, time::Duration};
 
 use prometheus::{
-    register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry,
-    register_int_counter_with_registry,
-    HistogramVec,
-    IntCounter,
-    IntCounterVec,
-    Registry,
+    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, HistogramVec, IntCounter, IntCounterVec, Registry,
 };
 use prometheus_parse::Scrape;
+use tokio::{task::JoinHandle, time::sleep};
 
 pub const LATENCY_S: &str = "latency_s";
 const LATENCY_SEC_BUCKETS: &[f64] = &[
@@ -250,6 +246,50 @@ impl Measurement {
     }
 }
 
+pub fn periodically_print_metrics(
+    metric_addr: SocketAddr,
+    workload: String,
+    period: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            sleep(period).await;
+            let summary = summarize_metrics(metric_addr, &workload)
+                .await
+                .expect("Failed to print metrics");
+            if !summary.is_empty() {
+                println!("{summary}\n");
+            }
+        }
+    })
+}
+
+pub async fn summarize_metrics(
+    metric_addr: SocketAddr,
+    workload: &str,
+) -> Result<String, reqwest::Error> {
+    let future = async move {
+        let route: &str = "/metrics";
+        let res = reqwest::get(format! {"http://{metric_addr}{route}"}).await?;
+        let string = res.text().await?;
+        let measurements = Measurement::from_prometheus(&string);
+        let summary = measurements
+            .get(workload)
+            .map(|measurement| {
+                format!(
+                    "TPS: {} tx/s\tLatency (avg): {:?}",
+                    measurement.tps(),
+                    measurement.average_latency()
+                )
+            })
+            .unwrap_or_default();
+
+        Ok(summary)
+    };
+
+    future.await
+}
+
 #[cfg(test)]
 mod test {
     use super::Measurement;
@@ -285,5 +325,7 @@ mod test {
         assert_eq!(measurement.count, 30001);
 
         assert_eq!(measurement.benchmark_duration().as_secs(), 30);
+        println!("tps: {:?}", measurement.tps());
+        println!("average_latency: {:?}", measurement.average_latency());
     }
 }
