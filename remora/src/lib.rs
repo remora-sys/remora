@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dependency_controller;
 pub mod executor;
 pub mod load_balancer;
 pub mod load_generator;

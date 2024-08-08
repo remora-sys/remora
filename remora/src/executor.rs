@@ -90,6 +90,8 @@ pub trait ExecutableTransaction {
     fn digest(&self) -> &TransactionDigest;
 
     fn input_objects(&self) -> Vec<InputObjectKind>;
+
+    fn input_object_ids(&self) -> Vec<ObjectID>;
 }
 
 pub trait StateStore<C>: BackingStore {
@@ -130,6 +132,15 @@ impl ExecutableTransaction for CertifiedTransaction {
         self.transaction_data()
             .input_objects()
             .expect("Cannot get input object kinds")
+    }
+
+    fn input_object_ids(&self) -> Vec<ObjectID> {
+        self.transaction_data()
+            .input_objects()
+            .expect("Cannot get input object kinds")
+            .iter()
+            .map(|kind| kind.object_id())
+            .collect()
     }
 }
 

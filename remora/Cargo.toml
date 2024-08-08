@@ -53,6 +53,7 @@ move-binary-format.workspace = true
 move-core-types.workspace = true
 move-bytecode-utils.workspace = true
 sui-archival.workspace = true
+rustc-hash = "2.0.0"
 
 [dev-dependencies]
 tracing-test = "0.2.5"
