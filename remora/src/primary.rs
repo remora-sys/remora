@@ -16,11 +16,7 @@ use tokio::{
 
 use crate::{
     executor::{
-        ExecutableTransaction,
-        ExecutionEffects,
-        Executor,
-        StateStore,
-        TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionEffects, Executor, StateStore, TransactionWithTimestamp,
     },
     mock_consensus::ConsensusCommit,
 };
@@ -91,7 +87,7 @@ impl<E: Executor> PrimaryExecutor<E> {
         let mut skip = true;
 
         if let Some((_, proxy_result)) = proxy_results.remove(transaction.deref().digest()) {
-            let initial_state = self.get_input_objects(&*transaction);
+            let initial_state = self.get_input_objects(transaction);
             for (id, vid) in &proxy_result.modified_at_versions() {
                 let (_, v, _) = initial_state
                     .get(id)
@@ -163,7 +159,7 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
+        executor::{generate_transactions, Executor, SuiExecutor, SuiTransactionWithTimestamp},
         primary::PrimaryExecutor,
     };
 
@@ -177,8 +173,7 @@ mod tests {
         // Generate transactions.
         let config = BenchmarkConfig::new_for_tests();
         let mut executor = SuiExecutor::new(&config).await;
-        let transactions: Vec<_> = executor
-            .generate_transactions()
+        let transactions: Vec<_> = generate_transactions(&config)
             .await
             .into_iter()
             .map(|tx| SuiTransactionWithTimestamp::new_for_tests(tx))

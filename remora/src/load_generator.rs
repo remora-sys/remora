@@ -11,39 +11,36 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::{Executor, TransactionWithTimestamp},
+    executor::{generate_transactions, TransactionWithTimestamp},
     metrics::{ErrorType, Metrics},
 };
 
 /// The load generator generates transactions at a specified rate and submits them to the system.
-pub struct LoadGenerator<E> {
+pub struct LoadGenerator {
     /// The benchmark configurations.
     config: BenchmarkConfig,
     /// The network target to send transactions to.
     target: SocketAddr,
-    /// The executor for generating transactions.
-    executor: E,
     /// A best effort network sender.
     network: SimpleSender,
     /// Metrics for the load generator.
     metrics: Metrics,
 }
 
-impl<E: Executor> LoadGenerator<E> {
+impl LoadGenerator {
     /// Create a new load generator.
-    pub fn new(config: BenchmarkConfig, target: SocketAddr, executor: E, metrics: Metrics) -> Self {
+    pub fn new(config: BenchmarkConfig, target: SocketAddr, metrics: Metrics) -> Self {
         LoadGenerator {
             config,
             target,
-            executor,
             network: SimpleSender::new(),
             metrics,
         }
     }
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
-    pub async fn initialize(&mut self) -> Vec<E::Transaction> {
-        self.executor.generate_transactions().await
+    pub async fn initialize(&mut self) -> Vec<CertifiedTransaction> {
+        generate_transactions(&self.config).await
     }
 
     /// Run the load generator. This will submit transactions to the system at the specified rate
@@ -92,10 +89,8 @@ pub mod tests {
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     use crate::{
-        config::BenchmarkConfig,
-        executor::{SuiExecutor, SuiTransactionWithTimestamp},
-        load_generator::LoadGenerator,
-        metrics::Metrics,
+        config::BenchmarkConfig, executor::SuiTransactionWithTimestamp,
+        load_generator::LoadGenerator, metrics::Metrics,
     };
 
     /// Create a network listener that will receive a single message and return it.
@@ -116,7 +111,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn generate_transactions() {
+    async fn test_generate_transactions() {
         // Boot a test server to receive transactions.
         // TODO: Implement a better way to get a port for tests
         let target = SocketAddr::from(([127, 0, 0, 1], 18181));
@@ -126,8 +121,7 @@ pub mod tests {
         // Create genesis and generate transactions.
         let metrics = Metrics::new_for_tests();
         let config = BenchmarkConfig::new_for_tests();
-        let executor = SuiExecutor::new(&config).await;
-        let mut load_generator = LoadGenerator::new(config, target, executor, metrics);
+        let mut load_generator = LoadGenerator::new(config, target, metrics);
         let transactions = load_generator.initialize().await;
 
         // Submit transactions to the server.

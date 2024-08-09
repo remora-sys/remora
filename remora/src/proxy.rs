@@ -1,12 +1,17 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
 };
 
-use crate::executor::{ExecutionEffects, Executor, TransactionWithTimestamp};
+use crate::{
+    dependency_controller::DependencyController,
+    executor::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
+};
 
 pub type ProxyId = usize;
 
@@ -17,11 +22,13 @@ pub struct Proxy<E: Executor> {
     /// The executor for the transactions.
     executor: E,
     /// The object store.
-    store: E::Store,
+    store: Arc<E::Store>,
     /// The receiver for transactions.
     rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
     /// The sender for transactions with results.
     tx_results: Sender<ExecutionEffects<E::StateChanges>>,
+    /// The dependency controller for multi-core tx execution.
+    dependency_controller: DependencyController,
 }
 
 impl<E: Executor> Proxy<E> {
@@ -36,34 +43,50 @@ impl<E: Executor> Proxy<E> {
         Self {
             id,
             executor,
-            store,
+            store: Arc::new(store),
             rx_transactions,
             tx_results,
+            dependency_controller: DependencyController::new(),
         }
     }
 
-    /// Pre-execute a transaction.
-    // TODO: Naive single-threaded execution.
-    async fn pre_execute(
-        &mut self,
-        transaction: &TransactionWithTimestamp<E::Transaction>,
-    ) -> ExecutionEffects<E::StateChanges> {
-        self.executor.execute(&self.store, transaction).await
-    }
-
     /// Run the proxy.
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self)
+    where
+        E: Send + 'static,
+        <E as Executor>::Store: Send + Sync,
+        <E as Executor>::Transaction: Send + Sync,
+        <E as Executor>::StateChanges: Send,
+    {
         tracing::info!("Proxy {} started", self.id);
 
+        let mut task_id = 0;
+        let ctx = self.executor.get_context();
         while let Some(transaction) = self.rx_transactions.recv().await {
-            let execution_result = self.pre_execute(&transaction).await;
-            if self.tx_results.send(execution_result).await.is_err() {
-                tracing::warn!(
-                    "Failed to send execution result, stopping proxy {}",
-                    self.id
-                );
-                break;
-            }
+            task_id += 1;
+            let (prior_handles, current_handles) = self
+                .dependency_controller
+                .get_dependencies(task_id, transaction.input_object_ids());
+
+            let store = self.store.clone();
+            let id = self.id;
+            let tx_results = self.tx_results.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                for prior_notify in prior_handles {
+                    prior_notify.notified().await;
+                }
+
+                let execution_result = E::exec_on_ctx(ctx, store, transaction).await;
+
+                for notify in current_handles {
+                    notify.notify_one();
+                }
+
+                if tx_results.send(execution_result).await.is_err() {
+                    tracing::warn!("Failed to send execution result, stopping proxy {}", id);
+                }
+            });
         }
     }
 
@@ -71,7 +94,7 @@ impl<E: Executor> Proxy<E> {
     pub fn spawn(mut self) -> JoinHandle<()>
     where
         E: Send + 'static,
-        <E as Executor>::Store: Send,
+        <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
         <E as Executor>::StateChanges: Send,
     {
@@ -88,7 +111,8 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::{Executor, SuiExecutor, SuiTransactionWithTimestamp},
+        executor::SuiTransactionWithTimestamp,
+        executor::{generate_transactions, SuiExecutor},
         proxy::Proxy,
     };
 
@@ -98,9 +122,9 @@ mod tests {
         let (tx_results, mut rx_results) = mpsc::channel(100);
 
         let config = BenchmarkConfig::new_for_tests();
-        let mut executor = SuiExecutor::new(&config).await;
+        let executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
-        let transactions = executor.generate_transactions().await;
+        let transactions = generate_transactions(&config).await;
         let proxy = Proxy::new(0, executor, store, rx_proxy, tx_results);
 
         // Send transactions to the proxy.

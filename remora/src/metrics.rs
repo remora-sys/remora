@@ -183,7 +183,7 @@ impl Measurement {
                 .collect::<Vec<_>>()
                 .join(",");
 
-            if sample.metric == LATENCY_S.to_string() {
+            if sample.metric == *LATENCY_S.to_string() {
                 let measurement = measurements.entry(label).or_insert_with(Self::default);
                 match &sample.value {
                     prometheus_parse::Value::Histogram(values) => {

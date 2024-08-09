@@ -7,7 +7,6 @@ use anyhow::Context;
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
-    executor::SuiExecutor,
     load_generator::LoadGenerator,
     metrics::Metrics,
 };
@@ -44,14 +43,10 @@ async fn main() -> anyhow::Result<()> {
     let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
     let metrics = Metrics::new(&registry.default_registry());
 
-    //
-    let executor = SuiExecutor::new(&benchmark_config).await;
-
     // Create genesis and generate transactions.
     let mut load_generator = LoadGenerator::new(
         benchmark_config,
         validator_config.validator_address,
-        executor,
         metrics,
     );
     let transactions = load_generator.initialize().await;
