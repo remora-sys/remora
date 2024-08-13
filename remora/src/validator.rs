@@ -173,4 +173,44 @@ mod tests {
             assert!(result.success());
         }
     }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn no_proxies() {
+        // TODO: Implement a better way to get a port for tests
+        let validator_address = SocketAddr::from(([127, 0, 0, 1], 18588));
+        let metrics_address = SocketAddr::from(([127, 0, 0, 1], 18589));
+        let config = ValidatorConfig {
+            validator_address,
+            metrics_address,
+            num_proxies: 0,
+            consensus_delay_model: FixedDelay::default(),
+            consensus_parameters: MockConsensusParameters::default(),
+        };
+        let benchmark_config = BenchmarkConfig::new_for_tests();
+
+        // Create a Sui executor.
+        let executor = SuiExecutor::new(&benchmark_config).await;
+
+        // Start the validator.
+        let validator_metrics = Arc::new(Metrics::new_for_tests());
+        let mut validator =
+            SingleMachineValidator::start(executor.clone(), &config, validator_metrics).await;
+        tokio::task::yield_now().await;
+
+        // Generate transactions.
+        let load_generator_metrics = Metrics::new_for_tests();
+        let mut load_generator =
+            LoadGenerator::new(benchmark_config, validator_address, load_generator_metrics);
+
+        let transactions = load_generator.initialize().await;
+        let total_transactions = transactions.len();
+        load_generator.run(transactions).await;
+
+        // Wait for all transactions to be processed.
+        for _ in 0..total_transactions {
+            let (_tx, result) = validator.rx_output.recv().await.unwrap();
+            assert!(result.success());
+        }
+    }
 }

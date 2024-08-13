@@ -39,6 +39,7 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Try other proxies if the target proxy fails to send the transaction.
+    /// NOTE: This functions panics if called when `tx_proxies` is empty.
     async fn try_other_proxies(
         &self,
         failed: ProxyId,
@@ -76,17 +77,19 @@ impl<E: Executor> LoadBalancer<E> {
                 break;
             }
 
-            let proxy_id = i % self.tx_proxies.len();
-            let proxy = &self.tx_proxies[proxy_id];
-            match proxy.send(transaction.clone()).await {
-                Ok(()) => {
-                    tracing::debug!("Sent transaction to proxy {proxy_id}");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Failed to send transaction to proxy {proxy_id}, trying other proxies"
-                    );
-                    self.try_other_proxies(proxy_id, transaction).await;
+            if !self.tx_proxies.is_empty() {
+                let proxy_id = i % self.tx_proxies.len();
+                let proxy = &self.tx_proxies[proxy_id];
+                match proxy.send(transaction.clone()).await {
+                    Ok(()) => {
+                        tracing::debug!("Sent transaction to proxy {proxy_id}");
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to send transaction to proxy {proxy_id}, trying other proxies"
+                        );
+                        self.try_other_proxies(proxy_id, transaction).await;
+                    }
                 }
             }
 
