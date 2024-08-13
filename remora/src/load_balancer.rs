@@ -40,6 +40,7 @@ impl<E: Executor> LoadBalancer<E> {
 
     /// Try other proxies if the target proxy fails to send the transaction.
     /// NOTE: This functions panics if called when `tx_proxies` is empty.
+    // TODO: loop forever if all proxies crash. Fix this when adding the networking.
     async fn try_other_proxies(
         &self,
         failed: ProxyId,
