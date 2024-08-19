@@ -207,7 +207,8 @@ impl SuiExecutor {
         let workload = init_workload(config);
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
-        let ctx = BenchmarkContext::new(workload.clone(), component, true).await;
+        let mut ctx = BenchmarkContext::new(workload.clone(), component, true).await;
+        let _ = workload.create_tx_generator(&mut ctx).await;
         let elapsed = start_time.elapsed();
         tracing::debug!(
             "Genesis created {} accounts/s in {} ms",
