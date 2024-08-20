@@ -45,8 +45,6 @@ sui-move-natives = { path = "../../sui-execution/latest/sui-move-natives", packa
 move-vm-runtime = { path = "../../external-crates/move/crates/move-vm-runtime" }
 mysten-metrics = { path = "../mysten-metrics" }
 
-network = { path = "network" }
-
 typed-store.workspace = true
 clap.workspace = true
 move-binary-format.workspace = true

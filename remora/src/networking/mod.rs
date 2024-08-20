@@ -19,17 +19,17 @@ mod tests {
     #[tokio::test]
     async fn client_primary_connection() {
         let config = ValidatorConfig::new_for_tests();
+        let server_address = config.validator_address;
         let transactions: Vec<_> = (0..100).collect();
 
         // Spawn the server, wait for a client connection, and receive transactions from the client.
-        let cloned_config = config.clone();
         let cloned_transactions = transactions.clone();
         let server = async move {
             let (tx_client_connections, mut rx_client_connections) = mpsc::channel(1);
             let (tx_transactions, mut rx_transactions) = mpsc::channel(100);
 
             let server =
-                NetworkServer::<_, ()>::new(cloned_config, tx_client_connections, tx_transactions);
+                NetworkServer::<_, ()>::new(server_address, tx_client_connections, tx_transactions);
             let _server_handle = server.spawn();
 
             // Wait for a client connection and hold it (to avoid closing the channel).
@@ -47,7 +47,7 @@ mod tests {
             let (tx_unused, _rx_unused) = mpsc::channel(1);
             let (tx_transactions, rx_transactions) = mpsc::channel(1);
 
-            let client = NetworkClient::<(), _>::new(config, tx_unused, rx_transactions);
+            let client = NetworkClient::<(), _>::new(server_address, tx_unused, rx_transactions);
             let _client_handle = client.spawn();
 
             // Send a transaction to the primary.
@@ -63,18 +63,18 @@ mod tests {
     #[tokio::test]
     async fn proxy_primary_connection() {
         let config = ValidatorConfig::new_for_tests();
+        let server_address = config.validator_address;
         let transaction = "transaction".to_string();
         let result = "transaction result".to_string();
 
         // Spawn the server, wait for a proxy connection, and send a transaction to the proxy.
-        let cloned_config = config.clone();
         let cloned_transaction = transaction.clone();
         let cloned_result = result.clone();
         let server = async move {
             let (tx_proxy_connections, mut rx_proxy_connections) = mpsc::channel(1);
             let (tx_proxy_results, mut rx_proxy_results) = mpsc::channel(1);
 
-            let server = NetworkServer::new(cloned_config, tx_proxy_connections, tx_proxy_results);
+            let server = NetworkServer::new(server_address, tx_proxy_connections, tx_proxy_results);
             let _server_handle = server.spawn();
 
             // Wait for a proxy connection and send a transaction.
@@ -91,7 +91,7 @@ mod tests {
             let (tx_transactions, mut rx_transactions) = mpsc::channel(1);
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(1);
 
-            let client = NetworkClient::new(config, tx_transactions, rx_proxy_results);
+            let client = NetworkClient::new(server_address, tx_transactions, rx_proxy_results);
             let _client_handle = client.spawn();
 
             let t: String = rx_transactions.recv().await.unwrap();

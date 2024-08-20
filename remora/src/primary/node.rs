@@ -1,13 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, sync::Arc};
+use std::sync::Arc;
 
-use axum::async_trait;
-use bytes::Bytes;
-use network::{MessageHandler, Writer};
 use tokio::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     task::JoinHandle,
 };
 
@@ -16,6 +13,7 @@ use crate::{
     config::ValidatorConfig,
     executor::sui::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::Metrics,
+    networking::server::NetworkServer,
     proxy::core::ProxyCore,
 };
 
@@ -82,10 +80,14 @@ impl PrimaryNode {
         .spawn();
         handles.push(load_balancer_handle);
 
-        let network_handler = SingleMachineValidatorHandler {
-            deliver: tx_client_transactions,
-        };
-        network::Receiver::spawn(config.validator_address, network_handler);
+        // Boot the server.
+        // TODO: Introduce error type and add the server handle to the handles list.
+        let _server_handle = NetworkServer::new(
+            config.validator_address,
+            tx_proxy_connections,
+            tx_client_transactions,
+        )
+        .spawn();
 
         Self {
             handles,
@@ -103,20 +105,6 @@ impl PrimaryNode {
             // TODO: Record transactions success and failure.
             self.metrics.update_metrics(submit_timestamp);
         }
-    }
-}
-
-#[derive(Clone)]
-struct SingleMachineValidatorHandler {
-    deliver: Sender<SuiTransactionWithTimestamp>,
-}
-
-#[async_trait]
-impl MessageHandler for SingleMachineValidatorHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        let message = bincode::deserialize(&message).expect("Failed to deserialize transaction");
-        self.deliver.send(message).await.unwrap();
-        Ok(())
     }
 }
 

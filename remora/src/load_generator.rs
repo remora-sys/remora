@@ -3,26 +3,29 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use bytes::Bytes;
 use itertools::Itertools;
-use network::SimpleSender;
 use sui_types::transaction::CertifiedTransaction;
-use tokio::time::{interval, Instant, MissedTickBehavior};
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::{interval, Instant, MissedTickBehavior},
+};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::{api::TransactionWithTimestamp, sui::generate_transactions},
+    executor::{
+        api::TransactionWithTimestamp,
+        sui::{generate_transactions, SuiTransactionWithTimestamp},
+    },
     metrics::{ErrorType, Metrics},
+    networking::client::NetworkClient,
 };
 
 /// The load generator generates transactions at a specified rate and submits them to the system.
 pub struct LoadGenerator {
     /// The benchmark configurations.
     config: BenchmarkConfig,
-    /// The network target to send transactions to.
-    target: SocketAddr,
     /// A best effort network sender.
-    network: SimpleSender,
+    sender: Sender<SuiTransactionWithTimestamp>,
     /// Metrics for the load generator.
     metrics: Metrics,
 }
@@ -30,10 +33,16 @@ pub struct LoadGenerator {
 impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkConfig, target: SocketAddr, metrics: Metrics) -> Self {
+        // Spawn the network client.
+        // TODO: Move this into the run function.
+        let (tx_unused, _rx_unused) = mpsc::channel(1);
+        let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
+        let _client_handle =
+            NetworkClient::<(), _>::new(target, tx_unused, rx_transactions).spawn();
+
         LoadGenerator {
             config,
-            target,
-            network: SimpleSender::new(),
+            sender: tx_transactions,
             metrics,
         }
     }
@@ -66,9 +75,10 @@ impl LoadGenerator {
             let timestamp = Metrics::now().as_secs_f64();
             for tx in chunk {
                 let full_tx = TransactionWithTimestamp::new(tx, timestamp);
-                let serialized = bincode::serialize(&full_tx).expect("serialization failed");
-                let bytes = Bytes::from(serialized);
-                self.network.send(self.target, bytes).await;
+                self.sender
+                    .send(full_tx)
+                    .await
+                    .expect("Cannot send transaction");
             }
 
             if now.elapsed() > burst_duration {
@@ -155,43 +165,30 @@ impl LoadGenerator {
 
 #[cfg(test)]
 pub mod tests {
-    use std::net::SocketAddr;
 
-    use bytes::Bytes;
-    use futures::{sink::SinkExt, stream::StreamExt};
-    use tokio::{net::TcpListener, task::JoinHandle};
-    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+    use tokio::sync::mpsc;
 
     use crate::{
-        config::BenchmarkConfig,
+        config::{get_test_address, BenchmarkConfig},
         executor::sui::SuiTransactionWithTimestamp,
         load_generator::LoadGenerator,
         metrics::Metrics,
+        networking::server::NetworkServer,
     };
-
-    /// Create a network listener that will receive a single message and return it.
-    fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(&address).await.unwrap();
-            let (socket, _) = listener.accept().await.unwrap();
-            let transport = Framed::new(socket, LengthDelimitedCodec::new());
-            let (mut writer, mut reader) = transport.split();
-            match reader.next().await {
-                Some(Ok(received)) => {
-                    writer.send(Bytes::from("Ack")).await.unwrap();
-                    return received.freeze();
-                }
-                _ => panic!("Failed to receive network message"),
-            }
-        })
-    }
 
     #[tokio::test]
     async fn test_generate_transactions() {
+        let target = get_test_address();
+
         // Boot a test server to receive transactions.
-        // TODO: Implement a better way to get a port for tests
-        let target = SocketAddr::from(([127, 0, 0, 1], 18181));
-        let handle = listener(target);
+        let (tx_client_connections, _rx_client_connections) = mpsc::channel(1);
+        let (tx_transactions, mut rx_transactions) = mpsc::channel(100);
+        let _handle = NetworkServer::<SuiTransactionWithTimestamp, ()>::new(
+            target,
+            tx_client_connections,
+            tx_transactions,
+        )
+        .spawn();
         tokio::task::yield_now().await;
 
         // Create genesis and generate transactions.
@@ -205,8 +202,7 @@ pub mod tests {
         load_generator.run(transactions).await;
 
         // Check that the transactions were received.
-        let received = handle.await.unwrap();
-        let tx: SuiTransactionWithTimestamp = bincode::deserialize(&received).unwrap();
-        assert!(tx.timestamp() > now);
+        let transaction = rx_transactions.recv().await.unwrap();
+        assert!(transaction.timestamp() > now);
     }
 }

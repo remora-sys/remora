@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
+use std::{io, net::SocketAddr};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -10,7 +10,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{config::ValidatorConfig, networking::worker::ConnectionWorker};
+use crate::networking::worker::ConnectionWorker;
 
 /// The size of the server-worker communication channel.
 pub const WORKER_CHANNEL_SIZE: usize = 1000;
@@ -21,8 +21,8 @@ pub const WORKER_CHANNEL_SIZE: usize = 1000;
 /// as well. To this purpose, the server propagate a communication channel to the application
 /// layer, which can use it to send messages to the client.
 pub struct NetworkServer<I, O> {
-    /// The configuration for the validator.
-    config: ValidatorConfig,
+    /// The socket address of the server.
+    server_address: SocketAddr,
     /// The sender for client connections. When a new client connects, this channel
     /// is used to propagate a sender to the application layer, which can use it
     /// to send messages to the client.
@@ -38,12 +38,12 @@ where
 {
     /// Create a new server.
     pub fn new(
-        config: ValidatorConfig,
+        server_address: SocketAddr,
         tx_connections: Sender<Sender<O>>,
         tx_incoming: Sender<I>,
     ) -> Self {
         Self {
-            config,
+            server_address,
             tx_connections,
             tx_incoming,
         }
@@ -51,8 +51,8 @@ where
 
     /// Run the server.
     pub async fn run(&self) -> io::Result<()> {
-        let server = TcpListener::bind(self.config.validator_address).await?;
-        tracing::debug!("Listening on {}", self.config.validator_address);
+        let server = TcpListener::bind(self.server_address).await?;
+        tracing::debug!("Listening on {}", self.server_address);
 
         loop {
             let (stream, peer) = server.accept().await?;
