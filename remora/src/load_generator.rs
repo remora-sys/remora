@@ -11,7 +11,7 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::{generate_transactions, TransactionWithTimestamp},
+    executor::executor::{generate_transactions, TransactionWithTimestamp},
     metrics::{ErrorType, Metrics},
 };
 
@@ -163,8 +163,10 @@ pub mod tests {
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     use crate::{
-        config::BenchmarkConfig, executor::SuiTransactionWithTimestamp,
-        load_generator::LoadGenerator, metrics::Metrics,
+        config::BenchmarkConfig,
+        executor::executor::SuiTransactionWithTimestamp,
+        load_generator::LoadGenerator,
+        metrics::Metrics,
     };
 
     /// Create a network listener that will receive a single message and return it.

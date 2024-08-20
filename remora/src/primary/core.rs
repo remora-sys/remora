@@ -14,16 +14,18 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
-    executor::{
-        ExecutableTransaction, ExecutionEffects, Executor, StateStore, TransactionWithTimestamp,
-    },
-    mock_consensus::ConsensusCommit,
+use super::mock_consensus::ConsensusCommit;
+use crate::executor::executor::{
+    ExecutableTransaction,
+    ExecutionEffects,
+    Executor,
+    StateStore,
+    TransactionWithTimestamp,
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
 /// from the proxies.
-pub struct PrimaryExecutor<E: Executor> {
+pub struct PrimaryCore<E: Executor> {
     /// The executor for the transactions.
     executor: E,
     /// The object store.
@@ -39,7 +41,7 @@ pub struct PrimaryExecutor<E: Executor> {
     )>,
 }
 
-impl<E: Executor> PrimaryExecutor<E> {
+impl<E: Executor> PrimaryCore<E> {
     /// Create a new primary executor.
     pub fn new(
         executor: E,
@@ -159,8 +161,13 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::{generate_transactions, Executor, SuiExecutor, SuiTransactionWithTimestamp},
-        primary::PrimaryExecutor,
+        executor::executor::{
+            generate_transactions,
+            Executor,
+            SuiExecutor,
+            SuiTransactionWithTimestamp,
+        },
+        primary::core::PrimaryCore,
     };
 
     #[tokio::test]
@@ -189,7 +196,7 @@ mod tests {
 
         // Boot the primary executor.
         let store = executor.create_in_memory_store();
-        PrimaryExecutor::new(executor, store, rx_commit, rx_results, tx_output).spawn();
+        PrimaryCore::new(executor, store, rx_commit, rx_results, tx_output).spawn();
 
         // Merge the proxy results into the primary.
         for r in proxy_results {

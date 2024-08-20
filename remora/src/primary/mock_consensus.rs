@@ -210,7 +210,7 @@ mod test {
 
     use tokio::{sync::mpsc, time::Instant};
 
-    use crate::mock_consensus::{
+    use crate::primary::mock_consensus::{
         models::{FixedDelay, UniformDelay},
         MockConsensus,
         MockConsensusParameters,

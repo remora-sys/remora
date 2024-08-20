@@ -8,7 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
+use crate::executor::{
     dependency_controller::DependencyController,
     executor::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
 };
@@ -16,7 +16,7 @@ use crate::{
 pub type ProxyId = usize;
 
 /// A proxy is responsible for pre-executing transactions.
-pub struct Proxy<E: Executor> {
+pub struct ProxyCore<E: Executor> {
     /// The ID of the proxy.
     id: ProxyId,
     /// The executor for the transactions.
@@ -31,7 +31,7 @@ pub struct Proxy<E: Executor> {
     dependency_controller: DependencyController,
 }
 
-impl<E: Executor> Proxy<E> {
+impl<E: Executor> ProxyCore<E> {
     /// Create a new proxy.
     pub fn new(
         id: ProxyId,
@@ -111,9 +111,8 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::SuiTransactionWithTimestamp,
-        executor::{generate_transactions, SuiExecutor},
-        proxy::Proxy,
+        executor::executor::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
+        proxy::core::ProxyCore,
     };
 
     #[tokio::test]
@@ -125,7 +124,7 @@ mod tests {
         let executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
         let transactions = generate_transactions(&config).await;
-        let proxy = Proxy::new(0, executor, store, rx_proxy, tx_results);
+        let proxy = ProxyCore::new(0, executor, store, rx_proxy, tx_results);
 
         // Send transactions to the proxy.
         for tx in transactions {

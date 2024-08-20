@@ -7,9 +7,9 @@ use anyhow::Context;
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
-    executor::SuiExecutor,
+    executor::executor::SuiExecutor,
     metrics::{periodically_print_metrics, Metrics},
-    validator::Validator,
+    primary::node::PrimaryNode,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         validator_config.validator_address
     );
     tracing::info!("Exposing metrics on {}", validator_config.metrics_address);
-    Validator::start(executor, &validator_config, metrics)
+    PrimaryNode::start(executor, &validator_config, metrics)
         .await
         .collect_results()
         .await;

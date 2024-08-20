@@ -11,21 +11,20 @@ use tokio::{
     task::JoinHandle,
 };
 
+use super::load_balancer::LoadBalancer;
 use crate::{
     config::ValidatorConfig,
-    executor::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
-    load_balancer::LoadBalancer,
+    executor::executor::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::Metrics,
-    mock_consensus::MockConsensus,
-    primary::PrimaryExecutor,
-    proxy::Proxy,
+    primary::{core::PrimaryCore, mock_consensus::MockConsensus},
+    proxy::core::ProxyCore,
 };
 
 /// Default channel size for communication between components.
 const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 /// The single machine validator is a simple validator that runs all components.
-pub struct Validator {
+pub struct PrimaryNode {
     /// The handles for all components.
     pub handles: Vec<JoinHandle<()>>,
     /// The receiver for the final execution results.
@@ -34,7 +33,7 @@ pub struct Validator {
     pub metrics: Arc<Metrics>,
 }
 
-impl Validator {
+impl PrimaryNode {
     /// Start the single machine validator.
     pub async fn start(
         executor: SuiExecutor,
@@ -53,7 +52,7 @@ impl Validator {
         for i in 0..config.local_proxies {
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = executor.create_in_memory_store();
-            let proxy = Proxy::new(i, executor.clone(), store, rx, tx_proxy_results.clone());
+            let proxy = ProxyCore::new(i, executor.clone(), store, rx, tx_proxy_results.clone());
             handles.push(proxy.spawn());
             tx_proxy_connections.send(tx).await.expect("Channel open");
         }
@@ -71,7 +70,7 @@ impl Validator {
         // Boot the primary executor.
         let store = executor.create_in_memory_store();
         let primary_handle =
-            PrimaryExecutor::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
+            PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
         handles.push(primary_handle);
 
         // Boot the load balancer.
@@ -128,10 +127,10 @@ mod tests {
 
     use crate::{
         config::{BenchmarkConfig, ValidatorConfig},
-        executor::SuiExecutor,
+        executor::executor::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
-        validator::Validator,
+        primary::node::PrimaryNode,
     };
 
     #[tokio::test]
@@ -146,7 +145,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = Validator::start(executor.clone(), &config, validator_metrics).await;
+        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -180,7 +179,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = Validator::start(executor.clone(), &config, validator_metrics).await;
+        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.

@@ -1,5 +1,9 @@
-use rustc_hash::FxHashMap;
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 use sui_types::base_types::ObjectID;
 use tokio::sync::Notify;
 
@@ -9,7 +13,7 @@ pub type TaskHandle = (TaskID, Arc<Notify>);
 pub type TaskEntry = Option<TaskHandle>;
 pub type ObjectTaskMap = FxHashMap<ObjectID, TaskEntry>;
 
-/// The dependency controller is reponsible for dynamically maintaining
+/// The dependency controller is responsible for dynamically maintaining
 /// inter-task dependency graph due to overlapped resource accesses.
 pub struct DependencyController {
     /// This map contains the tail task of all priors ones

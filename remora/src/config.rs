@@ -11,7 +11,7 @@ use std::{
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::mock_consensus::{models::FixedDelay, MockConsensusParameters};
+use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
 /// Return a socket address on the local machine with a random port.
 /// This is useful for tests.
@@ -74,7 +74,7 @@ impl ValidatorConfig {
 mod default_validator_config {
     use std::net::SocketAddr;
 
-    use crate::mock_consensus::{models::FixedDelay, MockConsensusParameters};
+    use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
     pub fn default_validator_address() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 18500))
