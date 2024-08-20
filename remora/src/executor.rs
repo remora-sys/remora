@@ -394,4 +394,57 @@ mod tests {
             assert!(results.success());
         }
     }
+
+    #[tokio::test]
+    async fn test_sui_executor_with_shared_objects() {
+        let config = BenchmarkConfig {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::Transfers,
+        };
+
+        let mut executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
+        let pre_generation = config.load * config.duration.as_secs();
+
+        // Determine the workload.
+        let workload_type = match config.workload {
+            WorkloadType::Transfers => WorkloadKind::PTB {
+                num_transfers: 0,
+                num_dynamic_fields: 0,
+                use_batch_mint: false,
+                computation: 0,
+                use_native_transfer: false,
+                num_mints: 0,
+                num_shared_objects: 1,
+                nft_size: 32,
+            },
+        };
+
+        // Create genesis.
+        tracing::debug!("Creating genesis for {pre_generation} transactions...");
+        let workload = Workload::new(pre_generation, workload_type);
+
+        let mut ctx =
+            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
+        let start_time = Instant::now();
+        let tx_generator = workload.create_tx_generator(&mut ctx).await;
+        let transactions = ctx.generate_transactions(tx_generator).await;
+        let transactions = ctx.certify_transactions(transactions, false).await;
+
+        let elapsed = start_time.elapsed();
+        tracing::debug!(
+            "Generated {} txs in {} ms",
+            transactions.len(),
+            elapsed.as_millis(),
+        );
+
+        assert!(transactions.len() > 10);
+
+        for tx in transactions {
+            let transaction = TransactionWithTimestamp::new_for_tests(tx);
+            let results = executor.execute(&store, &transaction).await;
+            assert!(results.success());
+        }
+    }
 }
