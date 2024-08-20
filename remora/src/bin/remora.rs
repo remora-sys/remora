@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
-    executor::executor::SuiExecutor,
+    executor::sui::SuiExecutor,
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
 };

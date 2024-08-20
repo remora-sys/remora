@@ -11,12 +11,11 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::load_balancer::LoadBalancer;
+use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::ValidatorConfig,
-    executor::executor::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
+    executor::sui::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::Metrics,
-    primary::{core::PrimaryCore, mock_consensus::MockConsensus},
     proxy::core::ProxyCore,
 };
 
@@ -127,7 +126,7 @@ mod tests {
 
     use crate::{
         config::{BenchmarkConfig, ValidatorConfig},
-        executor::executor::SuiExecutor,
+        executor::sui::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
         primary::node::PrimaryNode,

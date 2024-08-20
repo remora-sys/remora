@@ -11,7 +11,7 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 
 use crate::{
     config::BenchmarkConfig,
-    executor::executor::{generate_transactions, TransactionWithTimestamp},
+    executor::{api::TransactionWithTimestamp, sui::generate_transactions},
     metrics::{ErrorType, Metrics},
 };
 
@@ -164,7 +164,7 @@ pub mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::executor::SuiTransactionWithTimestamp,
+        executor::sui::SuiTransactionWithTimestamp,
         load_generator::LoadGenerator,
         metrics::Metrics,
     };

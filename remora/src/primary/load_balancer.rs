@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    executor::executor::{Executor, TransactionWithTimestamp},
+    executor::api::{Executor, TransactionWithTimestamp},
     metrics::Metrics,
 };
 

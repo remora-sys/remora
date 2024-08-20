@@ -9,8 +9,8 @@ use tokio::{
 };
 
 use crate::executor::{
+    api::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
     dependency_controller::DependencyController,
-    executor::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
 };
 
 pub type ProxyId = usize;
@@ -111,7 +111,7 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::executor::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
+        executor::sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
         proxy::core::ProxyCore,
     };
 

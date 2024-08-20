@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use super::mock_consensus::ConsensusCommit;
-use crate::executor::executor::{
+use crate::executor::api::{
     ExecutableTransaction,
     ExecutionEffects,
     Executor,
@@ -161,11 +161,9 @@ mod tests {
 
     use crate::{
         config::BenchmarkConfig,
-        executor::executor::{
-            generate_transactions,
-            Executor,
-            SuiExecutor,
-            SuiTransactionWithTimestamp,
+        executor::{
+            api::Executor,
+            sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
         },
         primary::core::PrimaryCore,
     };
