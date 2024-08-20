@@ -9,7 +9,7 @@ mod worker;
 mod tests {
 
     use futures::join;
-    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::{self};
 
     use crate::{
         config::ValidatorConfig,
@@ -17,7 +17,52 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn client_server() {
+    #[tracing_test::traced_test]
+    async fn client_primary_connection() {
+        let config = ValidatorConfig::default();
+        let transactions: Vec<_> = (0..100).collect();
+
+        // Spawn the server, wait for a client connection, and receive transactions from the client.
+        let cloned_config = config.clone();
+        let cloned_transactions = transactions.clone();
+        let server = async move {
+            let (tx_client_connections, mut rx_client_connections) = mpsc::channel(1);
+            let (tx_transactions, mut rx_transactions) = mpsc::channel(100);
+
+            let server =
+                NetworkServer::<_, ()>::new(cloned_config, tx_client_connections, tx_transactions);
+            let _server_handle = server.spawn();
+
+            // Wait for a client connection and hold it (to avoid closing the channel).
+            let _connection = rx_client_connections.recv().await.unwrap();
+
+            // Wait for the result.
+            for i in cloned_transactions {
+                let t: u32 = rx_transactions.recv().await.unwrap();
+                assert_eq!(t, i);
+            }
+        };
+
+        // Spawn the client and send transactions to the primary.
+        let client = async move {
+            let (tx_unused, _rx_unused) = mpsc::channel(1);
+            let (tx_transactions, rx_transactions) = mpsc::channel(1);
+
+            let client = NetworkClient::<(), _>::new(config, tx_unused, rx_transactions);
+            let _client_handle = client.spawn();
+
+            // Send a transaction to the primary.
+            for t in transactions {
+                tx_transactions.send(t).await.unwrap();
+            }
+        };
+
+        // Ensure both the client and server completed successfully.
+        join!(server, client);
+    }
+
+    #[tokio::test]
+    async fn proxy_primary_connection() {
         let config = ValidatorConfig::default();
         let transaction = "transaction".to_string();
         let result = "transaction result".to_string();

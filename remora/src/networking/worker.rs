@@ -16,37 +16,37 @@ use tokio::{
 };
 
 /// A worker that handles a bidirectional connection with a peer.
-pub struct ConnectionWorker<S, R> {
+pub struct ConnectionWorker<I, O> {
     /// The TCP stream.
     stream: TcpStream,
     /// The sender for messages received from the network.
-    tx_message: Sender<R>,
+    tx_incoming: Sender<I>,
     /// The receiver for messages to send to the network.
-    rx_message: Receiver<S>,
+    rx_outgoing: Receiver<O>,
 }
 
-impl<S, R> ConnectionWorker<S, R>
+impl<I, O> ConnectionWorker<I, O>
 where
-    S: Send + Serialize,
-    R: Send + DeserializeOwned,
+    I: Send + DeserializeOwned,
+    O: Send + Serialize,
 {
     /// The maximum size of a network message.
     const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
     /// Create a new worker.
-    pub fn new(stream: TcpStream, tx_message: Sender<R>, rx_message: Receiver<S>) -> Self {
+    pub fn new(stream: TcpStream, tx_incoming: Sender<I>, rx_outgoing: Receiver<O>) -> Self {
         Self {
             stream,
-            tx_message,
-            rx_message,
+            tx_incoming,
+            rx_outgoing,
         }
     }
 
     /// Run the worker.
     pub async fn run(self) {
         let (reader, writer) = self.stream.into_split();
-        let read_stream_handle = Self::handle_read_stream(reader, self.tx_message).boxed();
-        let write_stream_handle = Self::handle_write_stream(writer, self.rx_message).boxed();
+        let read_stream_handle = Self::handle_read_stream(reader, self.tx_incoming).boxed();
+        let write_stream_handle = Self::handle_write_stream(writer, self.rx_outgoing).boxed();
         tokio::select! {
             _ = read_stream_handle => (),
             _ = write_stream_handle => (),
@@ -56,7 +56,7 @@ where
     /// Handle reading from the stream.
     async fn handle_read_stream(
         mut reader: OwnedReadHalf,
-        tx_proxy_result: Sender<R>,
+        tx_incoming: Sender<I>,
     ) -> io::Result<()> {
         let mut buffer = vec![0u8; Self::MAX_MESSAGE_SIZE as usize].into_boxed_slice();
 
@@ -70,7 +70,7 @@ where
             // Send the message to the application layer.
             match bincode::deserialize(message) {
                 Ok(proxy_result) => {
-                    if tx_proxy_result.send(proxy_result).await.is_err() {
+                    if tx_incoming.send(proxy_result).await.is_err() {
                         tracing::warn!("Cannot send message to application layer, stopping worker");
                         break Ok(());
                     }
@@ -86,9 +86,9 @@ where
     /// Handle writing to the stream.
     async fn handle_write_stream(
         mut writer: OwnedWriteHalf,
-        mut rx_transactions: Receiver<S>,
+        mut rx_outgoing: Receiver<O>,
     ) -> io::Result<()> {
-        while let Some(transaction) = rx_transactions.recv().await {
+        while let Some(transaction) = rx_outgoing.recv().await {
             // Serialize and send the message.
             let serialized = bincode::serialize(&transaction).expect("Infallible serialization");
             writer.write_u32(serialized.len() as u32).await?;
@@ -99,10 +99,10 @@ where
     }
 }
 
-impl<T, R> ConnectionWorker<T, R>
+impl<I, O> ConnectionWorker<I, O>
 where
-    T: Send + Serialize + 'static,
-    R: Send + DeserializeOwned + 'static,
+    I: Send + DeserializeOwned + 'static,
+    O: Send + Serialize + 'static,
 {
     /// Spawn the worker in a new task.
     pub fn spawn(self) -> JoinHandle<()> {

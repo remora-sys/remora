@@ -12,39 +12,40 @@ use tokio::{
 
 use crate::{config::ValidatorConfig, networking::worker::ConnectionWorker};
 
-/// The size of the server worker channel.
+/// The size of the server-worker communication channel.
 pub const WORKER_CHANNEL_SIZE: usize = 1000;
 
-/// A server run by the primary machine that listens for connections from proxies.
-/// When a new proxy connects, a new worker is spawned. The server leverages the
-/// bidirectional channel opened by the proxy to send transactions to the proxy.
-/// The server also listens for proxy results and forwards them to the primary.
-pub struct NetworkServer<T, R> {
+/// A server run by the primary machine that listens for connections from proxies
+/// and transactions from clients. When a new client connects, a new worker is spawned.
+/// The server can leverage the bidirectional channel opened by the client to send messages
+/// as well. To this purpose, the server propagate a communication channel to the application
+/// layer, which can use it to send messages to the client.
+pub struct NetworkServer<I, O> {
     /// The configuration for the validator.
     config: ValidatorConfig,
-    /// The sender for proxy connections. When a new proxy connects, this channel
-    /// is used to propagate a sender to the load balancer, which will use it
-    /// to send transactions through the network.
-    tx_proxy_connections: Sender<Sender<T>>,
-    /// The sender for proxy results received from the network.
-    tx_proxy_results: Sender<R>,
+    /// The sender for client connections. When a new client connects, this channel
+    /// is used to propagate a sender to the application layer, which can use it
+    /// to send messages to the client.
+    tx_connections: Sender<Sender<O>>,
+    /// The sender for messages received from the network to send to the application layer.
+    tx_incoming: Sender<I>,
 }
 
-impl<T, R> NetworkServer<T, R>
+impl<I, O> NetworkServer<I, O>
 where
-    T: Send + Serialize + 'static,
-    R: Send + DeserializeOwned + 'static,
+    I: Send + DeserializeOwned + 'static,
+    O: Send + Serialize + 'static,
 {
     /// Create a new server.
     pub fn new(
         config: ValidatorConfig,
-        tx_proxy_connections: Sender<Sender<T>>,
-        tx_proxy_results: Sender<R>,
+        tx_connections: Sender<Sender<O>>,
+        tx_incoming: Sender<I>,
     ) -> Self {
         Self {
             config,
-            tx_proxy_connections,
-            tx_proxy_results,
+            tx_connections,
+            tx_incoming,
         }
     }
 
@@ -56,18 +57,17 @@ where
         loop {
             let (stream, peer) = server.accept().await?;
             stream.set_nodelay(true)?;
-            tracing::info!("Accepted connection from proxy {peer}");
+            tracing::info!("Accepted connection from client {peer}");
 
             // Spawn a worker to handle the connection.
-            let (tx_transactions, rx_transactions) = mpsc::channel(WORKER_CHANNEL_SIZE);
-            let tx_proxy_results = self.tx_proxy_results.clone();
-            let worker = ConnectionWorker::new(stream, tx_proxy_results, rx_transactions);
+            let (tx, rx) = mpsc::channel(WORKER_CHANNEL_SIZE);
+            let worker = ConnectionWorker::new(stream, self.tx_incoming.clone(), rx);
             let _handle = worker.spawn();
 
-            // Notify the load balancer that a new proxy has connected.
-            let result = self.tx_proxy_connections.send(tx_transactions).await;
+            // Notify the application layer that a new client has connected.
+            let result = self.tx_connections.send(tx).await;
             if result.is_err() {
-                tracing::warn!("Failed to send proxy connection to load balancer, stopping server");
+                tracing::warn!("Cannot send connection to application, stopping server");
                 break Ok(());
             }
         }

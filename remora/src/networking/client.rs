@@ -13,69 +13,64 @@ use tokio::{
 
 use crate::{config::ValidatorConfig, networking::worker::ConnectionWorker};
 
-/// A client ran by the proxy to connects to the primary machine and receive transactions
-/// to process. The client also sends the results of the transactions back to the primary.
-pub struct NetworkClient<T, R> {
+/// A client ran by the proxy (and the load generator) to connects to the server on the
+/// primary machine and receive messages to process. The client can also leverage the
+/// bidirectional connection to send messages back to the server.
+pub struct NetworkClient<I, O> {
     /// The configuration for the validator.
     config: ValidatorConfig,
-    /// The sender for transactions received from the network.
-    tx_transactions: Sender<T>,
-    /// The receiver for proxy results to send through the network.
-    rx_proxy_results: Receiver<R>,
+    /// The sender for messages received from the network to send to the application layer.
+    tx_incoming: Sender<I>,
+    /// The receiver for messages to send through the network.
+    rx_outgoing: Receiver<O>,
 }
 
-impl<T, R> NetworkClient<T, R>
+impl<I, O> NetworkClient<I, O>
 where
-    T: Send + DeserializeOwned,
-    R: Send + Serialize,
+    I: Send + DeserializeOwned,
+    O: Send + Serialize,
 {
     /// Create a new client.
-    pub fn new(
-        config: ValidatorConfig,
-        tx_transactions: Sender<T>,
-        rx_proxy_results: Receiver<R>,
-    ) -> Self {
+    pub fn new(config: ValidatorConfig, tx_incoming: Sender<I>, rx_outgoing: Receiver<O>) -> Self {
         Self {
             config,
-            tx_transactions,
-            rx_proxy_results,
+            tx_incoming,
+            rx_outgoing,
         }
     }
 
     /// Run the client.
     pub async fn run(self) -> io::Result<()> {
-        tracing::info!(
-            "Trying to connect to primary {}",
-            self.config.validator_address
-        );
+        let server_address = self.config.validator_address;
+        tracing::info!("Trying to connect to server {server_address}");
 
         let stream = loop {
-            let socket = if self.config.validator_address.is_ipv4() {
+            let socket = if server_address.is_ipv4() {
                 TcpSocket::new_v4()?
             } else {
                 TcpSocket::new_v6()?
             };
 
-            match socket.connect(self.config.validator_address).await {
+            match socket.connect(server_address).await {
                 Ok(stream) => break stream,
                 Err(e) => {
-                    tracing::info!("Failed to connect to primary (retrying): {e}");
+                    tracing::info!("Failed to connect to server (retrying): {e}");
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         };
-        tracing::info!("Connected to {}", self.config.validator_address);
+        tracing::info!("Connected to {server_address}");
 
-        let worker = ConnectionWorker::new(stream, self.tx_transactions, self.rx_proxy_results);
+        let worker = ConnectionWorker::new(stream, self.tx_incoming, self.rx_outgoing);
         worker.run().await;
         Ok(())
     }
 }
 
-impl<T, R> NetworkClient<T, R>
+impl<I, O> NetworkClient<I, O>
 where
-    T: Send + DeserializeOwned + 'static,
-    R: Send + Serialize + 'static,
+    I: Send + DeserializeOwned + 'static,
+    O: Send + Serialize + 'static,
 {
     /// Spawn the client in a new task.
     pub fn spawn(self) -> JoinHandle<io::Result<()>> {
