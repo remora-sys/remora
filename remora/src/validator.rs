@@ -25,7 +25,7 @@ use crate::{
 const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 /// The single machine validator is a simple validator that runs all components.
-pub struct SingleMachineValidator {
+pub struct Validator {
     /// The handles for all components.
     pub handles: Vec<JoinHandle<()>>,
     /// The receiver for the final execution results.
@@ -34,7 +34,7 @@ pub struct SingleMachineValidator {
     pub metrics: Arc<Metrics>,
 }
 
-impl SingleMachineValidator {
+impl Validator {
     /// Start the single machine validator.
     pub async fn start(
         executor: SuiExecutor,
@@ -43,19 +43,19 @@ impl SingleMachineValidator {
     ) -> Self {
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_load_balancer_load, rx_load_balancer_load) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        // Boot the proxies.
+        // Boot the local proxies. Additional proxies can still remotely connect.
         let mut handles = Vec::new();
-        let mut proxy_senders = Vec::new();
-        for i in 0..config.num_proxies {
+        for i in 0..config.local_proxies {
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = executor.create_in_memory_store();
             let proxy = Proxy::new(i, executor.clone(), store, rx, tx_proxy_results.clone());
             handles.push(proxy.spawn());
-            proxy_senders.push(tx);
+            tx_proxy_connections.send(tx).await.expect("Channel open");
         }
 
         // Boot the consensus.
@@ -78,9 +78,10 @@ impl SingleMachineValidator {
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
             rx_client_transactions,
             tx_load_balancer_load,
-            proxy_senders,
+            rx_proxy_connections,
+            metrics.clone(),
         )
-        .spawn(metrics.clone());
+        .spawn();
         handles.push(load_balancer_handle);
 
         let network_handler = SingleMachineValidatorHandler {
@@ -130,7 +131,7 @@ mod tests {
         executor::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
-        validator::SingleMachineValidator,
+        validator::Validator,
     };
 
     #[tokio::test]
@@ -145,8 +146,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator =
-            SingleMachineValidator::start(executor.clone(), &config, validator_metrics).await;
+        let mut validator = Validator::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -169,7 +169,7 @@ mod tests {
     #[tracing_test::traced_test]
     async fn no_proxies() {
         let config = ValidatorConfig {
-            num_proxies: 0,
+            local_proxies: 0,
             ..ValidatorConfig::new_for_tests()
         };
         let validator_address = config.validator_address;
@@ -180,8 +180,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator =
-            SingleMachineValidator::start(executor.clone(), &config, validator_metrics).await;
+        let mut validator = Validator::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.

@@ -14,6 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
 /// Return a socket address on the local machine with a random port.
+/// This is useful for tests.
 pub fn get_test_address() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
         .expect("Failed to bind to a random port")
@@ -33,8 +34,7 @@ pub trait ImportExport: Serialize + DeserializeOwned {
 
     /// Print the configuration object to a file in YAML format.
     fn print<P: AsRef<Path>>(&self, path: P) -> Result<(), io::Error> {
-        let content =
-            serde_yaml::to_string(self).expect("Failed to serialize object to YAML string");
+        let content = serde_yaml::to_string(self).expect("Failed to serialize to YAML string");
         fs::write(&path, content)
     }
 }
@@ -48,9 +48,10 @@ pub struct ValidatorConfig {
     /// The address to expose metrics on.
     #[serde(default = "default_validator_config::default_metrics_address")]
     pub metrics_address: SocketAddr,
-    /// The number of proxies to use.
-    #[serde(default = "default_validator_config::default_num_proxies")]
-    pub num_proxies: usize,
+    /// The number of local proxies to use. That is, the number of proxies running on the same
+    /// machine as the primary. Additional remote proxies can still connect to the primary.
+    #[serde(default = "default_validator_config::default_local_proxies")]
+    pub local_proxies: usize,
     /// The consensus delay model.
     #[serde(default = "default_validator_config::default_consensus_delay_model")]
     pub consensus_delay_model: FixedDelay,
@@ -83,7 +84,7 @@ mod default_validator_config {
         SocketAddr::from(([127, 0, 0, 1], 18501))
     }
 
-    pub fn default_num_proxies() -> usize {
+    pub fn default_local_proxies() -> usize {
         1
     }
 
@@ -101,7 +102,7 @@ impl Default for ValidatorConfig {
         ValidatorConfig {
             validator_address: default_validator_config::default_validator_address(),
             metrics_address: default_validator_config::default_metrics_address(),
-            num_proxies: default_validator_config::default_num_proxies(),
+            local_proxies: default_validator_config::default_local_proxies(),
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
         }

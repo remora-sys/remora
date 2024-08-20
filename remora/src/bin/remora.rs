@@ -9,7 +9,7 @@ use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
     executor::SuiExecutor,
     metrics::{periodically_print_metrics, Metrics},
-    validator::SingleMachineValidator,
+    validator::Validator,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         validator_config.validator_address
     );
     tracing::info!("Exposing metrics on {}", validator_config.metrics_address);
-    SingleMachineValidator::start(executor, &validator_config, metrics)
+    Validator::start(executor, &validator_config, metrics)
         .await
         .collect_results()
         .await;
