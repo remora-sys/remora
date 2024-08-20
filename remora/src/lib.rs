@@ -5,6 +5,7 @@ pub mod load_balancer;
 pub mod load_generator;
 pub mod metrics;
 pub mod mock_consensus;
+pub mod networking;
 pub mod primary;
 pub mod proxy;
 pub mod validator;
