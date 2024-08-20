@@ -1,11 +1,25 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, io, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    fs,
+    io,
+    net::{SocketAddr, TcpListener},
+    path::Path,
+    time::Duration,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::mock_consensus::{models::FixedDelay, MockConsensusParameters};
+
+/// Return a socket address on the local machine with a random port.
+pub fn get_test_address() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("Failed to bind to a random port")
+        .local_addr()
+        .expect("Failed to get local address")
+}
 
 /// A trait for importing and exporting configuration objects.
 pub trait ImportExport: Serialize + DeserializeOwned {
@@ -43,6 +57,17 @@ pub struct ValidatorConfig {
     /// The consensus parameters.
     #[serde(default = "default_validator_config::default_consensus_parameters")]
     pub consensus_parameters: MockConsensusParameters,
+}
+
+impl ValidatorConfig {
+    /// Create a new validator configuration for tests.
+    pub fn new_for_tests() -> Self {
+        ValidatorConfig {
+            validator_address: get_test_address(),
+            metrics_address: get_test_address(),
+            ..Default::default()
+        }
+    }
 }
 
 mod default_validator_config {

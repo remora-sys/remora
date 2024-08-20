@@ -17,9 +17,8 @@ mod tests {
     };
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn client_primary_connection() {
-        let config = ValidatorConfig::default();
+        let config = ValidatorConfig::new_for_tests();
         let transactions: Vec<_> = (0..100).collect();
 
         // Spawn the server, wait for a client connection, and receive transactions from the client.
@@ -63,7 +62,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_primary_connection() {
-        let config = ValidatorConfig::default();
+        let config = ValidatorConfig::new_for_tests();
         let transaction = "transaction".to_string();
         let result = "transaction result".to_string();
 
@@ -89,7 +88,6 @@ mod tests {
 
         // Spawn the client, wait for a transaction from the primary, and send back a result.
         let client = async move {
-            let config = ValidatorConfig::default();
             let (tx_transactions, mut rx_transactions) = mpsc::channel(1);
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(1);
 

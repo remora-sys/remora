@@ -123,30 +123,21 @@ impl MessageHandler for SingleMachineValidatorHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::sync::Arc;
 
     use crate::{
         config::{BenchmarkConfig, ValidatorConfig},
         executor::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
-        mock_consensus::{models::FixedDelay, MockConsensusParameters},
         validator::SingleMachineValidator,
     };
 
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn execute_transactions() {
-        // TODO: Implement a better way to get a port for tests
-        let validator_address = SocketAddr::from(([127, 0, 0, 1], 18588));
-        let metrics_address = SocketAddr::from(([127, 0, 0, 1], 18589));
-        let config = ValidatorConfig {
-            validator_address,
-            metrics_address,
-            num_proxies: 1,
-            consensus_delay_model: FixedDelay::default(),
-            consensus_parameters: MockConsensusParameters::default(),
-        };
+        let config = ValidatorConfig::new_for_tests();
+        let validator_address = config.validator_address;
         let benchmark_config = BenchmarkConfig::new_for_tests();
 
         // Create a Sui executor.
@@ -177,16 +168,11 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn no_proxies() {
-        // TODO: Implement a better way to get a port for tests
-        let validator_address = SocketAddr::from(([127, 0, 0, 1], 18588));
-        let metrics_address = SocketAddr::from(([127, 0, 0, 1], 18589));
         let config = ValidatorConfig {
-            validator_address,
-            metrics_address,
             num_proxies: 0,
-            consensus_delay_model: FixedDelay::default(),
-            consensus_parameters: MockConsensusParameters::default(),
+            ..ValidatorConfig::new_for_tests()
         };
+        let validator_address = config.validator_address;
         let benchmark_config = BenchmarkConfig::new_for_tests();
 
         // Create a Sui executor.
