@@ -61,19 +61,17 @@ impl<T: Clone> LoadBalancer<T> {
         // Send the transaction to the proxies. If the connection to a proxy fails, remove it
         // from the list of connections and try with another proxy.
         while !self.proxy_connections.is_empty() {
-            let proxy_id = self.index % self.proxy_connections.len();
-            let proxy = &self.proxy_connections[proxy_id];
+            let i = self.index % self.proxy_connections.len();
+            let proxy = &self.proxy_connections[i];
             match proxy.send(transaction.clone()).await {
                 Ok(()) => {
-                    tracing::debug!("Sent transaction to proxy {proxy_id}");
+                    tracing::debug!("Sent transaction to proxy");
                     self.index += 1;
                     break;
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "Failed to send transaction to proxy {proxy_id}, trying other proxies"
-                    );
-                    self.proxy_connections.swap_remove(proxy_id);
+                    tracing::warn!("Failed to send transaction to proxy, trying other proxies");
+                    self.proxy_connections.swap_remove(i);
                 }
             }
         }

@@ -40,7 +40,6 @@ async fn remote_proxy() {
     let load_generator_metrics = Metrics::new_for_tests();
     let mut load_generator =
         LoadGenerator::new(benchmark_config, validator_address, load_generator_metrics);
-
     let transactions = load_generator.initialize().await;
     let total_transactions = transactions.len();
     load_generator.run(transactions).await;
