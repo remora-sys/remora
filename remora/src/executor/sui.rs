@@ -24,11 +24,7 @@ use sui_types::{
 use tokio::time::Instant;
 
 use super::api::{
-    ExecutableTransaction,
-    ExecutionEffects,
-    Executor,
-    StateStore,
-    TransactionWithTimestamp,
+    ExecutableTransaction, ExecutionEffects, Executor, StateStore, TransactionWithTimestamp,
 };
 use crate::config::{BenchmarkConfig, WorkloadType};
 
@@ -83,6 +79,16 @@ pub fn init_workload(config: &BenchmarkConfig) -> Workload {
             num_shared_objects: 0,
             nft_size: 32,
         },
+        WorkloadType::SharedObjects => WorkloadKind::PTB {
+            num_transfers: 0,
+            num_dynamic_fields: 0,
+            use_batch_mint: false,
+            computation: 0,
+            use_native_transfer: false,
+            num_mints: 0,
+            num_shared_objects: 1,
+            nft_size: 32,
+        },
     };
 
     // Create genesis.
@@ -106,6 +112,48 @@ pub async fn generate_transactions(config: &BenchmarkConfig) -> Vec<CertifiedTra
     );
 
     transactions
+}
+
+use std::{fs, io::BufReader, path::PathBuf};
+
+use sui_single_node_benchmark::mock_account::Account;
+use sui_types::base_types::SuiAddress;
+pub fn export_to_files(
+    accounts: &BTreeMap<SuiAddress, Account>,
+    txs: &Vec<CertifiedTransaction>,
+    working_directory: PathBuf,
+) {
+    let start_time: std::time::Instant = std::time::Instant::now();
+
+    let accounts_path = working_directory.join("accounts.dat");
+    let txs_path = working_directory.join("txs.dat");
+
+    let accounts_s = bincode::serialize(accounts).unwrap();
+    let txs_s = bincode::serialize(txs).unwrap();
+
+    fs::write(accounts_path, accounts_s).expect("Failed to write accounts");
+    fs::write(txs_path, txs_s).expect("Failed to write txs");
+    let elapsed = start_time.elapsed().as_millis() as f64;
+    println!("Export took {} ms", elapsed,);
+}
+
+pub fn import_from_files(
+    working_directory: PathBuf,
+) -> (BTreeMap<SuiAddress, Account>, Vec<CertifiedTransaction>) {
+    let start_time: std::time::Instant = std::time::Instant::now();
+
+    let accounts_file = BufReader::new(
+        fs::File::open(working_directory.join("accounts.dat")).expect("Failed to open accounts"),
+    );
+    let txs_file = BufReader::new(
+        fs::File::open(working_directory.join("txs.dat")).expect("Failed to open txs"),
+    );
+
+    let accounts = bincode::deserialize_from(accounts_file).unwrap();
+    let txs = bincode::deserialize_from(txs_file).unwrap();
+    let elapsed = start_time.elapsed().as_millis() as f64;
+    println!("Import took {} ms", elapsed,);
+    (accounts, txs)
 }
 
 impl SuiExecutor {
@@ -302,35 +350,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_sui_executor_with_shared_objects() {
         let config = BenchmarkConfig {
             load: 10,
             duration: Duration::from_secs(1),
-            workload: WorkloadType::Transfers,
+            workload: WorkloadType::SharedObjects,
         };
 
         let mut executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
-        let pre_generation = config.load * config.duration.as_secs();
-
-        // Determine the workload.
-        let workload_type = match config.workload {
-            WorkloadType::Transfers => WorkloadKind::PTB {
-                num_transfers: 0,
-                num_dynamic_fields: 0,
-                use_batch_mint: false,
-                computation: 0,
-                use_native_transfer: false,
-                num_mints: 0,
-                num_shared_objects: 1,
-                nft_size: 32,
-            },
-        };
-
-        // Create genesis.
-        tracing::debug!("Creating genesis for {pre_generation} transactions...");
-        let workload = Workload::new(pre_generation, workload_type);
-
+        let workload = init_workload(&config);
         let mut ctx =
             BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
         let start_time = Instant::now();
@@ -348,6 +378,50 @@ mod tests {
         assert!(transactions.len() > 10);
 
         for tx in transactions {
+            let transaction = TransactionWithTimestamp::new_for_tests(tx);
+            let results = executor.execute(&store, &transaction).await;
+            assert!(results.success());
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_object_test_with_imported_file() {
+        let config = BenchmarkConfig {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::SharedObjects,
+        };
+
+        let working_directory = "~/test_export";
+        fs::create_dir_all(&working_directory).expect(&format!(
+            "Failed to create directory '{}'",
+            working_directory
+        ));
+
+        // generate txs and export to files
+        let workload = init_workload(&config);
+        let mut ctx =
+            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
+        let tx_generator = workload.create_tx_generator(&mut ctx).await;
+        let txs = ctx.generate_transactions(tx_generator).await;
+        let txs = ctx.certify_transactions(txs, false).await;
+
+        super::export_to_files(ctx.get_accounts(), &txs, working_directory.into());
+
+        // execute on another executor
+        let mut executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
+
+        // import txs to assign shared-object versions
+        let (read_accounts, read_txs) = super::import_from_files(working_directory.into());
+        assert_eq!(read_accounts.len(), ctx.get_accounts().len());
+        executor
+            .get_context()
+            .validator()
+            .assigned_shared_object_versions(&read_txs) // Important!!
+            .await;
+
+        for tx in read_txs {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
             let results = executor.execute(&store, &transaction).await;
             assert!(results.success());

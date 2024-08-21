@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    fs,
-    io,
+    fs, io,
     net::{SocketAddr, TcpListener},
     path::Path,
     time::Duration,
@@ -115,6 +114,7 @@ impl ImportExport for ValidatorConfig {}
 #[derive(Serialize, Deserialize)]
 pub enum WorkloadType {
     Transfers,
+    SharedObjects,
 }
 
 /// The configuration for the benchmark.
