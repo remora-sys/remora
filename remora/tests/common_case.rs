@@ -15,7 +15,10 @@ use remora::{
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn remote_proxy() {
-    let config = ValidatorConfig::new_for_tests();
+    let config = ValidatorConfig {
+        local_proxies: 0,
+        ..ValidatorConfig::new_for_tests()
+    };
     let validator_address = config.validator_address;
     let benchmark_config = BenchmarkConfig::new_for_tests();
 
@@ -29,7 +32,8 @@ async fn remote_proxy() {
     tokio::task::yield_now().await;
 
     // Start a remote proxy.
-    let _proxy = ProxyNode::start(executor, &config, validator_metrics).await;
+    let proxy_id = 0;
+    let _proxy = ProxyNode::start(proxy_id, executor, &config, validator_metrics).await;
     tokio::task::yield_now().await;
 
     // Generate transactions.
