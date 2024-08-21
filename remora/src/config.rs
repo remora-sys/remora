@@ -1,6 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::{
+    fmt::Debug,
+    fs,
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    path::Path,
+    time::Duration,
+};
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
@@ -114,6 +123,7 @@ impl Debug for WorkloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkloadType::Transfers => write!(f, "transfers"),
+            WorkloadType::SharedObjects => write!(f, "shared objects"),
         }
     }
 }
