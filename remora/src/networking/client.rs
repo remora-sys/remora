@@ -68,15 +68,13 @@ where
         worker.run().await;
         Ok(())
     }
-}
 
-impl<I, O> NetworkClient<I, O>
-where
-    I: Send + DeserializeOwned + 'static,
-    O: Send + Serialize + 'static,
-{
     /// Spawn the client in a new task.
-    pub fn spawn(self) -> JoinHandle<io::Result<()>> {
+    pub fn spawn(self) -> JoinHandle<io::Result<()>>
+    where
+        I: 'static,
+        O: 'static,
+    {
         tokio::spawn(async move { self.run().await })
     }
 }

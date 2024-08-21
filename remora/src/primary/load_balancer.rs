@@ -8,35 +8,32 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
-    executor::api::{Executor, TransactionWithTimestamp},
-    metrics::Metrics,
-};
+use crate::metrics::Metrics;
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
-pub struct LoadBalancer<E: Executor> {
+pub struct LoadBalancer<T> {
     /// The receiver for transactions.
-    rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
+    rx_transactions: Receiver<T>,
     /// The sender to forward transactions to the consensus.
-    tx_consensus: Sender<TransactionWithTimestamp<E::Transaction>>,
+    tx_consensus: Sender<T>,
     /// Receive handles to forward transactions to proxies. When a new client connects,
     /// this channel receives a sender from the network layer which is used to forward
     /// transactions to the proxies.
-    rx_proxy_connections: Receiver<Sender<TransactionWithTimestamp<E::Transaction>>>,
+    rx_proxy_connections: Receiver<Sender<T>>,
     /// Holds senders to forward transactions to proxies.
-    proxy_connections: Vec<Sender<TransactionWithTimestamp<E::Transaction>>>,
+    proxy_connections: Vec<Sender<T>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: usize,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor> LoadBalancer<E> {
+impl<T: Clone> LoadBalancer<T> {
     /// Create a new load balancer.
     pub fn new(
-        rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
-        tx_consensus: Sender<TransactionWithTimestamp<E::Transaction>>,
-        rx_proxy_connections: Receiver<Sender<TransactionWithTimestamp<E::Transaction>>>,
+        rx_transactions: Receiver<T>,
+        tx_consensus: Sender<T>,
+        rx_proxy_connections: Receiver<Sender<T>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -50,10 +47,7 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Forward a transaction to the consensus and proxies.
-    async fn forward_transaction(
-        &mut self,
-        transaction: TransactionWithTimestamp<E::Transaction>,
-    ) -> Option<()> {
+    async fn forward_transaction(&mut self, transaction: T) -> Option<()> {
         if self.index == 0 {
             self.metrics.register_start_time();
         }
@@ -111,8 +105,7 @@ impl<E: Executor> LoadBalancer<E> {
     /// Spawn the load balancer in a new task.
     pub fn spawn(mut self) -> JoinHandle<()>
     where
-        E: 'static,
-        <E as Executor>::Transaction: Send,
+        T: Send + 'static,
     {
         tokio::spawn(async move {
             self.run().await;

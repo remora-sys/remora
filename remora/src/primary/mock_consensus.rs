@@ -83,12 +83,7 @@ impl<M, T> MockConsensus<M, T> {
     }
 }
 
-impl<M: DelayModel<T> + Send + 'static, T: Send + 'static> MockConsensus<M, T> {
-    /// Spawn the mock consensus engine in a separate task.
-    pub fn spawn(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move { self.run().await })
-    }
-
+impl<M: DelayModel<T>, T> MockConsensus<M, T> {
     /// Run the mock consensus engine.
     pub async fn run(&mut self) {
         let timer = sleep(self.parameters.max_batch_delay);
@@ -141,6 +136,15 @@ impl<M: DelayModel<T> + Send + 'static, T: Send + 'static> MockConsensus<M, T> {
             // Give the change to schedule other tasks.
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Spawn the mock consensus engine in a separate task.
+    pub fn spawn(mut self) -> JoinHandle<()>
+    where
+        M: Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::spawn(async move { self.run().await })
     }
 }
 

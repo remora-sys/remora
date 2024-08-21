@@ -79,7 +79,7 @@ impl PrimaryNode {
         handles.push(primary_handle);
 
         // Boot the load balancer.
-        let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
+        let load_balancer_handle = LoadBalancer::new(
             rx_client_transactions,
             tx_load_balancer_load,
             rx_proxy_connections,

@@ -97,15 +97,13 @@ where
         tracing::warn!("Cannot receive transaction from application layer, stopping worker");
         Ok(())
     }
-}
 
-impl<I, O> ConnectionWorker<I, O>
-where
-    I: Send + DeserializeOwned + 'static,
-    O: Send + Serialize + 'static,
-{
     /// Spawn the worker in a new task.
-    pub fn spawn(self) -> JoinHandle<()> {
+    pub fn spawn(self) -> JoinHandle<()>
+    where
+        I: 'static,
+        O: 'static,
+    {
         tokio::spawn(async move {
             self.run().await;
         })
