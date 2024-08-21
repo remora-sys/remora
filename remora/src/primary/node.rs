@@ -49,8 +49,16 @@ impl PrimaryNode {
         for i in 0..config.local_proxies {
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = executor.create_in_memory_store();
-            let proxy = ProxyCore::new(i, executor.clone(), store, rx, tx_proxy_results.clone());
-            handles.push(proxy.spawn());
+            let proxy_handle = ProxyCore::new(
+                i,
+                executor.clone(),
+                store,
+                rx,
+                tx_proxy_results.clone(),
+                metrics.clone(),
+            )
+            .spawn();
+            handles.push(proxy_handle);
             tx_proxy_connections.send(tx).await.expect("Channel open");
         }
 
@@ -132,7 +140,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
+        let mut primary = PrimaryNode::start(executor, &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -146,7 +154,7 @@ mod tests {
 
         // Wait for all transactions to be processed.
         for _ in 0..total_transactions {
-            let (_tx, result) = validator.rx_output.recv().await.unwrap();
+            let (_tx, result) = primary.rx_output.recv().await.unwrap();
             assert!(result.success());
         }
     }

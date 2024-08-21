@@ -8,9 +8,12 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::executor::{
-    api::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
-    dependency_controller::DependencyController,
+use crate::{
+    executor::{
+        api::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
+        dependency_controller::DependencyController,
+    },
+    metrics::Metrics,
 };
 
 pub type ProxyId = usize;
@@ -29,6 +32,8 @@ pub struct ProxyCore<E: Executor> {
     tx_results: Sender<ExecutionEffects<E::StateChanges>>,
     /// The dependency controller for multi-core tx execution.
     dependency_controller: DependencyController,
+    /// The  metrics for the proxy
+    metrics: Arc<Metrics>,
 }
 
 impl<E: Executor> ProxyCore<E> {
@@ -39,6 +44,7 @@ impl<E: Executor> ProxyCore<E> {
         store: E::Store,
         rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
         tx_results: Sender<ExecutionEffects<E::StateChanges>>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             id,
@@ -47,6 +53,7 @@ impl<E: Executor> ProxyCore<E> {
             rx_transactions,
             tx_results,
             dependency_controller: DependencyController::new(),
+            metrics,
         }
     }
 
@@ -63,6 +70,7 @@ impl<E: Executor> ProxyCore<E> {
         let mut task_id = 0;
         let ctx = self.executor.get_context();
         while let Some(transaction) = self.rx_transactions.recv().await {
+            self.metrics.increase_proxy_load(self.id);
             task_id += 1;
             let (prior_handles, current_handles) = self
                 .dependency_controller
@@ -72,6 +80,7 @@ impl<E: Executor> ProxyCore<E> {
             let id = self.id;
             let tx_results = self.tx_results.clone();
             let ctx = ctx.clone();
+            let metrics = self.metrics.clone();
             tokio::spawn(async move {
                 for prior_notify in prior_handles {
                     prior_notify.notified().await;
@@ -84,8 +93,9 @@ impl<E: Executor> ProxyCore<E> {
                 }
 
                 if tx_results.send(execution_result).await.is_err() {
-                    tracing::warn!("Failed to send execution result, stopping proxy {}", id);
+                    tracing::warn!("Failed to send execution result, stopping proxy {id}");
                 }
+                metrics.decrease_proxy_load(id);
             });
         }
     }
@@ -107,11 +117,14 @@ impl<E: Executor> ProxyCore<E> {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
     use tokio::sync::mpsc;
 
     use crate::{
         config::BenchmarkConfig,
         executor::sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
+        metrics::Metrics,
         proxy::core::ProxyCore,
     };
 
@@ -123,10 +136,11 @@ mod tests {
         let config = BenchmarkConfig::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
-        let transactions = generate_transactions(&config).await;
-        let proxy = ProxyCore::new(0, executor, store, rx_proxy, tx_results);
+        let metrics = Arc::new(Metrics::new_for_tests());
+        let proxy = ProxyCore::new(0, executor, store, rx_proxy, tx_results, metrics);
 
         // Send transactions to the proxy.
+        let transactions = generate_transactions(&config).await;
         for tx in transactions {
             let transaction = SuiTransactionWithTimestamp::new_for_tests(tx);
             tx_proxy.send(transaction).await.unwrap();

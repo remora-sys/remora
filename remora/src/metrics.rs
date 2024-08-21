@@ -4,8 +4,15 @@
 use std::{cmp::max, collections::HashMap, io::BufRead, net::SocketAddr, time::Duration};
 
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, HistogramVec, IntCounter, IntCounterVec, Registry,
+    register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry,
+    register_int_counter_with_registry,
+    register_int_gauge_vec_with_registry,
+    HistogramVec,
+    IntCounter,
+    IntCounterVec,
+    IntGaugeVec,
+    Registry,
 };
 use prometheus_parse::Scrape;
 use tokio::{task::JoinHandle, time::sleep};
@@ -43,6 +50,8 @@ pub struct Metrics {
     pub latency_squared_sum: IntCounter,
     /// Number of errors.
     pub errors: IntCounterVec,
+    /// Number of in-flight transactions in the proxy.
+    pub proxy_load: IntGaugeVec,
 }
 
 impl Metrics {
@@ -84,6 +93,13 @@ impl Metrics {
                 "errors",
                 "Number of errors",
                 &["error_type"],
+                registry
+            )
+            .unwrap(),
+            proxy_load: register_int_gauge_vec_with_registry!(
+                "proxy_load",
+                "Number of in-flight transactions in the proxy",
+                &["proxy_id"],
                 registry
             )
             .unwrap(),
@@ -155,6 +171,20 @@ impl Metrics {
     pub fn update_metrics(&self, submit_timestamp: f64) {
         const WORKLOAD: &str = "default";
         self.register_transaction(submit_timestamp, WORKLOAD);
+    }
+
+    /// Increase the proxy load.
+    pub fn increase_proxy_load(&self, proxy_id: usize) {
+        self.proxy_load
+            .with_label_values(&[&proxy_id.to_string()])
+            .inc();
+    }
+
+    /// Decrease the proxy load.
+    pub fn decrease_proxy_load(&self, proxy_id: usize) {
+        self.proxy_load
+            .with_label_values(&[&proxy_id.to_string()])
+            .dec();
     }
 }
 
