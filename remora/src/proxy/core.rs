@@ -16,7 +16,7 @@ use crate::{
     metrics::Metrics,
 };
 
-pub type ProxyId = usize;
+pub type ProxyId = String;
 
 /// A proxy is responsible for pre-executing transactions.
 pub struct ProxyCore<E: Executor> {
@@ -70,14 +70,14 @@ impl<E: Executor> ProxyCore<E> {
         let mut task_id = 0;
         let ctx = self.executor.get_context();
         while let Some(transaction) = self.rx_transactions.recv().await {
-            self.metrics.increase_proxy_load(self.id);
+            self.metrics.increase_proxy_load(&self.id);
             task_id += 1;
             let (prior_handles, current_handles) = self
                 .dependency_controller
                 .get_dependencies(task_id, transaction.input_object_ids());
 
             let store = self.store.clone();
-            let id = self.id;
+            let id = self.id.clone();
             let tx_results = self.tx_results.clone();
             let ctx = ctx.clone();
             let metrics = self.metrics.clone();
@@ -95,7 +95,7 @@ impl<E: Executor> ProxyCore<E> {
                 if tx_results.send(execution_result).await.is_err() {
                     tracing::warn!("Failed to send execution result, stopping proxy {id}");
                 }
-                metrics.decrease_proxy_load(id);
+                metrics.decrease_proxy_load(&id);
             });
         }
     }
@@ -137,7 +137,8 @@ mod tests {
         let executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
         let metrics = Arc::new(Metrics::new_for_tests());
-        let proxy = ProxyCore::new(0, executor, store, rx_proxy, tx_results, metrics);
+        let proxy_id = "0".to_string();
+        let proxy = ProxyCore::new(proxy_id, executor, store, rx_proxy, tx_results, metrics);
 
         // Send transactions to the proxy.
         let transactions = generate_transactions(&config).await;

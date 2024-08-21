@@ -17,6 +17,8 @@ use prometheus::{
 use prometheus_parse::Scrape;
 use tokio::{task::JoinHandle, time::sleep};
 
+use crate::proxy::core::ProxyId;
+
 pub const LATENCY_S: &str = "latency_s";
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.011, 0.012, 0.013,
@@ -174,17 +176,13 @@ impl Metrics {
     }
 
     /// Increase the proxy load.
-    pub fn increase_proxy_load(&self, proxy_id: usize) {
-        self.proxy_load
-            .with_label_values(&[&proxy_id.to_string()])
-            .inc();
+    pub fn increase_proxy_load(&self, proxy_id: &ProxyId) {
+        self.proxy_load.with_label_values(&[proxy_id]).inc();
     }
 
     /// Decrease the proxy load.
-    pub fn decrease_proxy_load(&self, proxy_id: usize) {
-        self.proxy_load
-            .with_label_values(&[&proxy_id.to_string()])
-            .dec();
+    pub fn decrease_proxy_load(&self, proxy_id: &ProxyId) {
+        self.proxy_load.with_label_values(&[proxy_id]).dec();
     }
 }
 

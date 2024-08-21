@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use tokio::{
     sync::mpsc::{self, Receiver},
@@ -35,6 +35,7 @@ impl PrimaryNode {
     pub async fn start(
         executor: SuiExecutor,
         config: &ValidatorConfig,
+        primary_address: SocketAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -46,11 +47,12 @@ impl PrimaryNode {
 
         // Boot the local proxies. Additional proxies can still remotely connect.
         let mut handles = Vec::new();
-        for i in 0..config.local_proxies {
+        for i in 0..config.collocated_pre_executors.primary {
+            let proxy_id = format!("primary-{i}");
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = executor.create_in_memory_store();
             let proxy_handle = ProxyCore::new(
-                i,
+                proxy_id,
                 executor.clone(),
                 store,
                 rx,
@@ -91,7 +93,7 @@ impl PrimaryNode {
         // Boot the server.
         // TODO: Introduce error type and add the server handle to the handles list.
         let _server_handle = NetworkServer::new(
-            config.validator_address,
+            primary_address,
             tx_proxy_connections,
             tx_client_transactions,
         )
@@ -121,7 +123,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        config::{BenchmarkConfig, ValidatorConfig},
+        config::{get_test_address, BenchmarkConfig, CollocatedPreExecutors, ValidatorConfig},
         executor::sui::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
@@ -132,7 +134,7 @@ mod tests {
     #[tracing_test::traced_test]
     async fn execute_transactions() {
         let config = ValidatorConfig::new_for_tests();
-        let validator_address = config.validator_address;
+        let primary_address = get_test_address();
         let benchmark_config = BenchmarkConfig::new_for_tests();
 
         // Create a Sui executor.
@@ -140,13 +142,14 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut primary = PrimaryNode::start(executor, &config, validator_metrics).await;
+        let mut primary =
+            PrimaryNode::start(executor, &config, primary_address, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
         let load_generator_metrics = Metrics::new_for_tests();
         let mut load_generator =
-            LoadGenerator::new(benchmark_config, validator_address, load_generator_metrics);
+            LoadGenerator::new(benchmark_config, primary_address, load_generator_metrics);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
@@ -162,11 +165,14 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn no_proxies() {
+        let primary_address = get_test_address();
         let config = ValidatorConfig {
-            local_proxies: 0,
+            collocated_pre_executors: CollocatedPreExecutors {
+                primary: 0,
+                proxy: 0,
+            },
             ..ValidatorConfig::new_for_tests()
         };
-        let validator_address = config.validator_address;
         let benchmark_config = BenchmarkConfig::new_for_tests();
 
         // Create a Sui executor.
@@ -174,13 +180,19 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
+        let mut validator = PrimaryNode::start(
+            executor.clone(),
+            &config,
+            primary_address,
+            validator_metrics,
+        )
+        .await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
         let load_generator_metrics = Metrics::new_for_tests();
         let mut load_generator =
-            LoadGenerator::new(benchmark_config, validator_address, load_generator_metrics);
+            LoadGenerator::new(benchmark_config, primary_address, load_generator_metrics);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();

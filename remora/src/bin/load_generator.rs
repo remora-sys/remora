@@ -6,8 +6,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use clap::Parser;
 use remora::{
-    config::{BenchmarkConfig, ImportExport, ValidatorConfig},
-    load_generator::LoadGenerator,
+    config::{BenchmarkConfig, ImportExport},
+    load_generator::{default_metrics_address, LoadGenerator},
     metrics::Metrics,
 };
 
@@ -18,11 +18,11 @@ struct Args {
     /// The configuration for the benchmark.
     #[clap(long, value_name = "FILE")]
     benchmark_config: Option<PathBuf>,
-    /// The configuration for the validator.
-    #[clap(long, value_name = "FILE")]
-    validator_config: Option<PathBuf>,
+    /// The address of the primary.
+    #[clap(long, value_name = "ADDRESS")]
+    primary_address: SocketAddr,
     /// The address to expose metrics on.
-    #[clap(long, value_name = "ADDRESS", default_value = "127.0.0.1:18600")]
+    #[clap(long, value_name = "ADDRESS", default_value_t = default_metrics_address())]
     metrics_address: SocketAddr,
 }
 
@@ -34,21 +34,14 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => BenchmarkConfig::load(path).context("Failed to load benchmark config")?,
         None => BenchmarkConfig::default(),
     };
-    let validator_config = match args.validator_config {
-        Some(path) => ValidatorConfig::load(path).context("Failed to load validator config")?,
-        None => ValidatorConfig::default(),
-    };
+    let primary_address = args.primary_address;
 
     let _ = tracing_subscriber::fmt::try_init();
     let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
     let metrics = Metrics::new(&registry.default_registry());
 
     // Create genesis and generate transactions.
-    let mut load_generator = LoadGenerator::new(
-        benchmark_config,
-        validator_config.validator_address,
-        metrics,
-    );
+    let mut load_generator = LoadGenerator::new(benchmark_config, primary_address, metrics);
     let transactions = load_generator.initialize().await;
 
     // Submit transactions to the server.

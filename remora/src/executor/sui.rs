@@ -24,7 +24,11 @@ use sui_types::{
 use tokio::time::Instant;
 
 use super::api::{
-    ExecutableTransaction, ExecutionEffects, Executor, StateStore, TransactionWithTimestamp,
+    ExecutableTransaction,
+    ExecutionEffects,
+    Executor,
+    StateStore,
+    TransactionWithTimestamp,
 };
 use crate::config::{BenchmarkConfig, WorkloadType};
 
@@ -323,19 +327,13 @@ impl Executor for SuiExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use super::*;
     use crate::config::WorkloadType;
 
     #[tokio::test]
     async fn test_sui_executor() {
-        let config = BenchmarkConfig {
-            load: 10,
-            duration: Duration::from_secs(1),
-            workload: WorkloadType::Transfers,
-        };
-
+        let config = BenchmarkConfig::new_for_tests();
         let mut executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
 
@@ -353,11 +351,9 @@ mod tests {
     #[ignore]
     async fn test_sui_executor_with_shared_objects() {
         let config = BenchmarkConfig {
-            load: 10,
-            duration: Duration::from_secs(1),
             workload: WorkloadType::SharedObjects,
+            ..BenchmarkConfig::new_for_tests()
         };
-
         let mut executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
         let workload = init_workload(&config);
@@ -387,9 +383,8 @@ mod tests {
     #[tokio::test]
     async fn shared_object_test_with_imported_file() {
         let config = BenchmarkConfig {
-            load: 10,
-            duration: Duration::from_secs(1),
             workload: WorkloadType::SharedObjects,
+            ..BenchmarkConfig::new_for_tests()
         };
 
         let working_directory = "~/test_export";

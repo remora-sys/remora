@@ -1,7 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use itertools::Itertools;
 use sui_types::transaction::CertifiedTransaction;
@@ -205,4 +208,9 @@ pub mod tests {
         let transaction = rx_transactions.recv().await.unwrap();
         assert!(transaction.timestamp() > now);
     }
+}
+
+/// The default metrics address.
+pub fn default_metrics_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18600)
 }

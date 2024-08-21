@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
+use futures::future::join_all;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::core::{ProxyCore, ProxyId};
@@ -18,7 +19,7 @@ const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 pub struct ProxyNode {
     /// The handles for all components.
-    proxy_handle: JoinHandle<()>,
+    handles: Vec<JoinHandle<()>>,
     /// The  metrics for the proxy
     _metrics: Arc<Metrics>,
 }
@@ -28,34 +29,40 @@ impl ProxyNode {
         proxy_id: ProxyId,
         executor: SuiExecutor,
         config: &ValidatorConfig,
+        primary_address: SocketAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
-        // Boot the local proxies. Additional proxies can still remotely connect.
-        let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let mut handles = Vec::new();
+        for i in 0..config.collocated_pre_executors.proxy {
+            let id = format!("{proxy_id}-{i}");
+            let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+            let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        let store = executor.create_in_memory_store();
-        let proxy_handle = ProxyCore::new(
-            proxy_id,
-            executor.clone(),
-            store,
-            rx_transactions,
-            tx_proxy_results,
-            metrics.clone(),
-        )
-        .spawn();
+            let store = executor.create_in_memory_store();
+            let proxy_handle = ProxyCore::new(
+                id,
+                executor.clone(),
+                store,
+                rx_transactions,
+                tx_proxy_results,
+                metrics.clone(),
+            )
+            .spawn();
+            handles.push(proxy_handle);
 
-        let address = config.validator_address;
-        let _handle = NetworkClient::new(address, tx_transactions, rx_proxy_results).spawn();
+            // TODO: Add the handle of the network client to the handles list.
+            let _handle =
+                NetworkClient::new(primary_address, tx_transactions, rx_proxy_results).spawn();
+        }
 
         Self {
-            proxy_handle,
+            handles,
             _metrics: metrics,
         }
     }
 
     /// Collect the results from the validator.
     pub async fn await_completion(self) {
-        self.proxy_handle.await.unwrap();
+        join_all(self.handles).await;
     }
 }

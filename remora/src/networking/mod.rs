@@ -12,14 +12,13 @@ mod tests {
     use tokio::sync::mpsc::{self};
 
     use crate::{
-        config::ValidatorConfig,
+        config::get_test_address,
         networking::{client::NetworkClient, server::NetworkServer},
     };
 
     #[tokio::test]
     async fn client_primary_connection() {
-        let config = ValidatorConfig::new_for_tests();
-        let server_address = config.validator_address;
+        let server_address = get_test_address();
         let transactions: Vec<_> = (0..100).collect();
 
         // Spawn the server, wait for a client connection, and receive transactions from the client.
@@ -62,8 +61,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_primary_connection() {
-        let config = ValidatorConfig::new_for_tests();
-        let server_address = config.validator_address;
+        let server_address = get_test_address();
         let transaction = "transaction".to_string();
         let result = "transaction result".to_string();
 

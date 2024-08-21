@@ -1,13 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    fs, io,
-    net::{SocketAddr, TcpListener},
-    path::Path,
-    time::Duration,
-};
-
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
@@ -38,19 +31,31 @@ pub trait ImportExport: Serialize + DeserializeOwned {
     }
 }
 
+/// The default port for the primary.
+pub fn default_primary_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500)
+}
+/// The default port for the metrics server.
+pub fn default_metrics_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18501)
+}
+
+/// Configuration to collocate pre-executors.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CollocatedPreExecutors {
+    /// The number of pre-executors running on the same machine as the primary.
+    pub primary: usize,
+    /// The number of pre-executors running on each proxy machine.
+    pub proxy: usize,
+}
+
 /// The configuration for the validator.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ValidatorConfig {
-    /// The address to bind the validator to.
-    #[serde(default = "default_validator_config::default_validator_address")]
-    pub validator_address: SocketAddr,
-    /// The address to expose metrics on.
-    #[serde(default = "default_validator_config::default_metrics_address")]
-    pub metrics_address: SocketAddr,
-    /// The number of local proxies to use. That is, the number of proxies running on the same
-    /// machine as the primary. Additional remote proxies can still connect to the primary.
-    #[serde(default = "default_validator_config::default_local_proxies")]
-    pub local_proxies: usize,
+    /// The number of collocated pre-executors to use. That is, the number of pre-executor running on
+    /// the same machine as the primary and on the same machine as each proxy.
+    #[serde(default = "default_validator_config::default_collocated_pre_executors")]
+    pub collocated_pre_executors: CollocatedPreExecutors,
     /// The consensus delay model.
     #[serde(default = "default_validator_config::default_consensus_delay_model")]
     pub consensus_delay_model: FixedDelay,
@@ -62,29 +67,19 @@ pub struct ValidatorConfig {
 impl ValidatorConfig {
     /// Create a new validator configuration for tests.
     pub fn new_for_tests() -> Self {
-        ValidatorConfig {
-            validator_address: get_test_address(),
-            metrics_address: get_test_address(),
-            ..Default::default()
-        }
+        Self::default()
     }
 }
 
 mod default_validator_config {
-    use std::net::SocketAddr;
-
+    use super::CollocatedPreExecutors;
     use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
-    pub fn default_validator_address() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 18500))
-    }
-
-    pub fn default_metrics_address() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 18501))
-    }
-
-    pub fn default_local_proxies() -> usize {
-        1
+    pub fn default_collocated_pre_executors() -> CollocatedPreExecutors {
+        CollocatedPreExecutors {
+            primary: 1,
+            proxy: 0,
+        }
     }
 
     pub fn default_consensus_delay_model() -> FixedDelay {
@@ -99,9 +94,7 @@ mod default_validator_config {
 impl Default for ValidatorConfig {
     fn default() -> Self {
         ValidatorConfig {
-            validator_address: default_validator_config::default_validator_address(),
-            metrics_address: default_validator_config::default_metrics_address(),
-            local_proxies: default_validator_config::default_local_proxies(),
+            collocated_pre_executors: default_validator_config::default_collocated_pre_executors(),
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
         }
@@ -111,14 +104,22 @@ impl Default for ValidatorConfig {
 impl ImportExport for ValidatorConfig {}
 
 /// The workload type to generate.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum WorkloadType {
     Transfers,
     SharedObjects,
 }
 
+impl Debug for WorkloadType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkloadType::Transfers => write!(f, "transfers"),
+        }
+    }
+}
+
 /// The configuration for the benchmark.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BenchmarkConfig {
     /// The load to generate in transactions per second.
     #[serde(default = "default_benchmark_config::default_load")]
