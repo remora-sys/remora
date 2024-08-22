@@ -18,7 +18,7 @@ struct Args {
     /// The configuration for the benchmark.
     #[clap(long, value_name = "FILE")]
     benchmark_config: Option<PathBuf>,
-    /// The address of the primary.
+    /// The address of the primary or a path to a file containing the address.
     #[clap(long, value_name = "ADDRESS or PATH")]
     primary_address: String,
     /// The address to expose metrics on.
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => {
             let path = args.primary_address;
             let s = read_to_string(&path).context("Failed to read primary address from file")?;
-            SocketAddr::from_str(&s).context("Failed to parse primary address")?
+            SocketAddr::from_str(&s.trim()).context("Failed to parse primary address")?
         }
     };
 
