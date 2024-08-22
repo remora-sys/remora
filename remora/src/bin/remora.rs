@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport, ValidatorConfig},
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start the metrics server.
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
     let registry = mysten_metrics::start_prometheus_server(metrics_address);
     let metrics = Arc::new(Metrics::new(&registry.default_registry()));
     tracing::info!("Exposing metrics on {metrics_address}");
