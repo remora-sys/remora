@@ -65,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
     let mut primary_address = args.primary_address;
     let mut metrics_address = args.metrics_address;
     if let Some(binding_address) = args.binding_address {
-        primary_address.set_ip(binding_address);
         metrics_address.set_ip(binding_address);
     }
 
@@ -88,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
     match args.role {
         Role::Primary => {
             tracing::info!("Starting primary on {primary_address}");
+            if let Some(binding_address) = args.binding_address {
+                primary_address.set_ip(binding_address);
+            }
             PrimaryNode::start(executor, &validator_config, primary_address, metrics)
                 .await
                 .collect_results()
