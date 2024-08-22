@@ -46,11 +46,11 @@ pub fn default_primary_address_for_proxies() -> SocketAddr {
 }
 /// The default address of the primary server where the clients connect.
 pub fn default_primary_address_for_clients() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18501)
 }
 /// The default address for the metrics server.
 pub fn default_metrics_address() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18501)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18502)
 }
 
 /// Configuration to collocate pre-executors.
