@@ -160,7 +160,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        config::BenchmarkConfig,
+        config::BenchmarkParameters,
         executor::{
             api::Executor,
             sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
@@ -176,7 +176,7 @@ mod tests {
         let (tx_output, mut rx_output) = mpsc::channel(100);
 
         // Generate transactions.
-        let config = BenchmarkConfig::new_for_tests();
+        let config = BenchmarkParameters::new_for_tests();
         let mut executor = SuiExecutor::new(&config).await;
         let transactions: Vec<_> = generate_transactions(&config)
             .await

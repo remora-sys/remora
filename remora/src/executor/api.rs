@@ -48,7 +48,7 @@ impl<T: Clone> Deref for TransactionWithTimestamp<T> {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionEffects<C: Clone + Debug> {
     pub changes: C,
     pub new_state: BTreeMap<ObjectID, Object>,

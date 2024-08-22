@@ -24,9 +24,13 @@ use sui_types::{
 use tokio::time::Instant;
 
 use super::api::{
-    ExecutableTransaction, ExecutionEffects, Executor, StateStore, TransactionWithTimestamp,
+    ExecutableTransaction,
+    ExecutionEffects,
+    Executor,
+    StateStore,
+    TransactionWithTimestamp,
 };
-use crate::config::{BenchmarkConfig, WorkloadType};
+use crate::config::{BenchmarkParameters, WorkloadType};
 
 pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
 pub type SuiExecutionEffects = ExecutionEffects<TransactionEffects>;
@@ -64,7 +68,7 @@ pub struct SuiExecutor {
     ctx: Arc<BenchmarkContext>,
 }
 
-pub fn init_workload(config: &BenchmarkConfig) -> Workload {
+pub fn init_workload(config: &BenchmarkParameters) -> Workload {
     let pre_generation = config.load * config.duration.as_secs();
 
     // Determine the workload.
@@ -96,7 +100,7 @@ pub fn init_workload(config: &BenchmarkConfig) -> Workload {
     Workload::new(pre_generation, workload_type)
 }
 
-pub async fn generate_transactions(config: &BenchmarkConfig) -> Vec<CertifiedTransaction> {
+pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<CertifiedTransaction> {
     tracing::debug!("Generating all transactions...");
     let workload = init_workload(config);
     let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
@@ -157,7 +161,7 @@ pub fn import_from_files(
 }
 
 impl SuiExecutor {
-    pub async fn new(config: &BenchmarkConfig) -> Self {
+    pub async fn new(config: &BenchmarkParameters) -> Self {
         let workload = init_workload(config);
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
@@ -329,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sui_executor() {
-        let config = BenchmarkConfig::new_for_tests();
+        let config = BenchmarkParameters::new_for_tests();
         let mut executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
 
@@ -346,9 +350,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sui_executor_with_shared_objects() {
-        let config = BenchmarkConfig {
+        let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects,
-            ..BenchmarkConfig::new_for_tests()
+            ..BenchmarkParameters::new_for_tests()
         };
         let mut executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
@@ -378,9 +382,9 @@ mod tests {
 
     #[tokio::test]
     async fn shared_object_test_with_imported_file() {
-        let config = BenchmarkConfig {
+        let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects,
-            ..BenchmarkConfig::new_for_tests()
+            ..BenchmarkParameters::new_for_tests()
         };
 
         let working_directory = "~/test_export";

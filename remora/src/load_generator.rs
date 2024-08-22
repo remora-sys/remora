@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    config::BenchmarkConfig,
+    config::BenchmarkParameters,
     executor::{
         api::TransactionWithTimestamp,
         sui::{generate_transactions, SuiTransactionWithTimestamp},
@@ -26,7 +26,7 @@ use crate::{
 /// The load generator generates transactions at a specified rate and submits them to the system.
 pub struct LoadGenerator {
     /// The benchmark configurations.
-    config: BenchmarkConfig,
+    config: BenchmarkParameters,
     /// A best effort network sender.
     sender: Sender<SuiTransactionWithTimestamp>,
     /// Metrics for the load generator.
@@ -35,7 +35,7 @@ pub struct LoadGenerator {
 
 impl LoadGenerator {
     /// Create a new load generator.
-    pub fn new(config: BenchmarkConfig, target: SocketAddr, metrics: Metrics) -> Self {
+    pub fn new(config: BenchmarkParameters, target: SocketAddr, metrics: Metrics) -> Self {
         // Spawn the network client.
         // TODO: Move this into the run function.
         let (tx_unused, _rx_unused) = mpsc::channel(1);
@@ -172,7 +172,7 @@ pub mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        config::{get_test_address, BenchmarkConfig},
+        config::{get_test_address, BenchmarkParameters},
         executor::sui::SuiTransactionWithTimestamp,
         load_generator::LoadGenerator,
         metrics::Metrics,
@@ -196,7 +196,7 @@ pub mod tests {
 
         // Create genesis and generate transactions.
         let metrics = Metrics::new_for_tests();
-        let config = BenchmarkConfig::new_for_tests();
+        let config = BenchmarkParameters::new_for_tests();
         let mut load_generator = LoadGenerator::new(config, target, metrics);
         let transactions = load_generator.initialize().await;
 

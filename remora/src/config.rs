@@ -40,11 +40,15 @@ pub trait ImportExport: Serialize + DeserializeOwned {
     }
 }
 
-/// The default port for the primary.
-pub fn default_primary_address() -> SocketAddr {
+/// The default address of the primary server where the proxies connect.
+pub fn default_primary_address_for_proxies() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500)
 }
-/// The default port for the metrics server.
+/// The default address of the primary server where the clients connect.
+pub fn default_primary_address_for_clients() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500)
+}
+/// The default address for the metrics server.
 pub fn default_metrics_address() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18501)
 }
@@ -58,9 +62,9 @@ pub struct CollocatedPreExecutors {
     pub proxy: usize,
 }
 
-/// The configuration for the validator.
+/// The parameters for the validator.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ValidatorConfig {
+pub struct ValidatorParameters {
     /// The number of collocated pre-executors to use. That is, the number of pre-executor running on
     /// the same machine as the primary and on the same machine as each proxy.
     #[serde(default = "default_validator_config::default_collocated_pre_executors")]
@@ -73,8 +77,8 @@ pub struct ValidatorConfig {
     pub consensus_parameters: MockConsensusParameters,
 }
 
-impl ValidatorConfig {
-    /// Create a new validator configuration for tests.
+impl ValidatorParameters {
+    /// Create a new validator parameters for tests.
     pub fn new_for_tests() -> Self {
         Self::default()
     }
@@ -100,12 +104,40 @@ mod default_validator_config {
     }
 }
 
-impl Default for ValidatorConfig {
+impl Default for ValidatorParameters {
     fn default() -> Self {
-        ValidatorConfig {
+        ValidatorParameters {
             collocated_pre_executors: default_validator_config::default_collocated_pre_executors(),
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
+        }
+    }
+}
+
+impl ImportExport for ValidatorParameters {}
+
+/// The configuration for the validator, containing network addresses. This structure
+/// is designed to be used by the orchestrator to configure the validator.
+#[derive(Serialize, Deserialize)]
+pub struct ValidatorConfig {
+    /// The address of the primary server where the proxies connect.
+    pub proxy_server_address: SocketAddr,
+    /// The address of the primary server where the clients connect.
+    pub client_server_address: SocketAddr,
+    /// The address of the primary server where validator exposes metrics.
+    pub metrics_address: SocketAddr,
+    /// The parameters for the validator.
+    pub validator_parameters: ValidatorParameters,
+}
+
+impl ValidatorConfig {
+    /// Create a new validator configuration for tests.
+    pub fn new_for_tests() -> Self {
+        ValidatorConfig {
+            proxy_server_address: get_test_address(),
+            client_server_address: get_test_address(),
+            metrics_address: get_test_address(),
+            validator_parameters: ValidatorParameters::new_for_tests(),
         }
     }
 }
@@ -130,7 +162,7 @@ impl Debug for WorkloadType {
 
 /// The configuration for the benchmark.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct BenchmarkConfig {
+pub struct BenchmarkParameters {
     /// The load to generate in transactions per second.
     #[serde(default = "default_benchmark_config::default_load")]
     pub load: u64,
@@ -142,10 +174,10 @@ pub struct BenchmarkConfig {
     pub workload: WorkloadType,
 }
 
-impl BenchmarkConfig {
+impl BenchmarkParameters {
     /// Create a new benchmark configuration for tests.
     pub fn new_for_tests() -> Self {
-        BenchmarkConfig {
+        BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
@@ -171,9 +203,9 @@ mod default_benchmark_config {
     }
 }
 
-impl Default for BenchmarkConfig {
+impl Default for BenchmarkParameters {
     fn default() -> Self {
-        BenchmarkConfig {
+        BenchmarkParameters {
             load: default_benchmark_config::default_load(),
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
@@ -181,4 +213,4 @@ impl Default for BenchmarkConfig {
     }
 }
 
-impl ImportExport for BenchmarkConfig {}
+impl ImportExport for BenchmarkParameters {}

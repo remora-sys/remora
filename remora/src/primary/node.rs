@@ -1,10 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use tokio::{
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 
@@ -26,6 +26,8 @@ pub struct PrimaryNode {
     pub handles: Vec<JoinHandle<()>>,
     /// The receiver for the final execution results.
     pub rx_output: Receiver<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
+    /// The receiver for client connections. These channels can be used to reply to the clients.
+    pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
     pub metrics: Arc<Metrics>,
 }
@@ -35,19 +37,52 @@ impl PrimaryNode {
     pub async fn start(
         executor: SuiExecutor,
         config: &ValidatorConfig,
-        primary_address: SocketAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_load_balancer_load, rx_load_balancer_load) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_forwarded_load, rx_forwarded_load) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        // Boot the local proxies. Additional proxies can still remotely connect.
         let mut handles = Vec::new();
-        for i in 0..config.collocated_pre_executors.primary {
+
+        // Boot the client transactions server. This component receives client transactions from the
+        // the network and forwards them to the load balancer.
+        // TODO: Introduce error type and add the server handle to the handles list.
+        let _server_handle = NetworkServer::new(
+            config.client_server_address,
+            tx_client_connections,
+            tx_client_transactions,
+        )
+        .spawn();
+
+        // Boot the load balancer. This component forwards transactions to the consensus and proxies.
+        let load_balancer_handle = LoadBalancer::new(
+            rx_client_transactions,
+            tx_forwarded_load,
+            rx_proxy_connections,
+            metrics.clone(),
+        )
+        .spawn();
+        handles.push(load_balancer_handle);
+
+        // Boot the (mock) consensus. This component delays transactions simulating consensus and
+        // then forwards them to the primary executor.
+        let consensus_handle = MockConsensus::new(
+            config.validator_parameters.consensus_delay_model.clone(),
+            config.validator_parameters.consensus_parameters.clone(),
+            rx_forwarded_load,
+            tx_commits,
+        )
+        .spawn();
+        handles.push(consensus_handle);
+
+        // Boot the local proxies. Additional proxies can still remotely connect. Proxies
+        // receive transactions in parallel with the consensus for pre-execution.
+        for i in 0..config.validator_parameters.collocated_pre_executors.primary {
             let proxy_id = format!("primary-{i}");
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = executor.create_in_memory_store();
@@ -64,56 +99,52 @@ impl PrimaryNode {
             tx_proxy_connections.send(tx).await.expect("Channel open");
         }
 
-        // Boot the consensus.
-        let consensus_handle = MockConsensus::new(
-            config.consensus_delay_model.clone(),
-            config.consensus_parameters.clone(),
-            rx_load_balancer_load,
-            tx_commits,
+        // Boot another server handling connections from (additional) remote proxies. These remote
+        // proxies perform the same functions the the local proxies.
+        let _server_handle = NetworkServer::new(
+            config.proxy_server_address,
+            tx_proxy_connections,
+            tx_proxy_results,
         )
         .spawn();
-        handles.push(consensus_handle);
 
-        // Boot the primary executor.
+        // Boot the primary executor. This component receives ordered transactions from consensus.
+        // It then combines the pre-execution results from the proxies and re-executes the transactions
+        // only if necessary.
         let store = executor.create_in_memory_store();
         let primary_handle =
             PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
         handles.push(primary_handle);
 
-        // Boot the load balancer.
-        let load_balancer_handle = LoadBalancer::new(
-            rx_client_transactions,
-            tx_load_balancer_load,
-            rx_proxy_connections,
-            metrics.clone(),
-        )
-        .spawn();
-        handles.push(load_balancer_handle);
-
-        // Boot the server.
-        // TODO: Introduce error type and add the server handle to the handles list.
-        let _server_handle = NetworkServer::new(
-            primary_address,
-            tx_proxy_connections,
-            tx_client_transactions,
-        )
-        .spawn();
-
         Self {
             handles,
             rx_output,
+            rx_client_connections,
             metrics,
         }
     }
 
     /// Collect the results from the validator.
     pub async fn collect_results(mut self) {
-        while let Some((tx, result)) = self.rx_output.recv().await {
-            tracing::debug!("Received output: {:?}", result);
-            assert!(result.success());
-            let submit_timestamp = tx.timestamp();
-            // TODO: Record transactions success and failure.
-            self.metrics.update_metrics(submit_timestamp);
+        // Collect client connections.
+        // TODO: In a real system, these connections would be used to reply to the clients, acknowledging
+        // the receipt of the transaction and its final execution status.
+        let mut client_connections = Vec::new();
+
+        loop {
+            tokio::select! {
+                Some((tx, result)) = self.rx_output.recv() => {
+                    tracing::debug!("Received output: {:?}", result);
+                    assert!(result.success());
+                    let submit_timestamp = tx.timestamp();
+                    // TODO: Record transactions success and failure.
+                    self.metrics.update_metrics(submit_timestamp);
+                }
+                Some(connection) = self.rx_client_connections.recv() => {
+                    tracing::info!("Received a new client connection");
+                    client_connections.push(connection);
+                }
+            }
         }
     }
 }
@@ -123,7 +154,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        config::{get_test_address, BenchmarkConfig, CollocatedPreExecutors, ValidatorConfig},
+        config::{
+            BenchmarkParameters,
+            CollocatedPreExecutors,
+            ValidatorConfig,
+            ValidatorParameters,
+        },
         executor::sui::SuiExecutor,
         load_generator::LoadGenerator,
         metrics::Metrics,
@@ -134,22 +170,23 @@ mod tests {
     #[tracing_test::traced_test]
     async fn execute_transactions() {
         let config = ValidatorConfig::new_for_tests();
-        let primary_address = get_test_address();
-        let benchmark_config = BenchmarkConfig::new_for_tests();
+        let benchmark_config = BenchmarkParameters::new_for_tests();
 
         // Create a Sui executor.
         let executor = SuiExecutor::new(&benchmark_config).await;
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut primary =
-            PrimaryNode::start(executor, &config, primary_address, validator_metrics).await;
+        let mut primary = PrimaryNode::start(executor, &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
         let load_generator_metrics = Metrics::new_for_tests();
-        let mut load_generator =
-            LoadGenerator::new(benchmark_config, primary_address, load_generator_metrics);
+        let mut load_generator = LoadGenerator::new(
+            benchmark_config,
+            config.client_server_address,
+            load_generator_metrics,
+        );
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
@@ -165,28 +202,26 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn no_proxies() {
-        let primary_address = get_test_address();
-        let config = ValidatorConfig {
+        let validator_parameters = ValidatorParameters {
             collocated_pre_executors: CollocatedPreExecutors {
                 primary: 0,
                 proxy: 0,
             },
+            ..ValidatorParameters::new_for_tests()
+        };
+        let config = ValidatorConfig {
+            validator_parameters,
             ..ValidatorConfig::new_for_tests()
         };
-        let benchmark_config = BenchmarkConfig::new_for_tests();
+        let benchmark_config = BenchmarkParameters::new_for_tests();
+        let primary_address = config.client_server_address;
 
         // Create a Sui executor.
         let executor = SuiExecutor::new(&benchmark_config).await;
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = PrimaryNode::start(
-            executor.clone(),
-            &config,
-            primary_address,
-            validator_metrics,
-        )
-        .await;
+        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.

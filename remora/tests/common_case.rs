@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use remora::{
-    config::{get_test_address, BenchmarkConfig, CollocatedPreExecutors, ValidatorConfig},
+    config::{BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters},
     executor::sui::SuiExecutor,
     load_generator::LoadGenerator,
     metrics::Metrics,
@@ -15,15 +15,19 @@ use remora::{
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn remote_proxy() {
-    let primary_address = get_test_address();
-    let benchmark_config = BenchmarkConfig::new_for_tests();
-    let config = ValidatorConfig {
+    let validator_parameters = ValidatorParameters {
         collocated_pre_executors: CollocatedPreExecutors {
             primary: 0,
             proxy: 1,
         },
+        ..ValidatorParameters::new_for_tests()
+    };
+    let validator_config = ValidatorConfig {
+        validator_parameters,
         ..ValidatorConfig::new_for_tests()
     };
+    let benchmark_config = BenchmarkParameters::new_for_tests();
+    let primary_address = validator_config.client_server_address;
 
     // Create a Sui executor.
     let executor = SuiExecutor::new(&benchmark_config).await;
@@ -32,8 +36,7 @@ async fn remote_proxy() {
     let validator_metrics = Arc::new(Metrics::new_for_tests());
     let mut primary = PrimaryNode::start(
         executor.clone(),
-        &config,
-        primary_address,
+        &validator_config,
         validator_metrics.clone(),
     )
     .await;
@@ -41,14 +44,7 @@ async fn remote_proxy() {
 
     // Start a remote proxy.
     let proxy_id = 0.to_string();
-    let _proxy = ProxyNode::start(
-        proxy_id,
-        executor,
-        &config,
-        primary_address,
-        validator_metrics,
-    )
-    .await;
+    let _proxy = ProxyNode::start(proxy_id, executor, &validator_config, validator_metrics);
     tokio::task::yield_now().await;
 
     // Generate transactions.

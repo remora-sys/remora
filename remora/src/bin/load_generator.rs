@@ -1,12 +1,12 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs::read_to_string, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
-    config::{BenchmarkConfig, ImportExport},
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig},
     load_generator::{default_metrics_address, LoadGenerator},
     metrics::Metrics,
 };
@@ -15,12 +15,12 @@ use remora::{
 #[clap(rename_all = "kebab-case")]
 #[command(author, version, about = "Remora load generator", long_about = None)]
 struct Args {
-    /// The configuration for the benchmark.
+    /// The path to the validator configuration.
+    #[clap(long, value_name = "FILE")]
+    validator_config: PathBuf,
+    /// The path to the configuration for the benchmark.
     #[clap(long, value_name = "FILE")]
     benchmark_config: Option<PathBuf>,
-    /// The address of the primary or a path to a file containing the address.
-    #[clap(long, value_name = "ADDRESS or PATH")]
-    primary_address: String,
     /// The address to expose metrics on.
     #[clap(long, value_name = "ADDRESS", default_value_t = default_metrics_address())]
     metrics_address: SocketAddr,
@@ -30,24 +30,21 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let validator_config =
+        ValidatorConfig::load(&args.validator_config).context("Failed to load validator config")?;
     let benchmark_config = match args.benchmark_config {
-        Some(path) => BenchmarkConfig::load(path).context("Failed to load benchmark config")?,
-        None => BenchmarkConfig::default(),
+        Some(path) => BenchmarkParameters::load(path).context("Failed to load benchmark config")?,
+        None => BenchmarkParameters::default(),
     };
-    let primary_address = match SocketAddr::from_str(&args.primary_address) {
-        Ok(address) => address,
-        Err(_) => {
-            let path = args.primary_address;
-            let s = read_to_string(&path).context("Failed to read primary address from file")?;
-            SocketAddr::from_str(&s.trim()).context("Failed to parse primary address")?
-        }
-    };
+    let metrics_address = args.metrics_address;
 
+    tracing::info!("Load generator exposing metrics on {metrics_address}");
     let _ = tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
-    let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
+    let registry = mysten_metrics::start_prometheus_server(metrics_address);
     let metrics = Metrics::new(&registry.default_registry());
 
     // Create genesis and generate transactions.
+    let primary_address = validator_config.client_server_address;
     let mut load_generator = LoadGenerator::new(benchmark_config, primary_address, metrics);
     let transactions = load_generator.initialize().await;
 

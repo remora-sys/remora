@@ -94,6 +94,7 @@ impl<E: Executor> ProxyCore<E> {
 
                 if tx_results.send(execution_result).await.is_err() {
                     tracing::warn!("Failed to send execution result, stopping proxy {id}");
+                    return;
                 }
                 metrics.decrease_proxy_load(&id);
             });
@@ -122,7 +123,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        config::BenchmarkConfig,
+        config::BenchmarkParameters,
         executor::sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
         metrics::Metrics,
         proxy::core::ProxyCore,
@@ -133,7 +134,7 @@ mod tests {
         let (tx_proxy, rx_proxy) = mpsc::channel(100);
         let (tx_results, mut rx_results) = mpsc::channel(100);
 
-        let config = BenchmarkConfig::new_for_tests();
+        let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
         let store = executor.create_in_memory_store();
         let metrics = Arc::new(Metrics::new_for_tests());

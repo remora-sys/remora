@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use futures::future::join_all;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -25,15 +25,14 @@ pub struct ProxyNode {
 }
 
 impl ProxyNode {
-    pub async fn start(
+    pub fn start(
         proxy_id: ProxyId,
         executor: SuiExecutor,
         config: &ValidatorConfig,
-        primary_address: SocketAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
         let mut handles = Vec::new();
-        for i in 0..config.collocated_pre_executors.proxy {
+        for i in 0..config.validator_parameters.collocated_pre_executors.proxy {
             let id = format!("{proxy_id}-{i}");
             let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -51,8 +50,12 @@ impl ProxyNode {
             handles.push(proxy_handle);
 
             // TODO: Add the handle of the network client to the handles list.
-            let _handle =
-                NetworkClient::new(primary_address, tx_transactions, rx_proxy_results).spawn();
+            let _handle = NetworkClient::new(
+                config.proxy_server_address,
+                tx_transactions,
+                rx_proxy_results,
+            )
+            .spawn();
         }
 
         Self {
