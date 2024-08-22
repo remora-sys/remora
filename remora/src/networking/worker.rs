@@ -69,8 +69,8 @@ where
 
             // Send the message to the application layer.
             match bincode::deserialize(message) {
-                Ok(proxy_result) => {
-                    if tx_incoming.send(proxy_result).await.is_err() {
+                Ok(data) => {
+                    if tx_incoming.send(data).await.is_err() {
                         tracing::warn!("Cannot send message to application layer, stopping worker");
                         break Ok(());
                     }

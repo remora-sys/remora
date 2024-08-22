@@ -3,7 +3,7 @@
 
 use std::{fs::read_to_string, net::SocketAddr, path::PathBuf, str::FromStr};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkConfig, ImportExport},
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
     let registry = mysten_metrics::start_prometheus_server(args.metrics_address);
     let metrics = Metrics::new(&registry.default_registry());
 
