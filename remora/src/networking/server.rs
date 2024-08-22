@@ -52,7 +52,7 @@ where
     /// Run the server.
     pub async fn run(&self) -> io::Result<()> {
         let server = TcpListener::bind(self.server_address).await?;
-        tracing::debug!("Listening on {}", self.server_address);
+        tracing::info!("Listening on {}", self.server_address);
 
         loop {
             let (stream, peer) = server.accept().await?;

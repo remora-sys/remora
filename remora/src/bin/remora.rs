@@ -72,11 +72,11 @@ async fn main() -> anyhow::Result<()> {
     match args.role {
         Role::Primary => {
             tracing::info!(
-                "Primary listening for proxies on {}",
+                "Primary accepting proxy connections on {}",
                 validator_config.proxy_server_address
             );
             tracing::info!(
-                "Primary listening for client transactions on {}",
+                "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
             if let Some(binding_address) = args.binding_address {

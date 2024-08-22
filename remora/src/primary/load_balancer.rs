@@ -90,10 +90,10 @@ impl<T: Clone> LoadBalancer<T> {
                 },
                 Some(connection) = self.rx_proxy_connections.recv() => {
                     self.proxy_connections.push(connection);
-                    tracing::info!("Added a new client connection");
+                    tracing::info!("Added a new proxy connection");
                 }
                 else => {
-                    tracing::warn!("No more transactions to process, stopping load balancer");
+                    tracing::warn!("All channels dropped, stopping load balancer");
                     break;
                 }
             }
