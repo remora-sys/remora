@@ -37,7 +37,7 @@ impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr, metrics: Metrics) -> Self {
         // Spawn the network client.
-        // TODO: Move this into the run function.
+        // TODO: Move this into the run function and call it after initializing the load generator.
         let (tx_unused, _rx_unused) = mpsc::channel(1);
         let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
         let _client_handle =
