@@ -41,19 +41,10 @@ impl ExecutableTransaction for CertifiedTransaction {
     }
 
     fn input_objects(&self) -> Vec<InputObjectKind> {
-        // TODO: Return error instead of panic
+        // TODO: Verify transaction syntax in the proxy.
         self.transaction_data()
             .input_objects()
-            .expect("Cannot get input object kinds")
-    }
-
-    fn input_object_ids(&self) -> Vec<ObjectID> {
-        self.transaction_data()
-            .input_objects()
-            .expect("Cannot get input object kinds")
-            .iter()
-            .map(|kind| kind.object_id())
-            .collect()
+            .expect("Transaction syntax already checked")
     }
 }
 
@@ -191,25 +182,20 @@ impl Executor for SuiExecutor {
         self.ctx.clone()
     }
 
-    async fn exec_on_ctx(
+    async fn execute(
         ctx: Arc<BenchmarkContext>,
         store: Arc<Self::Store>,
-        transaction: TransactionWithTimestamp<Self::Transaction>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> SuiExecutionEffects {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
-
-        // FIXME: ugly deref
-        let objects = store
-            .read_objects_for_execution(
-                &**(ctx.validator().get_epoch_store()),
-                &transaction.key(),
-                &input_objects,
-            )
-            .unwrap();
-
         let validator = ctx.validator();
-        let protocol_config = validator.get_epoch_store().protocol_config();
-        let reference_gas_price = validator.get_epoch_store().reference_gas_price();
+        let epoch_store = validator.get_epoch_store();
+        let protocol_config = epoch_store.protocol_config();
+        let reference_gas_price = epoch_store.reference_gas_price();
+
+        let objects = store
+            .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
+            .unwrap();
 
         let executable = VerifiedExecutableTransaction::new_from_certificate(
             VerifiedCertificate::new_unchecked(transaction.deref().clone()),
@@ -223,89 +209,16 @@ impl Executor for SuiExecutor {
         )
         .unwrap();
         let (kind, signer, gas) = executable.transaction_data().execution_parts();
-        let (inner_temp_store, _, effects, _) = ctx
-            .validator()
+        let (inner_temp_store, _, effects, _) = validator
             .get_epoch_store()
             .executor()
             .execute_transaction_to_effects(
                 &store,
                 protocol_config,
-                ctx.validator()
-                    .get_validator()
-                    .metrics
-                    .limits_metrics
-                    .clone(),
+                validator.get_validator().metrics.limits_metrics.clone(),
                 false,
                 &HashSet::new(),
-                &ctx.validator().get_epoch_store().epoch(),
-                0,
-                input_objects,
-                gas,
-                gas_status,
-                kind,
-                signer,
-                *executable.digest(),
-            );
-        debug_assert!(effects.status().is_ok());
-
-        let written = inner_temp_store.written.clone();
-
-        // Commit the objects to the store.
-        store.commit_objects(inner_temp_store);
-
-        SuiExecutionEffects::new(effects, written)
-    }
-
-    async fn execute(
-        &mut self,
-        store: &InMemoryObjectStore,
-        transaction: &SuiTransactionWithTimestamp,
-    ) -> SuiExecutionEffects {
-        let input_objects = transaction.transaction_data().input_objects().unwrap();
-
-        // FIXME: ugly deref
-        let objects = store
-            .read_objects_for_execution(
-                &**(self.ctx.validator().get_epoch_store()),
-                &transaction.key(),
-                &input_objects,
-            )
-            .unwrap();
-
-        let validator = self.ctx.validator();
-        let protocol_config = validator.get_epoch_store().protocol_config();
-        let reference_gas_price = validator.get_epoch_store().reference_gas_price();
-
-        let executable = VerifiedExecutableTransaction::new_from_certificate(
-            VerifiedCertificate::new_unchecked(transaction.deref().clone()),
-        );
-
-        let _validator = self.ctx.validator();
-        let (gas_status, input_objects) = sui_transaction_checks::check_certificate_input(
-            &executable,
-            objects,
-            protocol_config,
-            reference_gas_price,
-        )
-        .unwrap();
-        let (kind, signer, gas) = executable.transaction_data().execution_parts();
-        let (inner_temp_store, _, effects, _) = self
-            .ctx
-            .validator()
-            .get_epoch_store()
-            .executor()
-            .execute_transaction_to_effects(
-                store,
-                protocol_config,
-                self.ctx
-                    .validator()
-                    .get_validator()
-                    .metrics
-                    .limits_metrics
-                    .clone(),
-                false,
-                &HashSet::new(),
-                &self.ctx.validator().get_epoch_store().epoch(),
+                &epoch_store.epoch(),
                 0,
                 input_objects,
                 gas,
@@ -334,15 +247,16 @@ mod tests {
     #[tokio::test]
     async fn test_sui_executor() {
         let config = BenchmarkParameters::new_for_tests();
-        let mut executor = SuiExecutor::new(&config).await;
-        let store = executor.create_in_memory_store();
+        let executor = SuiExecutor::new(&config).await;
+        let store = Arc::new(executor.create_in_memory_store());
+        let ctx = executor.get_context();
 
         let transactions = generate_transactions(&config).await;
         assert!(transactions.len() > 10);
 
         for tx in transactions {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
-            let results = executor.execute(&store, &transaction).await;
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
     }
@@ -354,8 +268,8 @@ mod tests {
             workload: WorkloadType::SharedObjects,
             ..BenchmarkParameters::new_for_tests()
         };
-        let mut executor = SuiExecutor::new(&config).await;
-        let store = executor.create_in_memory_store();
+        let executor = SuiExecutor::new(&config).await;
+        let store = Arc::new(executor.create_in_memory_store());
         let workload = init_workload(&config);
         let mut ctx =
             BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
@@ -363,6 +277,7 @@ mod tests {
         let tx_generator = workload.create_tx_generator(&mut ctx).await;
         let transactions = ctx.generate_transactions(tx_generator).await;
         let transactions = ctx.certify_transactions(transactions, false).await;
+        assert!(transactions.len() > 10);
 
         let elapsed = start_time.elapsed();
         tracing::debug!(
@@ -371,11 +286,10 @@ mod tests {
             elapsed.as_millis(),
         );
 
-        assert!(transactions.len() > 10);
-
+        let ctx = executor.get_context();
         for tx in transactions {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
-            let results = executor.execute(&store, &transaction).await;
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
     }
@@ -404,8 +318,8 @@ mod tests {
         super::export_to_files(ctx.get_accounts(), &txs, working_directory.into());
 
         // execute on another executor
-        let mut executor = SuiExecutor::new(&config).await;
-        let store = executor.create_in_memory_store();
+        let executor = SuiExecutor::new(&config).await;
+        let store = Arc::new(executor.create_in_memory_store());
 
         // import txs to assign shared-object versions
         let (read_accounts, read_txs) = super::import_from_files(working_directory.into());
@@ -416,9 +330,10 @@ mod tests {
             .assigned_shared_object_versions(&read_txs) // Important!!
             .await;
 
+        let ctx = executor.get_context();
         for tx in read_txs {
             let transaction = TransactionWithTimestamp::new_for_tests(tx);
-            let results = executor.execute(&store, &transaction).await;
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
     }

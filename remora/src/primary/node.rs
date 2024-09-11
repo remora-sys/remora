@@ -89,7 +89,7 @@ impl PrimaryNode {
         for i in 0..config.validator_parameters.collocated_pre_executors.primary {
             let proxy_id = format!("primary-{i}");
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let store = executor.create_in_memory_store();
+            let store = Arc::new(executor.create_in_memory_store());
             let proxy_handle = ProxyCore::new(
                 proxy_id,
                 executor.clone(),
@@ -115,7 +115,7 @@ impl PrimaryNode {
         // Boot the primary executor. This component receives ordered transactions from consensus.
         // It then combines the pre-execution results from the proxies and re-executes the transactions
         // only if necessary.
-        let store = executor.create_in_memory_store();
+        let store = Arc::new(executor.create_in_memory_store());
         let primary_handle =
             PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
         primary_handles.push(primary_handle);

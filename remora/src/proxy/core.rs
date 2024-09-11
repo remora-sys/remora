@@ -42,7 +42,7 @@ impl<E: Executor> ProxyCore<E> {
     pub fn new(
         id: ProxyId,
         executor: E,
-        store: E::Store,
+        store: Arc<E::Store>,
         rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
         tx_results: Sender<ExecutionEffects<E::StateChanges>>,
         metrics: Arc<Metrics>,
@@ -50,7 +50,7 @@ impl<E: Executor> ProxyCore<E> {
         Self {
             id,
             executor,
-            store: Arc::new(store),
+            store,
             rx_transactions,
             tx_results,
             dependency_controller: DependencyController::new(),
@@ -87,7 +87,7 @@ impl<E: Executor> ProxyCore<E> {
                     prior_notify.notified().await;
                 }
 
-                let execution_result = E::exec_on_ctx(ctx, store, transaction).await;
+                let execution_result = E::execute(ctx, store, &transaction).await;
 
                 for notify in current_handles {
                     notify.notify_one();
@@ -137,7 +137,7 @@ mod tests {
 
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
-        let store = executor.create_in_memory_store();
+        let store = Arc::new(executor.create_in_memory_store());
         let metrics = Arc::new(Metrics::new_for_tests());
         let proxy_id = "0".to_string();
         let proxy = ProxyCore::new(proxy_id, executor, store, rx_proxy, tx_results, metrics);

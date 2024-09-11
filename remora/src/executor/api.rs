@@ -14,13 +14,34 @@ use sui_types::{
     transaction::InputObjectKind,
 };
 
+/// A transaction that can be executed.
+pub trait ExecutableTransaction {
+    /// The digest of the transaction.
+    fn digest(&self) -> &TransactionDigest;
+
+    /// The input objects kind of the transaction.
+    fn input_objects(&self) -> Vec<InputObjectKind>;
+
+    /// The object IDs for the input objects.
+    fn input_object_ids(&self) -> Vec<ObjectID> {
+        self.input_objects()
+            .iter()
+            .map(|kind| kind.object_id())
+            .collect()
+    }
+}
+
+/// A transaction with a timestamp. This is used to compute performance.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TransactionWithTimestamp<T: Clone> {
+pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
+    /// The transaction.
     transaction: T,
+    /// The timestamp when the transaction was created.
     timestamp: f64,
 }
 
-impl<T: Clone> TransactionWithTimestamp<T> {
+impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
+    /// Create a new transaction with a timestamp.
     pub fn new(transaction: T, timestamp: f64) -> Self {
         Self {
             transaction,
@@ -28,10 +49,12 @@ impl<T: Clone> TransactionWithTimestamp<T> {
         }
     }
 
+    /// Get the timestamp of the transaction.
     pub fn timestamp(&self) -> f64 {
         self.timestamp
     }
 
+    /// Create a new transaction with a fake timestamp for tests.
     pub fn new_for_tests(transaction: T) -> Self {
         Self {
             transaction,
@@ -40,7 +63,7 @@ impl<T: Clone> TransactionWithTimestamp<T> {
     }
 }
 
-impl<T: Clone> Deref for TransactionWithTimestamp<T> {
+impl<T: ExecutableTransaction + Clone> Deref for TransactionWithTimestamp<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -72,14 +95,6 @@ impl<C: TransactionEffectsAPI + Clone + Debug> ExecutionEffects<C> {
     }
 }
 
-pub trait ExecutableTransaction {
-    fn digest(&self) -> &TransactionDigest;
-
-    fn input_objects(&self) -> Vec<InputObjectKind>;
-
-    fn input_object_ids(&self) -> Vec<ObjectID>;
-}
-
 pub trait StateStore<C>: BackingStore {
     /// Commit the objects to the store.
     fn commit_objects(&self, changes: C, new_state: BTreeMap<ObjectID, Object>);
@@ -94,19 +109,13 @@ pub trait Executor {
     /// The type of store to store objects.
     type Store: StateStore<Self::StateChanges>;
 
-    /// Execute a transaction and return the results.
-    fn execute(
-        &mut self,
-        store: &Self::Store,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
-
-    ///
+    /// Get the context for the benchmark.
     fn get_context(&self) -> Arc<BenchmarkContext>;
 
-    fn exec_on_ctx(
+    /// Execute a transaction and return the results.
+    fn execute(
         ctx: Arc<BenchmarkContext>,
         store: Arc<Self::Store>,
-        transaction: TransactionWithTimestamp<Self::Transaction>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
 }

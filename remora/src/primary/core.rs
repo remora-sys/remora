@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use dashmap::DashMap;
 use sui_types::{
@@ -32,7 +32,7 @@ pub struct PrimaryCore<E: Executor> {
     /// The executor for the transactions.
     executor: E,
     /// The object store.
-    store: E::Store,
+    store: Arc<E::Store>,
     /// The receiver for consensus commits.
     rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
     /// The receiver for proxy results.
@@ -48,7 +48,7 @@ impl<E: Executor> PrimaryCore<E> {
     /// Create a new primary executor.
     pub fn new(
         executor: E,
-        store: E::Store,
+        store: Arc<E::Store>,
         rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
         rx_proxies: Receiver<ExecutionEffects<E::StateChanges>>,
         tx_output: Sender<(
@@ -110,7 +110,8 @@ impl<E: Executor> PrimaryCore<E> {
         }
 
         tracing::trace!("Re-executing transaction");
-        self.executor.execute(&self.store, &transaction).await
+        let ctx = self.executor.get_context();
+        E::execute(ctx, self.store.clone(), &transaction).await
     }
 
     /// Run the primary executor.
@@ -147,7 +148,7 @@ impl<E: Executor> PrimaryCore<E> {
     pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
-        <E as Executor>::Store: Send,
+        <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
         <E as Executor>::StateChanges: Send + Sync,
     {
@@ -157,6 +158,8 @@ impl<E: Executor> PrimaryCore<E> {
 
 #[cfg(test)]
 mod tests {
+
+    use std::sync::Arc;
 
     use tokio::sync::mpsc;
 
@@ -178,7 +181,8 @@ mod tests {
 
         // Generate transactions.
         let config = BenchmarkParameters::new_for_tests();
-        let mut executor = SuiExecutor::new(&config).await;
+        let executor = SuiExecutor::new(&config).await;
+        let ctx = executor.get_context();
         let transactions: Vec<_> = generate_transactions(&config)
             .await
             .into_iter()
@@ -188,13 +192,14 @@ mod tests {
 
         // Pre-execute the transactions.
         let mut proxy_results = Vec::new();
-        let proxy_store = executor.create_in_memory_store();
+        let proxy_store = Arc::new(executor.create_in_memory_store());
         for tx in transactions.clone() {
-            proxy_results.push(executor.execute(&proxy_store, &tx).await);
+            let results = SuiExecutor::execute(ctx.clone(), proxy_store.clone(), &tx).await;
+            proxy_results.push(results);
         }
 
         // Boot the primary executor.
-        let store = executor.create_in_memory_store();
+        let store = Arc::new(executor.create_in_memory_store());
         PrimaryCore::new(executor, store, rx_commit, rx_results, tx_output).spawn();
 
         // Merge the proxy results into the primary.

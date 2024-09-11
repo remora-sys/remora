@@ -41,7 +41,7 @@ impl ProxyNode {
             let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-            let store = executor.create_in_memory_store();
+            let store = Arc::new(executor.create_in_memory_store());
             let core_handle = ProxyCore::new(
                 id,
                 executor.clone(),
