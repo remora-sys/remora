@@ -72,26 +72,26 @@ impl<T: ExecutableTransaction + Clone> Deref for TransactionWithTimestamp<T> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionEffects<C: Clone + Debug> {
-    pub changes: C,
+pub struct ExecutionResultsAndStateUpdates<U: Clone + Debug> {
+    pub updates: U,
     pub new_state: BTreeMap<ObjectID, Object>,
 }
 
-impl<C: TransactionEffectsAPI + Clone + Debug> ExecutionEffects<C> {
-    pub fn new(changes: C, new_state: BTreeMap<ObjectID, Object>) -> Self {
-        Self { changes, new_state }
+impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndStateUpdates<U> {
+    pub fn new(updates: U, new_state: BTreeMap<ObjectID, Object>) -> Self {
+        Self { updates, new_state }
     }
 
     pub fn success(&self) -> bool {
-        self.changes.status().is_ok()
+        self.updates.status().is_ok()
     }
 
     pub fn transaction_digest(&self) -> &TransactionDigest {
-        self.changes.transaction_digest()
+        self.updates.transaction_digest()
     }
 
     pub fn modified_at_versions(&self) -> Vec<(ObjectID, SequenceNumber)> {
-        self.changes.modified_at_versions()
+        self.updates.modified_at_versions()
     }
 }
 
@@ -105,9 +105,9 @@ pub trait Executor {
     /// The type of transaction to execute.
     type Transaction: Clone + ExecutableTransaction;
     /// The type of results from executing a transaction.
-    type StateChanges: Clone + TransactionEffectsAPI + Debug;
+    type ExecutionResults: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
-    type Store: StateStore<Self::StateChanges>;
+    type Store: StateStore<Self::ExecutionResults>;
 
     /// Get the context for the benchmark.
     fn get_context(&self) -> Arc<BenchmarkContext>;
@@ -117,8 +117,11 @@ pub trait Executor {
         ctx: Arc<BenchmarkContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
+    ) -> impl Future<Output = ExecutionResultsAndStateUpdates<Self::ExecutionResults>> + Send;
 }
 
+/// Short for a transaction with a timestamp.
 pub type Transaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
-pub type ExecutionResults<E> = ExecutionEffects<<E as Executor>::StateChanges>;
+
+/// Short for the results of executing a transaction.
+pub type ExecutionResults<E> = ExecutionResultsAndStateUpdates<<E as Executor>::ExecutionResults>;

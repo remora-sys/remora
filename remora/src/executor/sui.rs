@@ -23,17 +23,14 @@ use sui_types::{
 };
 use tokio::time::Instant;
 
-use super::api::{
-    ExecutableTransaction,
-    ExecutionEffects,
-    Executor,
-    StateStore,
-    TransactionWithTimestamp,
-};
+use super::api::{ExecutableTransaction, ExecutionResults, Executor, StateStore, Transaction};
 use crate::config::{BenchmarkParameters, WorkloadType};
 
-pub type SuiTransactionWithTimestamp = TransactionWithTimestamp<CertifiedTransaction>;
-pub type SuiExecutionEffects = ExecutionEffects<TransactionEffects>;
+/// Represents a Sui transaction.
+pub type SuiTransaction = Transaction<SuiExecutor>;
+
+/// Represents the results of the execution of a Sui transaction.
+pub type SuiExecutionResults = ExecutionResults<SuiExecutor>;
 
 impl ExecutableTransaction for CertifiedTransaction {
     fn digest(&self) -> &TransactionDigest {
@@ -175,7 +172,7 @@ impl SuiExecutor {
 
 impl Executor for SuiExecutor {
     type Transaction = CertifiedTransaction;
-    type StateChanges = TransactionEffects;
+    type ExecutionResults = TransactionEffects;
     type Store = InMemoryObjectStore;
 
     fn get_context(&self) -> Arc<BenchmarkContext> {
@@ -185,8 +182,8 @@ impl Executor for SuiExecutor {
     async fn execute(
         ctx: Arc<BenchmarkContext>,
         store: Arc<InMemoryObjectStore>,
-        transaction: &SuiTransactionWithTimestamp,
-    ) -> SuiExecutionEffects {
+        transaction: &SuiTransaction,
+    ) -> SuiExecutionResults {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.validator();
         let epoch_store = validator.get_epoch_store();
@@ -234,15 +231,25 @@ impl Executor for SuiExecutor {
         // Commit the objects to the store.
         store.commit_objects(inner_temp_store);
 
-        SuiExecutionEffects::new(effects, written)
+        SuiExecutionResults::new(effects, written)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-    use crate::config::WorkloadType;
+    use std::{fs, sync::Arc};
+
+    use sui_single_node_benchmark::{benchmark_context::BenchmarkContext, command::Component};
+    use tokio::time::Instant;
+
+    use crate::{
+        config::{BenchmarkParameters, WorkloadType},
+        executor::{
+            api::Executor,
+            sui::{generate_transactions, init_workload, SuiExecutor, SuiTransaction},
+        },
+    };
 
     #[tokio::test]
     async fn test_sui_executor() {
@@ -255,7 +262,7 @@ mod tests {
         assert!(transactions.len() > 10);
 
         for tx in transactions {
-            let transaction = TransactionWithTimestamp::new_for_tests(tx);
+            let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
@@ -288,7 +295,7 @@ mod tests {
 
         let ctx = executor.get_context();
         for tx in transactions {
-            let transaction = TransactionWithTimestamp::new_for_tests(tx);
+            let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
@@ -332,7 +339,7 @@ mod tests {
 
         let ctx = executor.get_context();
         for tx in read_txs {
-            let transaction = TransactionWithTimestamp::new_for_tests(tx);
+            let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }

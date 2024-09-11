@@ -92,7 +92,7 @@ impl<E: Executor> PrimaryCore<E> {
             if skip {
                 let effects = proxy_result.clone();
                 self.store
-                    .commit_objects(effects.changes, effects.new_state);
+                    .commit_objects(effects.updates, effects.new_state);
                 return proxy_result;
             }
         }
@@ -138,7 +138,7 @@ impl<E: Executor> PrimaryCore<E> {
         E: Send + 'static,
         <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::StateChanges: Send + Sync,
+        <E as Executor>::ExecutionResults: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }
@@ -155,7 +155,7 @@ mod tests {
         config::BenchmarkParameters,
         executor::{
             api::Executor,
-            sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
+            sui::{generate_transactions, SuiExecutor, SuiTransaction},
         },
         primary::core::PrimaryCore,
     };
@@ -174,7 +174,7 @@ mod tests {
         let transactions: Vec<_> = generate_transactions(&config)
             .await
             .into_iter()
-            .map(|tx| SuiTransactionWithTimestamp::new_for_tests(tx))
+            .map(|tx| SuiTransaction::new_for_tests(tx))
             .collect();
         let total_transactions = transactions.len();
 

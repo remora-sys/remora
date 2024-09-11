@@ -64,7 +64,7 @@ impl<E: Executor> ProxyCore<E> {
         E: Send + 'static,
         <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::StateChanges: Send,
+        <E as Executor>::ExecutionResults: Send,
     {
         tracing::info!("Proxy {} started", self.id);
 
@@ -110,7 +110,7 @@ impl<E: Executor> ProxyCore<E> {
         E: Send + 'static,
         <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::StateChanges: Send,
+        <E as Executor>::ExecutionResults: Send,
     {
         tokio::spawn(async move { self.run().await })
     }
@@ -125,7 +125,7 @@ mod tests {
 
     use crate::{
         config::BenchmarkParameters,
-        executor::sui::{generate_transactions, SuiExecutor, SuiTransactionWithTimestamp},
+        executor::sui::{generate_transactions, SuiExecutor, SuiTransaction},
         metrics::Metrics,
         proxy::core::ProxyCore,
     };
@@ -145,7 +145,7 @@ mod tests {
         // Send transactions to the proxy.
         let transactions = generate_transactions(&config).await;
         for tx in transactions {
-            let transaction = SuiTransactionWithTimestamp::new_for_tests(tx);
+            let transaction = SuiTransaction::new_for_tests(tx);
             tx_proxy.send(transaction).await.unwrap();
         }
 

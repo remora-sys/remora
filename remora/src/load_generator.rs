@@ -17,7 +17,7 @@ use crate::{
     config::BenchmarkParameters,
     executor::{
         api::TransactionWithTimestamp,
-        sui::{generate_transactions, SuiTransactionWithTimestamp},
+        sui::{generate_transactions, SuiTransaction},
     },
     metrics::{ErrorType, Metrics},
     networking::client::NetworkClient,
@@ -28,7 +28,7 @@ pub struct LoadGenerator {
     /// The benchmark configurations.
     config: BenchmarkParameters,
     /// A best effort network sender.
-    sender: Sender<SuiTransactionWithTimestamp>,
+    sender: Sender<SuiTransaction>,
     /// Metrics for the load generator.
     metrics: Metrics,
 }
@@ -173,7 +173,7 @@ pub mod tests {
 
     use crate::{
         config::{get_test_address, BenchmarkParameters},
-        executor::sui::SuiTransactionWithTimestamp,
+        executor::sui::SuiTransaction,
         load_generator::LoadGenerator,
         metrics::Metrics,
         networking::server::NetworkServer,
@@ -186,7 +186,7 @@ pub mod tests {
         // Boot a test server to receive transactions.
         let (tx_client_connections, _rx_client_connections) = mpsc::channel(1);
         let (tx_transactions, mut rx_transactions) = mpsc::channel(100);
-        let _handle = NetworkServer::<SuiTransactionWithTimestamp, ()>::new(
+        let _handle = NetworkServer::<SuiTransaction, ()>::new(
             target,
             tx_client_connections,
             tx_transactions,

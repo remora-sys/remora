@@ -12,7 +12,7 @@ use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::Mock
 use crate::{
     config::ValidatorConfig,
     error::NodeResult,
-    executor::sui::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
+    executor::sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::ProxyCore,
@@ -30,7 +30,7 @@ pub struct PrimaryNode {
     /// The handle for the network server.
     pub network_handle: JoinHandle<io::Result<()>>,
     /// The receiver for the final execution results.
-    pub rx_output: Receiver<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
+    pub rx_output: Receiver<(SuiTransaction, SuiExecutionResults)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
     pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
