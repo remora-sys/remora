@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
@@ -11,6 +11,7 @@ use tokio::{
 use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::ValidatorConfig,
+    error::NodeResult,
     executor::sui::{SuiExecutionEffects, SuiExecutor, SuiTransactionWithTimestamp},
     metrics::Metrics,
     networking::server::NetworkServer,
@@ -22,8 +23,12 @@ const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct PrimaryNode {
-    /// The handles for all components.
-    pub handles: Vec<JoinHandle<()>>,
+    /// The handles for the core components.
+    pub primary_handles: Vec<JoinHandle<NodeResult<()>>>,
+    /// The handle for the (mock) consensus.
+    pub consensus_handle: JoinHandle<()>,
+    /// The handle for the network server.
+    pub network_handle: JoinHandle<io::Result<()>>,
     /// The receiver for the final execution results.
     pub rx_output: Receiver<(SuiTransactionWithTimestamp, SuiExecutionEffects)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
@@ -47,7 +52,7 @@ impl PrimaryNode {
         let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        let mut handles = Vec::new();
+        let mut primary_handles = Vec::new();
 
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.
@@ -67,7 +72,7 @@ impl PrimaryNode {
             metrics.clone(),
         )
         .spawn();
-        handles.push(load_balancer_handle);
+        primary_handles.push(load_balancer_handle);
 
         // Boot the (mock) consensus. This component delays transactions simulating consensus and
         // then forwards them to the primary executor.
@@ -78,7 +83,6 @@ impl PrimaryNode {
             tx_commits,
         )
         .spawn();
-        handles.push(consensus_handle);
 
         // Boot the local proxies. Additional proxies can still remotely connect. Proxies
         // receive transactions in parallel with the consensus for pre-execution.
@@ -95,13 +99,13 @@ impl PrimaryNode {
                 metrics.clone(),
             )
             .spawn();
-            handles.push(proxy_handle);
+            primary_handles.push(proxy_handle);
             tx_proxy_connections.send(tx).await.expect("Channel open");
         }
 
         // Boot another server handling connections from (additional) remote proxies. These remote
         // proxies perform the same functions the the local proxies.
-        let _server_handle = NetworkServer::new(
+        let network_handle = NetworkServer::new(
             config.proxy_server_address,
             tx_proxy_connections,
             tx_proxy_results,
@@ -114,10 +118,12 @@ impl PrimaryNode {
         let store = executor.create_in_memory_store();
         let primary_handle =
             PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
-        handles.push(primary_handle);
+        primary_handles.push(primary_handle);
 
         Self {
-            handles,
+            primary_handles,
+            consensus_handle,
+            network_handle,
             rx_output,
             rx_client_connections,
             metrics,

@@ -9,6 +9,7 @@ use tokio::{
 };
 
 use crate::{
+    error::{NodeError, NodeResult},
     executor::{
         api::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
         dependency_controller::DependencyController,
@@ -58,7 +59,7 @@ impl<E: Executor> ProxyCore<E> {
     }
 
     /// Run the proxy.
-    pub async fn run(&mut self)
+    pub async fn run(&mut self) -> NodeResult<()>
     where
         E: Send + 'static,
         <E as Executor>::Store: Send + Sync,
@@ -92,26 +93,26 @@ impl<E: Executor> ProxyCore<E> {
                     notify.notify_one();
                 }
 
-                if tx_results.send(execution_result).await.is_err() {
-                    tracing::warn!("Failed to send execution result, stopping proxy {id}");
-                    return;
-                }
+                tx_results
+                    .send(execution_result)
+                    .await
+                    .map_err(|_| NodeError::ShuttingDown)?;
                 metrics.decrease_proxy_load(&id);
+                Ok::<_, NodeError>(())
             });
         }
+        Ok(())
     }
 
     /// Spawn the proxy in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()>
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
         <E as Executor>::Store: Send + Sync,
         <E as Executor>::Transaction: Send + Sync,
         <E as Executor>::StateChanges: Send,
     {
-        tokio::spawn(async move {
-            self.run().await;
-        })
+        tokio::spawn(async move { self.run().await })
     }
 }
 

@@ -8,7 +8,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::metrics::Metrics;
+use crate::{
+    error::{NodeError, NodeResult},
+    metrics::Metrics,
+};
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
 pub struct LoadBalancer<T> {
@@ -47,16 +50,16 @@ impl<T: Clone> LoadBalancer<T> {
     }
 
     /// Forward a transaction to the consensus and proxies.
-    async fn forward_transaction(&mut self, transaction: T) -> Option<()> {
+    async fn forward_transaction(&mut self, transaction: T) -> NodeResult<()> {
         if self.index == 0 {
             self.metrics.register_start_time();
         }
 
         // Send the transaction to the consensus.
-        if self.tx_consensus.send(transaction.clone()).await.is_err() {
-            tracing::warn!("Failed to send transaction to consensus, stopping load balancer");
-            return None;
-        }
+        self.tx_consensus
+            .send(transaction.clone())
+            .await
+            .map_err(|_| NodeError::ShuttingDown)?;
 
         // Send the transaction to the proxies. If the connection to a proxy fails, remove it
         // from the list of connections and try with another proxy.
@@ -75,38 +78,32 @@ impl<T: Clone> LoadBalancer<T> {
                 }
             }
         }
-        Some(())
+        Ok(())
     }
 
     /// Run the load balancer.
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
         loop {
             tokio::select! {
-                Some(transaction) = self.rx_transactions.recv() => {
-                    if self.forward_transaction(transaction).await.is_none() {
-                        break;
-                    }
-                },
+                Some(transaction) = self.rx_transactions.recv() => self
+                    .forward_transaction(transaction)
+                    .await
+                    .map_err(|_| NodeError::ShuttingDown)?,
                 Some(connection) = self.rx_proxy_connections.recv() => {
                     self.proxy_connections.push(connection);
                     tracing::info!("Added a new proxy connection");
                 }
-                else => {
-                    tracing::warn!("All channels dropped, stopping load balancer");
-                    break;
-                }
+                else => Err(NodeError::ShuttingDown)?
             }
         }
     }
 
     /// Spawn the load balancer in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()>
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         T: Send + 'static,
     {
-        tokio::spawn(async move {
-            self.run().await;
-        })
+        tokio::spawn(async move { self.run().await })
     }
 }

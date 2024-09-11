@@ -15,12 +15,15 @@ use tokio::{
 };
 
 use super::mock_consensus::ConsensusCommit;
-use crate::executor::api::{
-    ExecutableTransaction,
-    ExecutionEffects,
-    Executor,
-    StateStore,
-    TransactionWithTimestamp,
+use crate::{
+    error::{NodeError, NodeResult},
+    executor::api::{
+        ExecutableTransaction,
+        ExecutionEffects,
+        Executor,
+        StateStore,
+        TransactionWithTimestamp,
+    },
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
@@ -111,7 +114,7 @@ impl<E: Executor> PrimaryCore<E> {
     }
 
     /// Run the primary executor.
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self) -> NodeResult<()> {
         let proxy_results = DashMap::new();
 
         loop {
@@ -121,10 +124,7 @@ impl<E: Executor> PrimaryCore<E> {
                     tracing::debug!("Received commit");
                     for tx in commit {
                         let results = self.merge_results(&proxy_results, &tx).await;
-                        if self.tx_output.send((tx,results)).await.is_err() {
-                            tracing::warn!("Failed to output execution result, stopping primary executor");
-                            break;
-                        }
+                        self.tx_output.send((tx,results)).await.map_err(|_| NodeError::ShuttingDown)?;
                     }
                 }
 
@@ -136,21 +136,22 @@ impl<E: Executor> PrimaryCore<E> {
                     );
                     tracing::debug!("Received proxy result");
                 }
+
+                // The channel is closed.
+                else => Err(NodeError::ShuttingDown)?
             }
         }
     }
 
     /// Spawn the primary executor in a new task.
-    pub fn spawn(mut self) -> JoinHandle<()>
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
         <E as Executor>::Store: Send,
         <E as Executor>::Transaction: Send + Sync,
         <E as Executor>::StateChanges: Send + Sync,
     {
-        tokio::spawn(async move {
-            self.run().await;
-        })
+        tokio::spawn(async move { self.run().await })
     }
 }
 

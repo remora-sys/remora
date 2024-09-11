@@ -118,6 +118,9 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch));
+                    } else if self.tx_primary_executor.is_closed() {
+                        tracing::warn!("Terminating consensus task: primary executor dropped the channel");
+                        break
                     }
                     timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
                 }
@@ -126,7 +129,7 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                 Some(commit) = waiter.next() => {
                     self.current_inflight_batches -= 1;
                     if self.tx_primary_executor.send(commit).await.is_err() {
-                        tracing::warn!("terminating consensus task: primary executor dropped the channel");
+                        tracing::warn!("Terminating consensus task: primary executor dropped the channel");
                         break
                     }
                     tracing::debug!("Delivered batch to primary executor");
