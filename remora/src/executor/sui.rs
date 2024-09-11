@@ -46,8 +46,8 @@ impl ExecutableTransaction for CertifiedTransaction {
 }
 
 impl StateStore<TransactionEffects> for InMemoryObjectStore {
-    fn commit_objects(&self, changes: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
-        self.commit_effects(changes, new_state);
+    fn commit_objects(&self, updates: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
+        self.commit_effects(updates, new_state);
     }
 }
 

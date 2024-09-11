@@ -72,12 +72,12 @@ impl<T: ExecutableTransaction + Clone> Deref for TransactionWithTimestamp<T> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionResultsAndStateUpdates<U: Clone + Debug> {
+pub struct ExecutionResultsAndEffects<U: Clone + Debug> {
     pub updates: U,
     pub new_state: BTreeMap<ObjectID, Object>,
 }
 
-impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndStateUpdates<U> {
+impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndEffects<U> {
     pub fn new(updates: U, new_state: BTreeMap<ObjectID, Object>) -> Self {
         Self { updates, new_state }
     }
@@ -95,9 +95,9 @@ impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndStateUpdates<U
     }
 }
 
-pub trait StateStore<C>: BackingStore {
+pub trait StateStore<U>: BackingStore {
     /// Commit the objects to the store.
-    fn commit_objects(&self, changes: C, new_state: BTreeMap<ObjectID, Object>);
+    fn commit_objects(&self, updates: U, new_state: BTreeMap<ObjectID, Object>);
 }
 
 /// The executor is responsible for executing transactions and generating new transactions.
@@ -117,11 +117,11 @@ pub trait Executor {
         ctx: Arc<BenchmarkContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = ExecutionResultsAndStateUpdates<Self::ExecutionResults>> + Send;
+    ) -> impl Future<Output = ExecutionResultsAndEffects<Self::ExecutionResults>> + Send;
 }
 
 /// Short for a transaction with a timestamp.
 pub type Transaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
 
 /// Short for the results of executing a transaction.
-pub type ExecutionResults<E> = ExecutionResultsAndStateUpdates<<E as Executor>::ExecutionResults>;
+pub type ExecutionResults<E> = ExecutionResultsAndEffects<<E as Executor>::ExecutionResults>;
