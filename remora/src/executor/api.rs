@@ -110,7 +110,7 @@ pub trait Executor {
     type Store: StateStore<Self::ExecutionResults>;
 
     /// Get the context for the benchmark.
-    fn get_context(&self) -> Arc<BenchmarkContext>;
+    fn context(&self) -> Arc<BenchmarkContext>;
 
     /// Execute a transaction and return the results.
     fn execute(
@@ -125,3 +125,6 @@ pub type Transaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>
 
 /// Short for the results of executing a transaction.
 pub type ExecutionResults<E> = ExecutionResultsAndEffects<<E as Executor>::ExecutionResults>;
+
+/// Short for the store used by the executor.
+pub type Store<E> = Arc<<E as Executor>::Store>;

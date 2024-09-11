@@ -11,7 +11,7 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutableTransaction, ExecutionResults, Executor, Transaction},
+        api::{ExecutableTransaction, ExecutionResults, Executor, Store, Transaction},
         dependency_controller::DependencyController,
     },
     metrics::Metrics,
@@ -26,7 +26,7 @@ pub struct ProxyCore<E: Executor> {
     /// The executor for the transactions.
     executor: E,
     /// The object store.
-    store: Arc<E::Store>,
+    store: Store<E>,
     /// The receiver for transactions.
     rx_transactions: Receiver<Transaction<E>>,
     /// The sender for transactions with results.
@@ -42,7 +42,7 @@ impl<E: Executor> ProxyCore<E> {
     pub fn new(
         id: ProxyId,
         executor: E,
-        store: Arc<E::Store>,
+        store: Store<E>,
         rx_transactions: Receiver<Transaction<E>>,
         tx_results: Sender<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
@@ -62,14 +62,14 @@ impl<E: Executor> ProxyCore<E> {
     pub async fn run(&mut self) -> NodeResult<()>
     where
         E: Send + 'static,
-        <E as Executor>::Store: Send + Sync,
-        <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::ExecutionResults: Send,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
     {
         tracing::info!("Proxy {} started", self.id);
 
         let mut task_id = 0;
-        let ctx = self.executor.get_context();
+        let ctx = self.executor.context();
         while let Some(transaction) = self.rx_transactions.recv().await {
             self.metrics.increase_proxy_load(&self.id);
             task_id += 1;
@@ -108,9 +108,9 @@ impl<E: Executor> ProxyCore<E> {
     pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
-        <E as Executor>::Store: Send + Sync,
-        <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::ExecutionResults: Send,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }

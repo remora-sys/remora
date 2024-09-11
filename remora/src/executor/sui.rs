@@ -175,7 +175,7 @@ impl Executor for SuiExecutor {
     type ExecutionResults = TransactionEffects;
     type Store = InMemoryObjectStore;
 
-    fn get_context(&self) -> Arc<BenchmarkContext> {
+    fn context(&self) -> Arc<BenchmarkContext> {
         self.ctx.clone()
     }
 
@@ -256,7 +256,7 @@ mod tests {
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
         let store = Arc::new(executor.create_in_memory_store());
-        let ctx = executor.get_context();
+        let ctx = executor.context();
 
         let transactions = generate_transactions(&config).await;
         assert!(transactions.len() > 10);
@@ -293,7 +293,7 @@ mod tests {
             elapsed.as_millis(),
         );
 
-        let ctx = executor.get_context();
+        let ctx = executor.context();
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
@@ -332,12 +332,12 @@ mod tests {
         let (read_accounts, read_txs) = super::import_from_files(working_directory.into());
         assert_eq!(read_accounts.len(), ctx.get_accounts().len());
         executor
-            .get_context()
+            .context()
             .validator()
             .assigned_shared_object_versions(&read_txs) // Important!!
             .await;
 
-        let ctx = executor.get_context();
+        let ctx = executor.context();
         for tx in read_txs {
             let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;

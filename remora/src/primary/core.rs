@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{collections::HashMap, ops::Deref};
 
 use dashmap::DashMap;
 use sui_types::{
@@ -17,7 +17,14 @@ use tokio::{
 use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
-    executor::api::{ExecutableTransaction, ExecutionResults, Executor, StateStore, Transaction},
+    executor::api::{
+        ExecutableTransaction,
+        ExecutionResults,
+        Executor,
+        StateStore,
+        Store,
+        Transaction,
+    },
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
@@ -26,7 +33,7 @@ pub struct PrimaryCore<E: Executor> {
     /// The executor for the transactions.
     executor: E,
     /// The object store.
-    store: Arc<E::Store>,
+    store: Store<E>,
     /// The receiver for consensus commits.
     rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
     /// The receiver for proxy results.
@@ -39,7 +46,7 @@ impl<E: Executor> PrimaryCore<E> {
     /// Create a new primary executor.
     pub fn new(
         executor: E,
-        store: Arc<E::Store>,
+        store: Store<E>,
         rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
         tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
@@ -98,7 +105,7 @@ impl<E: Executor> PrimaryCore<E> {
         }
 
         tracing::trace!("Re-executing transaction");
-        let ctx = self.executor.get_context();
+        let ctx = self.executor.context();
         E::execute(ctx, self.store.clone(), &transaction).await
     }
 
@@ -136,9 +143,9 @@ impl<E: Executor> PrimaryCore<E> {
     pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
-        <E as Executor>::Store: Send + Sync,
-        <E as Executor>::Transaction: Send + Sync,
-        <E as Executor>::ExecutionResults: Send + Sync,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }
@@ -170,7 +177,7 @@ mod tests {
         // Generate transactions.
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
-        let ctx = executor.get_context();
+        let ctx = executor.context();
         let transactions: Vec<_> = generate_transactions(&config)
             .await
             .into_iter()
