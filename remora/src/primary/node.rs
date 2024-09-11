@@ -27,8 +27,8 @@ pub struct PrimaryNode {
     pub primary_handles: Vec<JoinHandle<NodeResult<()>>>,
     /// The handle for the (mock) consensus.
     pub consensus_handle: JoinHandle<()>,
-    /// The handle for the network server.
-    pub network_handle: JoinHandle<io::Result<()>>,
+    /// The handles for the network servers.
+    pub network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The receiver for the final execution results.
     pub rx_output: Receiver<(SuiTransaction, SuiExecutionResults)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
@@ -53,16 +53,17 @@ impl PrimaryNode {
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
+        let mut network_handles = Vec::new();
 
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.
-        // TODO: Introduce error type and add the server handle to the handles list.
-        let _server_handle = NetworkServer::new(
+        let transactions_network_handle = NetworkServer::new(
             config.client_server_address,
             tx_client_connections,
             tx_client_transactions,
         )
         .spawn();
+        network_handles.push(transactions_network_handle);
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::new(
@@ -105,12 +106,13 @@ impl PrimaryNode {
 
         // Boot another server handling connections from (additional) remote proxies. These remote
         // proxies perform the same functions the the local proxies.
-        let network_handle = NetworkServer::new(
+        let proxy_network_handle = NetworkServer::new(
             config.proxy_server_address,
             tx_proxy_connections,
             tx_proxy_results,
         )
         .spawn();
+        network_handles.push(proxy_network_handle);
 
         // Boot the primary executor. This component receives ordered transactions from consensus.
         // It then combines the pre-execution results from the proxies and re-executes the transactions
@@ -123,7 +125,7 @@ impl PrimaryNode {
         Self {
             primary_handles,
             consensus_handle,
-            network_handle,
+            network_handles,
             rx_output,
             rx_client_connections,
             metrics,
