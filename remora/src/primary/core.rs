@@ -17,13 +17,7 @@ use tokio::{
 use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
-    executor::api::{
-        ExecutableTransaction,
-        ExecutionEffects,
-        Executor,
-        StateStore,
-        TransactionWithTimestamp,
-    },
+    executor::api::{ExecutableTransaction, ExecutionResults, Executor, StateStore, Transaction},
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
@@ -34,14 +28,11 @@ pub struct PrimaryCore<E: Executor> {
     /// The object store.
     store: Arc<E::Store>,
     /// The receiver for consensus commits.
-    rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
+    rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
     /// The receiver for proxy results.
-    rx_proxies: Receiver<ExecutionEffects<E::StateChanges>>,
+    rx_proxies: Receiver<ExecutionResults<E>>,
     /// Output channel for the final results.
-    tx_output: Sender<(
-        TransactionWithTimestamp<E::Transaction>,
-        ExecutionEffects<E::StateChanges>,
-    )>,
+    tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
 }
 
 impl<E: Executor> PrimaryCore<E> {
@@ -49,12 +40,9 @@ impl<E: Executor> PrimaryCore<E> {
     pub fn new(
         executor: E,
         store: Arc<E::Store>,
-        rx_commits: Receiver<ConsensusCommit<TransactionWithTimestamp<E::Transaction>>>,
-        rx_proxies: Receiver<ExecutionEffects<E::StateChanges>>,
-        tx_output: Sender<(
-            TransactionWithTimestamp<E::Transaction>,
-            ExecutionEffects<E::StateChanges>,
-        )>,
+        rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
+        rx_proxies: Receiver<ExecutionResults<E>>,
+        tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
     ) -> Self {
         Self {
             executor,
@@ -86,9 +74,9 @@ impl<E: Executor> PrimaryCore<E> {
     // TODO: Naive merging strategy for now.
     pub async fn merge_results(
         &mut self,
-        proxy_results: &DashMap<TransactionDigest, ExecutionEffects<E::StateChanges>>,
-        transaction: &TransactionWithTimestamp<E::Transaction>,
-    ) -> ExecutionEffects<E::StateChanges> {
+        proxy_results: &DashMap<TransactionDigest, ExecutionResults<E>>,
+        transaction: &Transaction<E>,
+    ) -> ExecutionResults<E> {
         let mut skip = true;
 
         if let Some((_, proxy_result)) = proxy_results.remove(transaction.deref().digest()) {

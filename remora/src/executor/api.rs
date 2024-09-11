@@ -119,3 +119,6 @@ pub trait Executor {
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionEffects<Self::StateChanges>> + Send;
 }
+
+pub type Transaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
+pub type ExecutionResults<E> = ExecutionEffects<<E as Executor>::StateChanges>;

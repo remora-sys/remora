@@ -11,7 +11,7 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutableTransaction, ExecutionEffects, Executor, TransactionWithTimestamp},
+        api::{ExecutableTransaction, ExecutionResults, Executor, Transaction},
         dependency_controller::DependencyController,
     },
     metrics::Metrics,
@@ -28,9 +28,9 @@ pub struct ProxyCore<E: Executor> {
     /// The object store.
     store: Arc<E::Store>,
     /// The receiver for transactions.
-    rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
+    rx_transactions: Receiver<Transaction<E>>,
     /// The sender for transactions with results.
-    tx_results: Sender<ExecutionEffects<E::StateChanges>>,
+    tx_results: Sender<ExecutionResults<E>>,
     /// The dependency controller for multi-core tx execution.
     dependency_controller: DependencyController,
     /// The  metrics for the proxy
@@ -43,8 +43,8 @@ impl<E: Executor> ProxyCore<E> {
         id: ProxyId,
         executor: E,
         store: Arc<E::Store>,
-        rx_transactions: Receiver<TransactionWithTimestamp<E::Transaction>>,
-        tx_results: Sender<ExecutionEffects<E::StateChanges>>,
+        rx_transactions: Receiver<Transaction<E>>,
+        tx_results: Sender<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
