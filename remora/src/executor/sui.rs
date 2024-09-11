@@ -184,8 +184,8 @@ impl Executor for SuiExecutor {
 
     async fn execute(
         ctx: Arc<BenchmarkContext>,
-        store: Arc<Self::Store>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
+        store: Arc<InMemoryObjectStore>,
+        transaction: &SuiTransactionWithTimestamp,
     ) -> SuiExecutionEffects {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.validator();
