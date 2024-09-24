@@ -6,12 +6,9 @@ use std::{io, sync::Arc};
 use futures::future::join_all;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use super::core::{ProxyCore, ProxyId};
+use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
-    config::ValidatorConfig,
-    error::NodeResult,
-    executor::sui::SuiExecutor,
-    metrics::Metrics,
+    config::ValidatorConfig, error::NodeResult, executor::sui::SuiExecutor, metrics::Metrics,
     networking::client::NetworkClient,
 };
 
@@ -36,6 +33,11 @@ impl ProxyNode {
     ) -> Self {
         let mut core_handles = Vec::new();
         let mut network_handles = Vec::new();
+        let mode = match config.parallel_proxy {
+            false => ProxyMode::SingleThreaded,
+            true => ProxyMode::MultiThreaded,
+        };
+
         for i in 0..config.validator_parameters.collocated_pre_executors.proxy {
             let id = format!("{proxy_id}-{i}");
             let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -45,6 +47,7 @@ impl ProxyNode {
             let core_handle = ProxyCore::new(
                 id,
                 executor.clone(),
+                mode,
                 store,
                 rx_transactions,
                 tx_proxy_results,

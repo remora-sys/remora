@@ -3,8 +3,7 @@
 
 use std::{
     fmt::Debug,
-    fs,
-    io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     time::Duration,
@@ -128,6 +127,8 @@ pub struct ValidatorConfig {
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
     pub validator_parameters: ValidatorParameters,
+    /// The execution mode of proxy.
+    pub parallel_proxy: bool,
 }
 
 impl ValidatorConfig {
@@ -138,6 +139,7 @@ impl ValidatorConfig {
             client_server_address: get_test_address(),
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
+            parallel_proxy: true,
         }
     }
 }
