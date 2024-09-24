@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start the metrics server.
-    let _ = tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
+    tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
     if let Some(binding_address) = args.binding_address {
         validator_config.metrics_address.set_ip(binding_address);
     }
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // Periodically print metrics.
     let workload = "default".to_string();
     let print_period = Duration::from_secs(5);
-    let _ = periodically_print_metrics(validator_config.metrics_address, workload, print_period);
+    periodically_print_metrics(validator_config.metrics_address, workload, print_period);
 
     // Build the executor.
     tracing::info!("Loading executor");

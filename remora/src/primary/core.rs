@@ -18,12 +18,7 @@ use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        StateStore,
-        Store,
-        Transaction,
+        ExecutableTransaction, ExecutionResults, Executor, StateStore, Store, Transaction,
     },
 };
 
@@ -106,7 +101,7 @@ impl<E: Executor> PrimaryCore<E> {
 
         tracing::trace!("Re-executing transaction");
         let ctx = self.executor.context();
-        E::execute(ctx, self.store.clone(), &transaction).await
+        E::execute(ctx, self.store.clone(), transaction).await
     }
 
     /// Run the primary executor.

@@ -106,7 +106,11 @@ pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<Certifie
     transactions
 }
 
-use std::{fs, io::BufReader, path::PathBuf};
+use std::{
+    fs,
+    io::{BufReader, Read},
+    path::PathBuf,
+};
 
 use sui_single_node_benchmark::mock_account::Account;
 use sui_types::base_types::SuiAddress;
@@ -133,16 +137,28 @@ pub fn import_from_files(
     working_directory: PathBuf,
 ) -> (BTreeMap<SuiAddress, Account>, Vec<CertifiedTransaction>) {
     let start_time: std::time::Instant = std::time::Instant::now();
-
-    let accounts_file = BufReader::new(
+    // Read the accounts file into a buffer
+    let mut accounts_file = BufReader::new(
         fs::File::open(working_directory.join("accounts.dat")).expect("Failed to open accounts"),
     );
-    let txs_file = BufReader::new(
+    let mut accounts_buf = Vec::new();
+    accounts_file
+        .read_to_end(&mut accounts_buf)
+        .expect("Failed to read accounts file");
+
+    // Read the transactions file into a buffer
+    let mut txs_file = BufReader::new(
         fs::File::open(working_directory.join("txs.dat")).expect("Failed to open txs"),
     );
+    let mut txs_buf = Vec::new();
+    txs_file
+        .read_to_end(&mut txs_buf)
+        .expect("Failed to read txs file");
 
-    let accounts = bincode::deserialize_from(accounts_file).unwrap();
-    let txs = bincode::deserialize_from(txs_file).unwrap();
+    // Deserialize from buffers
+    let accounts: BTreeMap<SuiAddress, Account> = bincode::deserialize(&accounts_buf).unwrap();
+    let txs: Vec<CertifiedTransaction> = bincode::deserialize(&txs_buf).unwrap();
+
     let elapsed = start_time.elapsed().as_millis() as f64;
     println!("Import took {} ms", elapsed,);
     (accounts, txs)

@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_address = args.metrics_address;
 
     tracing::info!("Load generator exposing metrics on {metrics_address}");
-    let _ = tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
+    tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
     let registry = mysten_metrics::start_prometheus_server(metrics_address);
     let metrics = Metrics::new(&registry.default_registry());
 
