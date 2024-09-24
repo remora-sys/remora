@@ -324,7 +324,7 @@ mod tests {
             ..BenchmarkParameters::new_for_tests()
         };
 
-        let working_directory = "~/test_export";
+        let working_directory = "./test_export";
         fs::create_dir_all(&working_directory).expect(&format!(
             "Failed to create directory '{}'",
             working_directory
@@ -359,5 +359,8 @@ mod tests {
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
             assert!(results.success());
         }
+
+        // Clean up directory after the test finishes
+        fs::remove_dir_all(&working_directory).expect("Failed to delete working directory");
     }
 }
