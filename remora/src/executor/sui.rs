@@ -54,6 +54,7 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<BenchmarkContext>,
+    workload_type: WorkloadType,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -71,16 +72,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
             num_shared_objects: 0,
             nft_size: 32,
         },
-        WorkloadType::SharedObjects => WorkloadKind::PTB {
-            num_transfers: 0,
-            num_dynamic_fields: 0,
-            use_batch_mint: false,
-            computation: 0,
-            use_native_transfer: false,
-            num_mints: 0,
-            num_shared_objects: 1,
-            nft_size: 32,
-        },
+        WorkloadType::SharedObjects => WorkloadKind::Counter { txs_per_counter: 2 },
     };
 
     // Create genesis.
@@ -91,7 +83,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
 pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<CertifiedTransaction> {
     tracing::debug!("Generating all transactions...");
     let workload = init_workload(config);
-    let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
+    let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
     let start_time = Instant::now();
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let transactions = ctx.generate_transactions(tx_generator).await;
@@ -114,6 +106,7 @@ use std::{
 
 use sui_single_node_benchmark::mock_account::Account;
 use sui_types::base_types::SuiAddress;
+
 pub fn export_to_files(
     accounts: &BTreeMap<SuiAddress, Account>,
     txs: &Vec<CertifiedTransaction>,
@@ -164,12 +157,14 @@ pub fn import_from_files(
     (accounts, txs)
 }
 
+pub const LOG_DIR: &str = "/tmp/export/";
+
 impl SuiExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
         let workload = init_workload(config);
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
-        let mut ctx = BenchmarkContext::new(workload.clone(), component, true).await;
+        let mut ctx = BenchmarkContext::new(workload.clone(), component, false).await;
         let _ = workload.create_tx_generator(&mut ctx).await;
         let elapsed = start_time.elapsed();
         tracing::debug!(
@@ -178,11 +173,26 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            workload_type: config.workload.clone(),
+        }
     }
 
     pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
         self.ctx.validator().create_in_memory_store()
+    }
+
+    pub async fn load_state_for_shared_objects(&self) {
+        if let WorkloadType::SharedObjects = self.workload_type {
+            let working_directory = LOG_DIR;
+            // import txs to assign shared-object versions
+            let (_, read_txs) = import_from_files(working_directory.into());
+            self.ctx
+                .validator()
+                .assigned_shared_object_versions(&read_txs)
+                .await;
+        }
     }
 }
 
@@ -275,7 +285,7 @@ mod tests {
         let ctx = executor.context();
 
         let transactions = generate_transactions(&config).await;
-        assert!(transactions.len() > 10);
+        assert!(transactions.len() == 10);
 
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
@@ -333,7 +343,7 @@ mod tests {
         // generate txs and export to files
         let workload = init_workload(&config);
         let mut ctx =
-            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
+            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
         let tx_generator = workload.create_tx_generator(&mut ctx).await;
         let txs = ctx.generate_transactions(tx_generator).await;
         let txs = ctx.certify_transactions(txs, false).await;

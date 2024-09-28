@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 validator_config.proxy_server_address
             );
             ProxyNode::start(proxy_id, executor, &validator_config, metrics)
+                .await
                 .await_completion()
                 .await;
         }

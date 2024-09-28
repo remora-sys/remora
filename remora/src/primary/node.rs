@@ -96,6 +96,7 @@ impl PrimaryNode {
             let proxy_id = format!("primary-{i}");
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = Arc::new(executor.create_in_memory_store());
+            executor.load_state_for_shared_objects().await; // TODO: check if duplicated
             let proxy_handle = ProxyCore::new(
                 proxy_id,
                 executor.clone(),
@@ -124,6 +125,7 @@ impl PrimaryNode {
         // It then combines the pre-execution results from the proxies and re-executes the transactions
         // only if necessary.
         let store = Arc::new(executor.create_in_memory_store());
+        executor.load_state_for_shared_objects().await;
         let primary_handle =
             PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
         primary_handles.push(primary_handle);

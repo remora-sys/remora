@@ -6,7 +6,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig},
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
+    executor::sui::{import_from_files, LOG_DIR},
     load_generator::{default_metrics_address, LoadGenerator},
     metrics::Metrics,
 };
@@ -45,8 +46,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Create genesis and generate transactions.
     let primary_address = validator_config.client_server_address;
-    let mut load_generator = LoadGenerator::new(benchmark_config, primary_address, metrics);
-    let transactions = load_generator.initialize().await;
+    let mut load_generator = LoadGenerator::new(benchmark_config.clone(), primary_address, metrics);
+
+    let transactions;
+    match benchmark_config.workload {
+        WorkloadType::Transfers => {
+            transactions = load_generator.initialize().await;
+        }
+        WorkloadType::SharedObjects => {
+            (_, transactions) = import_from_files(LOG_DIR.into());
+        }
+    };
 
     // Submit transactions to the server.
     load_generator.run(transactions).await;

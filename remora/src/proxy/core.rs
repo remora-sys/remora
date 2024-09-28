@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use sui_types::transaction::InputObjectKind;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -104,11 +105,31 @@ impl<E: Executor> ProxyCore<E> {
                 while let Some(transaction) = self.rx_transactions.recv().await {
                     self.metrics.increase_proxy_load(&self.id);
                     task_id += 1;
+
+                    // filter pkg id from the obj_id
+                    let obj_ids = transaction
+                        .input_objects()
+                        .into_iter()
+                        .filter_map(|kind| {
+                            match kind {
+                                InputObjectKind::ImmOrOwnedMoveObject((obj_id, _, _)) => {
+                                    Some(obj_id)
+                                }
+                                InputObjectKind::SharedMoveObject {
+                                    id: obj_id,
+                                    initial_shared_version: _,
+                                    mutable: _,
+                                } => Some(obj_id),
+                                _ => None, // filter out move package
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
                     let (prior_handles, current_handles) = self
                         .dependency_controller
                         .as_mut()
                         .expect("DependencyController should be initialized")
-                        .get_dependencies(task_id, transaction.input_object_ids());
+                        .get_dependencies(task_id, obj_ids);
 
                     let store = self.store.clone();
                     let id = self.id.clone();

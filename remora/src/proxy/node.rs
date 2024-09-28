@@ -25,7 +25,7 @@ pub struct ProxyNode {
 }
 
 impl ProxyNode {
-    pub fn start(
+    pub async fn start(
         proxy_id: ProxyId,
         executor: SuiExecutor,
         config: &ValidatorConfig,
@@ -44,6 +44,7 @@ impl ProxyNode {
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
             let store = Arc::new(executor.create_in_memory_store());
+            executor.load_state_for_shared_objects().await;
             let core_handle = ProxyCore::new(
                 id,
                 executor.clone(),
