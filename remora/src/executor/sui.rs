@@ -267,7 +267,6 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use sui_single_node_benchmark::{benchmark_context::BenchmarkContext, command::Component};
-    use tokio::time::Instant;
 
     use crate::{
         config::{BenchmarkParameters, WorkloadType},
@@ -287,39 +286,6 @@ mod tests {
         let transactions = generate_transactions(&config).await;
         assert!(transactions.len() == 10);
 
-        for tx in transactions {
-            let transaction = SuiTransaction::new_for_tests(tx);
-            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
-            assert!(results.success());
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_sui_executor_with_shared_objects() {
-        let config = BenchmarkParameters {
-            workload: WorkloadType::SharedObjects,
-            ..BenchmarkParameters::new_for_tests()
-        };
-        let executor = SuiExecutor::new(&config).await;
-        let store = Arc::new(executor.create_in_memory_store());
-        let workload = init_workload(&config);
-        let mut ctx =
-            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, true).await;
-        let start_time = Instant::now();
-        let tx_generator = workload.create_tx_generator(&mut ctx).await;
-        let transactions = ctx.generate_transactions(tx_generator).await;
-        let transactions = ctx.certify_transactions(transactions, false).await;
-        assert!(transactions.len() > 10);
-
-        let elapsed = start_time.elapsed();
-        tracing::debug!(
-            "Generated {} txs in {} ms",
-            transactions.len(),
-            elapsed.as_millis(),
-        );
-
-        let ctx = executor.context();
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
             let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;

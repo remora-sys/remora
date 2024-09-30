@@ -4,15 +4,9 @@
 use std::{cmp::max, collections::HashMap, io::BufRead, net::SocketAddr, time::Duration};
 
 use prometheus::{
-    register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry,
-    register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry,
-    HistogramVec,
-    IntCounter,
-    IntCounterVec,
-    IntGaugeVec,
-    Registry,
+    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_vec_with_registry, HistogramVec,
+    IntCounter, IntCounterVec, IntGaugeVec, Registry,
 };
 use prometheus_parse::Scrape;
 use tokio::{task::JoinHandle, time::sleep};
