@@ -150,14 +150,21 @@ impl ImportExport for ValidatorConfig {}
 #[derive(Serialize, Deserialize, Clone)]
 pub enum WorkloadType {
     Transfers,
-    SharedObjects,
+    SharedObjects {
+        #[serde(default = "default_cont_level_for_shared_obj")]
+        txs_per_counter: usize,
+    },
+}
+
+fn default_cont_level_for_shared_obj() -> usize {
+    2
 }
 
 impl Debug for WorkloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkloadType::Transfers => write!(f, "transfers"),
-            WorkloadType::SharedObjects => write!(f, "shared objects"),
+            WorkloadType::SharedObjects { .. } => write!(f, "shared objects"),
         }
     }
 }

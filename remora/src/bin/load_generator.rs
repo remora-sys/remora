@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         WorkloadType::Transfers => {
             transactions = load_generator.initialize().await;
         }
-        WorkloadType::SharedObjects => {
+        WorkloadType::SharedObjects { .. } => {
             check_logs_for_shared_object(&benchmark_config).await;
             (_, transactions) = import_from_files(LOG_DIR.into());
         }

@@ -72,7 +72,9 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
             num_shared_objects: 0,
             nft_size: 32,
         },
-        WorkloadType::SharedObjects => WorkloadKind::Counter { txs_per_counter: 2 },
+        WorkloadType::SharedObjects { txs_per_counter } => WorkloadKind::Counter {
+            txs_per_counter: txs_per_counter as u64,
+        },
     };
 
     // Create genesis.
@@ -200,7 +202,7 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
-        if let WorkloadType::SharedObjects = config.workload.clone() {
+        if let WorkloadType::SharedObjects { .. } = config.workload.clone() {
             // check if such log exists, otherwise generate the log
             check_logs_for_shared_object(config).await;
         }
@@ -216,7 +218,7 @@ impl SuiExecutor {
     }
 
     pub async fn load_state_for_shared_objects(&self) {
-        if let WorkloadType::SharedObjects = self.workload_type {
+        if let WorkloadType::SharedObjects { .. } = self.workload_type {
             let working_directory = LOG_DIR;
             // import txs to assign shared-object versions
             let (_, read_txs) = import_from_files(working_directory.into());
@@ -326,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn shared_object_test_with_imported_file() {
         let config = BenchmarkParameters {
-            workload: WorkloadType::SharedObjects,
+            workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
             ..BenchmarkParameters::new_for_tests()
         };
 
