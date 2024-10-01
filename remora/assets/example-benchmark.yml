@@ -1,0 +1,6 @@
+load: 10000
+duration:
+  secs: 10
+  nanos: 0
+workload: !SharedObjects
+  txs_per_counter: 2

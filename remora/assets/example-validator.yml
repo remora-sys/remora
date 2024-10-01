@@ -1,0 +1,8 @@
+proxy_server_address: "127.0.0.1:8080"
+client_server_address: "127.0.0.1:8081"
+metrics_address: "127.0.0.1:9090"
+validator_parameters:
+  collocated_pre_executors:
+    primary: 1
+    proxy: 0
+parallel_proxy: true
