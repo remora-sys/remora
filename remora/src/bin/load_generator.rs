@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
-    executor::sui::{check_logs_for_shared_object, import_from_files, LOG_DIR},
+    executor::sui::{check_logs_for_shared_object, import_from_files},
     load_generator::{default_metrics_address, LoadGenerator},
     metrics::Metrics,
 };
@@ -54,8 +54,8 @@ async fn main() -> anyhow::Result<()> {
             transactions = load_generator.initialize().await;
         }
         WorkloadType::SharedObjects { .. } => {
-            check_logs_for_shared_object(&benchmark_config).await;
-            (_, transactions) = import_from_files(LOG_DIR.into());
+            let log_dir = check_logs_for_shared_object(&benchmark_config).await;
+            (_, transactions) = import_from_files(log_dir);
         }
     };
 
