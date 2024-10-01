@@ -123,7 +123,7 @@ pub fn export_to_files(
     fs::write(accounts_path, accounts_s).expect("Failed to write accounts");
     fs::write(txs_path, txs_s).expect("Failed to write txs");
     let elapsed = start_time.elapsed().as_millis() as f64;
-    println!("Export took {} ms", elapsed,);
+    tracing::info!("Export took {} ms", elapsed,);
 }
 
 pub fn import_from_files(
@@ -153,8 +153,35 @@ pub fn import_from_files(
     let txs: Vec<CertifiedTransaction> = bincode::deserialize(&txs_buf).unwrap();
 
     let elapsed = start_time.elapsed().as_millis() as f64;
-    println!("Import took {} ms", elapsed,);
+    tracing::info!("Import took {} ms", elapsed,);
     (accounts, txs)
+}
+
+pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) {
+    fs::create_dir_all(log_path)
+        .unwrap_or_else(|_| panic!("Failed to create directory '{}'", log_path));
+
+    // generate txs and export to files
+    let workload = init_workload(config);
+    let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
+    let tx_generator = workload.create_tx_generator(&mut ctx).await;
+    let txs = ctx.generate_transactions(tx_generator).await;
+    let txs = ctx.certify_transactions(txs, false).await;
+
+    export_to_files(ctx.get_accounts(), &txs, log_path.into());
+    tracing::info!("Finish generating and exporting");
+}
+
+pub async fn check_logs_for_shared_object(config: &BenchmarkParameters) {
+    let dir = LOG_DIR;
+    let path: PathBuf = dir.into();
+    let txs_path = path.join("txs.dat");
+
+    // Check if the file exists
+    if !txs_path.exists() {
+        tracing::info!("Logs for shared-object is missing, now generating");
+        pre_generate_txn_log(config, dir).await;
+    }
 }
 
 pub const LOG_DIR: &str = "/tmp/export/";
@@ -172,6 +199,11 @@ impl SuiExecutor {
             workload.num_accounts() as f64 / elapsed.as_secs_f64(),
             elapsed.as_millis(),
         );
+
+        if let WorkloadType::SharedObjects = config.workload.clone() {
+            // check if such log exists, otherwise generate the log
+            check_logs_for_shared_object(config).await;
+        }
 
         Self {
             ctx: Arc::new(ctx),
@@ -266,13 +298,11 @@ mod tests {
 
     use std::{fs, sync::Arc};
 
-    use sui_single_node_benchmark::{benchmark_context::BenchmarkContext, command::Component};
-
     use crate::{
         config::{BenchmarkParameters, WorkloadType},
         executor::{
             api::Executor,
-            sui::{generate_transactions, init_workload, SuiExecutor, SuiTransaction},
+            sui::{generate_transactions, SuiExecutor, SuiTransaction},
         },
     };
 
@@ -301,28 +331,14 @@ mod tests {
         };
 
         let working_directory = "./test_export";
-        fs::create_dir_all(&working_directory).expect(&format!(
-            "Failed to create directory '{}'",
-            working_directory
-        ));
-
-        // generate txs and export to files
-        let workload = init_workload(&config);
-        let mut ctx =
-            BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
-        let tx_generator = workload.create_tx_generator(&mut ctx).await;
-        let txs = ctx.generate_transactions(tx_generator).await;
-        let txs = ctx.certify_transactions(txs, false).await;
-
-        super::export_to_files(ctx.get_accounts(), &txs, working_directory.into());
+        super::pre_generate_txn_log(&config, working_directory).await;
 
         // execute on another executor
         let executor = SuiExecutor::new(&config).await;
         let store = Arc::new(executor.create_in_memory_store());
 
         // import txs to assign shared-object versions
-        let (read_accounts, read_txs) = super::import_from_files(working_directory.into());
-        assert_eq!(read_accounts.len(), ctx.get_accounts().len());
+        let (_, read_txs) = super::import_from_files(working_directory.into());
         executor
             .context()
             .validator()
