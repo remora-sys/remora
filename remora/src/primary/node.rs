@@ -55,16 +55,6 @@ impl PrimaryNode {
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
-        // Boot the client transactions server. This component receives client transactions from the
-        // the network and forwards them to the load balancer.
-        let transactions_network_handle = NetworkServer::new(
-            config.client_server_address,
-            tx_client_connections,
-            tx_client_transactions,
-        )
-        .spawn();
-        network_handles.push(transactions_network_handle);
-
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::new(
             rx_client_transactions,
@@ -129,6 +119,16 @@ impl PrimaryNode {
         let primary_handle =
             PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
         primary_handles.push(primary_handle);
+
+        // Boot the client transactions server. This component receives client transactions from the
+        // the network and forwards them to the load balancer.
+        let transactions_network_handle = NetworkServer::new(
+            config.client_server_address,
+            tx_client_connections,
+            tx_client_transactions,
+        )
+        .spawn();
+        network_handles.push(transactions_network_handle);
 
         Self {
             primary_handles,
