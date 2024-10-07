@@ -5,7 +5,7 @@ use std::{io, net::SocketAddr, time::Duration};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
-    net::TcpSocket,
+    net::{TcpSocket, TcpStream},
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
     time::sleep,
@@ -76,5 +76,42 @@ where
         O: 'static,
     {
         tokio::spawn(async move { self.run().await })
+    }
+
+    /// Attempt to connect to the server.
+    /// This returns the connection stream if successful, or an error if the connection fails.
+    pub async fn connect(&self) -> io::Result<TcpStream> {
+        tracing::info!("Trying to connect to server {}", self.server_address);
+
+        let stream = loop {
+            let socket: TcpSocket = if self.server_address.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+
+            match socket.connect(self.server_address).await {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    tracing::info!("Failed to connect to server (retrying): {e}");
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+
+        tracing::info!("Connected to {}", self.server_address);
+        Ok(stream)
+    }
+
+    pub fn spawn_after_connect(self, stream: TcpStream) -> JoinHandle<io::Result<()>>
+    where
+        I: 'static,
+        O: 'static,
+    {
+        tokio::spawn(async move {
+            let worker = ConnectionWorker::new(stream, self.tx_incoming, self.rx_outgoing);
+            worker.run().await;
+            Ok(())
+        })
     }
 }

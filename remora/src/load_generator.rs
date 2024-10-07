@@ -27,8 +27,8 @@ use crate::{
 pub struct LoadGenerator {
     /// The benchmark configurations.
     config: BenchmarkParameters,
-    /// A best effort network sender.
-    sender: Sender<SuiTransaction>,
+    /// The target socket address.
+    target: SocketAddr,
     /// Metrics for the load generator.
     metrics: Metrics,
 }
@@ -36,16 +36,9 @@ pub struct LoadGenerator {
 impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr, metrics: Metrics) -> Self {
-        // Spawn the network client.
-        // TODO: Move this into the run function and call it after initializing the load generator.
-        let (tx_unused, _rx_unused) = mpsc::channel(1);
-        let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
-        let _client_handle =
-            NetworkClient::<(), _>::new(target, tx_unused, rx_transactions).spawn();
-
         LoadGenerator {
             config,
-            sender: tx_transactions,
+            target,
             metrics,
         }
     }
@@ -62,6 +55,7 @@ impl LoadGenerator {
         load: u64,
         precision: u64,
         burst_duration: Duration,
+        sender: Sender<SuiTransaction>,
     ) {
         let mut interval = interval(burst_duration);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -78,10 +72,7 @@ impl LoadGenerator {
             let timestamp = Metrics::now().as_secs_f64();
             for tx in chunk {
                 let full_tx = TransactionWithTimestamp::new(tx, timestamp);
-                self.sender
-                    .send(full_tx)
-                    .await
-                    .expect("Cannot send transaction");
+                sender.send(full_tx).await.expect("Cannot send transaction");
             }
 
             if now.elapsed() > burst_duration {
@@ -94,7 +85,26 @@ impl LoadGenerator {
         }
     }
 
+    async fn connect_and_spawn_network_client(&mut self) -> mpsc::Sender<SuiTransaction> {
+        let (tx_unused, _rx_unused) = mpsc::channel(1);
+        let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
+        let client = NetworkClient::<(), _>::new(self.target, tx_unused, rx_transactions);
+
+        match client.connect().await {
+            Ok(stream) => {
+                client.spawn_after_connect(stream);
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect to server: {}", e);
+            }
+        }
+
+        tx_transactions
+    }
+
     pub async fn run(&mut self, transactions: Vec<CertifiedTransaction>) {
+        let tx_transactions = self.connect_and_spawn_network_client().await;
+
         let warm_up_load = 2_000;
         let real_load = self.config.load;
 
@@ -106,10 +116,11 @@ impl LoadGenerator {
                 real_load,
                 warm_up_load
             );
-            self.real_run(transactions).await;
+            self.real_run(transactions, tx_transactions).await;
         } else {
             tracing::info!("Starting warm-up and real run phases...");
-            self.warm_up_and_real_run(transactions, warm_up_load).await;
+            self.warm_up_and_real_run(transactions, warm_up_load, tx_transactions)
+                .await;
         }
     }
 
@@ -117,6 +128,7 @@ impl LoadGenerator {
         &mut self,
         transactions: Vec<CertifiedTransaction>,
         warm_up_load: u64,
+        sender: Sender<SuiTransaction>,
     ) {
         let warm_up_duration = Duration::from_secs(1);
 
@@ -145,23 +157,28 @@ impl LoadGenerator {
             warm_up_load,
             warm_up_precision,
             warm_up_burst_duration,
+            sender.clone(),
         );
 
         // Use a timeout to limit the warm-up phase duration
         let _ = tokio::time::timeout(warm_up_duration, warm_up_future).await;
 
         // After warm-up, proceed to the real run
-        self.real_run(remaining_transactions.to_vec()).await;
+        self.real_run(remaining_transactions.to_vec(), sender).await;
     }
 
-    async fn real_run(&mut self, transactions: Vec<CertifiedTransaction>) {
+    async fn real_run(
+        &mut self,
+        transactions: Vec<CertifiedTransaction>,
+        sender: Sender<SuiTransaction>,
+    ) {
         let real_load = self.config.load;
         tracing::info!("Starting real run at {} load...", real_load);
 
         let precision = if real_load > 1_000 { 20 } else { 1 };
         let burst_duration = Duration::from_millis(1_000 / precision);
 
-        self.submit_transactions(transactions, real_load, precision, burst_duration)
+        self.submit_transactions(transactions, real_load, precision, burst_duration, sender)
             .await;
     }
 }
