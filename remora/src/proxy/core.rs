@@ -141,16 +141,35 @@ impl<E: Executor> ProxyCore<E> {
                             prior_notify.notified().await;
                         }
 
-                        let execution_result = E::execute(ctx, store, &transaction).await;
-
-                        for notify in current_handles {
-                            notify.notify_one();
+                        // check the version ID for shared objects
+                        // skip if versions don't match
+                        let mut ready_to_execute = true;
+                        if transaction.input_objects().iter().any(|input_object| {
+                            matches!(
+                                input_object,
+                                InputObjectKind::SharedMoveObject {
+                                    id: _,
+                                    initial_shared_version: _,
+                                    mutable: _,
+                                }
+                            )
+                        }) && !E::pre_execute_check(ctx.clone(), store.clone(), &transaction)
+                        {
+                            ready_to_execute = false;
                         }
 
-                        tx_results
-                            .send(execution_result)
-                            .await
-                            .map_err(|_| NodeError::ShuttingDown)?;
+                        if ready_to_execute {
+                            let execution_result = E::execute(ctx, store, &transaction).await;
+
+                            for notify in current_handles {
+                                notify.notify_one();
+                            }
+
+                            tx_results
+                                .send(execution_result)
+                                .await
+                                .map_err(|_| NodeError::ShuttingDown)?;
+                        }
                         metrics.decrease_proxy_load(&id);
                         Ok::<_, NodeError>(())
                     });

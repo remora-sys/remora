@@ -118,6 +118,13 @@ pub trait Executor {
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::ExecutionResults>> + Send;
+
+    /// Check version ID check prior to execution
+    fn pre_execute_check(
+        ctx: Arc<BenchmarkContext>,
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool;
 }
 
 /// Short for a transaction with a timestamp.

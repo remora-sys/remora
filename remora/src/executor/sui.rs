@@ -321,6 +321,20 @@ impl Executor for SuiExecutor {
 
         SuiExecutionResults::new(effects, written)
     }
+
+    fn pre_execute_check(
+        ctx: Arc<BenchmarkContext>,
+        store: Arc<Self::Store>,
+        transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        let input_objects = transaction.transaction_data().input_objects().unwrap();
+        let validator = ctx.validator();
+        let epoch_store = validator.get_epoch_store();
+
+        store
+            .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

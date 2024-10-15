@@ -99,7 +99,7 @@ impl<E: Executor> PrimaryCore<E> {
             }
         }
 
-        tracing::trace!("Re-executing transaction");
+        tracing::info!("Re-executing transaction");
         let ctx = self.executor.context();
         E::execute(ctx, self.store.clone(), transaction).await
     }
