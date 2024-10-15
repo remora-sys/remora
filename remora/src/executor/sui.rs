@@ -213,7 +213,7 @@ pub async fn check_logs_for_shared_object(config: &BenchmarkParameters) -> PathB
     workload_path
 }
 
-pub const LOG_DIR: &str = "/tmp/export/";
+pub const LOG_DIR: &str = "/tmp/";
 
 impl SuiExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
