@@ -56,7 +56,7 @@ impl PrimaryNode {
         let mut network_handles = Vec::new();
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
-        let load_balancer_handle = LoadBalancer::new(
+        let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
             rx_client_transactions,
             tx_forwarded_load,
             rx_proxy_connections,
