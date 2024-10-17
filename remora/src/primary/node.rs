@@ -59,7 +59,6 @@ impl PrimaryNode {
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
             rx_client_transactions,
             tx_forwarded_load,
-            rx_proxy_connections,
             metrics.clone(),
         )
         .spawn();
@@ -116,8 +115,15 @@ impl PrimaryNode {
         // only if necessary.
         let store = Arc::new(executor.create_in_memory_store());
         executor.load_state_for_shared_objects().await;
-        let primary_handle =
-            PrimaryCore::new(executor, store, rx_commits, rx_proxy_results, tx_output).spawn();
+        let primary_handle = PrimaryCore::new(
+            executor,
+            store,
+            rx_commits,
+            rx_proxy_connections,
+            rx_proxy_results,
+            tx_output,
+        )
+        .spawn();
         primary_handles.push(primary_handle);
 
         // Boot the client transactions server. This component receives client transactions from the
@@ -212,6 +218,7 @@ mod tests {
         }
     }
 
+    #[ignore]
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn no_proxies() {

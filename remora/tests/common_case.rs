@@ -44,7 +44,7 @@ async fn remote_proxy() {
 
     // Start a remote proxy.
     let proxy_id = 0.to_string();
-    let _proxy = ProxyNode::start(proxy_id, executor, &validator_config, validator_metrics);
+    let _proxy = ProxyNode::start(proxy_id, executor, &validator_config, validator_metrics).await;
     tokio::task::yield_now().await;
 
     // Generate transactions.
