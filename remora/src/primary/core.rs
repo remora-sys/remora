@@ -182,8 +182,9 @@ impl<E: Executor> PrimaryCore<E> {
             Some(commit) = self.rx_commits.recv() => {
                 tracing::debug!("Received commit");
                 for transaction in commit {
-                    // Determine proxy_index based on shared object or round-robin.
+                    // forward to proxies if exist else to the local executor
                     if !self.proxy_connections.is_empty() {
+                        // Determine proxy_index based on shared object or round-robin.
                         let proxy_index = if self.check_shared_objects(transaction.deref()) {
                             // If a shared object is found, check the hashmap for proxy assignment
                             if let Some(&proxy_index) = self.get_proxy_for_shared_object(&transaction) {
@@ -216,9 +217,20 @@ impl<E: Executor> PrimaryCore<E> {
                                 self.proxy_connections.swap_remove(proxy_index);
                             }
                         }
+                        pending_txns.insert(*transaction.digest(), transaction.clone());
+                    } else {
+                        // use the local executor
+                        let ctx = self.executor.context();
+                        let txn_result = E::execute(ctx, self.store.clone(), &transaction).await;
+                        if self
+                            .tx_output
+                            .send((transaction.clone(), txn_result))
+                            .await
+                            .is_err()
+                            {
+                                tracing::warn!("Failed to output execution result, stopping primary executor");
+                            }
                     }
-                    // TODO: set a local execution engine if no proxy
-                    pending_txns.insert(*transaction.digest(), transaction.clone());
                 }
             }
 
