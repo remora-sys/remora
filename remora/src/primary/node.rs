@@ -86,7 +86,7 @@ impl PrimaryNode {
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let store = Arc::new(executor.create_in_memory_store());
             executor.load_state_for_shared_objects().await; // TODO: check if duplicated
-            let proxy_handle = ProxyCore::new(
+            ProxyCore::new(
                 proxy_id,
                 executor.clone(),
                 mode,
@@ -95,8 +95,7 @@ impl PrimaryNode {
                 tx_proxy_results.clone(),
                 metrics.clone(),
             )
-            .spawn();
-            primary_handles.push(proxy_handle);
+            .spawn_with_threads();
             tx_proxy_connections.send(tx).await.expect("Channel open");
         }
 

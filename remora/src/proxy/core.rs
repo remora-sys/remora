@@ -189,6 +189,31 @@ impl<E: Executor> ProxyCore<E> {
     {
         tokio::spawn(async move { self.run().await })
     }
+
+    pub fn spawn_with_threads(mut self)
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
+    {
+        let num_threads = num_cpus::get();
+
+        // spawn the custom runtime in a dedicated thread to ensure active
+        std::thread::spawn(move || {
+            // Build a custom Tokio runtime with the specified number of worker threads
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(num_threads)
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // Block on the runtime to keep it alive and process tasks
+            rt.block_on(async move {
+                let _ = self.run().await;
+            });
+        });
+    }
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ impl ProxyNode {
         config: &ValidatorConfig,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let mut core_handles = Vec::new();
+        let core_handles = Vec::new();
         let mut network_handles = Vec::new();
         let mode = match config.parallel_proxy {
             false => ProxyMode::SingleThreaded,
@@ -45,7 +45,7 @@ impl ProxyNode {
 
             let store = Arc::new(executor.create_in_memory_store());
             executor.load_state_for_shared_objects().await;
-            let core_handle = ProxyCore::new(
+            ProxyCore::new(
                 id,
                 executor.clone(),
                 mode,
@@ -54,8 +54,7 @@ impl ProxyNode {
                 tx_proxy_results,
                 metrics.clone(),
             )
-            .spawn();
-            core_handles.push(core_handle);
+            .spawn_with_threads();
 
             let network_handle = NetworkClient::new(
                 config.proxy_server_address,
