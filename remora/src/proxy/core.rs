@@ -190,7 +190,7 @@ impl<E: Executor> ProxyCore<E> {
         tokio::spawn(async move { self.run().await })
     }
 
-    pub fn spawn_with_threads(mut self)
+    pub fn spawn_with_threads(mut self) -> std::thread::JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
@@ -212,7 +212,8 @@ impl<E: Executor> ProxyCore<E> {
             rt.block_on(async move {
                 let _ = self.run().await;
             });
-        });
+            Ok::<_, NodeError>(())
+        })
     }
 }
 

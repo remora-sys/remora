@@ -100,7 +100,6 @@ async fn main() -> anyhow::Result<()> {
             ProxyNode::start(proxy_id, executor, &validator_config, metrics)
                 .await
                 .await_completion()
-                .await;
         }
     }
 

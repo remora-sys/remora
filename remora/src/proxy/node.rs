@@ -3,7 +3,6 @@
 
 use std::{io, sync::Arc};
 
-use futures::future::join_all;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::core::{ProxyCore, ProxyId, ProxyMode};
@@ -17,7 +16,7 @@ const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 pub struct ProxyNode {
     /// The handles for the core components.
-    core_handles: Vec<JoinHandle<NodeResult<()>>>,
+    core_handles: Vec<std::thread::JoinHandle<NodeResult<()>>>,
     /// The handle for the network client.
     _network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The  metrics for the proxy
@@ -31,7 +30,7 @@ impl ProxyNode {
         config: &ValidatorConfig,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let core_handles = Vec::new();
+        let mut core_handles = Vec::new();
         let mut network_handles = Vec::new();
         let mode = match config.parallel_proxy {
             false => ProxyMode::SingleThreaded,
@@ -45,7 +44,7 @@ impl ProxyNode {
 
             let store = Arc::new(executor.create_in_memory_store());
             executor.load_state_for_shared_objects().await;
-            ProxyCore::new(
+            let core_handle = ProxyCore::new(
                 id,
                 executor.clone(),
                 mode,
@@ -55,6 +54,7 @@ impl ProxyNode {
                 metrics.clone(),
             )
             .spawn_with_threads();
+            core_handles.push(core_handle);
 
             let network_handle = NetworkClient::new(
                 config.proxy_server_address,
@@ -73,7 +73,12 @@ impl ProxyNode {
     }
 
     /// Collect the results from the validator.
-    pub async fn await_completion(self) {
-        join_all(self.core_handles).await;
+    pub fn await_completion(self) {
+        for handle in self.core_handles {
+            match handle.join() {
+                Ok(_) => println!("Thread completed successfully!"),
+                Err(e) => println!("Thread panicked: {:?}", e),
+            }
+        }
     }
 }
