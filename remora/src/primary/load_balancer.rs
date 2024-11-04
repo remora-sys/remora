@@ -1,17 +1,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
-use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    task::JoinHandle,
-};
+use dashmap::DashMap;
+use rustc_hash::FxHashMap;
+use std::{ops::Deref, sync::Arc};
 
 use crate::{
     error::{NodeError, NodeResult},
-    executor::api::{Executor, Transaction},
+    executor::api::{ExecutableTransaction, Executor, Transaction, TransactionWithTimestamp},
     metrics::Metrics,
+};
+use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task::JoinHandle,
 };
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
@@ -20,8 +22,20 @@ pub struct LoadBalancer<E: Executor> {
     rx_transactions: Receiver<Transaction<E>>,
     /// The sender to forward transactions to the consensus.
     tx_consensus: Sender<Transaction<E>>,
+    /// Receive handles to forward transactions to proxies. When a new client connects,
+    /// this channel receives a sender from the network layer which is used to forward
+    /// transactions to the proxies.
+    rx_proxy_connections: Receiver<Sender<Transaction<E>>>,
+    /// Holds senders to forward transactions to proxies.
+    proxy_connections: Vec<Sender<Transaction<E>>>,
+    /// The receiver for committed transactions
+    rx_committed_txns: Receiver<Transaction<E>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: usize,
+    /// Keeps track of shared-objects and its shards (proxy)
+    shared_object_shards: FxHashMap<ObjectID, usize>,
+    /// The transactions sent out to proxies
+    pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -31,18 +45,26 @@ impl<E: Executor> LoadBalancer<E> {
     pub fn new(
         rx_transactions: Receiver<Transaction<E>>,
         tx_consensus: Sender<Transaction<E>>,
+        rx_proxy_connections: Receiver<Sender<Transaction<E>>>,
+        rx_committed_txns: Receiver<Transaction<E>>,
+        pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             rx_transactions,
             tx_consensus,
+            rx_proxy_connections,
+            proxy_connections: Vec::new(),
+            rx_committed_txns,
             index: 0,
+            shared_object_shards: FxHashMap::default(),
+            pending_txns,
             metrics,
         }
     }
 
-    /// Forward a transaction to the consensus and proxies.
-    async fn forward_transaction(&mut self, transaction: Transaction<E>) -> NodeResult<()> {
+    /// Forward a transaction to the consensus.
+    async fn send_to_consensus(&mut self, transaction: Transaction<E>) -> NodeResult<()> {
         if self.index == 0 {
             self.metrics.register_start_time();
         }
@@ -56,16 +78,104 @@ impl<E: Executor> LoadBalancer<E> {
         Ok(())
     }
 
+    // TODO: a bit verbose and duplicated
+    /// Helper to check if tx contains shared-objects
+    fn check_shared_objects(&self, transaction: &E::Transaction) -> bool {
+        transaction.input_objects().iter().any(|input_object| {
+            matches!(
+                input_object,
+                InputObjectKind::SharedMoveObject {
+                    id: _,
+                    initial_shared_version: _,
+                    mutable: _
+                }
+            )
+        })
+    }
+
+    /// Helper function to get proxy for a shared object (if it exists).
+    fn get_proxy_for_shared_object(&self, transaction: &E::Transaction) -> Option<&usize> {
+        transaction.input_objects().iter().find_map(|input_object| {
+            if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
+                self.shared_object_shards.get(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Helper function to assign a shared object to a proxy and update the map.
+    fn assign_shared_object_to_proxy(&mut self, transaction: &E::Transaction, proxy_index: usize) {
+        if let Some(shared_object_id) =
+            transaction.input_objects().iter().find_map(|input_object| {
+                if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+        {
+            self.shared_object_shards
+                .insert(shared_object_id, proxy_index);
+        }
+    }
+
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
         loop {
             tokio::select! {
-                Some(transaction) = self.rx_transactions.recv() => self
-                    .forward_transaction(transaction)
+                Some(connection) = self.rx_proxy_connections.recv() => {
+                    self.proxy_connections.push(connection);
+                    tracing::info!("Added a new proxy connection");
+                }
+                Some(transaction) = self.rx_transactions.recv() =>
+                    self
+                    .send_to_consensus(transaction)
                     .await
                     .map_err(|_| NodeError::ShuttingDown)?,
-                                else => Err(NodeError::ShuttingDown)?
+                Some(transaction) = self.rx_committed_txns.recv() => {
+                    // forward to proxies if exist else to the local executor
+                    if !self.proxy_connections.is_empty() {
+                        // Determine proxy_index based on shared object or round-robin.
+                        let proxy_index = if self.check_shared_objects(transaction.deref()) {
+                            // If a shared object is found, check the hashmap for proxy assignment
+                            if let Some(&proxy_index) = self.get_proxy_for_shared_object(&transaction) {
+                                proxy_index
+                            } else {
+                                // If no proxy is assigned to this shared object, assign one in a round-robin fashion
+                                let proxy_index = self.index % self.proxy_connections.len();
+                                self.assign_shared_object_to_proxy(&transaction, proxy_index);
+                                proxy_index
+                            }
+                        } else {
+                            // No shared object, use round-robin to select proxy
+                            self.index % self.proxy_connections.len()
+                        };
+
+                        self.pending_txns.insert(*transaction.digest(), transaction.clone());
+                        // Send the transaction to the selected proxy
+                        match self.proxy_connections[proxy_index]
+                            .send(transaction.clone())
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!("Sent transaction to proxy {}", proxy_index);
+                                self.index += 1;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Failed to send transaction to proxy {}, trying other proxies",
+                                    proxy_index
+                                );
+                                self.proxy_connections.swap_remove(proxy_index);
+                            }
+                        }
+                    } else {
+                        // send back to primary local executor
+                    }
+                }
+                else => Err(NodeError::ShuttingDown)?,
             }
         }
     }

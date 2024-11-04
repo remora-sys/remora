@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use dashmap::DashMap;
 use std::{io, sync::Arc};
 
 use tokio::{
@@ -12,11 +13,15 @@ use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::Mock
 use crate::{
     config::ValidatorConfig,
     error::NodeResult,
-    executor::sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
+    executor::{
+        api::Transaction,
+        sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
+    },
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
 };
+use sui_types::digests::TransactionDigest;
 
 /// Default channel size for communication between components.
 const DEFAULT_CHANNEL_SIZE: usize = 1000;
@@ -50,15 +55,22 @@ impl PrimaryNode {
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
+        let pending_txns: Arc<DashMap<TransactionDigest, Transaction<SuiExecutor>>> =
+            Arc::new(DashMap::new());
+
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
             rx_client_transactions,
             tx_forwarded_load,
+            rx_proxy_connections,
+            rx_committed_txns,
+            pending_txns.clone(),
             metrics.clone(),
         )
         .spawn();
@@ -118,9 +130,10 @@ impl PrimaryNode {
             executor,
             store,
             rx_commits,
-            rx_proxy_connections,
             rx_proxy_results,
             tx_output,
+            pending_txns,
+            tx_committed_txns,
         )
         .spawn();
         primary_handles.push(primary_handle);
