@@ -40,6 +40,8 @@ pub struct PrimaryCore<E: Executor> {
     pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
     /// The sender to load balancer.
     tx_committed_txns: Sender<Transaction<E>>,
+    /// The receiver to a local executor if no pre-executor is available.
+    rx_executor_backup: Receiver<Transaction<E>>,
 }
 
 impl<E: Executor> PrimaryCore<E> {
@@ -52,6 +54,7 @@ impl<E: Executor> PrimaryCore<E> {
         tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
         pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
         tx_committed_txns: Sender<Transaction<E>>,
+        rx_executor_backup: Receiver<Transaction<E>>,
     ) -> Self {
         Self {
             executor,
@@ -61,6 +64,7 @@ impl<E: Executor> PrimaryCore<E> {
             tx_output,
             pending_txns,
             tx_committed_txns,
+            rx_executor_backup,
         }
     }
 
@@ -122,39 +126,48 @@ impl<E: Executor> PrimaryCore<E> {
         }
     }
 
+    async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>) {
+        // use the local executor
+        let ctx = self.executor.context();
+        let txn_result = E::execute(ctx, self.store.clone(), &transaction).await;
+        if self
+            .tx_output
+            .send((transaction.clone(), txn_result))
+            .await
+            .is_err()
+        {
+            tracing::warn!("Failed to output execution result, stopping primary executor");
+        }
+    }
+
     /// Run the primary executor.
     pub async fn run(&mut self) -> NodeResult<()> {
         loop {
             tokio::select! {
-            // Receive a commit from the consensus.
-            Some(commit) = self.rx_commits.recv() => {
-                tracing::debug!("Received commit");
-                for transaction in commit {
-                    // send to the load balancer
-                    if self.tx_committed_txns.send(transaction.clone()).await.is_err() {
-                        // use the local executor
-                        let ctx = self.executor.context();
-                        let txn_result = E::execute(ctx, self.store.clone(), &transaction).await;
-                        if self
-                            .tx_output
-                            .send((transaction.clone(), txn_result))
-                            .await
-                            .is_err()
-                            {
-                                tracing::warn!("Failed to output execution result, stopping primary executor");
-                            }
+                // Receive a commit from the consensus.
+                Some(commit) = self.rx_commits.recv() => {
+                    tracing::debug!("Received commit");
+                    for transaction in commit {
+                        // send to the load balancer
+                        if self.tx_committed_txns.send(transaction.clone()).await.is_err() {
+                            self.local_execute(transaction).await;
                         }
                     }
-            }
+                }
 
-            // Receive a execution result from a proxy.
-            Some(proxy_result) = self.rx_proxies.recv() => {
-                tracing::debug!("Received proxy result");
-                self.check_and_apply_proxy_results(self.pending_txns.clone(), proxy_result).await;
-            }
+                // Receive a execution result from a proxy.
+                Some(proxy_result) = self.rx_proxies.recv() => {
+                    tracing::debug!("Received proxy result");
+                    self.check_and_apply_proxy_results(self.pending_txns.clone(), proxy_result).await;
+                }
 
-            // The channel is closed.
-            else => Err(NodeError::ShuttingDown)?
+                Some(transaction) = self.rx_executor_backup.recv() => {
+                    tracing::debug!("Received transaction for local execution");
+                    self.local_execute(transaction).await;
+                }
+
+                // The channel is closed.
+                else => Err(NodeError::ShuttingDown)?
             }
         }
     }

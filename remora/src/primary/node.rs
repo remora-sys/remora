@@ -57,6 +57,7 @@ impl PrimaryNode {
         let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_executor_backup, rx_executor_backup) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
@@ -71,6 +72,7 @@ impl PrimaryNode {
             rx_proxy_connections,
             rx_committed_txns,
             pending_txns.clone(),
+            tx_executor_backup,
             metrics.clone(),
         )
         .spawn();
@@ -134,6 +136,7 @@ impl PrimaryNode {
             tx_output,
             pending_txns,
             tx_committed_txns,
+            rx_executor_backup,
         )
         .spawn();
         primary_handles.push(primary_handle);

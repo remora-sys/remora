@@ -36,6 +36,8 @@ pub struct LoadBalancer<E: Executor> {
     shared_object_shards: FxHashMap<ObjectID, usize>,
     /// The transactions sent out to proxies
     pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+    /// The sender to a local executor if no pre-executor is available.
+    tx_executor_backup: Sender<Transaction<E>>,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -48,6 +50,7 @@ impl<E: Executor> LoadBalancer<E> {
         rx_proxy_connections: Receiver<Sender<Transaction<E>>>,
         rx_committed_txns: Receiver<Transaction<E>>,
         pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+        tx_executor_backup: Sender<Transaction<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -59,6 +62,7 @@ impl<E: Executor> LoadBalancer<E> {
             index: 0,
             shared_object_shards: FxHashMap::default(),
             pending_txns,
+            tx_executor_backup,
             metrics,
         }
     }
@@ -173,6 +177,9 @@ impl<E: Executor> LoadBalancer<E> {
                         }
                     } else {
                         // send back to primary local executor
+                        if self.tx_executor_backup.send(transaction.clone()).await.is_err() {
+                            tracing::warn!("Failed to send transaction to the local executor");
+                        }
                     }
                 }
                 else => Err(NodeError::ShuttingDown)?,
