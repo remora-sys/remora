@@ -143,20 +143,17 @@ impl<E: Executor> ProxyCore<E> {
 
                         // check the version ID for shared objects
                         // skip if versions don't match
-                        let mut ready_to_execute = true;
-                        if transaction.input_objects().iter().any(|input_object| {
-                            matches!(
-                                input_object,
-                                InputObjectKind::SharedMoveObject {
-                                    id: _,
-                                    initial_shared_version: _,
-                                    mutable: _,
-                                }
-                            )
-                        }) && !E::pre_execute_check(ctx.clone(), store.clone(), &transaction)
-                        {
-                            ready_to_execute = false;
-                        }
+                        let ready_to_execute =
+                            !transaction.input_objects().iter().any(|input_object| {
+                                matches!(
+                                    input_object,
+                                    InputObjectKind::SharedMoveObject {
+                                        id: _,
+                                        initial_shared_version: _,
+                                        mutable: _,
+                                    }
+                                )
+                            }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
                         if ready_to_execute {
                             let execution_result = E::execute(ctx, store, &transaction).await;
