@@ -1,19 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use dashmap::DashMap;
-use rustc_hash::FxHashMap;
-use std::{ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
-use crate::{
-    error::{NodeError, NodeResult},
-    executor::api::{ExecutableTransaction, Executor, Transaction, TransactionWithTimestamp},
-    metrics::Metrics,
-};
-use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
+use rustc_hash::FxHashMap;
+use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
+};
+
+use crate::{
+    error::{NodeError, NodeResult},
+    executor::api::{
+        ExecutableTransaction,
+        ExecutionResults,
+        Executor,
+        NewStates,
+        PrimaryToProxyMessage,
+        Transaction,
+    },
+    metrics::Metrics,
+    primary::core::PendingTransactions,
 };
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
@@ -25,9 +33,9 @@ pub struct LoadBalancer<E: Executor> {
     /// Receive handles to forward transactions to proxies. When a new client connects,
     /// this channel receives a sender from the network layer which is used to forward
     /// transactions to the proxies.
-    rx_proxy_connections: Receiver<Sender<Transaction<E>>>,
+    rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
     /// Holds senders to forward transactions to proxies.
-    proxy_connections: Vec<Sender<Transaction<E>>>,
+    proxy_connections: Vec<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Transaction<E>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
@@ -35,9 +43,11 @@ pub struct LoadBalancer<E: Executor> {
     /// Keeps track of shared-objects and its shards (proxy)
     shared_object_shards: FxHashMap<ObjectID, usize>,
     /// The transactions sent out to proxies
-    pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+    pending_txns: PendingTransactions<E>,
     /// The sender to a local executor if no pre-executor is available.
     tx_executor_backup: Sender<Transaction<E>>,
+    /// The receiver of new effects from local executor and needs to forward to proxies.
+    rx_states_sync: Receiver<ExecutionResults<E>>,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -47,10 +57,11 @@ impl<E: Executor> LoadBalancer<E> {
     pub fn new(
         rx_transactions: Receiver<Transaction<E>>,
         tx_consensus: Sender<Transaction<E>>,
-        rx_proxy_connections: Receiver<Sender<Transaction<E>>>,
+        rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<Transaction<E>>,
-        pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+        pending_txns: PendingTransactions<E>,
         tx_executor_backup: Sender<Transaction<E>>,
+        rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -63,6 +74,7 @@ impl<E: Executor> LoadBalancer<E> {
             shared_object_shards: FxHashMap::default(),
             pending_txns,
             tx_executor_backup,
+            rx_states_sync,
             metrics,
         }
     }
@@ -124,6 +136,30 @@ impl<E: Executor> LoadBalancer<E> {
         }
     }
 
+    /// Prepare state updates based on sharding
+    fn prepare_state_updates(
+        &mut self,
+        execution_result: ExecutionResults<E>,
+    ) -> FxHashMap<usize, NewStates> {
+        // HashMap to hold the updates for each executor
+        let mut updates_by_executor: FxHashMap<usize, NewStates> = FxHashMap::default();
+
+        for (object_id, object) in execution_result.new_state {
+            // Determine the target executor for this object
+            if let Some(&executor_id) = self.shared_object_shards.get(&object_id) {
+                // Get or create the BTreeMap for this executor
+                let entry = updates_by_executor
+                    .entry(executor_id)
+                    .or_insert_with(BTreeMap::new);
+                entry.insert(object_id, object);
+            } else {
+                eprintln!("Warning: No executor found for ObjectID {}", object_id);
+            }
+        }
+
+        updates_by_executor
+    }
+
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
@@ -133,11 +169,13 @@ impl<E: Executor> LoadBalancer<E> {
                     self.proxy_connections.push(connection);
                     tracing::info!("Added a new proxy connection");
                 }
+
                 Some(transaction) = self.rx_transactions.recv() =>
                     self
                     .send_to_consensus(transaction)
                     .await
                     .map_err(|_| NodeError::ShuttingDown)?,
+
                 Some(transaction) = self.rx_committed_txns.recv() => {
                     // forward to proxies if exist else to the local executor
                     if !self.proxy_connections.is_empty() {
@@ -157,10 +195,10 @@ impl<E: Executor> LoadBalancer<E> {
                             self.index % self.proxy_connections.len()
                         };
 
-                        self.pending_txns.insert(*transaction.digest(), transaction.clone());
+                        self.pending_txns.insert(*transaction.digest(), (proxy_index, transaction.clone()));
                         // Send the transaction to the selected proxy
                         match self.proxy_connections[proxy_index]
-                            .send(transaction.clone())
+                            .send(PrimaryToProxyMessage::Txn(transaction.clone()))
                             .await
                         {
                             Ok(()) => {
@@ -182,6 +220,24 @@ impl<E: Executor> LoadBalancer<E> {
                         }
                     }
                 }
+
+                Some(result) = self.rx_states_sync.recv() => {
+                    // send states updates to the proxy
+                    let states_updates = self.prepare_state_updates(result);
+                    for (proxy_index, update) in states_updates {
+                        match self.proxy_connections[proxy_index].send(PrimaryToProxyMessage::States(update)).await {
+                            Ok(()) => {
+                                tracing::debug!("Sent updates to proxy {}", proxy_index);
+                            }
+                            Err(_) => {
+                                tracing::warn!("Failed to send states to proxy {}", proxy_index);
+                                // TODO
+                                // self.proxy_connections.swap_remove(proxy_index);
+                            }
+                        }
+                    }
+                }
+
                 else => Err(NodeError::ShuttingDown)?,
             }
         }
@@ -192,6 +248,7 @@ impl<E: Executor> LoadBalancer<E> {
     where
         E: Send + 'static,
         Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send,
     {
         tokio::spawn(async move { self.run().await })
     }

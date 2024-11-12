@@ -18,10 +18,27 @@ use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, StateStore, Store, Transaction,
+        ExecutableTransaction,
+        ExecutionResults,
+        Executor,
+        StateStore,
+        Store,
+        Transaction,
         TransactionWithTimestamp,
     },
 };
+
+pub type ExecutorIndex = usize;
+
+pub type PendingTransactions<E> = Arc<
+    DashMap<
+        TransactionDigest,
+        (
+            ExecutorIndex,
+            TransactionWithTimestamp<<E as Executor>::Transaction>,
+        ),
+    >,
+>;
 
 /// The primary executor is responsible for executing transactions and merging the results
 /// from the proxies.
@@ -37,11 +54,13 @@ pub struct PrimaryCore<E: Executor> {
     /// Output channel for the final results.
     tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
     /// The transactions sent out to proxies
-    pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+    pending_txns: PendingTransactions<E>,
     /// The sender to load balancer.
     tx_committed_txns: Sender<Transaction<E>>,
     /// The receiver to a local executor if no pre-executor is available.
     rx_executor_backup: Receiver<Transaction<E>>,
+    /// The sender to sync updates to proxy via load-balancer.
+    tx_states_sync: Sender<ExecutionResults<E>>,
 }
 
 impl<E: Executor> PrimaryCore<E> {
@@ -52,9 +71,10 @@ impl<E: Executor> PrimaryCore<E> {
         rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
         tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
-        pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+        pending_txns: PendingTransactions<E>,
         tx_committed_txns: Sender<Transaction<E>>,
         rx_executor_backup: Receiver<Transaction<E>>,
+        tx_states_sync: Sender<ExecutionResults<E>>,
     ) -> Self {
         Self {
             executor,
@@ -65,6 +85,7 @@ impl<E: Executor> PrimaryCore<E> {
             pending_txns,
             tx_committed_txns,
             rx_executor_backup,
+            tx_states_sync,
         }
     }
 
@@ -87,11 +108,12 @@ impl<E: Executor> PrimaryCore<E> {
 
     pub async fn check_and_apply_proxy_results(
         &mut self,
-        pending_txns: Arc<DashMap<TransactionDigest, TransactionWithTimestamp<E::Transaction>>>,
+        pending_txns: PendingTransactions<E>,
         proxy_result: ExecutionResults<E>,
     ) {
         let mut skip = true;
-        if let Some((_, transaction)) = pending_txns.remove(proxy_result.transaction_digest()) {
+        if let Some((_, (_, transaction))) = pending_txns.remove(proxy_result.transaction_digest())
+        {
             let initial_state = self.get_input_objects(&transaction);
             for (id, vid) in &proxy_result.modified_at_versions() {
                 let (_, v, _) = initial_state
@@ -126,18 +148,23 @@ impl<E: Executor> PrimaryCore<E> {
         }
     }
 
-    async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>) {
+    async fn local_execute(
+        &mut self,
+        transaction: TransactionWithTimestamp<E::Transaction>,
+    ) -> ExecutionResults<E> {
         // use the local executor
         let ctx = self.executor.context();
         let txn_result = E::execute(ctx, self.store.clone(), &transaction).await;
         if self
             .tx_output
-            .send((transaction.clone(), txn_result))
+            .send((transaction.clone(), txn_result.clone()))
             .await
             .is_err()
         {
             tracing::warn!("Failed to output execution result, stopping primary executor");
         }
+
+        txn_result
     }
 
     /// Run the primary executor.
@@ -163,7 +190,10 @@ impl<E: Executor> PrimaryCore<E> {
 
                 Some(transaction) = self.rx_executor_backup.recv() => {
                     tracing::debug!("Received transaction for local execution");
-                    self.local_execute(transaction).await;
+                    let effects = self.local_execute(transaction).await;
+                    if self.tx_states_sync.send(effects).await.is_err() {
+                        tracing::warn!("Failed to send execution results of local executor to load balancer");
+                    }
                 }
 
                 // The channel is closed.

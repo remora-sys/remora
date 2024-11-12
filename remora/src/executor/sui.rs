@@ -49,6 +49,9 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
     fn commit_objects(&self, updates: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
         self.commit_effects(updates, new_state);
     }
+    fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>) {
+        self.commit_new_objects(new_state);
+    }
 }
 
 #[derive(Clone)]

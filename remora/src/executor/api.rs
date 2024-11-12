@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sui_single_node_benchmark::benchmark_context::BenchmarkContext;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
@@ -98,12 +98,13 @@ impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndEffects<U> {
 pub trait StateStore<U>: BackingStore {
     /// Commit the objects to the store.
     fn commit_objects(&self, updates: U, new_state: BTreeMap<ObjectID, Object>);
+    fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>);
 }
 
 /// The executor is responsible for executing transactions and generating new transactions.
-pub trait Executor {
+pub trait Executor: Clone {
     /// The type of transaction to execute.
-    type Transaction: Clone + ExecutableTransaction;
+    type Transaction: Clone + ExecutableTransaction + Serialize + DeserializeOwned;
     /// The type of results from executing a transaction.
     type ExecutionResults: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
@@ -135,3 +136,14 @@ pub type ExecutionResults<E> = ExecutionResultsAndEffects<<E as Executor>::Execu
 
 /// Short for the store used by the executor.
 pub type Store<E> = Arc<<E as Executor>::Store>;
+
+pub type NewStates = BTreeMap<ObjectID, Object>;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum PrimaryToProxyMessage<T>
+where
+    T: ExecutableTransaction + Clone,
+{
+    Txn(TransactionWithTimestamp<T>),
+    States(NewStates),
+}

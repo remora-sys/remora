@@ -1,27 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use dashmap::DashMap;
 use std::{io, sync::Arc};
 
+use dashmap::DashMap;
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 
-use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
+use super::{
+    core::{PendingTransactions, PrimaryCore},
+    load_balancer::LoadBalancer,
+    mock_consensus::MockConsensus,
+};
 use crate::{
     config::ValidatorConfig,
     error::NodeResult,
-    executor::{
-        api::Transaction,
-        sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
-    },
+    executor::sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
 };
-use sui_types::digests::TransactionDigest;
 
 /// Default channel size for communication between components.
 const DEFAULT_CHANNEL_SIZE: usize = 1000;
@@ -58,12 +58,12 @@ impl PrimaryNode {
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_executor_backup, rx_executor_backup) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_states_sync, rx_states_sync) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
-        let pending_txns: Arc<DashMap<TransactionDigest, Transaction<SuiExecutor>>> =
-            Arc::new(DashMap::new());
+        let pending_txns: PendingTransactions<SuiExecutor> = Arc::new(DashMap::new());
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
@@ -73,6 +73,7 @@ impl PrimaryNode {
             rx_committed_txns,
             pending_txns.clone(),
             tx_executor_backup,
+            rx_states_sync,
             metrics.clone(),
         )
         .spawn();
@@ -114,7 +115,7 @@ impl PrimaryNode {
         }
 
         // Boot another server handling connections from (additional) remote proxies. These remote
-        // proxies perform the same functions the the local proxies.
+        // proxies perform the same functions as the local proxies.
         let proxy_network_handle = NetworkServer::new(
             config.proxy_server_address,
             tx_proxy_connections,
@@ -137,6 +138,7 @@ impl PrimaryNode {
             pending_txns,
             tx_committed_txns,
             rx_executor_backup,
+            tx_states_sync,
         )
         .spawn();
         primary_handles.push(primary_handle);
@@ -192,7 +194,10 @@ mod tests {
 
     use crate::{
         config::{
-            BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters,
+            BenchmarkParameters,
+            CollocatedPreExecutors,
+            ValidatorConfig,
+            ValidatorParameters,
         },
         executor::sui::SuiExecutor,
         load_generator::LoadGenerator,

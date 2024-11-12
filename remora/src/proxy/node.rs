@@ -56,6 +56,7 @@ impl ProxyNode {
             .spawn_with_threads();
             core_handles.push(core_handle);
 
+            // communication for distributed transactions from the load balancer in the primary
             let network_handle = NetworkClient::new(
                 config.proxy_server_address,
                 tx_transactions,
