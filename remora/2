@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use sui_single_node_benchmark::benchmark_context::BenchmarkContext;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
@@ -102,9 +102,9 @@ pub trait StateStore<U>: BackingStore {
 }
 
 /// The executor is responsible for executing transactions and generating new transactions.
-pub trait Executor: Clone {
+pub trait Executor {
     /// The type of transaction to execute.
-    type Transaction: Clone + ExecutableTransaction + Serialize + DeserializeOwned;
+    type Transaction: Clone + ExecutableTransaction;
     /// The type of results from executing a transaction.
     type ExecutionResults: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
@@ -139,7 +139,7 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PrimaryToProxyMessage<T>
 where
     T: ExecutableTransaction + Clone,
@@ -147,5 +147,3 @@ where
     Txn(TransactionWithTimestamp<T>),
     States(NewStates),
 }
-
-pub type ExecutorIndex = usize;

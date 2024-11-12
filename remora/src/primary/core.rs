@@ -18,17 +18,10 @@ use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        StateStore,
-        Store,
-        Transaction,
-        TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, StateStore, Store,
+        Transaction, TransactionWithTimestamp,
     },
 };
-
-pub type ExecutorIndex = usize;
 
 pub type PendingTransactions<E> = Arc<
     DashMap<
@@ -182,12 +175,13 @@ impl<E: Executor> PrimaryCore<E> {
                     }
                 }
 
-                // Receive a execution result from a proxy.
+                // Receive an execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     tracing::debug!("Received proxy result");
                     self.check_and_apply_proxy_results(self.pending_txns.clone(), proxy_result).await;
                 }
 
+                // Receieve a transaction for local execution.
                 Some(transaction) = self.rx_executor_backup.recv() => {
                     tracing::debug!("Received transaction for local execution");
                     let effects = self.local_execute(transaction).await;

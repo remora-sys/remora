@@ -13,12 +13,8 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        NewStates,
-        PrimaryToProxyMessage,
-        Transaction,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
+        PrimaryToProxyMessage, Transaction,
     },
     metrics::Metrics,
     primary::core::PendingTransactions,
@@ -39,9 +35,9 @@ pub struct LoadBalancer<E: Executor> {
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Transaction<E>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
-    index: usize,
+    index: ExecutorIndex,
     /// Keeps track of shared-objects and its shards (proxy)
-    shared_object_shards: FxHashMap<ObjectID, usize>,
+    shared_object_shards: FxHashMap<ObjectID, ExecutorIndex>,
     /// The transactions sent out to proxies
     pending_txns: PendingTransactions<E>,
     /// The sender to a local executor if no pre-executor is available.
@@ -110,7 +106,7 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Helper function to get proxy for a shared object (if it exists).
-    fn get_proxy_for_shared_object(&self, transaction: &E::Transaction) -> Option<&usize> {
+    fn get_proxy_for_shared_object(&self, transaction: &E::Transaction) -> Option<&ExecutorIndex> {
         transaction.input_objects().iter().find_map(|input_object| {
             if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
                 self.shared_object_shards.get(id)
@@ -121,7 +117,11 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Helper function to assign a shared object to a proxy and update the map.
-    fn assign_shared_object_to_proxy(&mut self, transaction: &E::Transaction, proxy_index: usize) {
+    fn assign_shared_object_to_proxy(
+        &mut self,
+        transaction: &E::Transaction,
+        proxy_index: ExecutorIndex,
+    ) {
         if let Some(shared_object_id) =
             transaction.input_objects().iter().find_map(|input_object| {
                 if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
@@ -140,9 +140,9 @@ impl<E: Executor> LoadBalancer<E> {
     fn prepare_state_updates(
         &mut self,
         execution_result: ExecutionResults<E>,
-    ) -> FxHashMap<usize, NewStates> {
+    ) -> FxHashMap<ExecutorIndex, NewStates> {
         // HashMap to hold the updates for each executor
-        let mut updates_by_executor: FxHashMap<usize, NewStates> = FxHashMap::default();
+        let mut updates_by_executor: FxHashMap<ExecutorIndex, NewStates> = FxHashMap::default();
 
         for (object_id, object) in execution_result.new_state {
             // Determine the target executor for this object
