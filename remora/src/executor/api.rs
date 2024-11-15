@@ -10,7 +10,6 @@ use sui_types::{
     digests::TransactionDigest,
     effects::TransactionEffectsAPI,
     object::Object,
-    storage::BackingStore,
     transaction::InputObjectKind,
 };
 
@@ -122,7 +121,11 @@ where
     }
 }
 
-pub trait StateStore<U>: BackingStore {
+pub trait StateStore<U> {
+    fn read_object(
+        &self,
+        id: &ObjectID,
+    ) -> Result<Option<Object>, sui_types::storage::error::Error>;
     /// Commit the objects to the store.
     fn commit_objects(&self, updates: U, new_state: BTreeMap<ObjectID, Object>);
     fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>);

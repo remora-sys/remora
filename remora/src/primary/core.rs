@@ -9,10 +9,7 @@ use std::{
     },
 };
 
-use sui_types::{
-    base_types::{ObjectID, ObjectRef},
-    storage::ObjectStore,
-};
+use sui_types::base_types::{ObjectID, ObjectRef};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -25,10 +22,10 @@ use crate::{
         ExecutionResults,
         Executor,
         RemoraTransaction,
-        StateStore,
-        Store,
         Timestamp,
         TransactionWithTimestamp,
+        StateStore,
+        Store,
     },
 };
 
@@ -87,7 +84,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
             .iter()
             .map(|kind| {
                 store
-                    .get_object(&kind.object_id())
+                    .read_object(&kind.object_id())
                     .expect("Failed to read objects from store")
                     .map(|object| (object.id(), object.compute_object_reference()))
                     .expect("Input object not found") // TODO: Return error instead of panic

@@ -17,7 +17,8 @@ use sui_types::{
     digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
     object::Object,
-    transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
+    storage::ObjectStore,
+    transaction::{CheckedInputObjects, InputObjectKind, TransactionDataAPI, Transaction},
 };
 use tokio::time::Instant;
 
@@ -53,8 +54,16 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
     fn commit_objects(&self, updates: TransactionEffects, new_state: BTreeMap<ObjectID, Object>) {
         self.commit_effects(updates, new_state);
     }
+
     fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>) {
         self.commit_new_objects(new_state);
+    }
+
+    fn read_object(
+        &self,
+        id: &ObjectID,
+    ) -> Result<Option<Object>, sui_types::storage::error::Error> {
+        self.get_object(id)
     }
 }
 
