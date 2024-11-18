@@ -92,6 +92,7 @@ impl<E: Executor> ProxyCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         tracing::info!("Proxy {} started", self.id);
         match self.mode {
@@ -191,6 +192,7 @@ impl<E: Executor> ProxyCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         let store = self.store.clone();
         let id = self.id.clone();
@@ -242,6 +244,7 @@ impl<E: Executor> ProxyCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }
@@ -252,6 +255,7 @@ impl<E: Executor> ProxyCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         let num_threads = num_cpus::get();
 

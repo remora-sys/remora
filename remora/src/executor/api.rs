@@ -4,7 +4,6 @@
 use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sui_single_node_benchmark::benchmark_context::BenchmarkContext;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
@@ -139,20 +138,22 @@ pub trait Executor: Clone {
     type ExecutionResults: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
     type Store: StateStore<Self::ExecutionResults>;
+    /// The benchmark context.
+    type ExecutionContext;
 
     /// Get the context for the benchmark.
-    fn context(&self) -> Arc<BenchmarkContext>;
+    fn context(&self) -> Arc<Self::ExecutionContext>;
 
     /// Execute a transaction and return the results.
     fn execute(
-        ctx: Arc<BenchmarkContext>,
+        ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send;
 
     /// Check version ID check prior to execution
     fn pre_execute_check(
-        ctx: Arc<BenchmarkContext>,
+        ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool;
