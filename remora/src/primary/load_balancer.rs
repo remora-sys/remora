@@ -223,6 +223,11 @@ impl<E: Executor> LoadBalancer<E> {
 
                 Some(result) = self.rx_states_sync.recv() => {
                     // send states updates to the proxy
+                    if self.proxy_connections.len() == 0 {
+                        tracing::debug!("Skip states updating given no available other executors");
+                        continue;
+                    }
+
                     let states_updates = self.prepare_state_updates(result);
                     for (proxy_index, update) in states_updates {
                         match self.proxy_connections[proxy_index].send(PrimaryToProxyMessage::States(update)).await {
@@ -231,8 +236,7 @@ impl<E: Executor> LoadBalancer<E> {
                             }
                             Err(_) => {
                                 tracing::warn!("Failed to send states to proxy {}", proxy_index);
-                                // TODO
-                                // self.proxy_connections.swap_remove(proxy_index);
+                                self.proxy_connections.swap_remove(proxy_index);
                             }
                         }
                     }
