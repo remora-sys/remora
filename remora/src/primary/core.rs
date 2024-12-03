@@ -149,27 +149,48 @@ impl<E: Executor> PrimaryCore<E> {
         }
     }
 
-    async fn local_execute(
-        &mut self,
-        transaction: TransactionWithTimestamp<E::Transaction>,
-    ) -> ExecutionResults<E> {
-        // use the local executor
+    async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>)
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
+    {
         let ctx = self.executor.context();
-        let txn_result = E::execute(ctx, self.store.clone(), &transaction).await;
-        if self
-            .tx_output
-            .send((transaction.clone(), txn_result.clone()))
-            .await
-            .is_err()
-        {
-            tracing::warn!("Failed to output execution result, stopping primary executor");
-        }
+        let store = self.store.clone();
+        let tx_output = self.tx_output.clone();
+        let tx_states_sync = self.tx_states_sync.clone();
 
-        txn_result
+        // FIXME: this probably doesn't work for shared objects
+        // Need to track dependency and merge commit_objects with local execution
+        tokio::spawn(async move {
+            let txn_result = E::execute(ctx, store, &transaction).await;
+
+            if tx_output
+                .send((transaction.clone(), txn_result.clone()))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to output execution result, stopping primary executor");
+            }
+
+            // Sends the sync updates after each local execution
+            if tx_states_sync.send(txn_result.clone()).await.is_err() {
+                tracing::warn!(
+                    "Failed to send execution results of local executor to load balancer"
+                );
+            }
+        });
     }
 
     /// Run the primary executor.
-    pub async fn run(&mut self) -> NodeResult<()> {
+    pub async fn run(&mut self) -> NodeResult<()>
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        Transaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
+    {
         loop {
             tokio::select! {
                 // Receive a commit from the consensus.
@@ -200,10 +221,7 @@ impl<E: Executor> PrimaryCore<E> {
                 // Receieve a transaction for local execution.
                 Some(transaction) = self.rx_executor_local.recv() => {
                     tracing::debug!("Received transaction for local execution");
-                    let effects = self.local_execute(transaction).await;
-                    if self.tx_states_sync.send(effects).await.is_err() {
-                        tracing::warn!("Failed to send execution results of local executor to load balancer");
-                    }
+                    self.local_execute(transaction).await;
                 }
 
                 // The channel is closed.
