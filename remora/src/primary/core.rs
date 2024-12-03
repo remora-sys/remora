@@ -50,8 +50,10 @@ pub struct PrimaryCore<E: Executor> {
     pending_txns: PendingTransactions<E>,
     /// The sender to load balancer.
     tx_committed_txns: Sender<Transaction<E>>,
-    /// The receiver to a local executor if no pre-executor is available.
-    rx_executor_backup: Receiver<Transaction<E>>,
+    /// The sender to a local executor.
+    tx_executor_local: Sender<Transaction<E>>,
+    /// The receiver to a local executor.
+    rx_executor_local: Receiver<Transaction<E>>,
     /// The sender to sync updates to proxy via load-balancer.
     tx_states_sync: Sender<ExecutionResults<E>>,
 }
@@ -66,7 +68,8 @@ impl<E: Executor> PrimaryCore<E> {
         tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
         pending_txns: PendingTransactions<E>,
         tx_committed_txns: Sender<Transaction<E>>,
-        rx_executor_backup: Receiver<Transaction<E>>,
+        tx_executor_local: Sender<Transaction<E>>,
+        rx_executor_local: Receiver<Transaction<E>>,
         tx_states_sync: Sender<ExecutionResults<E>>,
     ) -> Self {
         Self {
@@ -77,7 +80,8 @@ impl<E: Executor> PrimaryCore<E> {
             tx_output,
             pending_txns,
             tx_committed_txns,
-            rx_executor_backup,
+            tx_executor_local,
+            rx_executor_local,
             tx_states_sync,
         }
     }
@@ -117,24 +121,28 @@ impl<E: Executor> PrimaryCore<E> {
                 }
             }
 
-            let results: ExecutionResults<E> = if skip {
+            if skip {
                 let effects = proxy_result.clone();
                 self.store
                     .commit_objects(effects.updates, effects.new_state);
-                proxy_result
+                if self
+                    .tx_output
+                    .send((transaction.clone(), proxy_result))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to output execution result, stopping primary executor");
+                }
             } else {
-                tracing::trace!("Re-executing transaction");
-                let ctx = self.executor.context();
-                E::execute(ctx, self.store.clone(), &transaction).await
-            };
-
-            if self
-                .tx_output
-                .send((transaction.clone(), results))
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to output execution result, stopping primary executor");
+                tracing::warn!("Failed to apply proxy results, sends to local executor");
+                if self
+                    .tx_executor_local
+                    .send(transaction.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send transaction to the local executor");
+                }
             }
         } else {
             tracing::warn!("The received result is not in pending txns");
@@ -170,7 +178,15 @@ impl<E: Executor> PrimaryCore<E> {
                     for transaction in commit {
                         // send to the load balancer
                         if self.tx_committed_txns.send(transaction.clone()).await.is_err() {
-                            self.local_execute(transaction).await;
+                            tracing::warn!("Failed to send transaction to load balancer");
+                            if self
+                                .tx_executor_local
+                                .send(transaction.clone())
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!("Failed to send transaction to the local executor");
+                            }
                         }
                     }
                 }
@@ -182,7 +198,7 @@ impl<E: Executor> PrimaryCore<E> {
                 }
 
                 // Receieve a transaction for local execution.
-                Some(transaction) = self.rx_executor_backup.recv() => {
+                Some(transaction) = self.rx_executor_local.recv() => {
                     tracing::debug!("Received transaction for local execution");
                     let effects = self.local_execute(transaction).await;
                     if self.tx_states_sync.send(effects).await.is_err() {

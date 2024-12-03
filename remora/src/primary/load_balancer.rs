@@ -41,7 +41,7 @@ pub struct LoadBalancer<E: Executor> {
     /// The transactions sent out to proxies
     pending_txns: PendingTransactions<E>,
     /// The sender to a local executor if no pre-executor is available.
-    tx_executor_backup: Sender<Transaction<E>>,
+    tx_executor_local: Sender<Transaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
     rx_states_sync: Receiver<ExecutionResults<E>>,
     /// The metrics for the validator.
@@ -56,7 +56,7 @@ impl<E: Executor> LoadBalancer<E> {
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<Transaction<E>>,
         pending_txns: PendingTransactions<E>,
-        tx_executor_backup: Sender<Transaction<E>>,
+        tx_executor_local: Sender<Transaction<E>>,
         rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -69,7 +69,7 @@ impl<E: Executor> LoadBalancer<E> {
             index: 0,
             shared_object_shards: FxHashMap::default(),
             pending_txns,
-            tx_executor_backup,
+            tx_executor_local,
             rx_states_sync,
             metrics,
         }
@@ -215,7 +215,7 @@ impl<E: Executor> LoadBalancer<E> {
                         }
                     } else {
                         // send back to primary local executor
-                        if self.tx_executor_backup.send(transaction.clone()).await.is_err() {
+                        if self.tx_executor_local.send(transaction.clone()).await.is_err() {
                             tracing::warn!("Failed to send transaction to the local executor");
                         }
                     }
