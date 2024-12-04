@@ -27,7 +27,7 @@ pub struct NetworkClient<I, O> {
 
 impl<I, O> NetworkClient<I, O>
 where
-    I: Send + DeserializeOwned,
+    I: Send + DeserializeOwned + 'static,
     O: Send + Serialize,
 {
     /// Create a new client.

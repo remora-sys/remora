@@ -27,7 +27,7 @@ pub struct ConnectionWorker<I, O> {
 
 impl<I, O> ConnectionWorker<I, O>
 where
-    I: Send + DeserializeOwned,
+    I: Send + DeserializeOwned + 'static,
     O: Send + Serialize,
 {
     /// The maximum size of a network message.
@@ -66,20 +66,24 @@ where
             let message = &mut buffer[..size as usize];
             let bytes_read = reader.read_exact(message).await?;
             debug_assert_eq!(bytes_read, message.len());
+            let tx_incoming = tx_incoming.clone();
+            let message = message.to_vec();
 
-            // Send the message to the application layer.
-            match bincode::deserialize(message) {
-                Ok(data) => {
-                    if tx_incoming.send(data).await.is_err() {
-                        tracing::warn!("Cannot send message to application layer, stopping worker");
-                        break Ok(());
+            // Offload deserialization and message sending to a separate task.
+            tokio::spawn(async move {
+                match bincode::deserialize(&message) {
+                    Ok(data) => {
+                        if tx_incoming.send(data).await.is_err() {
+                            tracing::warn!(
+                                "Cannot send message to application layer, stopping worker"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Cannot deserialize message (killing connection): {e:?}");
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Cannot deserialize message (killing connection): {e:?}");
-                    break Ok(());
-                }
-            }
+            });
         }
     }
 
