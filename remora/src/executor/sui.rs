@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    ops::Deref,
     sync::Arc,
 };
 
@@ -17,10 +16,9 @@ use sui_types::{
     base_types::ObjectID,
     digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
-    executable_transaction::VerifiedExecutableTransaction,
     object::Object,
     transaction::{
-        CertifiedTransaction, InputObjectKind, Transaction, TransactionDataAPI, VerifiedCertificate,
+        CertifiedTransaction, CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI,
     },
 };
 use tokio::time::Instant;
@@ -289,21 +287,18 @@ impl Executor for SuiExecutor {
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .unwrap();
 
-        let mut transaction = ctx
-            .certify_transactions(vec![transaction.deref().to_owned()], true)
-            .await;
-        let executable = VerifiedExecutableTransaction::new_from_certificate(
-            VerifiedCertificate::new_unchecked(transaction.pop().unwrap()),
-        );
-
-        let (gas_status, input_objects) = sui_transaction_checks::check_certificate_input(
-            &executable,
-            objects,
+        let (kind, signer, gas) = transaction.transaction_data().execution_parts();
+        let gas_status = sui_transaction_checks::get_gas_status(
+            &objects,
+            &gas,
             protocol_config,
             reference_gas_price,
+            transaction.transaction_data(),
         )
         .unwrap();
-        let (kind, signer, gas) = executable.transaction_data().execution_parts();
+
+        let objects = CheckedInputObjects::new_with_checked_transaction_inputs(objects);
+
         let (inner_temp_store, _, effects, _) = validator
             .get_epoch_store()
             .executor()
@@ -315,12 +310,12 @@ impl Executor for SuiExecutor {
                 &HashSet::new(),
                 &epoch_store.epoch(),
                 0,
-                input_objects,
+                objects,
                 gas,
                 gas_status,
                 kind,
                 signer,
-                *executable.digest(),
+                *transaction.digest(),
             );
         debug_assert!(effects.status().is_ok());
 
