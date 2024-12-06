@@ -14,7 +14,7 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
         ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
-        PrimaryToProxyMessage, Transaction,
+        PrimaryToProxyMessage, RemoraTransaction,
     },
     metrics::Metrics,
     primary::core::PendingTransactions,
@@ -23,9 +23,9 @@ use crate::{
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
 pub struct LoadBalancer<E: Executor> {
     /// The receiver for transactions.
-    rx_transactions: Receiver<Transaction<E>>,
+    rx_transactions: Receiver<RemoraTransaction<E>>,
     /// The sender to forward transactions to the consensus.
-    tx_consensus: Sender<Transaction<E>>,
+    tx_consensus: Sender<RemoraTransaction<E>>,
     /// Receive handles to forward transactions to proxies. When a new client connects,
     /// this channel receives a sender from the network layer which is used to forward
     /// transactions to the proxies.
@@ -33,7 +33,7 @@ pub struct LoadBalancer<E: Executor> {
     /// Holds senders to forward transactions to proxies.
     proxy_connections: Vec<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
     /// The receiver for committed transactions
-    rx_committed_txns: Receiver<Transaction<E>>,
+    rx_committed_txns: Receiver<RemoraTransaction<E>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
     /// Keeps track of shared-objects and its shards (proxy)
@@ -41,7 +41,7 @@ pub struct LoadBalancer<E: Executor> {
     /// The transactions sent out to proxies
     pending_txns: PendingTransactions<E>,
     /// The sender to a local executor if no pre-executor is available.
-    tx_executor_local: Sender<Transaction<E>>,
+    tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
     rx_states_sync: Receiver<ExecutionResults<E>>,
     /// The metrics for the validator.
@@ -51,12 +51,12 @@ pub struct LoadBalancer<E: Executor> {
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
     pub fn new(
-        rx_transactions: Receiver<Transaction<E>>,
-        tx_consensus: Sender<Transaction<E>>,
+        rx_transactions: Receiver<RemoraTransaction<E>>,
+        tx_consensus: Sender<RemoraTransaction<E>>,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        rx_committed_txns: Receiver<Transaction<E>>,
+        rx_committed_txns: Receiver<RemoraTransaction<E>>,
         pending_txns: PendingTransactions<E>,
-        tx_executor_local: Sender<Transaction<E>>,
+        tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -76,7 +76,7 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Forward a transaction to the consensus.
-    async fn send_to_consensus(&mut self, transaction: Transaction<E>) -> NodeResult<()> {
+    async fn send_to_consensus(&mut self, transaction: RemoraTransaction<E>) -> NodeResult<()> {
         if self.index == 0 {
             self.metrics.register_start_time();
         }
@@ -251,7 +251,7 @@ impl<E: Executor> LoadBalancer<E> {
     pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send,
     {
         tokio::spawn(async move { self.run().await })

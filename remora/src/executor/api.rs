@@ -129,7 +129,7 @@ pub trait Executor: Clone {
 }
 
 /// Short for a transaction with a timestamp.
-pub type Transaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
+pub type RemoraTransaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
 
 /// Short for the results of executing a transaction.
 pub type ExecutionResults<E> = ExecutionResultsAndEffects<<E as Executor>::ExecutionResults>;

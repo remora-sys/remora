@@ -16,13 +16,8 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction,
-            ExecutionResults,
-            Executor,
-            PrimaryToProxyMessage,
-            StateStore,
-            Store,
-            Transaction,
+            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
+            RemoraTransaction, StateStore, Store,
         },
         dependency_controller::DependencyController,
     },
@@ -90,7 +85,7 @@ impl<E: Executor> ProxyCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         tracing::info!("Proxy {} started", self.id);
@@ -151,7 +146,7 @@ impl<E: Executor> ProxyCore<E> {
 
     pub fn get_dependencies(
         &mut self,
-        transaction: Transaction<E>,
+        transaction: RemoraTransaction<E>,
         task_id: u64,
     ) -> (Vec<Arc<Notify>>, Vec<Arc<Notify>>) {
         // filter pkg id from the obj_id
@@ -179,14 +174,14 @@ impl<E: Executor> ProxyCore<E> {
 
     pub async fn schedule_txn_parallel(
         &mut self,
-        transaction: Transaction<E>,
+        transaction: RemoraTransaction<E>,
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
     ) -> NodeResult<()>
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         let store = self.store.clone();
@@ -236,7 +231,7 @@ impl<E: Executor> ProxyCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
@@ -246,7 +241,7 @@ impl<E: Executor> ProxyCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         let num_threads = num_cpus::get();

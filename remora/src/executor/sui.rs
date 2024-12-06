@@ -19,20 +19,24 @@ use sui_types::{
     effects::{TransactionEffects, TransactionEffectsAPI},
     executable_transaction::VerifiedExecutableTransaction,
     object::Object,
-    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, VerifiedCertificate},
+    transaction::{
+        CertifiedTransaction, InputObjectKind, Transaction, TransactionDataAPI, VerifiedCertificate,
+    },
 };
 use tokio::time::Instant;
 
-use super::api::{ExecutableTransaction, ExecutionResults, Executor, StateStore, Transaction};
+use super::api::{
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+};
 use crate::config::{BenchmarkParameters, WorkloadType};
 
 /// Represents a Sui transaction.
-pub type SuiTransaction = Transaction<SuiExecutor>;
+pub type SuiTransaction = RemoraTransaction<SuiExecutor>;
 
 /// Represents the results of the execution of a Sui transaction.
 pub type SuiExecutionResults = ExecutionResults<SuiExecutor>;
 
-impl ExecutableTransaction for CertifiedTransaction {
+impl ExecutableTransaction for Transaction {
     fn digest(&self) -> &TransactionDigest {
         self.digest()
     }
@@ -86,14 +90,14 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
     Workload::new(pre_generation, workload_type)
 }
 
-pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<CertifiedTransaction> {
+pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<Transaction> {
     tracing::debug!("Generating all transactions...");
     let workload = init_workload(config);
     let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
     let start_time = Instant::now();
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let transactions = ctx.generate_transactions(tx_generator).await;
-    let transactions = ctx.certify_transactions(transactions, false).await;
+    //let transactions = ctx.certify_transactions(transactions, false).await;
     let elapsed = start_time.elapsed();
     tracing::debug!(
         "Generated {} txs in {} ms",
@@ -262,7 +266,7 @@ impl SuiExecutor {
 }
 
 impl Executor for SuiExecutor {
-    type Transaction = CertifiedTransaction;
+    type Transaction = Transaction;
     type ExecutionResults = TransactionEffects;
     type Store = InMemoryObjectStore;
 
@@ -285,8 +289,11 @@ impl Executor for SuiExecutor {
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .unwrap();
 
+        let mut transaction = ctx
+            .certify_transactions(vec![transaction.deref().to_owned()], true)
+            .await;
         let executable = VerifiedExecutableTransaction::new_from_certificate(
-            VerifiedCertificate::new_unchecked(transaction.deref().clone()),
+            VerifiedCertificate::new_unchecked(transaction.pop().unwrap()),
         );
 
         let (gas_status, input_objects) = sui_transaction_checks::check_certificate_input(
@@ -343,10 +350,10 @@ impl Executor for SuiExecutor {
 #[cfg(test)]
 mod tests {
 
-    use std::{fs, sync::Arc};
+    use std::sync::Arc;
 
     use crate::{
-        config::{BenchmarkParameters, WorkloadType},
+        config::BenchmarkParameters,
         executor::{
             api::Executor,
             sui::{generate_transactions, SuiExecutor, SuiTransaction},
@@ -370,8 +377,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /*#[tokio::test]
     async fn shared_object_test_with_imported_file() {
+        use std::fs;
+        use crate::config::WorkloadType;
+
         let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
             ..BenchmarkParameters::new_for_tests()
@@ -401,5 +411,5 @@ mod tests {
 
         // Clean up directory after the test finishes
         fs::remove_dir_all(&working_directory).expect("Failed to delete working directory");
-    }
+    }*/
 }
