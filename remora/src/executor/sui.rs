@@ -17,9 +17,7 @@ use sui_types::{
     digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
     object::Object,
-    transaction::{
-        CertifiedTransaction, CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI,
-    },
+    transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
 };
 use tokio::time::Instant;
 
@@ -117,7 +115,7 @@ use sui_types::base_types::SuiAddress;
 
 pub fn export_to_files(
     accounts: &BTreeMap<SuiAddress, Account>,
-    txs: &Vec<CertifiedTransaction>,
+    txs: &Vec<Transaction>,
     working_directory: PathBuf,
 ) {
     let start_time: std::time::Instant = std::time::Instant::now();
@@ -136,7 +134,7 @@ pub fn export_to_files(
 
 pub fn import_from_files(
     working_directory: PathBuf,
-) -> (BTreeMap<SuiAddress, Account>, Vec<CertifiedTransaction>) {
+) -> (BTreeMap<SuiAddress, Account>, Vec<Transaction>) {
     let start_time: std::time::Instant = std::time::Instant::now();
     // Read the accounts file into a buffer
     let mut accounts_file = BufReader::new(
@@ -158,7 +156,7 @@ pub fn import_from_files(
 
     // Deserialize from buffers
     let accounts: BTreeMap<SuiAddress, Account> = bincode::deserialize(&accounts_buf).unwrap();
-    let txs: Vec<CertifiedTransaction> = bincode::deserialize(&txs_buf).unwrap();
+    let txs: Vec<Transaction> = bincode::deserialize(&txs_buf).unwrap();
 
     let elapsed = start_time.elapsed().as_millis() as f64;
     tracing::info!("Import took {} ms", elapsed,);
@@ -174,7 +172,6 @@ pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) 
     let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let txs = ctx.generate_transactions(tx_generator).await;
-    let txs = ctx.certify_transactions(txs, false).await;
 
     export_to_files(ctx.get_accounts(), &txs, log_path.into());
     tracing::info!("Finish generating and exporting");
@@ -257,7 +254,7 @@ impl SuiExecutor {
             let (_, read_txs) = import_from_files(self.log_dir_path.clone().unwrap());
             self.ctx
                 .validator()
-                .assigned_shared_object_versions(&read_txs)
+                .assigned_shared_object_versions_on_transaction(&read_txs)
                 .await;
         }
     }
@@ -372,10 +369,10 @@ mod tests {
         }
     }
 
-    /*#[tokio::test]
+    #[tokio::test]
     async fn shared_object_test_with_imported_file() {
-        use std::fs;
         use crate::config::WorkloadType;
+        use std::fs;
 
         let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
@@ -394,7 +391,7 @@ mod tests {
         executor
             .context()
             .validator()
-            .assigned_shared_object_versions(&read_txs) // Important!!
+            .assigned_shared_object_versions_on_transaction(&read_txs) // Important!!
             .await;
 
         let ctx = executor.context();
@@ -406,5 +403,5 @@ mod tests {
 
         // Clean up directory after the test finishes
         fs::remove_dir_all(&working_directory).expect("Failed to delete working directory");
-    }*/
+    }
 }
