@@ -3,7 +3,8 @@
 
 use std::io;
 
-use futures::{stream, FutureExt, StreamExt};
+use bytes::{Buf, BytesMut};
+use futures::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -31,7 +32,7 @@ where
     O: Send + Serialize,
 {
     /// The maximum size of a network message.
-    const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     /// The maximum batch size for batched processing.
     const MAX_BATCH_SIZE: usize = 16;
 
@@ -58,51 +59,39 @@ where
     /// Handle reading from the stream.
     async fn handle_read_stream(
         mut reader: OwnedReadHalf,
-        tx_incoming: Sender<I>,
+        tx_incoming: tokio::sync::mpsc::Sender<I>,
     ) -> io::Result<()> {
-        let buffer_size = Self::MAX_MESSAGE_SIZE as usize;
+        const MSG_LEN_BYTES: usize = std::mem::size_of::<u32>();
+        let buffer_size: usize = MSG_LEN_BYTES + Self::MAX_MESSAGE_SIZE * 10;
+        let mut buffer = BytesMut::with_capacity(buffer_size);
 
-        // Create an stream using unfold.
-        let message_stream = stream::unfold(&mut reader, move |reader| async move {
-            match reader.read_u32().await {
-                Ok(size) => {
-                    let size = size as usize;
-
-                    // Make sure that the size is not larger than the buffer size to prevent overflows.
-                    if size > buffer_size {
-                        tracing::error!(
-                            "Message size exceeds maximum allowed: {} > {}",
-                            size,
-                            buffer_size
-                        );
-                        return None;
-                    }
-
-                    let mut message = vec![0u8; size];
-                    match reader.read_exact(&mut message).await {
-                        Ok(_) => Some((message, reader)),
-                        Err(e) => {
-                            tracing::error!("Error reading message content: {:?}", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    tracing::warn!("Connection closed by peer (EOF)");
-                    None
-                }
-                Err(e) => {
-                    tracing::error!("Error reading message size: {:?}", e);
-                    None
-                }
+        loop {
+            // Wait until we have more data in the buffer.
+            if reader.read_buf(&mut buffer).await? == 0 {
+                // EOF reached, breaking the loop.
+                tracing::info!("EOF reached, stopping read stream");
+                break;
             }
-        });
 
-        message_stream
-            .for_each_concurrent(Some(Self::MAX_BATCH_SIZE), |message| {
+            // Process all available messages in the buffer.
+            while buffer.len() >= MSG_LEN_BYTES {
+                // big-endian is aligned to handle_write_stream which uses network byte order
+                let size = u32::from_be_bytes(buffer[..MSG_LEN_BYTES].try_into().unwrap()) as usize;
+
+                if buffer.len() < MSG_LEN_BYTES + size {
+                    break;
+                }
+
+                // Extract the message and process it
+                buffer.advance(MSG_LEN_BYTES);
+                let data = buffer.split_to(size);
+
                 let tx_incoming = tx_incoming.clone();
-                async move {
-                    match bincode::deserialize::<I>(&message) {
+                let data = data.to_vec();
+
+                // Offload deserialization and message sending to a separate task.
+                tokio::spawn(async move {
+                    match bincode::deserialize(&data) {
                         Ok(data) => {
                             if tx_incoming.send(data).await.is_err() {
                                 tracing::warn!(
@@ -112,14 +101,18 @@ where
                         }
                         Err(e) => {
                             tracing::error!(
-                                "Cannot deserialize message (killing connection): {:?}",
-                                e
+                                "Cannot deserialize message (killing connection): {e:?}"
                             );
                         }
                     }
-                }
-            })
-            .await;
+                });
+            }
+
+            // Shrink the buffer if it has grown too large, to free memory
+            if buffer.capacity() > buffer_size {
+                buffer = BytesMut::with_capacity(buffer_size);
+            }
+        }
 
         Ok(())
     }
