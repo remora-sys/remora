@@ -18,8 +18,8 @@ use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, StateStore, Store,
-        Transaction, TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, RemoraTransaction,
+        StateStore, Store, TransactionWithTimestamp,
     },
 };
 
@@ -41,19 +41,19 @@ pub struct PrimaryCore<E: Executor> {
     /// The object store.
     store: Store<E>,
     /// The receiver for consensus commits.
-    rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
+    rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
     /// The receiver for proxy results.
     rx_proxies: Receiver<ExecutionResults<E>>,
     /// Output channel for the final results.
-    tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
+    tx_output: Sender<(RemoraTransaction<E>, ExecutionResults<E>)>,
     /// The transactions sent out to proxies
     pending_txns: PendingTransactions<E>,
     /// The sender to load balancer.
-    tx_committed_txns: Sender<Transaction<E>>,
+    tx_committed_txns: Sender<RemoraTransaction<E>>,
     /// The sender to a local executor.
-    tx_executor_local: Sender<Transaction<E>>,
+    tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver to a local executor.
-    rx_executor_local: Receiver<Transaction<E>>,
+    rx_executor_local: Receiver<RemoraTransaction<E>>,
     /// The sender to sync updates to proxy via load-balancer.
     tx_states_sync: Sender<ExecutionResults<E>>,
 }
@@ -63,13 +63,13 @@ impl<E: Executor> PrimaryCore<E> {
     pub fn new(
         executor: E,
         store: Store<E>,
-        rx_commits: Receiver<ConsensusCommit<Transaction<E>>>,
+        rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
-        tx_output: Sender<(Transaction<E>, ExecutionResults<E>)>,
+        tx_output: Sender<(RemoraTransaction<E>, ExecutionResults<E>)>,
         pending_txns: PendingTransactions<E>,
-        tx_committed_txns: Sender<Transaction<E>>,
-        tx_executor_local: Sender<Transaction<E>>,
-        rx_executor_local: Receiver<Transaction<E>>,
+        tx_committed_txns: Sender<RemoraTransaction<E>>,
+        tx_executor_local: Sender<RemoraTransaction<E>>,
+        rx_executor_local: Receiver<RemoraTransaction<E>>,
         tx_states_sync: Sender<ExecutionResults<E>>,
     ) -> Self {
         Self {
@@ -153,7 +153,7 @@ impl<E: Executor> PrimaryCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         let ctx = self.executor.context();
@@ -188,7 +188,7 @@ impl<E: Executor> PrimaryCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         loop {
@@ -235,7 +235,7 @@ impl<E: Executor> PrimaryCore<E> {
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
-        Transaction<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })

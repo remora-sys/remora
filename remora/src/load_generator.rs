@@ -7,7 +7,7 @@ use std::{
 };
 
 use itertools::Itertools;
-use sui_types::transaction::CertifiedTransaction;
+use sui_types::transaction::Transaction;
 use tokio::{
     sync::mpsc::{self, Sender},
     time::{interval, Instant, MissedTickBehavior},
@@ -44,14 +44,14 @@ impl LoadGenerator {
     }
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
-    pub async fn initialize(&mut self) -> Vec<CertifiedTransaction> {
+    pub async fn initialize(&mut self) -> Vec<Transaction> {
         generate_transactions(&self.config).await
     }
 
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
         &mut self,
-        transactions: Vec<CertifiedTransaction>,
+        transactions: Vec<Transaction>,
         load: u64,
         precision: u64,
         burst_duration: Duration,
@@ -102,7 +102,7 @@ impl LoadGenerator {
         tx_transactions
     }
 
-    pub async fn run(&mut self, transactions: Vec<CertifiedTransaction>) {
+    pub async fn run(&mut self, transactions: Vec<Transaction>) {
         let tx_transactions = self.connect_and_spawn_network_client().await;
 
         let warm_up_load = 2_000;
@@ -126,7 +126,7 @@ impl LoadGenerator {
 
     async fn warm_up_and_real_run(
         &mut self,
-        transactions: Vec<CertifiedTransaction>,
+        transactions: Vec<Transaction>,
         warm_up_load: u64,
         sender: Sender<SuiTransaction>,
     ) {
@@ -167,11 +167,7 @@ impl LoadGenerator {
         self.real_run(remaining_transactions.to_vec(), sender).await;
     }
 
-    async fn real_run(
-        &mut self,
-        transactions: Vec<CertifiedTransaction>,
-        sender: Sender<SuiTransaction>,
-    ) {
+    async fn real_run(&mut self, transactions: Vec<Transaction>, sender: Sender<SuiTransaction>) {
         let real_load = self.config.load;
         tracing::info!("Starting real run at {} load...", real_load);
 

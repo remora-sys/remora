@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    ops::Deref,
     sync::Arc,
 };
 
@@ -17,22 +16,23 @@ use sui_types::{
     base_types::ObjectID,
     digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
-    executable_transaction::VerifiedExecutableTransaction,
     object::Object,
-    transaction::{CertifiedTransaction, InputObjectKind, TransactionDataAPI, VerifiedCertificate},
+    transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
 };
 use tokio::time::Instant;
 
-use super::api::{ExecutableTransaction, ExecutionResults, Executor, StateStore, Transaction};
+use super::api::{
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+};
 use crate::config::{BenchmarkParameters, WorkloadType};
 
 /// Represents a Sui transaction.
-pub type SuiTransaction = Transaction<SuiExecutor>;
+pub type SuiTransaction = RemoraTransaction<SuiExecutor>;
 
 /// Represents the results of the execution of a Sui transaction.
 pub type SuiExecutionResults = ExecutionResults<SuiExecutor>;
 
-impl ExecutableTransaction for CertifiedTransaction {
+impl ExecutableTransaction for Transaction {
     fn digest(&self) -> &TransactionDigest {
         self.digest()
     }
@@ -86,14 +86,14 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
     Workload::new(pre_generation, workload_type)
 }
 
-pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<CertifiedTransaction> {
+pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<Transaction> {
     tracing::debug!("Generating all transactions...");
     let workload = init_workload(config);
     let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
     let start_time = Instant::now();
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let transactions = ctx.generate_transactions(tx_generator).await;
-    let transactions = ctx.certify_transactions(transactions, false).await;
+    //let transactions = ctx.certify_transactions(transactions, false).await;
     let elapsed = start_time.elapsed();
     tracing::debug!(
         "Generated {} txs in {} ms",
@@ -115,7 +115,7 @@ use sui_types::base_types::SuiAddress;
 
 pub fn export_to_files(
     accounts: &BTreeMap<SuiAddress, Account>,
-    txs: &Vec<CertifiedTransaction>,
+    txs: &Vec<Transaction>,
     working_directory: PathBuf,
 ) {
     let start_time: std::time::Instant = std::time::Instant::now();
@@ -134,7 +134,7 @@ pub fn export_to_files(
 
 pub fn import_from_files(
     working_directory: PathBuf,
-) -> (BTreeMap<SuiAddress, Account>, Vec<CertifiedTransaction>) {
+) -> (BTreeMap<SuiAddress, Account>, Vec<Transaction>) {
     let start_time: std::time::Instant = std::time::Instant::now();
     // Read the accounts file into a buffer
     let mut accounts_file = BufReader::new(
@@ -156,7 +156,7 @@ pub fn import_from_files(
 
     // Deserialize from buffers
     let accounts: BTreeMap<SuiAddress, Account> = bincode::deserialize(&accounts_buf).unwrap();
-    let txs: Vec<CertifiedTransaction> = bincode::deserialize(&txs_buf).unwrap();
+    let txs: Vec<Transaction> = bincode::deserialize(&txs_buf).unwrap();
 
     let elapsed = start_time.elapsed().as_millis() as f64;
     tracing::info!("Import took {} ms", elapsed,);
@@ -172,7 +172,6 @@ pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) 
     let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let txs = ctx.generate_transactions(tx_generator).await;
-    let txs = ctx.certify_transactions(txs, false).await;
 
     export_to_files(ctx.get_accounts(), &txs, log_path.into());
     tracing::info!("Finish generating and exporting");
@@ -255,14 +254,14 @@ impl SuiExecutor {
             let (_, read_txs) = import_from_files(self.log_dir_path.clone().unwrap());
             self.ctx
                 .validator()
-                .assigned_shared_object_versions(&read_txs)
+                .assigned_shared_object_versions_on_transaction(&read_txs)
                 .await;
         }
     }
 }
 
 impl Executor for SuiExecutor {
-    type Transaction = CertifiedTransaction;
+    type Transaction = Transaction;
     type ExecutionResults = TransactionEffects;
     type Store = InMemoryObjectStore;
 
@@ -285,18 +284,18 @@ impl Executor for SuiExecutor {
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .unwrap();
 
-        let executable = VerifiedExecutableTransaction::new_from_certificate(
-            VerifiedCertificate::new_unchecked(transaction.deref().clone()),
-        );
-
-        let (gas_status, input_objects) = sui_transaction_checks::check_certificate_input(
-            &executable,
-            objects,
+        let (kind, signer, gas) = transaction.transaction_data().execution_parts();
+        let gas_status = sui_transaction_checks::get_gas_status(
+            &objects,
+            &gas,
             protocol_config,
             reference_gas_price,
+            transaction.transaction_data(),
         )
         .unwrap();
-        let (kind, signer, gas) = executable.transaction_data().execution_parts();
+
+        let objects = CheckedInputObjects::new_with_checked_transaction_inputs(objects);
+
         let (inner_temp_store, _, effects, _) = validator
             .get_epoch_store()
             .executor()
@@ -308,12 +307,12 @@ impl Executor for SuiExecutor {
                 &HashSet::new(),
                 &epoch_store.epoch(),
                 0,
-                input_objects,
+                objects,
                 gas,
                 gas_status,
                 kind,
                 signer,
-                *executable.digest(),
+                *transaction.digest(),
             );
         debug_assert!(effects.status().is_ok());
 
@@ -343,10 +342,10 @@ impl Executor for SuiExecutor {
 #[cfg(test)]
 mod tests {
 
-    use std::{fs, sync::Arc};
+    use std::sync::Arc;
 
     use crate::{
-        config::{BenchmarkParameters, WorkloadType},
+        config::BenchmarkParameters,
         executor::{
             api::Executor,
             sui::{generate_transactions, SuiExecutor, SuiTransaction},
@@ -372,6 +371,9 @@ mod tests {
 
     #[tokio::test]
     async fn shared_object_test_with_imported_file() {
+        use crate::config::WorkloadType;
+        use std::fs;
+
         let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
             ..BenchmarkParameters::new_for_tests()
@@ -389,7 +391,7 @@ mod tests {
         executor
             .context()
             .validator()
-            .assigned_shared_object_versions(&read_txs) // Important!!
+            .assigned_shared_object_versions_on_transaction(&read_txs) // Important!!
             .await;
 
         let ctx = executor.context();
