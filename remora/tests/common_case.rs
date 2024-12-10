@@ -57,7 +57,7 @@ async fn remote_proxy() {
 
     // Wait for all transactions to be processed.
     for _ in 0..total_transactions {
-        let (_tx, result) = primary.rx_output.recv().await.unwrap();
+        let (_ts, result) = primary.rx_output.recv().await.unwrap();
         assert!(result.success());
     }
 }

@@ -31,18 +31,20 @@ pub trait ExecutableTransaction {
     }
 }
 
+pub type Timestamp = f64;
+
 /// A transaction with a timestamp. This is used to compute performance.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     /// The transaction.
     transaction: T,
     /// The timestamp when the transaction was created.
-    timestamp: f64,
+    timestamp: Timestamp,
 }
 
 impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
     /// Create a new transaction with a timestamp.
-    pub fn new(transaction: T, timestamp: f64) -> Self {
+    pub fn new(transaction: T, timestamp: Timestamp) -> Self {
         Self {
             transaction,
             timestamp,
@@ -50,7 +52,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
     }
 
     /// Get the timestamp of the transaction.
-    pub fn timestamp(&self) -> f64 {
+    pub fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
 

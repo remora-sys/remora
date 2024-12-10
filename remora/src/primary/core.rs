@@ -19,7 +19,7 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
         ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, RemoraTransaction,
-        StateStore, Store, TransactionWithTimestamp,
+        StateStore, Store, Timestamp, TransactionWithTimestamp,
     },
 };
 
@@ -45,7 +45,7 @@ pub struct PrimaryCore<E: Executor> {
     /// The receiver for proxy results.
     rx_proxies: Receiver<ExecutionResults<E>>,
     /// Output channel for the final results.
-    tx_output: Sender<(RemoraTransaction<E>, ExecutionResults<E>)>,
+    tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
     /// The transactions sent out to proxies
     pending_txns: PendingTransactions<E>,
     /// The sender to load balancer.
@@ -65,7 +65,7 @@ impl<E: Executor> PrimaryCore<E> {
         store: Store<E>,
         rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
-        tx_output: Sender<(RemoraTransaction<E>, ExecutionResults<E>)>,
+        tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
         pending_txns: PendingTransactions<E>,
         tx_committed_txns: Sender<RemoraTransaction<E>>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
@@ -127,7 +127,7 @@ impl<E: Executor> PrimaryCore<E> {
                     .commit_objects(effects.updates, effects.new_state);
                 if self
                     .tx_output
-                    .send((transaction.clone(), proxy_result))
+                    .send((transaction.timestamp(), proxy_result))
                     .await
                     .is_err()
                 {
@@ -167,7 +167,7 @@ impl<E: Executor> PrimaryCore<E> {
             let txn_result = E::execute(ctx, store, &transaction).await;
 
             if tx_output
-                .send((transaction.clone(), txn_result.clone()))
+                .send((transaction.timestamp(), txn_result.clone()))
                 .await
                 .is_err()
             {

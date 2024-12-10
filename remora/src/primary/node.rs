@@ -17,7 +17,10 @@ use super::{
 use crate::{
     config::ValidatorConfig,
     error::NodeResult,
-    executor::sui::{SuiExecutionResults, SuiExecutor, SuiTransaction},
+    executor::{
+        api::Timestamp,
+        sui::{SuiExecutionResults, SuiExecutor},
+    },
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
@@ -35,7 +38,7 @@ pub struct PrimaryNode {
     /// The handles for the network servers.
     pub network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The receiver for the final execution results.
-    pub rx_output: Receiver<(SuiTransaction, SuiExecutionResults)>,
+    pub rx_output: Receiver<(Timestamp, SuiExecutionResults)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
     pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
@@ -173,12 +176,11 @@ impl PrimaryNode {
 
         loop {
             tokio::select! {
-                Some((tx, result)) = self.rx_output.recv() => {
+                Some((timestamp, result)) = self.rx_output.recv() => {
                     tracing::debug!("Received output: {:?}", result);
                     assert!(result.success());
-                    let submit_timestamp = tx.timestamp();
                     // TODO: Record transactions success and failure.
-                    self.metrics.update_metrics(submit_timestamp);
+                    self.metrics.update_metrics(timestamp);
                 }
                 Some(connection) = self.rx_client_connections.recv() => {
                     tracing::info!("Received a new client connection");
@@ -231,7 +233,7 @@ mod tests {
 
         // Wait for all transactions to be processed.
         for _ in 0..total_transactions {
-            let (_tx, result) = primary.rx_output.recv().await.unwrap();
+            let (_ts, result) = primary.rx_output.recv().await.unwrap();
             assert!(result.success());
         }
     }
@@ -272,7 +274,7 @@ mod tests {
 
         // Wait for all transactions to be processed.
         for _ in 0..total_transactions {
-            let (_tx, result) = validator.rx_output.recv().await.unwrap();
+            let (_ts, result) = validator.rx_output.recv().await.unwrap();
             assert!(result.success());
         }
     }
