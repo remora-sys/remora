@@ -83,7 +83,7 @@ impl<E: Executor> LoadBalancer<E> {
 
         // Send the transaction to the consensus.
         self.tx_consensus
-            .send(transaction.clone())
+            .send(transaction)
             .await
             .map_err(|_| NodeError::ShuttingDown)?;
 
@@ -198,7 +198,7 @@ impl<E: Executor> LoadBalancer<E> {
                         self.pending_txns.insert(*transaction.digest(), (proxy_index, transaction.clone()));
                         // Send the transaction to the selected proxy
                         match self.proxy_connections[proxy_index]
-                            .send(PrimaryToProxyMessage::Txn(transaction.clone()))
+                            .send(PrimaryToProxyMessage::Txn(transaction))
                             .await
                         {
                             Ok(()) => {
@@ -215,7 +215,7 @@ impl<E: Executor> LoadBalancer<E> {
                         }
                     } else {
                         // send back to primary local executor
-                        if self.tx_executor_local.send(transaction.clone()).await.is_err() {
+                        if self.tx_executor_local.send(transaction).await.is_err() {
                             tracing::warn!("Failed to send transaction to the local executor");
                         }
                     }
