@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Load generator exposing metrics on {metrics_address}");
     tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
+    let _registry = mysten_metrics::start_prometheus_server(metrics_address);
 
     // Create genesis and generate transactions.
     let primary_address = validator_config.client_server_address;
