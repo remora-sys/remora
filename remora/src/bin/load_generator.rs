@@ -6,10 +6,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
     //executor::sui::{check_logs_for_shared_object, import_from_files},
     client::load_generator::{default_metrics_address, LoadGenerator},
-    metrics::Metrics,
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
 };
 
 #[derive(Parser, Debug)]
@@ -41,12 +40,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Load generator exposing metrics on {metrics_address}");
     tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
-    let registry = mysten_metrics::start_prometheus_server(metrics_address);
-    let metrics = Metrics::new(&registry.default_registry());
 
     // Create genesis and generate transactions.
     let primary_address = validator_config.client_server_address;
-    let mut load_generator = LoadGenerator::new(benchmark_config.clone(), primary_address, metrics);
+    let mut load_generator = LoadGenerator::new(benchmark_config.clone(), primary_address);
 
     let transactions;
     match benchmark_config.workload {

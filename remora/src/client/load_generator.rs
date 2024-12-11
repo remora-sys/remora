@@ -31,20 +31,17 @@ pub struct LoadGenerator {
     config: BenchmarkParameters,
     /// The target socket address.
     target: SocketAddr,
-    /// Metrics for the load generator.
-    metrics: Metrics,
     /// Request inter arrival distribution.
     arrival: Distribution,
 }
 
 impl LoadGenerator {
     /// Create a new load generator.
-    pub fn new(config: BenchmarkParameters, target: SocketAddr, metrics: Metrics) -> Self {
+    pub fn new(config: BenchmarkParameters, target: SocketAddr) -> Self {
         let ns_per_packet = 1_000_000_000 / config.load;
         LoadGenerator {
             config,
             target,
-            metrics,
             arrival: Distribution::Exponential(ns_per_packet as f64),
         }
     }
@@ -63,9 +60,6 @@ impl LoadGenerator {
     async fn submit_transactions(
         &mut self,
         transactions: Vec<Transaction>,
-        _load: u64,
-        _precision: u64,
-        _burst_duration: Duration,
         sender: Sender<SuiTransaction>,
     ) {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
@@ -144,13 +138,9 @@ impl LoadGenerator {
 
         // Warm-up configuration
         tracing::info!("Starting warm-up phase at {} load...", warm_up_load);
-        let warm_up_precision = if warm_up_load > 1_000 { 20 } else { 1 };
-        let warm_up_burst_duration = Duration::from_millis(1_000 / warm_up_precision);
 
         // Calculate how many transactions are needed for the warm-up phase
-        let warm_up_chunk_size = (warm_up_load / warm_up_precision) as usize;
-        let warm_up_tx_count = warm_up_chunk_size
-            * (warm_up_duration.as_secs_f64() * warm_up_precision as f64) as usize;
+        let warm_up_tx_count = warm_up_load * warm_up_duration.as_secs_f64() as u64;
 
         tracing::info!(
             "warm-up len {}, total_len {}",
@@ -160,13 +150,10 @@ impl LoadGenerator {
 
         // Split the transactions into warm-up and real run transactions
         let (warm_up_transactions, remaining_transactions) =
-            transactions.split_at(warm_up_tx_count);
+            transactions.split_at(warm_up_tx_count as usize);
 
         let warm_up_future = self.submit_transactions(
             warm_up_transactions.to_vec(), // Use the warm-up transactions
-            warm_up_load,
-            warm_up_precision,
-            warm_up_burst_duration,
             sender.clone(),
         );
 
@@ -181,11 +168,7 @@ impl LoadGenerator {
         let real_load = self.config.load;
         tracing::info!("Starting real run at {} load...", real_load);
 
-        let precision = if real_load > 1_000 { 20 } else { 1 };
-        let burst_duration = Duration::from_millis(1_000 / precision);
-
-        self.submit_transactions(transactions, real_load, precision, burst_duration, sender)
-            .await;
+        self.submit_transactions(transactions, sender).await;
     }
 }
 
@@ -218,9 +201,8 @@ pub mod tests {
         tokio::task::yield_now().await;
 
         // Create genesis and generate transactions.
-        let metrics = Metrics::new_for_tests();
         let config = BenchmarkParameters::new_for_tests();
-        let mut load_generator = LoadGenerator::new(config, target, metrics);
+        let mut load_generator = LoadGenerator::new(config, target);
         let transactions = load_generator.initialize().await;
 
         // Submit transactions to the server.

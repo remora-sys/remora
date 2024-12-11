@@ -34,7 +34,7 @@ impl Distribution {
     }
 
     pub fn create(spec: &str) -> Result<Self, &str> {
-        let tokens: Vec<&str> = spec.split(":").collect();
+        let tokens: Vec<&str> = spec.split(':').collect();
         assert!(!tokens.is_empty());
         match tokens[0] {
             "zero" => Ok(Distribution::Zero),
