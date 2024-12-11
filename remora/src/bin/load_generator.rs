@@ -8,7 +8,7 @@ use clap::Parser;
 use remora::{
     config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
     //executor::sui::{check_logs_for_shared_object, import_from_files},
-    load_generator::{default_metrics_address, LoadGenerator},
+    client::load_generator::{default_metrics_address, LoadGenerator},
     metrics::Metrics,
 };
 

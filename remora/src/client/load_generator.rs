@@ -6,20 +6,22 @@ use std::{
     time::Duration,
 };
 
-use itertools::Itertools;
+use rand::Rng;
+use rand_mt::Mt64;
 use sui_types::transaction::Transaction;
 use tokio::{
     sync::mpsc::{self, Sender},
-    time::{interval, Instant, MissedTickBehavior},
+    time::Instant,
 };
 
 use crate::{
+    client::request_arrival_distribution::Distribution,
     config::BenchmarkParameters,
     executor::{
         api::TransactionWithTimestamp,
         sui::{generate_transactions, SuiTransaction},
     },
-    metrics::{ErrorType, Metrics},
+    metrics::Metrics,
     networking::client::NetworkClient,
 };
 
@@ -31,15 +33,19 @@ pub struct LoadGenerator {
     target: SocketAddr,
     /// Metrics for the load generator.
     metrics: Metrics,
+    /// Request inter arrival distribution.
+    arrival: Distribution,
 }
 
 impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr, metrics: Metrics) -> Self {
+        let ns_per_packet = 1_000_000_000 / config.load;
         LoadGenerator {
             config,
             target,
             metrics,
+            arrival: Distribution::Exponential(ns_per_packet as f64),
         }
     }
 
@@ -48,40 +54,44 @@ impl LoadGenerator {
         generate_transactions(&self.config).await
     }
 
+    /// Generate inter-arrival interval
+    pub fn gen_inter_arrival(&self, rng: &mut Mt64) -> u64 {
+        self.arrival.sample(rng)
+    }
+
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
         &mut self,
         transactions: Vec<Transaction>,
-        load: u64,
-        precision: u64,
-        burst_duration: Duration,
+        _load: u64,
+        _precision: u64,
+        _burst_duration: Duration,
         sender: Sender<SuiTransaction>,
     ) {
-        let mut interval = interval(burst_duration);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
+        let mut next_ts = Instant::now();
 
-        let chunks_size = (load / precision) as usize;
-        let chunks = &transactions.into_iter().chunks(chunks_size);
+        for (counter, tx) in transactions.into_iter().enumerate() {
+            // Wait until the next interval before sending the next transaction
+            while Instant::now() < next_ts {}
 
-        for (counter, chunk) in chunks.into_iter().enumerate() {
-            if counter % 1000 == 0 && counter != 0 {
-                tracing::debug!("Submitted {} txs", counter * chunks_size);
-            }
-
-            let now = Instant::now();
+            // Get the current timestamp for metrics
             let timestamp = Metrics::now().as_secs_f64();
-            for tx in chunk {
-                let full_tx = TransactionWithTimestamp::new(tx, timestamp);
-                sender.send(full_tx).await.expect("Cannot send transaction");
+            let full_tx = TransactionWithTimestamp::new(tx, timestamp);
+
+            // Send the transaction
+            if sender.send(full_tx).await.is_err() {
+                tracing::error!("Failed to send transaction");
+                break; // Exit the loop on send failure
             }
 
-            if now.elapsed() > burst_duration {
-                tracing::warn!("Transaction rate too high for this client");
-                self.metrics
-                    .register_error(ErrorType::TransactionRateTooHigh);
+            // Increment transaction counter for logging
+            if counter > 0 && counter % 1000 == 0 {
+                tracing::debug!("Submitted {} transactions", counter);
             }
 
-            interval.tick().await;
+            // Calculate the next interval
+            next_ts += Duration::from_nanos(Self::gen_inter_arrival(self, &mut rng));
         }
     }
 
@@ -185,9 +195,9 @@ pub mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
+        client::load_generator::LoadGenerator,
         config::{get_test_address, BenchmarkParameters},
         executor::sui::SuiTransaction,
-        load_generator::LoadGenerator,
         metrics::Metrics,
         networking::server::NetworkServer,
     };

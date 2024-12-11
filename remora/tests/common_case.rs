@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use remora::{
+    client::load_generator::LoadGenerator,
     config::{BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters},
     executor::sui::SuiExecutor,
-    load_generator::LoadGenerator,
     metrics::Metrics,
     primary::node::PrimaryNode,
     proxy::node::ProxyNode,

@@ -6,9 +6,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
+    client::load_generator::default_metrics_address,
     config::{BenchmarkParameters, ImportExport, WorkloadType},
     executor::sui::check_logs_for_shared_object,
-    load_generator::default_metrics_address,
 };
 
 #[derive(Parser, Debug)]
