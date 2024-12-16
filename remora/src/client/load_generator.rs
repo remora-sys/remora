@@ -40,7 +40,7 @@ const NUM_CLIENTS: usize = 8;
 impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr) -> Self {
-        let ns_per_packet = 1_000_000_000 / config.load / NUM_CLIENTS as u64;
+        let ns_per_packet = 1_000_000_000 / config.load * NUM_CLIENTS as u64;
         LoadGenerator {
             config,
             target,
@@ -136,13 +136,21 @@ impl LoadGenerator {
 
         // split the transactions
         let split = self.split_transactions(transactions);
-        let arrival = self.arrival;
 
         // spawn for each client
+        let mut handles = vec![];
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
-            tokio::spawn(async move {
+            let arrival = self.arrival.clone();
+            let handle = tokio::spawn(async move {
                 Self::submit_transactions(tx_chunk, tx, arrival).await;
             });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::error!("Task error: {:?}", e);
+            }
         }
     }
 }
