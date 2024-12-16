@@ -35,10 +35,12 @@ pub struct LoadGenerator {
     arrival: Distribution,
 }
 
+const NUM_CLIENTS: usize = 8;
+
 impl LoadGenerator {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr) -> Self {
-        let ns_per_packet = 1_000_000_000 / config.load;
+        let ns_per_packet = 1_000_000_000 / config.load * NUM_CLIENTS as u64;
         LoadGenerator {
             config,
             target,
@@ -52,15 +54,15 @@ impl LoadGenerator {
     }
 
     /// Generate inter-arrival interval
-    pub fn gen_inter_arrival(&self, rng: &mut Mt64) -> u64 {
-        self.arrival.sample(rng)
+    pub fn gen_inter_arrival(rng: &mut Mt64, arrival: Distribution) -> u64 {
+        arrival.sample(rng)
     }
 
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
-        &mut self,
         transactions: Vec<Transaction>,
         sender: Sender<SuiTransaction>,
+        arrival: Distribution,
     ) {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
         let mut next_ts = Instant::now();
@@ -85,90 +87,71 @@ impl LoadGenerator {
             }
 
             // Calculate the next interval
-            next_ts += Duration::from_nanos(Self::gen_inter_arrival(self, &mut rng));
+            next_ts += Duration::from_nanos(Self::gen_inter_arrival(&mut rng, arrival));
         }
     }
 
-    async fn connect_and_spawn_network_client(&mut self) -> mpsc::Sender<SuiTransaction> {
-        let (tx_unused, _rx_unused) = mpsc::channel(1);
-        let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
-        let client = NetworkClient::<(), _>::new(self.target, tx_unused, rx_transactions);
+    async fn connect_and_spawn_network_client(&mut self) -> Vec<mpsc::Sender<SuiTransaction>> {
+        let mut senders = Vec::with_capacity(NUM_CLIENTS);
 
-        match client.connect().await {
-            Ok(stream) => {
-                client.spawn_after_connect(stream);
-            }
-            Err(e) => {
-                tracing::error!("Failed to connect to server: {}", e);
+        for _ in 0..NUM_CLIENTS {
+            let (tx_unused, _rx_unused) = mpsc::channel(1);
+            let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
+            let client = NetworkClient::<(), _>::new(self.target, tx_unused, rx_transactions);
+
+            match client.connect().await {
+                Ok(stream) => {
+                    client.spawn_after_connect(stream);
+                    senders.push(tx_transactions);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to server: {}", e);
+                }
             }
         }
 
-        tx_transactions
+        senders
     }
 
     pub async fn run(&mut self, transactions: Vec<Transaction>) {
         let tx_transactions = self.connect_and_spawn_network_client().await;
-
-        let warm_up_load = 2_000;
-        let real_load = self.config.load;
-
-        // If the real load is less than or equal to the warm-up load, skip the warm-up
-        // used for test cases
-        if real_load <= warm_up_load {
-            tracing::info!(
-                "Skipping warm-up phase as real load ({}) <= warm-up load ({})",
-                real_load,
-                warm_up_load
-            );
-            self.real_run(transactions, tx_transactions).await;
-        } else {
-            tracing::info!("Starting warm-up and real run phases...");
-            self.warm_up_and_real_run(transactions, warm_up_load, tx_transactions)
-                .await;
-        }
+        self.real_run(transactions, tx_transactions).await;
     }
 
-    async fn warm_up_and_real_run(
+    pub fn split_transactions(&self, transactions: Vec<Transaction>) -> Vec<Vec<Transaction>> {
+        let chunk_size = (transactions.len() + NUM_CLIENTS - 1) / NUM_CLIENTS; // Ceiling division
+        transactions
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+
+    async fn real_run(
         &mut self,
         transactions: Vec<Transaction>,
-        warm_up_load: u64,
-        sender: Sender<SuiTransaction>,
+        senders: Vec<Sender<SuiTransaction>>,
     ) {
-        let warm_up_duration = Duration::from_secs(1);
-
-        // Warm-up configuration
-        tracing::info!("Starting warm-up phase at {} load...", warm_up_load);
-
-        // Calculate how many transactions are needed for the warm-up phase
-        let warm_up_tx_count = warm_up_load * warm_up_duration.as_secs_f64() as u64;
-
-        tracing::info!(
-            "warm-up len {}, total_len {}",
-            warm_up_tx_count,
-            transactions.len(),
-        );
-
-        // Split the transactions into warm-up and real run transactions
-        let (warm_up_transactions, remaining_transactions) =
-            transactions.split_at(warm_up_tx_count as usize);
-
-        let warm_up_future = self.submit_transactions(
-            warm_up_transactions.to_vec(), // Use the warm-up transactions
-            sender.clone(),
-        );
-
-        // Use a timeout to limit the warm-up phase duration
-        let _ = tokio::time::timeout(warm_up_duration, warm_up_future).await;
-
-        // After warm-up, proceed to the real run
-        self.real_run(remaining_transactions.to_vec(), sender).await;
-    }
-
-    async fn real_run(&mut self, transactions: Vec<Transaction>, sender: Sender<SuiTransaction>) {
         let real_load = self.config.load;
-        tracing::info!("Starting real run at {} load...", real_load);
+        tracing::info!("Starting run at {} load...", real_load);
 
-        self.submit_transactions(transactions, sender).await;
+        // split the transactions
+        let split = self.split_transactions(transactions);
+
+        // spawn for each client
+        let mut handles = vec![];
+        for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
+            let arrival = self.arrival.clone();
+            let handle = tokio::spawn(async move {
+                Self::submit_transactions(tx_chunk, tx, arrival).await;
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::error!("Task error: {:?}", e);
+            }
+        }
     }
 }
 

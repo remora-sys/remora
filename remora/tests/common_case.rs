@@ -12,7 +12,7 @@ use remora::{
     proxy::node::ProxyNode,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[tracing_test::traced_test]
 async fn remote_proxy() {
     let validator_parameters = ValidatorParameters {
