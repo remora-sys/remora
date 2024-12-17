@@ -272,7 +272,7 @@ impl Executor for SuiExecutor {
     async fn execute(
         ctx: Arc<BenchmarkContext>,
         store: Arc<InMemoryObjectStore>,
-        transaction: &SuiTransaction,
+        transaction: SuiTransaction,
     ) -> SuiExecutionResults {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.validator();
@@ -321,7 +321,7 @@ impl Executor for SuiExecutor {
         // Commit the objects to the store.
         store.commit_objects(inner_temp_store);
 
-        SuiExecutionResults::new(effects, written)
+        SuiExecutionResults::new(transaction, effects, written)
     }
 
     fn pre_execute_check(
@@ -364,7 +364,7 @@ mod tests {
 
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
-            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), transaction).await;
             assert!(results.success());
         }
     }
@@ -397,7 +397,7 @@ mod tests {
         let ctx = executor.context();
         for tx in read_txs {
             let transaction = SuiTransaction::new_for_tests(tx);
-            let results = SuiExecutor::execute(ctx.clone(), store.clone(), &transaction).await;
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), transaction).await;
             assert!(results.success());
         }
 

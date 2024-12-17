@@ -3,17 +3,12 @@
 
 use std::{io, sync::Arc};
 
-use dashmap::DashMap;
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 
-use super::{
-    core::{PendingTransactions, PrimaryCore},
-    load_balancer::LoadBalancer,
-    mock_consensus::MockConsensus,
-};
+use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::ValidatorConfig,
     error::NodeResult,
@@ -66,15 +61,12 @@ impl PrimaryNode {
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
-        let pending_txns: PendingTransactions<SuiExecutor> = Arc::new(DashMap::new());
-
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
             rx_client_transactions,
             tx_forwarded_load,
             rx_proxy_connections,
             rx_committed_txns,
-            pending_txns.clone(),
             tx_executor_local.clone(),
             rx_states_sync,
             metrics.clone(),
@@ -138,7 +130,6 @@ impl PrimaryNode {
             rx_commits,
             rx_proxy_results,
             tx_output,
-            pending_txns,
             tx_committed_txns,
             tx_executor_local,
             rx_executor_local,

@@ -98,7 +98,7 @@ impl<E: Executor> ProxyCore<E> {
                             let execution_result = E::execute(
                                 self.executor.context(),
                                 self.store.clone(),
-                                &transaction,
+                                transaction,
                             )
                             .await;
                             self.metrics.decrease_proxy_load(&self.id);
@@ -209,7 +209,7 @@ impl<E: Executor> ProxyCore<E> {
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
             if ready_to_execute {
-                let execution_result = E::execute(ctx, store, &transaction).await;
+                let execution_result = E::execute(ctx, store, transaction).await;
                 tx_results
                     .send(execution_result)
                     .await

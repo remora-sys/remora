@@ -17,7 +17,6 @@ use crate::{
         PrimaryToProxyMessage, RemoraTransaction,
     },
     metrics::Metrics,
-    primary::core::PendingTransactions,
 };
 
 /// A load balancer is responsible for distributing transactions to the consensus and proxies.
@@ -38,8 +37,6 @@ pub struct LoadBalancer<E: Executor> {
     index: ExecutorIndex,
     /// Keeps track of shared-objects and its shards (proxy)
     shared_object_shards: FxHashMap<ObjectID, ExecutorIndex>,
-    /// The transactions sent out to proxies
-    pending_txns: PendingTransactions<E>,
     /// The sender to a local executor if no pre-executor is available.
     tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
@@ -55,7 +52,6 @@ impl<E: Executor> LoadBalancer<E> {
         tx_consensus: Sender<RemoraTransaction<E>>,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<RemoraTransaction<E>>,
-        pending_txns: PendingTransactions<E>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
@@ -68,7 +64,6 @@ impl<E: Executor> LoadBalancer<E> {
             rx_committed_txns,
             index: 0,
             shared_object_shards: FxHashMap::default(),
-            pending_txns,
             tx_executor_local,
             rx_states_sync,
             metrics,
@@ -195,7 +190,6 @@ impl<E: Executor> LoadBalancer<E> {
                             self.index % self.proxy_connections.len()
                         };
 
-                        self.pending_txns.insert(*transaction.digest(), (proxy_index, transaction.clone()));
                         // Send the transaction to the selected proxy
                         match self.proxy_connections[proxy_index]
                             .send(PrimaryToProxyMessage::Txn(transaction))
