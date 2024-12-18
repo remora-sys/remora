@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Default channel size for communication between components.
-const DEFAULT_CHANNEL_SIZE: usize = 1000;
+const DEFAULT_CHANNEL_SIZE: usize = 100_000;
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct PrimaryNode {
