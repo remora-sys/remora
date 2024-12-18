@@ -125,6 +125,9 @@ impl<E: Executor> ProxyCore<E> {
                         Some(message) = self.rx_transactions.recv() => {
                             match message {
                                 PrimaryToProxyMessage::Txn(transaction) => {
+                                    if task_id == 0 {
+                                        self.metrics.register_start_time();
+                                    }
                                     task_id += 1;
                                     self.metrics.increase_proxy_load(&self.id);
                                     let (prior_handles, current_handles) = self.get_dependencies(transaction.clone(), task_id);
@@ -209,7 +212,7 @@ impl<E: Executor> ProxyCore<E> {
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
             if ready_to_execute {
-                let execution_result = E::execute(ctx, store, transaction).await;
+                let execution_result = E::execute(ctx, store, transaction.clone()).await;
                 tx_results
                     .send(execution_result)
                     .await
@@ -221,6 +224,7 @@ impl<E: Executor> ProxyCore<E> {
             }
 
             metrics.decrease_proxy_load(&id);
+            metrics.update_metrics(transaction.timestamp());
             Ok::<_, NodeError>(())
         });
         Ok(())
