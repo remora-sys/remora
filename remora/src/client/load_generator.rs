@@ -11,7 +11,7 @@ use rand_mt::Mt64;
 use sui_types::transaction::Transaction;
 use tokio::{
     sync::mpsc::{self, Sender},
-    time::Instant,
+    time::{sleep, Instant},
 };
 
 use crate::{
@@ -69,7 +69,9 @@ impl LoadGenerator {
 
         for (counter, tx) in transactions.into_iter().enumerate() {
             // Wait until the next interval before sending the next transaction
-            while Instant::now() < next_ts {}
+            while Instant::now() < next_ts {
+                std::hint::spin_loop();
+            }
 
             // Get the current timestamp for metrics
             let timestamp = Metrics::now().as_secs_f64();
@@ -96,7 +98,7 @@ impl LoadGenerator {
 
         for _ in 0..NUM_CLIENTS {
             let (tx_unused, _rx_unused) = mpsc::channel(1);
-            let (tx_transactions, rx_transactions) = mpsc::channel(100_000);
+            let (tx_transactions, rx_transactions) = mpsc::channel(1_000_000);
             let client = NetworkClient::<(), _>::new(self.target, tx_unused, rx_transactions);
 
             match client.connect().await {
@@ -142,6 +144,7 @@ impl LoadGenerator {
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
             let arrival = self.arrival.clone();
             let handle = tokio::spawn(async move {
+                sleep(Duration::from_secs(1)).await;
                 Self::submit_transactions(tx_chunk, tx, arrival).await;
             });
             handles.push(handle);

@@ -34,7 +34,7 @@ pub trait ExecutableTransaction {
 pub type Timestamp = f64;
 
 /// A transaction with a timestamp. This is used to compute performance.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     /// The transaction.
     transaction: T,
@@ -74,14 +74,31 @@ impl<T: ExecutableTransaction + Clone> Deref for TransactionWithTimestamp<T> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExecutionResultsAndEffects<U: Clone + Debug> {
+pub struct ExecutionResultsAndEffects<T, U>
+where
+    T: ExecutableTransaction + Clone,
+    U: Clone + Debug,
+{
+    pub transaction: TransactionWithTimestamp<T>,
     pub updates: U,
     pub new_state: BTreeMap<ObjectID, Object>,
 }
 
-impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndEffects<U> {
-    pub fn new(updates: U, new_state: BTreeMap<ObjectID, Object>) -> Self {
-        Self { updates, new_state }
+impl<T, U> ExecutionResultsAndEffects<T, U>
+where
+    T: ExecutableTransaction + Clone,
+    U: TransactionEffectsAPI + Clone + Debug,
+{
+    pub fn new(
+        transaction: TransactionWithTimestamp<T>, // Include the transaction here
+        updates: U,
+        new_state: BTreeMap<ObjectID, Object>,
+    ) -> Self {
+        Self {
+            transaction,
+            updates,
+            new_state,
+        }
     }
 
     pub fn success(&self) -> bool {
@@ -94,6 +111,14 @@ impl<U: TransactionEffectsAPI + Clone + Debug> ExecutionResultsAndEffects<U> {
 
     pub fn modified_at_versions(&self) -> Vec<(ObjectID, SequenceNumber)> {
         self.updates.modified_at_versions()
+    }
+
+    pub fn transaction_with_timestamp(&self) -> &TransactionWithTimestamp<T> {
+        &self.transaction
+    }
+
+    pub fn transaction_timestamp(&self) -> Timestamp {
+        self.transaction.timestamp()
     }
 }
 
@@ -119,8 +144,8 @@ pub trait Executor: Clone {
     fn execute(
         ctx: Arc<BenchmarkContext>,
         store: Arc<Self::Store>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = ExecutionResultsAndEffects<Self::ExecutionResults>> + Send;
+        transaction: TransactionWithTimestamp<Self::Transaction>,
+    ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send;
 
     /// Check version ID check prior to execution
     fn pre_execute_check(
@@ -134,7 +159,8 @@ pub trait Executor: Clone {
 pub type RemoraTransaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
 
 /// Short for the results of executing a transaction.
-pub type ExecutionResults<E> = ExecutionResultsAndEffects<<E as Executor>::ExecutionResults>;
+pub type ExecutionResults<E> =
+    ExecutionResultsAndEffects<<E as Executor>::Transaction, <E as Executor>::ExecutionResults>;
 
 /// Short for the store used by the executor.
 pub type Store<E> = Arc<<E as Executor>::Store>;

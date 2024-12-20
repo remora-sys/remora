@@ -1,12 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use dashmap::DashMap;
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
-    digests::TransactionDigest,
     storage::ObjectStore,
 };
 use tokio::{
@@ -18,20 +16,10 @@ use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, RemoraTransaction,
-        StateStore, Store, Timestamp, TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore, Store,
+        Timestamp, TransactionWithTimestamp,
     },
 };
-
-pub type PendingTransactions<E> = Arc<
-    DashMap<
-        TransactionDigest,
-        (
-            ExecutorIndex,
-            TransactionWithTimestamp<<E as Executor>::Transaction>,
-        ),
-    >,
->;
 
 /// The primary executor is responsible for executing transactions and merging the results
 /// from the proxies.
@@ -46,8 +34,6 @@ pub struct PrimaryCore<E: Executor> {
     rx_proxies: Receiver<ExecutionResults<E>>,
     /// Output channel for the final results.
     tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
-    /// The transactions sent out to proxies
-    pending_txns: PendingTransactions<E>,
     /// The sender to load balancer.
     tx_committed_txns: Sender<RemoraTransaction<E>>,
     /// The sender to a local executor.
@@ -66,7 +52,6 @@ impl<E: Executor> PrimaryCore<E> {
         rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
         tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
-        pending_txns: PendingTransactions<E>,
         tx_committed_txns: Sender<RemoraTransaction<E>>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_executor_local: Receiver<RemoraTransaction<E>>,
@@ -78,7 +63,6 @@ impl<E: Executor> PrimaryCore<E> {
             rx_commits,
             rx_proxies,
             tx_output,
-            pending_txns,
             tx_committed_txns,
             tx_executor_local,
             rx_executor_local,
@@ -103,49 +87,40 @@ impl<E: Executor> PrimaryCore<E> {
             .collect()
     }
 
-    pub async fn check_and_apply_proxy_results(
-        &mut self,
-        pending_txns: PendingTransactions<E>,
-        proxy_result: ExecutionResults<E>,
-    ) {
+    pub async fn check_and_apply_proxy_results(&mut self, proxy_result: ExecutionResults<E>) {
         let mut skip = true;
-        if let Some((_, (_, transaction))) = pending_txns.remove(proxy_result.transaction_digest())
-        {
-            let initial_state = self.get_input_objects(&transaction);
-            for (id, vid) in &proxy_result.modified_at_versions() {
-                let (_, v, _) = initial_state
-                    .get(id)
-                    .expect("Transaction's inputs already checked");
-                if v != vid {
-                    skip = false;
-                }
+        let initial_state = self.get_input_objects(&proxy_result.transaction);
+        for (id, vid) in &proxy_result.modified_at_versions() {
+            let (_, v, _) = initial_state
+                .get(id)
+                .expect("Transaction's inputs already checked");
+            if v != vid {
+                skip = false;
             }
+        }
 
-            if skip {
-                let effects = proxy_result.clone();
-                self.store
-                    .commit_objects(effects.updates, effects.new_state);
-                if self
-                    .tx_output
-                    .send((transaction.timestamp(), proxy_result))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("Failed to output execution result, stopping primary executor");
-                }
-            } else {
-                tracing::warn!("Failed to apply proxy results, sends to local executor");
-                if self
-                    .tx_executor_local
-                    .send(transaction.clone())
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("Failed to send transaction to the local executor");
-                }
+        if skip {
+            let effects = proxy_result.clone();
+            self.store
+                .commit_objects(effects.updates, effects.new_state);
+            if self
+                .tx_output
+                .send((proxy_result.transaction.timestamp(), proxy_result))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to output execution result, stopping primary executor");
             }
         } else {
-            tracing::warn!("The received result is not in pending txns");
+            tracing::warn!("Failed to apply proxy results, sends to local executor");
+            if self
+                .tx_executor_local
+                .send(proxy_result.transaction.clone())
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to send transaction to the local executor");
+            }
         }
     }
 
@@ -164,7 +139,7 @@ impl<E: Executor> PrimaryCore<E> {
         // FIXME: this probably doesn't work for shared objects
         // Need to track dependency and merge commit_objects with local execution
         tokio::spawn(async move {
-            let txn_result = E::execute(ctx, store, &transaction).await;
+            let txn_result = E::execute(ctx, store, transaction.clone()).await;
 
             if tx_output
                 .send((transaction.timestamp(), txn_result.clone()))
@@ -215,7 +190,7 @@ impl<E: Executor> PrimaryCore<E> {
                 // Receive an execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     tracing::debug!("Received proxy result");
-                    self.check_and_apply_proxy_results(self.pending_txns.clone(), proxy_result).await;
+                    self.check_and_apply_proxy_results(proxy_result).await;
                 }
 
                 // Receieve a transaction for local execution.
