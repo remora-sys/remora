@@ -65,6 +65,7 @@ impl PrimaryNode {
             rx_committed_txns,
             tx_executor_local.clone(),
             rx_states_sync,
+            metrics.clone(),
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
