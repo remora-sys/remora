@@ -12,7 +12,6 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::mock_consensus::ConsensusCommit;
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
@@ -28,14 +27,10 @@ pub struct PrimaryCore<E: Executor> {
     executor: E,
     /// The object store.
     store: Store<E>,
-    /// The receiver for consensus commits.
-    rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
     /// The receiver for proxy results.
     rx_proxies: Receiver<ExecutionResults<E>>,
     /// Output channel for the final results.
     tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
-    /// The sender to load balancer.
-    tx_committed_txns: Sender<RemoraTransaction<E>>,
     /// The sender to a local executor.
     tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver to a local executor.
@@ -49,10 +44,8 @@ impl<E: Executor> PrimaryCore<E> {
     pub fn new(
         executor: E,
         store: Store<E>,
-        rx_commits: Receiver<ConsensusCommit<RemoraTransaction<E>>>,
         rx_proxies: Receiver<ExecutionResults<E>>,
         tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
-        tx_committed_txns: Sender<RemoraTransaction<E>>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_executor_local: Receiver<RemoraTransaction<E>>,
         tx_states_sync: Sender<ExecutionResults<E>>,
@@ -60,10 +53,8 @@ impl<E: Executor> PrimaryCore<E> {
         Self {
             executor,
             store,
-            rx_commits,
             rx_proxies,
             tx_output,
-            tx_committed_txns,
             tx_executor_local,
             rx_executor_local,
             tx_states_sync,
@@ -168,25 +159,6 @@ impl<E: Executor> PrimaryCore<E> {
     {
         loop {
             tokio::select! {
-                // Receive a commit from the consensus.
-                Some(commit) = self.rx_commits.recv() => {
-                    tracing::debug!("Received commit");
-                    for transaction in commit {
-                        // send to the load balancer
-                        if self.tx_committed_txns.send(transaction.clone()).await.is_err() {
-                            tracing::warn!("Failed to send transaction to load balancer");
-                            if self
-                                .tx_executor_local
-                                .send(transaction.clone())
-                                .await
-                                .is_err()
-                            {
-                                tracing::warn!("Failed to send transaction to the local executor");
-                            }
-                        }
-                    }
-                }
-
                 // Receive an execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     tracing::debug!("Received proxy result");

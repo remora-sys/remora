@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, ops::Deref};
 
 use rustc_hash::FxHashMap;
 use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
@@ -16,15 +16,10 @@ use crate::{
         ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
         PrimaryToProxyMessage, RemoraTransaction,
     },
-    metrics::Metrics,
 };
 
-/// A load balancer is responsible for distributing transactions to the consensus and proxies.
+/// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
-    /// The receiver for transactions.
-    rx_transactions: Receiver<RemoraTransaction<E>>,
-    /// The sender to forward transactions to the consensus.
-    tx_consensus: Sender<RemoraTransaction<E>>,
     /// Receive handles to forward transactions to proxies. When a new client connects,
     /// this channel receives a sender from the network layer which is used to forward
     /// transactions to the proxies.
@@ -32,7 +27,7 @@ pub struct LoadBalancer<E: Executor> {
     /// Holds senders to forward transactions to proxies.
     proxy_connections: Vec<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
     /// The receiver for committed transactions
-    rx_committed_txns: Receiver<RemoraTransaction<E>>,
+    rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
     /// Keeps track of shared-objects and its shards (proxy)
@@ -41,24 +36,17 @@ pub struct LoadBalancer<E: Executor> {
     tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
     rx_states_sync: Receiver<ExecutionResults<E>>,
-    /// The metrics for the validator.
-    metrics: Arc<Metrics>,
 }
 
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
     pub fn new(
-        rx_transactions: Receiver<RemoraTransaction<E>>,
-        tx_consensus: Sender<RemoraTransaction<E>>,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        rx_committed_txns: Receiver<RemoraTransaction<E>>,
+        rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_states_sync: Receiver<ExecutionResults<E>>,
-        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            rx_transactions,
-            tx_consensus,
             rx_proxy_connections,
             proxy_connections: Vec::new(),
             rx_committed_txns,
@@ -66,23 +54,7 @@ impl<E: Executor> LoadBalancer<E> {
             shared_object_shards: FxHashMap::default(),
             tx_executor_local,
             rx_states_sync,
-            metrics,
         }
-    }
-
-    /// Forward a transaction to the consensus.
-    async fn send_to_consensus(&mut self, transaction: RemoraTransaction<E>) -> NodeResult<()> {
-        if self.index == 0 {
-            self.metrics.register_start_time();
-        }
-
-        // Send the transaction to the consensus.
-        self.tx_consensus
-            .send(transaction)
-            .await
-            .map_err(|_| NodeError::ShuttingDown)?;
-
-        Ok(())
     }
 
     // TODO: a bit verbose and duplicated
@@ -155,6 +127,50 @@ impl<E: Executor> LoadBalancer<E> {
         updates_by_executor
     }
 
+    pub async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
+        // forward to proxies if exist else to the local executor
+        if !self.proxy_connections.is_empty() {
+            // Determine proxy_index based on shared object or round-robin.
+            let proxy_index = if self.check_shared_objects(transaction.deref()) {
+                // If a shared object is found, check the hashmap for proxy assignment
+                if let Some(&proxy_index) = self.get_proxy_for_shared_object(&transaction) {
+                    proxy_index
+                } else {
+                    // If no proxy is assigned to this shared object, assign one in a round-robin fashion
+                    let proxy_index = self.index % self.proxy_connections.len();
+                    self.assign_shared_object_to_proxy(&transaction, proxy_index);
+                    proxy_index
+                }
+            } else {
+                // No shared object, use round-robin to select proxy
+                self.index % self.proxy_connections.len()
+            };
+
+            // Send the transaction to the selected proxy
+            match self.proxy_connections[proxy_index]
+                .send(PrimaryToProxyMessage::Txn(transaction))
+                .await
+            {
+                Ok(()) => {
+                    tracing::debug!("Sent transaction to proxy {}", proxy_index);
+                    self.index += 1;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Failed to send transaction to proxy {}, trying other proxies",
+                        proxy_index
+                    );
+                    self.proxy_connections.swap_remove(proxy_index);
+                }
+            }
+        } else {
+            // send back to primary local executor
+            if self.tx_executor_local.send(transaction).await.is_err() {
+                tracing::warn!("Failed to send transaction to the local executor");
+            }
+        }
+    }
+
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
@@ -165,53 +181,9 @@ impl<E: Executor> LoadBalancer<E> {
                     tracing::info!("Added a new proxy connection");
                 }
 
-                Some(transaction) = self.rx_transactions.recv() =>
-                    self
-                    .send_to_consensus(transaction)
-                    .await
-                    .map_err(|_| NodeError::ShuttingDown)?,
-
-                Some(transaction) = self.rx_committed_txns.recv() => {
-                    // forward to proxies if exist else to the local executor
-                    if !self.proxy_connections.is_empty() {
-                        // Determine proxy_index based on shared object or round-robin.
-                        let proxy_index = if self.check_shared_objects(transaction.deref()) {
-                            // If a shared object is found, check the hashmap for proxy assignment
-                            if let Some(&proxy_index) = self.get_proxy_for_shared_object(&transaction) {
-                                proxy_index
-                            } else {
-                                // If no proxy is assigned to this shared object, assign one in a round-robin fashion
-                                let proxy_index = self.index % self.proxy_connections.len();
-                                self.assign_shared_object_to_proxy(&transaction, proxy_index);
-                                proxy_index
-                            }
-                        } else {
-                            // No shared object, use round-robin to select proxy
-                            self.index % self.proxy_connections.len()
-                        };
-
-                        // Send the transaction to the selected proxy
-                        match self.proxy_connections[proxy_index]
-                            .send(PrimaryToProxyMessage::Txn(transaction))
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::debug!("Sent transaction to proxy {}", proxy_index);
-                                self.index += 1;
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "Failed to send transaction to proxy {}, trying other proxies",
-                                    proxy_index
-                                );
-                                self.proxy_connections.swap_remove(proxy_index);
-                            }
-                        }
-                    } else {
-                        // send back to primary local executor
-                        if self.tx_executor_local.send(transaction).await.is_err() {
-                            tracing::warn!("Failed to send transaction to the local executor");
-                        }
+                Some(transactions) = self.rx_committed_txns.recv() => {
+                    for transaction in transactions {
+                        self.forward_txn_to_proxy(transaction).await;
                     }
                 }
 

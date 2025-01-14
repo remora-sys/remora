@@ -49,10 +49,8 @@ impl PrimaryNode {
     ) -> Self {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_forwarded_load, rx_forwarded_load) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_commits, rx_commits) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_executor_local, rx_executor_local) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -63,13 +61,10 @@ impl PrimaryNode {
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
-            rx_client_transactions,
-            tx_forwarded_load,
             rx_proxy_connections,
             rx_committed_txns,
             tx_executor_local.clone(),
             rx_states_sync,
-            metrics.clone(),
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
@@ -79,8 +74,8 @@ impl PrimaryNode {
         let consensus_handle = MockConsensus::new(
             config.validator_parameters.consensus_delay_model.clone(),
             config.validator_parameters.consensus_parameters.clone(),
-            rx_forwarded_load,
-            tx_commits,
+            rx_client_transactions,
+            tx_committed_txns,
         )
         .spawn();
 
@@ -127,10 +122,8 @@ impl PrimaryNode {
         let primary_handle = PrimaryCore::new(
             executor,
             store,
-            rx_commits,
             rx_proxy_results,
             tx_output,
-            tx_committed_txns,
             tx_executor_local,
             rx_executor_local,
             tx_states_sync,
