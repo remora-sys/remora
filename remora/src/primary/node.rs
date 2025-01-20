@@ -10,7 +10,7 @@ use tokio::{
 
 use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
-    config::ValidatorConfig,
+    config::{DEFAULT_CHANNEL_SIZE, ValidatorConfig},
     error::NodeResult,
     executor::{
         api::Timestamp,
@@ -20,9 +20,6 @@ use crate::{
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
 };
-
-/// Default channel size for communication between components.
-const DEFAULT_CHANNEL_SIZE: usize = 100_000;
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct PrimaryNode {

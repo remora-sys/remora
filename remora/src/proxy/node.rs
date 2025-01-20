@@ -7,12 +7,9 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
-    config::ValidatorConfig, error::NodeResult, executor::sui::SuiExecutor, metrics::Metrics,
+    config::{DEFAULT_CHANNEL_SIZE, ValidatorConfig}, error::NodeResult, executor::sui::SuiExecutor, metrics::Metrics,
     networking::client::NetworkClient,
 };
-
-/// Default channel size for communication between components.
-const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 pub struct ProxyNode {
     /// The handles for the core components.

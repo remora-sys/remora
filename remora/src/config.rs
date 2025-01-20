@@ -13,6 +13,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
+/// Default channel size for communication between components.
+pub const DEFAULT_CHANNEL_SIZE: usize = 100_000;
+
 /// Return a socket address on the local machine with a random port.
 /// This is useful for tests.
 pub fn get_test_address() -> SocketAddr {
