@@ -10,10 +10,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::networking::worker::ConnectionWorker;
-
-/// The size of the server-worker communication channel.
-pub const WORKER_CHANNEL_SIZE: usize = 1000;
+use crate::{config::DEFAULT_CHANNEL_SIZE, networking::worker::ConnectionWorker};
 
 /// A server run by the primary machine that listens for connections from proxies
 /// and transactions from clients. When a new client connects, a new worker is spawned.
@@ -60,7 +57,7 @@ where
             tracing::info!("Accepted connection from client {peer}");
 
             // Spawn a worker to handle the connection.
-            let (tx, rx) = mpsc::channel(WORKER_CHANNEL_SIZE);
+            let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let worker = ConnectionWorker::new(stream, self.tx_incoming.clone(), rx);
             let _handle = worker.spawn();
 
