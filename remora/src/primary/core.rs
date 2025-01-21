@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
     storage::ObjectStore,
@@ -166,32 +166,30 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
     {
-        let mut futures = FuturesUnordered::new();
-        let mut in_flight_futures: usize = 0;
+        let in_flight_futures = Arc::new(AtomicUsize::new(0));
 
         loop {
             tokio::select! {
                 // Receive an execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv(),
-                    if in_flight_futures < MAX_INFLIGHT_FUTURES => {
+                    if in_flight_futures.load(Ordering::Relaxed) < MAX_INFLIGHT_FUTURES => {
 
                     tracing::debug!("Received proxy result");
+                    let in_flight = in_flight_futures.clone();
+                    in_flight.fetch_add(1, Ordering::Relaxed);
                     let store = self.store.clone();
                     let tx_output = self.tx_output.clone();
                     let tx_executor_local = self.tx_executor_local.clone();
-                    futures.push(Self::check_and_apply_proxy_results(store, tx_output, tx_executor_local, proxy_result));
-                    in_flight_futures += 1;
+                    tokio::spawn(async move {
+                        Self::check_and_apply_proxy_results(store, tx_output, tx_executor_local, proxy_result).await;
+                        in_flight.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
 
                 // Receieve a transaction for local execution.
                 Some(transaction) = self.rx_executor_local.recv() => {
                     tracing::debug!("Received transaction for local execution");
                     self.local_execute(transaction).await;
-                }
-
-                // On finishing a spawned future
-                Some(()) = futures.next() => {
-                    in_flight_futures -= 1;
                 }
 
                 // The channel is closed.
