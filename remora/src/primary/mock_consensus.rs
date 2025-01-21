@@ -135,9 +135,6 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                     tracing::debug!("Delivered batch to primary executor");
                 }
             }
-
-            // Give the change to schedule other tasks.
-            tokio::task::yield_now().await;
         }
     }
 
