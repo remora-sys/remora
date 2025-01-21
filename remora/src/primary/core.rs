@@ -64,12 +64,12 @@ impl<E: Executor> PrimaryCore<E> {
     /// Get the input objects for a transaction.
     // TODO: This function should return an error when the input object is not found
     // or the input objects are malformed instead of panicking.
-    fn get_input_objects(&self, transaction: &E::Transaction) -> HashMap<ObjectID, ObjectRef> {
+    fn get_input_objects(store: Store<E>, transaction: &E::Transaction) -> HashMap<ObjectID, ObjectRef> {
         transaction
             .input_objects()
             .iter()
             .map(|kind| {
-                self.store
+                store
                     .get_object(&kind.object_id())
                     .expect("Failed to read objects from store")
                     .map(|object| (object.id(), object.compute_object_reference()))
@@ -78,41 +78,50 @@ impl<E: Executor> PrimaryCore<E> {
             .collect()
     }
 
-    pub async fn check_and_apply_proxy_results(&mut self, proxy_result: ExecutionResults<E>) {
-        let mut skip = true;
-        let initial_state = self.get_input_objects(&proxy_result.transaction);
-        for (id, vid) in &proxy_result.modified_at_versions() {
-            let (_, v, _) = initial_state
-                .get(id)
-                .expect("Transaction's inputs already checked");
-            if v != vid {
-                skip = false;
-            }
-        }
+    pub async fn check_and_apply_proxy_results(&mut self, proxy_result: ExecutionResults<E>) 
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
+    {
+        let store = self.store.clone();
+        let tx_output = self.tx_output.clone();
+        let tx_executor_local = self.tx_executor_local.clone();
 
-        if skip {
-            let effects = proxy_result.clone();
-            self.store
-                .commit_objects(effects.updates, effects.new_state);
-            if self
-                .tx_output
-                .send((proxy_result.transaction.timestamp(), proxy_result))
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to output execution result, stopping primary executor");
+        tokio::spawn(async move {
+            let mut skip = true;
+            let initial_state = Self::get_input_objects(store.clone(), &proxy_result.transaction);
+            for (id, vid) in &proxy_result.modified_at_versions() {
+                let (_, v, _) = initial_state
+                    .get(id)
+                    .expect("Transaction's inputs already checked");
+                if v != vid {
+                    skip = false;
+                }
             }
-        } else {
-            tracing::warn!("Failed to apply proxy results, sends to local executor");
-            if self
-                .tx_executor_local
-                .send(proxy_result.transaction.clone())
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to send transaction to the local executor");
+
+            if skip {
+                let effects = proxy_result.clone();
+                store.commit_objects(effects.updates, effects.new_state);
+                if tx_output
+                    .send((proxy_result.transaction.timestamp(), proxy_result))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to output execution result, stopping primary executor");
+                }
+            } else {
+                tracing::warn!("Failed to apply proxy results, sends to local executor");
+                if tx_executor_local
+                    .send(proxy_result.transaction.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send transaction to the local executor");
+                }
             }
-        }
+        });
     }
 
     async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>)
