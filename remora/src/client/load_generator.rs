@@ -50,7 +50,7 @@ impl LoadGenerator {
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
     pub async fn initialize(&mut self) -> Vec<Transaction> {
-        generate_transactions(&self.config).await
+        generate_transactions(&self.config, None).await
     }
 
     /// Generate inter-arrival interval

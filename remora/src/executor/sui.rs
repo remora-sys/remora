@@ -22,7 +22,11 @@ use sui_types::{
 use tokio::time::Instant;
 
 use super::api::{
-    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+    ExecutableTransaction,
+    ExecutionResults,
+    Executor,
+    RemoraTransaction,
+    StateStore,
 };
 use crate::config::{BenchmarkParameters, WorkloadType};
 
@@ -86,10 +90,23 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
     Workload::new(pre_generation, workload_type)
 }
 
-pub async fn generate_transactions(config: &BenchmarkParameters) -> Vec<Transaction> {
+pub async fn generate_transactions(
+    config: &BenchmarkParameters,
+    working_directory: Option<PathBuf>,
+) -> Vec<Transaction> {
     tracing::debug!("Generating all transactions...");
     let workload = init_workload(config);
-    let mut ctx = BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await;
+    let mut ctx = if let Some(path) = working_directory {
+        BenchmarkContext::new_with_exportable_state(
+            workload.clone(),
+            Component::PipeTxsToChannel,
+            false,
+            path,
+        )
+        .await
+    } else {
+        BenchmarkContext::new(workload.clone(), Component::PipeTxsToChannel, false).await
+    };
     let start_time = Instant::now();
     let tx_generator = workload.create_tx_generator(&mut ctx).await;
     let transactions = ctx.generate_transactions(tx_generator).await;
@@ -342,7 +359,9 @@ impl Executor for SuiExecutor {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
+    use tokio::time::Instant;
 
     use crate::{
         config::BenchmarkParameters,
@@ -359,7 +378,7 @@ mod tests {
         let store = Arc::new(executor.create_in_memory_store());
         let ctx = executor.context();
 
-        let transactions = generate_transactions(&config).await;
+        let transactions = generate_transactions(&config, None).await;
         assert!(transactions.len() == 10);
 
         for tx in transactions {
@@ -371,8 +390,9 @@ mod tests {
 
     #[tokio::test]
     async fn shared_object_test_with_imported_file() {
-        use crate::config::WorkloadType;
         use std::fs;
+
+        use crate::config::WorkloadType;
 
         let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
@@ -403,5 +423,26 @@ mod tests {
 
         // Clean up directory after the test finishes
         fs::remove_dir_all(&working_directory).expect("Failed to delete working directory");
+    }
+
+    #[tokio::test]
+    #[ignore = "slow"]
+    async fn test_generate_transactions_with_exportable_state() {
+        let config = BenchmarkParameters {
+            load: 100,
+            duration: Duration::from_secs(1000),
+            ..BenchmarkParameters::new_for_tests()
+        };
+        let working_directory = PathBuf::from("./test_export");
+        let start_time = Instant::now();
+        let transactions = generate_transactions(&config, Some(working_directory)).await;
+        let elapsed = start_time.elapsed();
+        tracing::info!(
+            "Generated {} txs in {} ms",
+            transactions.len(),
+            elapsed.as_millis(),
+        );
+
+        assert!(false)
     }
 }

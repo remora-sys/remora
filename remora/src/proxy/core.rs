@@ -16,8 +16,13 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
-            RemoraTransaction, StateStore, Store,
+            ExecutableTransaction,
+            ExecutionResults,
+            Executor,
+            PrimaryToProxyMessage,
+            RemoraTransaction,
+            StateStore,
+            Store,
         },
         dependency_controller::DependencyController,
     },
@@ -299,7 +304,7 @@ mod tests {
         );
 
         // Send transactions to the proxy.
-        let transactions = generate_transactions(&config).await;
+        let transactions = generate_transactions(&config, None).await;
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
             let message = PrimaryToProxyMessage::Txn(transaction);
