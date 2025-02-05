@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use rand::Rng;
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
     committee::EpochId,
@@ -42,6 +43,11 @@ pub fn fake_owned_object(version: u64) -> Object {
 /// A fake shared object for testing.
 pub fn fake_shared_object(version: u64) -> Object {
     let id = ObjectID::random();
+    fake_shared_object_with_id(version, id)
+}
+
+/// A fake shared object with a fixed Id for testing.
+pub fn fake_shared_object_with_id(version: u64, id: ObjectID) -> Object {
     let object_version = SequenceNumber::from_u64(version);
     let obj = MoveObject::new_gas_coin(object_version, id, 10);
     let owner = Owner::Shared {
@@ -418,11 +424,35 @@ impl Executor for FakeExecutor {
     }
 }
 
+/// Generate a fake transaction with a given number of inputs and contention level. Setting
+/// contention to 0 will generate a transaction accessing only one shared object, while setting
+/// contention to 100 will generate a transaction accessing different shared objects.
+pub fn generate_fake_shared_object_transaction(
+    number_of_inputs: usize,
+    contention: u64,
+) -> FakeTransaction {
+    let contention = contention.max(100);
+    let coin = rand::thread_rng().gen_range(0..100);
+    let inputs: Vec<_> = (0..number_of_inputs)
+        .map(|i| {
+            // Depending on the contention level, the first object may have a fixed id.
+            let object = if contention > coin && i == 0 {
+                fake_shared_object_with_id(0, ObjectID::ZERO)
+            } else {
+                fake_shared_object(0)
+            };
+            let reference = object.compute_object_reference();
+            InputObjectKind::ImmOrOwnedMoveObject(reference)
+        })
+        .collect();
+    FakeTransaction::new(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use sui_types::transaction::InputObjectKind;
+    use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
     use tokio::time::Instant;
 
     use crate::executor::{
@@ -430,6 +460,8 @@ mod tests {
         fake::{
             fake_owned_object,
             fake_shared_object,
+            fake_shared_object_with_id,
+            generate_fake_shared_object_transaction,
             FakeExecutionContext,
             FakeExecutor,
             FakeObjectStore,
@@ -520,4 +552,32 @@ mod tests {
         assert!(duration >= execution_duration);
     }
 
+    #[tokio::test]
+    async fn execute_fake_shared_object_transaction_with_contention() {
+        let store = Arc::new(FakeObjectStore::new());
+        let execution_duration = Duration::from_millis(3);
+        let checks_duration = Duration::from_millis(1);
+        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
+        let executor = FakeExecutor::new(execution_context);
+        let ctx = executor.context();
+
+        // Write the object to the store
+        let object = fake_shared_object_with_id(0, ObjectID::ZERO);
+        store.write_object(object);
+
+        for _ in 0..10 {
+            let contention = 100;
+            let transaction = generate_fake_shared_object_transaction(1, contention);
+            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+
+            let start = Instant::now();
+            let result =
+                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp)
+                    .await;
+            let duration = start.elapsed();
+
+            assert!(result.success());
+            assert!(duration >= execution_duration);
+        }
+    }
 }
