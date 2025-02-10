@@ -13,14 +13,21 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
-        PrimaryToProxyMessage, RemoraTransaction,
+        ExecutableTransaction,
+        ExecutionResults,
+        Executor,
+        ExecutorIndex,
+        NewStates,
+        PrimaryToProxyMessage,
+        RemoraTransaction,
     },
     metrics::Metrics,
 };
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
+    /// The executor is only used to assigned shared object versions.
+    executor: E,
     /// Receive handles to forward transactions to proxies. When a new client connects,
     /// this channel receives a sender from the network layer which is used to forward
     /// transactions to the proxies.
@@ -44,6 +51,7 @@ pub struct LoadBalancer<E: Executor> {
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
     pub fn new(
+        executor: E,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
@@ -51,6 +59,7 @@ impl<E: Executor> LoadBalancer<E> {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            executor,
             rx_proxy_connections,
             proxy_connections: Vec::new(),
             rx_committed_txns,
@@ -189,6 +198,15 @@ impl<E: Executor> LoadBalancer<E> {
                 }
 
                 Some(transactions) = self.rx_committed_txns.recv() => {
+
+                    // Assign shared objects version.
+                    self.executor
+                        .assign_shared_object_versions(
+                            &transactions.iter().map(|tx| tx.deref().clone()).collect::<Vec<_>>()
+                        )
+                        .await;
+
+
                     txn_cnt += 1;
                     if txn_cnt == 1 {
                         self.metrics.register_start_time();
@@ -231,6 +249,7 @@ impl<E: Executor> LoadBalancer<E> {
         E: Send + 'static,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send,
+        <E as Executor>::Transaction: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }

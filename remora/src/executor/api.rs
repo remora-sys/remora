@@ -153,6 +153,12 @@ pub trait Executor: Clone {
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool;
+
+    /// Assign a shared object version.
+    fn assign_shared_object_versions(
+        &self,
+        _transactions: &[Self::Transaction],
+    ) -> impl Future<Output = ()> + std::marker::Send;
 }
 
 /// Short for a transaction with a timestamp.

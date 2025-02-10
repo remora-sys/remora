@@ -10,7 +10,7 @@ use tokio::{
 
 use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
-    config::{DEFAULT_CHANNEL_SIZE, ValidatorConfig},
+    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
     executor::{
         api::Timestamp,
@@ -58,6 +58,7 @@ impl PrimaryNode {
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
+            executor.clone(),
             rx_proxy_connections,
             rx_committed_txns,
             tx_executor_local.clone(),
@@ -180,7 +181,10 @@ mod tests {
     use crate::{
         client::load_generator::LoadGenerator,
         config::{
-            BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters,
+            BenchmarkParameters,
+            CollocatedPreExecutors,
+            ValidatorConfig,
+            ValidatorParameters,
         },
         executor::sui::SuiExecutor,
         metrics::Metrics,

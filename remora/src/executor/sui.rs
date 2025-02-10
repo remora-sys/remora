@@ -354,6 +354,13 @@ impl Executor for SuiExecutor {
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .is_ok()
     }
+
+    async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
+        self.context()
+            .validator()
+            .assigned_shared_object_versions_on_transaction(transactions)
+            .await;
+    }
 }
 
 #[cfg(test)]
