@@ -156,6 +156,7 @@ impl PrimaryNode {
         // TODO: In a real system, these connections would be used to reply to the clients, acknowledging
         // the receipt of the transaction and its final execution status.
         let mut client_connections = Vec::new();
+        let mut counter = 0;
 
         loop {
             tokio::select! {
@@ -164,6 +165,10 @@ impl PrimaryNode {
                     assert!(result.success());
                     // TODO: Record transactions success and failure.
                     self.metrics.update_metrics(timestamp);
+                    counter += 1;
+                    if counter % 100 == 0 {
+                        tracing::debug!("Successfully processed {counter} transactions");
+                    }
                 }
                 Some(connection) = self.rx_client_connections.recv() => {
                     tracing::info!("Received a new client connection");

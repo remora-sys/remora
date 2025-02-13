@@ -1,9 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use sui_types::{
     base_types::{ObjectID, ObjectRef},
     storage::ObjectStore,
@@ -16,8 +21,14 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore, Store,
-        Timestamp, TransactionWithTimestamp,
+        ExecutableTransaction,
+        ExecutionResults,
+        Executor,
+        RemoraTransaction,
+        StateStore,
+        Store,
+        Timestamp,
+        TransactionWithTimestamp,
     },
 };
 
@@ -67,7 +78,10 @@ impl<E: Executor + Sync> PrimaryCore<E> {
     /// Get the input objects for a transaction.
     // TODO: This function should return an error when the input object is not found
     // or the input objects are malformed instead of panicking.
-    fn get_input_objects(store: Store<E>, transaction: &E::Transaction) -> HashMap<ObjectID, ObjectRef> {
+    fn get_input_objects(
+        store: Store<E>,
+        transaction: &E::Transaction,
+    ) -> HashMap<ObjectID, ObjectRef> {
         transaction
             .input_objects()
             .iter()
@@ -81,11 +95,12 @@ impl<E: Executor + Sync> PrimaryCore<E> {
             .collect()
     }
 
-    pub async fn check_and_apply_proxy_results(store: Store<E>,
+    pub async fn check_and_apply_proxy_results(
+        store: Store<E>,
         tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
-        proxy_result: ExecutionResults<E>)
-    where
+        proxy_result: ExecutionResults<E>,
+    ) where
         E: Send + 'static,
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
@@ -138,24 +153,22 @@ impl<E: Executor + Sync> PrimaryCore<E> {
 
         // FIXME: this probably doesn't work for shared objects
         // Need to track dependency and merge commit_objects with local execution
-        tokio::spawn(async move {
-            let txn_result = E::execute(ctx, store, transaction.clone()).await;
+        // tokio::spawn(async move {
+        let txn_result = E::execute(ctx, store, transaction.clone()).await;
 
-            if tx_output
-                .send((transaction.timestamp(), txn_result.clone()))
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to output execution result, stopping primary executor");
-            }
+        if tx_output
+            .send((transaction.timestamp(), txn_result.clone()))
+            .await
+            .is_err()
+        {
+            tracing::warn!("Failed to output execution result, stopping primary executor");
+        }
 
-            // Sends the sync updates after each local execution
-            if tx_states_sync.send(txn_result.clone()).await.is_err() {
-                tracing::warn!(
-                    "Failed to send execution results of local executor to load balancer"
-                );
-            }
-        });
+        // Sends the sync updates after each local execution
+        if tx_states_sync.send(txn_result.clone()).await.is_err() {
+            tracing::warn!("Failed to send execution results of local executor to load balancer");
+        }
+        // });
     }
 
     /// Run the primary executor.
@@ -186,7 +199,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
                     });
                 }
 
-                // Receieve a transaction for local execution.
+                // Receive a transaction for local execution.
                 Some(transaction) = self.rx_executor_local.recv() => {
                     tracing::debug!("Received transaction for local execution");
                     self.local_execute(transaction).await;

@@ -291,12 +291,20 @@ impl Executor for SuiExecutor {
         store: Arc<InMemoryObjectStore>,
         transaction: SuiTransaction,
     ) -> SuiExecutionResults {
+        let tx_id = transaction.digest();
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.validator();
         let epoch_store = validator.get_epoch_store();
         let protocol_config = epoch_store.protocol_config();
         let reference_gas_price = epoch_store.reference_gas_price();
 
+        tracing::debug!(
+            "[{tx_id}] Reading objects for execution...{:?}",
+            input_objects
+                .iter()
+                .map(|input_object| (input_object.object_id(), input_object.version()))
+                .collect::<Vec<_>>()
+        );
         let objects = store
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .unwrap();
@@ -336,6 +344,14 @@ impl Executor for SuiExecutor {
         let written = inner_temp_store.written.clone();
 
         // Commit the objects to the store.
+        tracing::debug!(
+            "[{tx_id}] Committing objects to the store.: {:?}",
+            inner_temp_store
+                .written
+                .iter()
+                .map(|(id, o)| (id, o.version()))
+                .collect::<Vec<_>>()
+        );
         store.commit_objects(inner_temp_store);
 
         SuiExecutionResults::new(transaction, effects, written)
@@ -358,7 +374,7 @@ impl Executor for SuiExecutor {
     async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
         self.context()
             .validator()
-            .assigned_shared_object_versions_on_transaction(transactions)
+            .assigned_shared_object_versions_on_transaction_not_idempotent(transactions)
             .await;
     }
 }

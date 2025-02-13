@@ -10,6 +10,7 @@ use remora::{
     client::load_generator::{default_metrics_address, LoadGenerator},
     config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
 };
+use sui_types::transaction::TransactionDataAPI;
 
 #[derive(Parser, Debug)]
 #[clap(rename_all = "kebab-case")]
@@ -52,7 +53,15 @@ async fn main() -> anyhow::Result<()> {
             transactions = load_generator.initialize().await;
         }
         WorkloadType::SharedObjects { .. } => {
-            todo!();
+            transactions = load_generator.initialize().await;
+            tracing::debug!(
+                "Transactions: {:?}",
+                transactions
+                    .iter()
+                    .map(|tx| tx.transaction_data().input_objects())
+                    .collect::<Vec<_>>()
+            );
+            // todo!();
             //let log_dir = check_logs_for_shared_object(&benchmark_config).await;
             //(_, transactions) = import_from_files(log_dir);
         }
