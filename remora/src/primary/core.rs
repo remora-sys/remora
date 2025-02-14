@@ -17,16 +17,13 @@ use tokio::{
 
 use crate::{
     error::{NodeError, NodeResult},
-    executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        RemoraTransaction,
-        Timestamp,
-        TransactionWithTimestamp,
-        StateStore,
-        Store,
-    },
+    executor::{
+        api::{
+            ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore, Store, Timestamp, TransactionWithTimestamp
+        },
+        dependency_controller::DependencyController,
+        sui::get_object_ids_for_dependency_tracking,
+    }
 };
 
 const MAX_INFLIGHT_FUTURES: usize = 100;
@@ -48,6 +45,8 @@ pub struct PrimaryCore<E: Executor> {
     rx_executor_local: Receiver<RemoraTransaction<E>>,
     /// The sender to sync updates to proxy via load-balancer.
     tx_states_sync: Sender<ExecutionResults<E>>,
+    /// The dependency controller for multi-core tx execution.
+    dependency_controller: DependencyController,
 }
 
 impl<E: Executor + Sync> PrimaryCore<E> {
@@ -69,6 +68,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
             tx_executor_local,
             rx_executor_local,
             tx_states_sync,
+            dependency_controller: DependencyController::new(),
         }
     }
 
@@ -102,6 +102,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         let mut skip = true;
         let initial_state = Self::get_input_objects(store.clone(), &proxy_result.transaction);
@@ -136,36 +137,48 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         }
     }
 
-    async fn local_execute(&self, transaction: TransactionWithTimestamp<E::Transaction>)
+    async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>, task_id: u64)
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         let ctx = self.executor.context();
         let store = self.store.clone();
         let tx_output = self.tx_output.clone();
         let tx_states_sync = self.tx_states_sync.clone();
 
-        // FIXME: this probably doesn't work for shared objects
-        // Need to track dependency and merge commit_objects with local execution
-        // tokio::spawn(async move {
-        let txn_result = E::execute(ctx, store, transaction.clone()).await;
+        let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction.clone()); 
 
-        if tx_output
-            .send((transaction.timestamp(), txn_result.clone()))
-            .await
-            .is_err()
-        {
-            tracing::warn!("Failed to output execution result, stopping primary executor");
-        }
+        let (prior_handles, current_handles) = self.dependency_controller
+            .get_dependencies(task_id, obj_ids);
 
-        // Sends the sync updates after each local execution
-        if tx_states_sync.send(txn_result.clone()).await.is_err() {
-            tracing::warn!("Failed to send execution results of local executor to load balancer");
-        }
-        // });
+        tokio::spawn(async move {
+            for prior_notify in prior_handles {
+                prior_notify.notified().await;
+            }
+
+            let txn_result = E::execute(ctx, store, transaction.clone()).await;
+
+            if tx_output
+                .send((transaction.timestamp(), txn_result.clone()))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to output execution result, stopping primary executor");
+            }
+
+            // Sends the sync updates after each local execution
+            if tx_states_sync.send(txn_result.clone()).await.is_err() {
+                tracing::warn!("Failed to send execution results of local executor to load balancer");
+            }
+
+            for notify in current_handles {
+                notify.notify_one();
+            }
+        });
     }
 
     /// Run the primary executor.
@@ -175,8 +188,10 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         let in_flight_futures = Arc::new(AtomicUsize::new(0));
+        let mut task_id = 0;
 
         loop {
             tokio::select! {
@@ -198,8 +213,9 @@ impl<E: Executor + Sync> PrimaryCore<E> {
 
                 // Receive a transaction for local execution.
                 Some(transaction) = self.rx_executor_local.recv() => {
+                    task_id += 1;
                     tracing::debug!("Received transaction for local execution");
-                    self.local_execute(transaction).await;
+                    self.local_execute(transaction, task_id).await;
                 }
 
                 // The channel is closed.
@@ -215,6 +231,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
     }

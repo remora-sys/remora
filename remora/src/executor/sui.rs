@@ -236,6 +236,25 @@ pub async fn check_logs_for_shared_object(config: &BenchmarkParameters) -> PathB
     workload_path
 }
 
+pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTransaction<E>) -> Vec<ObjectID> {
+    // filter pkg id from the obj_id
+    transaction
+        .input_objects()
+        .into_iter()
+        .filter_map(|kind| {
+            match kind {
+                InputObjectKind::ImmOrOwnedMoveObject((obj_id, _, _)) => Some(obj_id),
+                InputObjectKind::SharedMoveObject {
+                    id: obj_id,
+                    initial_shared_version: _,
+                    mutable: _,
+                } => Some(obj_id),
+                _ => None, // filter out move package
+            }
+        })
+    .collect::<Vec<_>>()
+}
+
 pub const LOG_DIR: &str = "/tmp/";
 
 impl SuiExecutor {

@@ -24,7 +24,7 @@ use crate::{
             StateStore,
             Store,
         },
-        dependency_controller::DependencyController,
+        dependency_controller::DependencyController, sui::get_object_ids_for_dependency_tracking,
     },
     metrics::Metrics,
 };
@@ -158,22 +158,7 @@ impl<E: Executor> ProxyCore<E> {
         transaction: RemoraTransaction<E>,
         task_id: u64,
     ) -> (Vec<Arc<Notify>>, Vec<Arc<Notify>>) {
-        // filter pkg id from the obj_id
-        let obj_ids = transaction
-            .input_objects()
-            .into_iter()
-            .filter_map(|kind| {
-                match kind {
-                    InputObjectKind::ImmOrOwnedMoveObject((obj_id, _, _)) => Some(obj_id),
-                    InputObjectKind::SharedMoveObject {
-                        id: obj_id,
-                        initial_shared_version: _,
-                        mutable: _,
-                    } => Some(obj_id),
-                    _ => None, // filter out move package
-                }
-            })
-            .collect::<Vec<_>>();
+        let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction);
 
         self.dependency_controller
             .as_mut()
