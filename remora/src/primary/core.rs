@@ -1,13 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::collections::HashMap;
 
 use sui_types::base_types::{ObjectID, ObjectRef};
 use tokio::{
@@ -25,8 +19,6 @@ use crate::{
         sui::get_object_ids_for_dependency_tracking,
     }
 };
-
-const MAX_INFLIGHT_FUTURES: usize = 100;
 
 /// The primary executor is responsible for executing transactions and merging the results
 /// from the proxies.
@@ -93,10 +85,12 @@ impl<E: Executor + Sync> PrimaryCore<E> {
     }
 
     pub async fn check_and_apply_proxy_results(
+        &mut self,
         store: Store<E>,
         tx_output: Sender<(Timestamp, ExecutionResults<E>)>,
         tx_executor_local: Sender<RemoraTransaction<E>>,
         proxy_result: ExecutionResults<E>,
+        task_id: u64,
     ) where
         E: Send + 'static,
         Store<E>: Send + Sync,
@@ -105,36 +99,53 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         <E as Executor>::ExecutionContext: Send + Sync,
     {
         let mut skip = true;
-        let initial_state = Self::get_input_objects(store.clone(), &proxy_result.transaction);
-        for (id, vid) in &proxy_result.modified_at_versions() {
-            let (_, v, _) = initial_state
-                .get(id)
-                .expect("Transaction's inputs already checked");
-            if v != vid {
-                skip = false;
-            }
-        }
 
-        if skip {
-            let effects = proxy_result.clone();
-            store.commit_objects(effects.updates, effects.new_state);
-            if tx_output
-                .send((proxy_result.transaction.timestamp(), proxy_result))
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to output execution result, stopping primary executor");
+        let obj_ids = get_object_ids_for_dependency_tracking::<E>(proxy_result.transaction.clone()); 
+
+        let (prior_handles, current_handles) = self.dependency_controller
+            .get_dependencies(task_id, obj_ids);
+
+        tokio::spawn(async move {
+            for prior_notify in prior_handles {
+                prior_notify.notified().await;
             }
-        } else {
-            tracing::warn!("Failed to apply proxy results, sends to local executor");
-            if tx_executor_local
-                .send(proxy_result.transaction.clone())
-                .await
-                .is_err()
-            {
-                tracing::warn!("Failed to send transaction to the local executor");
+
+            let initial_state = Self::get_input_objects(store.clone(), &proxy_result.transaction);
+            for (id, vid) in &proxy_result.modified_at_versions() {
+                let (_, v, _) = initial_state
+                    .get(id)
+                    .expect("Transaction's inputs already checked");
+                if v != vid {
+                    tracing::warn!("Failed to apply result due to obj: {}, vid: {} while current v is {}", id, vid, v);
+                    skip = false;
+                }
             }
-        }
+
+            if skip {
+                let effects = proxy_result.clone();
+                store.commit_objects(effects.updates, effects.new_state);
+                if tx_output
+                    .send((proxy_result.transaction.timestamp(), proxy_result))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to output execution result, stopping primary executor");
+                }
+            } else {
+                tracing::warn!("Failed to apply proxy results, sends to local executor");
+                if tx_executor_local
+                    .send(proxy_result.transaction.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send transaction to the local executor");
+                }
+            }
+
+            for notify in current_handles {
+                notify.notify_one();
+            }
+        });
     }
 
     async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>, task_id: u64)
@@ -190,25 +201,18 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         ExecutionResults<E>: Send + Sync,
         <E as Executor>::ExecutionContext: Send + Sync,
     {
-        let in_flight_futures = Arc::new(AtomicUsize::new(0));
         let mut task_id = 0;
 
         loop {
             tokio::select! {
                 // Receive an execution result from a proxy.
-                Some(proxy_result) = self.rx_proxies.recv(),
-                    if in_flight_futures.load(Ordering::Relaxed) < MAX_INFLIGHT_FUTURES => {
-
+                Some(proxy_result) = self.rx_proxies.recv() => {
                     tracing::debug!("Received proxy result");
-                    let in_flight = in_flight_futures.clone();
-                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    task_id += 1;
                     let store = self.store.clone();
                     let tx_output = self.tx_output.clone();
                     let tx_executor_local = self.tx_executor_local.clone();
-                    tokio::spawn(async move {
-                        Self::check_and_apply_proxy_results(store, tx_output, tx_executor_local, proxy_result).await;
-                        in_flight.fetch_sub(1, Ordering::Relaxed);
-                    });
+                    self.check_and_apply_proxy_results(store, tx_output, tx_executor_local, proxy_result, task_id).await;
                 }
 
                 // Receive a transaction for local execution.
