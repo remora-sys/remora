@@ -74,8 +74,6 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<BenchmarkContext>,
-    workload_type: WorkloadType,
-    log_dir_path: Option<PathBuf>,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -198,44 +196,6 @@ pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) 
     tracing::info!("Finish generating and exporting");
 }
 
-pub async fn check_logs_for_shared_object(config: &BenchmarkParameters) -> PathBuf {
-    let log_dir = LOG_DIR;
-    let log_dir_path: PathBuf = log_dir.into();
-
-    // Create a separate dir to indicate workload
-    // the path is in the format of <log_dir>/<workload>/*.dat
-    // where <workload> is denoted by {txn_cnt}-{contention_level}
-    let mut cont_level: usize = 1;
-    let txn_cnt: u64 = config.load * config.duration.as_secs();
-    if let WorkloadType::SharedObjects { txs_per_counter } = config.workload {
-        cont_level = txs_per_counter;
-    }
-    let workload_path: PathBuf = log_dir_path.join(format!("{}-{}", txn_cnt, cont_level));
-    let txs_path: PathBuf = workload_path.join("txs.dat");
-
-    if !workload_path.exists() {
-        tracing::info!(
-            "Workload directory does not exist, creating it at: {:?}",
-            workload_path
-        );
-
-        fs::create_dir_all(&workload_path).expect("Failed to create workload directory");
-    }
-
-    if !txs_path.exists() {
-        tracing::info!(
-            "Logs for shared-object are missing, now generating txs.dat in: {:?}",
-            workload_path
-        );
-
-        pre_generate_txn_log(config, workload_path.to_str().unwrap()).await;
-    } else {
-        tracing::info!("Logs for shared-object already exist in: {:?}", txs_path);
-    }
-
-    workload_path
-}
-
 pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTransaction<E>) -> Vec<ObjectID> {
     // filter pkg id from the obj_id
     transaction
@@ -271,32 +231,11 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
-        let mut log_dir_path: Option<PathBuf> = None;
-        if let WorkloadType::SharedObjects { .. } = config.workload.clone() {
-            // check if such log exists, otherwise generate the log
-            log_dir_path = Some(check_logs_for_shared_object(config).await);
-        }
-
-        Self {
-            ctx: Arc::new(ctx),
-            workload_type: config.workload.clone(),
-            log_dir_path,
-        }
+        Self { ctx: Arc::new(ctx) }
     }
 
     pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
         self.ctx.validator().create_in_memory_store()
-    }
-
-    pub async fn load_state_for_shared_objects(&self) {
-        if let WorkloadType::SharedObjects { .. } = self.workload_type {
-            // import txs to assign shared-object versions
-            let (_, read_txs) = import_from_files(self.log_dir_path.clone().unwrap());
-            self.ctx
-                .validator()
-                .assigned_shared_object_versions_on_transaction(&read_txs)
-                .await;
-        }
     }
 }
 

@@ -209,6 +209,8 @@ impl<E: Executor> ProxyCore<E> {
                     .send(execution_result)
                     .await
                     .map_err(|_| NodeError::ShuttingDown)?;
+            } else {
+                tracing::warn!("Proxy skipped execution");
             }
 
             for notify in current_handles {
