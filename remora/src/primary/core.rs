@@ -13,7 +13,7 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore, Store, Timestamp, TransactionWithTimestamp
+            ExecutionResults, Executor, RemoraTransaction, StateStore, Store, Timestamp, TransactionWithTimestamp
         },
         dependency_controller::DependencyController,
         sui::get_object_ids_for_dependency_tracking,
@@ -67,16 +67,15 @@ impl<E: Executor + Sync> PrimaryCore<E> {
     /// Get the input objects for a transaction.
     // TODO: This function should return an error when the input object is not found
     // or the input objects are malformed instead of panicking.
-    fn get_input_objects(
+    fn get_input_object_ids_and_versions(
         store: Store<E>,
-        transaction: &E::Transaction,
+        obj_ids: Vec<ObjectID>,
     ) -> HashMap<ObjectID, ObjectRef> {
-        transaction
-            .input_objects()
+        obj_ids
             .iter()
-            .map(|kind| {
+            .map(|id| {
                 store
-                    .read_object(&kind.object_id())
+                    .read_object(id)
                     .expect("Failed to read objects from store")
                     .map(|object| (object.id(), object.compute_object_reference()))
                     .expect("Input object not found") // TODO: Return error instead of panic
@@ -103,14 +102,14 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         let obj_ids = get_object_ids_for_dependency_tracking::<E>(proxy_result.transaction.clone()); 
 
         let (prior_handles, current_handles) = self.dependency_controller
-            .get_dependencies(task_id, obj_ids);
+            .get_dependencies(task_id, obj_ids.clone());
 
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
 
-            let initial_state = Self::get_input_objects(store.clone(), &proxy_result.transaction);
+            let initial_state = Self::get_input_object_ids_and_versions(store.clone(), obj_ids);
             for (id, vid) in &proxy_result.modified_at_versions() {
                 let (_, v, _) = initial_state
                     .get(id)
