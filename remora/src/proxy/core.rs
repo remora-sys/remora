@@ -275,7 +275,7 @@ mod tests {
         config::BenchmarkParameters,
         executor::{
             api::PrimaryToProxyMessage,
-            sui::{generate_transactions, SuiExecutor, SuiTransaction},
+            sui::{generate_sui_transactions, SuiExecutor, SuiTransaction},
         },
         metrics::Metrics,
         proxy::core::{ProxyCore, ProxyMode},
@@ -295,7 +295,7 @@ mod tests {
         );
 
         // Send transactions to the proxy.
-        let transactions = generate_transactions(&config, None).await;
+        let transactions = generate_sui_transactions(&config, None).await;
         for tx in transactions {
             let transaction = SuiTransaction::new_for_tests(tx);
             let message = PrimaryToProxyMessage::Txn(transaction);

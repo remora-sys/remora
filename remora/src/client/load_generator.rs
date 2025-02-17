@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
+    marker::PhantomData, net::{IpAddr, Ipv4Addr, SocketAddr}, time::Duration
 };
 
 use rand::Rng;
 use rand_mt::Mt64;
-use sui_types::transaction::Transaction;
 use tokio::{
     sync::mpsc::{self, Sender},
     time::{sleep, Instant},
@@ -17,16 +15,15 @@ use tokio::{
 use crate::{
     client::request_arrival_distribution::Distribution,
     config::BenchmarkParameters,
-    executor::{
-        api::TransactionWithTimestamp,
-        sui::{generate_transactions, SuiTransaction},
-    },
+    executor::api::{Executor, RemoraTransaction, TransactionWithTimestamp},
     metrics::Metrics,
     networking::client::NetworkClient,
 };
 
 /// The load generator generates transactions at a specified rate and submits them to the system.
-pub struct LoadGenerator {
+pub struct LoadGenerator<Executor> {
+    /// The executor for the transactions.
+    _phantom: PhantomData<Executor>,
     /// The benchmark configurations.
     config: BenchmarkParameters,
     /// The target socket address.
@@ -37,11 +34,12 @@ pub struct LoadGenerator {
 
 const NUM_CLIENTS: usize = 8;
 
-impl LoadGenerator {
+impl<E: Executor> LoadGenerator<E> {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr) -> Self {
         let ns_per_packet = 1_000_000_000 / config.load * NUM_CLIENTS as u64;
         LoadGenerator {
+            _phantom: PhantomData,
             config,
             target,
             arrival: Distribution::Exponential(ns_per_packet as f64),
@@ -49,8 +47,8 @@ impl LoadGenerator {
     }
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
-    pub async fn initialize(&mut self) -> Vec<Transaction> {
-        generate_transactions(&self.config, None).await
+    pub async fn initialize(&mut self) -> Vec<E::Transaction> {
+        E::generate_transactions(&self.config, None).await
     }
 
     /// Generate inter-arrival interval
@@ -60,10 +58,10 @@ impl LoadGenerator {
 
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
-        transactions: Vec<Transaction>,
-        sender: Sender<SuiTransaction>,
+        transactions: Vec<E::Transaction>,
+        sender: Sender<RemoraTransaction<E>>,
         arrival: Distribution,
-    ) {
+    ) where <E as Executor>::Transaction: std::marker::Send + 'static {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
         let mut next_ts = Instant::now();
 
@@ -93,7 +91,8 @@ impl LoadGenerator {
         }
     }
 
-    async fn connect_and_spawn_network_client(&mut self) -> Vec<mpsc::Sender<SuiTransaction>> {
+    async fn connect_and_spawn_network_client(&mut self) -> Vec<Sender<RemoraTransaction<E>>>
+    where <E as Executor>::Transaction: std::marker::Send + 'static {
         let mut senders = Vec::with_capacity(NUM_CLIENTS);
 
         for _ in 0..NUM_CLIENTS {
@@ -115,12 +114,13 @@ impl LoadGenerator {
         senders
     }
 
-    pub async fn run(&mut self, transactions: Vec<Transaction>) {
+    pub async fn run(&mut self, transactions: Vec<E::Transaction>)
+    where <E as Executor>::Transaction: std::marker::Send + 'static {
         let tx_transactions = self.connect_and_spawn_network_client().await;
         self.real_run(transactions, tx_transactions).await;
     }
 
-    pub fn split_transactions(&self, transactions: Vec<Transaction>) -> Vec<Vec<Transaction>> {
+    pub fn split_transactions(&self, transactions: Vec<E::Transaction>) -> Vec<Vec<E::Transaction>> {
         let chunk_size = (transactions.len() + NUM_CLIENTS - 1) / NUM_CLIENTS; // Ceiling division
         transactions
             .chunks(chunk_size)
@@ -130,9 +130,9 @@ impl LoadGenerator {
 
     async fn real_run(
         &mut self,
-        transactions: Vec<Transaction>,
-        senders: Vec<Sender<SuiTransaction>>,
-    ) {
+        transactions: Vec<E::Transaction>,
+        senders: Vec<Sender<RemoraTransaction<E>>>,
+    ) where <E as Executor>::Transaction: std::marker::Send + 'static {
         let real_load = self.config.load;
         tracing::info!("Starting run at {} load...", real_load);
 
@@ -166,7 +166,7 @@ pub mod tests {
     use crate::{
         client::load_generator::LoadGenerator,
         config::{get_test_address, BenchmarkParameters},
-        executor::sui::SuiTransaction,
+        executor::sui::{SuiExecutor, SuiTransaction},
         metrics::Metrics,
         networking::server::NetworkServer,
     };
@@ -188,7 +188,7 @@ pub mod tests {
 
         // Create genesis and generate transactions.
         let config = BenchmarkParameters::new_for_tests();
-        let mut load_generator = LoadGenerator::new(config, target);
+        let mut load_generator: LoadGenerator<SuiExecutor> = LoadGenerator::new(config, target);
         let transactions = load_generator.initialize().await;
 
         // Submit transactions to the server.

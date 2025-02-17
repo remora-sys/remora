@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc, path::PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sui_types::{
@@ -11,6 +11,8 @@ use sui_types::{
     object::Object,
     transaction::InputObjectKind,
 };
+
+use crate::config::BenchmarkParameters;
 
 /// A transaction that can be executed.
 pub trait ExecutableTransaction {
@@ -163,6 +165,11 @@ pub trait Executor: Clone {
         &self,
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send;
+
+    fn generate_transactions(
+        config: &BenchmarkParameters,
+        working_directory: Option<PathBuf>,
+    ) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 }
 
 /// Short for a transaction with a timestamp.

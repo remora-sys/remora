@@ -33,7 +33,7 @@ use super::api::{
     RemoraTransaction,
     StateStore,
 };
-use crate::config::{BenchmarkParameters, WorkloadType};
+use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
 /// Represents a Sui transaction.
 pub type SuiTransaction = RemoraTransaction<SuiExecutor>;
@@ -81,7 +81,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
 
     // Determine the workload.
     let workload_type = match config.workload {
-        WorkloadType::Transfers => WorkloadKind::PTB {
+        WorkloadType::Transfers => Ok(WorkloadKind::PTB {
             num_transfers: 0,
             num_dynamic_fields: 0,
             use_batch_mint: false,
@@ -90,18 +90,21 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
             num_mints: 0,
             num_shared_objects: 0,
             nft_size: 32,
-        },
-        WorkloadType::SharedObjects { txs_per_counter } => WorkloadKind::Counter {
+        }),
+        WorkloadType::SharedObjects { txs_per_counter } => Ok(WorkloadKind::Counter {
             txs_per_counter: txs_per_counter as u64,
-        },
+        }),
+        _ => {
+            Err(ConfigErrorType::InvalidWorkload)
+        }
     };
 
     // Create genesis.
     tracing::debug!("Creating genesis for {pre_generation} transactions...");
-    Workload::new(pre_generation, workload_type)
+    Workload::new(pre_generation, workload_type.unwrap())
 }
 
-pub async fn generate_transactions(
+pub async fn generate_sui_transactions(
     config: &BenchmarkParameters,
     working_directory: Option<PathBuf>,
 ) -> Vec<Transaction> {
@@ -340,6 +343,13 @@ impl Executor for SuiExecutor {
             .assigned_shared_object_versions_on_transaction_not_idempotent(transactions)
             .await;
     }
+
+    fn generate_transactions(
+            config: &BenchmarkParameters,
+            working_directory: Option<PathBuf>,
+        ) -> impl std::future::Future<Output = Vec<Self::Transaction>> + Send {
+        generate_sui_transactions(config, working_directory)
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +363,7 @@ mod tests {
         config::BenchmarkParameters,
         executor::{
             api::Executor,
-            sui::{generate_transactions, SuiExecutor, SuiTransaction},
+            sui::{generate_sui_transactions, SuiExecutor, SuiTransaction},
         },
     };
 
@@ -364,7 +374,7 @@ mod tests {
         let store = Arc::new(executor.create_in_memory_store());
         let ctx = executor.context();
 
-        let transactions = generate_transactions(&config, None).await;
+        let transactions = generate_sui_transactions(&config, None).await;
         assert!(transactions.len() == 10);
 
         for tx in transactions {
@@ -421,7 +431,7 @@ mod tests {
         };
         let working_directory = PathBuf::from("./test_export");
         let start_time = Instant::now();
-        let transactions = generate_transactions(&config, Some(working_directory)).await;
+        let transactions = generate_sui_transactions(&config, Some(working_directory)).await;
         let elapsed = start_time.elapsed();
         tracing::info!(
             "Generated {} txs in {} ms",

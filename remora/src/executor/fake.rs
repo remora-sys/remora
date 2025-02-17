@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use rand::Rng;
 use sui_types::{
@@ -24,12 +25,18 @@ use sui_types::{
 };
 use tokio::time::Instant;
 
-use super::api::{
+use super::{
+    api::{
     ExecutableTransaction,
     ExecutionResultsAndEffects,
     Executor,
     StateStore,
     TransactionWithTimestamp,
+    },
+    super::config::{
+        BenchmarkParameters,
+        WorkloadType,
+    },
 };
 
 /// A fake owned object for testing.
@@ -422,16 +429,38 @@ impl Executor for FakeExecutor {
             todo!()
         }
     }
+
+    fn generate_transactions(
+        config: &BenchmarkParameters,
+        _working_directory: Option<std::path::PathBuf>,
+    ) -> impl Future<Output = Vec<Self::Transaction>> + Send {
+        generate_fake_transactions(config)
+    }
 }
 
-/// Generate a fake transaction with a given number of inputs and contention level. Setting
-/// contention to 0 will generate a transaction accessing only one shared object, while setting
-/// contention to 100 will generate a transaction accessing different shared objects.
+pub fn generate_fake_owned_object_transaction(
+    number_of_inputs: usize
+) -> FakeTransaction {
+    let inputs: Vec<_> = (0..number_of_inputs)
+        .map(|_| {
+            let object = fake_owned_object(0);
+            let reference = object.compute_object_reference();
+            InputObjectKind::ImmOrOwnedMoveObject(reference)
+        })
+        .collect();
+    FakeTransaction::new(inputs)
+}
+
+/// Generate a fake transaction with a given number of inputs and contention level.
+/// Setting contention to 0 will generate a transaction accessing shared objects
+/// that are not overlapped with any other transactions, while setting contention
+/// to 100 will generate a transaction accessing a same shared object with all
+/// other transactions.
 pub fn generate_fake_shared_object_transaction(
     number_of_inputs: usize,
     contention: u64,
 ) -> FakeTransaction {
-    let contention = contention.max(100);
+    let contention = contention.min(100);
     let coin = rand::thread_rng().gen_range(0..100);
     let inputs: Vec<_> = (0..number_of_inputs)
         .map(|i| {
@@ -446,6 +475,52 @@ pub fn generate_fake_shared_object_transaction(
         })
         .collect();
     FakeTransaction::new(inputs)
+}
+
+pub async fn parallel_generate_transaction<F>(cnt: u64, number_of_inputs: usize, func: F)
+-> Vec<FakeTransaction>
+where F: Fn(usize) -> FakeTransaction + Send + 'static + Copy {
+
+    let tasks: FuturesUnordered<_> = Default::default();
+    for _ in 0..cnt {
+        tasks.push(
+            tokio::spawn(async move {
+                func(number_of_inputs)
+            })
+        );
+    }
+    let results: Vec<_> = tasks.collect().await;
+    results.into_iter().filter_map(|res| match res {
+        Ok(tx) => Some(tx),
+        Err(err) => {
+            eprintln!("Faked Transaction generation faild {:?}", err);
+            None
+        }
+    }).collect()
+}
+
+pub async fn generate_fake_transactions(
+    config: &BenchmarkParameters,
+) -> Vec<FakeTransaction> {
+    let pre_generation = config.load * config.duration.as_secs();
+
+    match config.workload {
+        WorkloadType::FakedNoContention { number_of_inputs } => {
+            parallel_generate_transaction(
+                pre_generation, number_of_inputs,
+                generate_fake_owned_object_transaction).await
+        },
+
+        WorkloadType::FakedContention { number_of_inputs, contention } => {
+            parallel_generate_transaction(
+                pre_generation, number_of_inputs,
+                move |x| generate_fake_shared_object_transaction(x, contention)).await
+        },
+
+        _ => {
+            panic!("Error: Unsupported workloadtype in the fake executor");
+        }
+    }
 }
 
 #[cfg(test)]

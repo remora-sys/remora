@@ -209,7 +209,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::new(benchmark_config, config.client_server_address);
+        let mut load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
@@ -248,7 +248,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::new(benchmark_config, primary_address);
+        let mut load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    fmt::Debug,
+    error::Error,
+    fmt::{Debug, Display},
     fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
@@ -157,10 +158,24 @@ pub enum WorkloadType {
         #[serde(default = "default_cont_level_for_shared_obj")]
         txs_per_counter: usize,
     },
+    FakedNoContention {
+        #[serde(default = "default_cont_level_for_shared_obj")]
+        number_of_inputs: usize,
+    },
+    FakedContention {
+        #[serde(default = "default_cont_level_for_shared_obj")]
+        number_of_inputs: usize,
+        #[serde(default = "default_contention_level")]
+        contention: u64
+    },
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
     2
+}
+
+fn default_contention_level() -> u64 {
+    100
 }
 
 impl Debug for WorkloadType {
@@ -168,9 +183,26 @@ impl Debug for WorkloadType {
         match self {
             WorkloadType::Transfers => write!(f, "transfers"),
             WorkloadType::SharedObjects { .. } => write!(f, "shared objects"),
+            WorkloadType::FakedNoContention { .. } => write!(f, "faked no contention"),
+            WorkloadType::FakedContention { .. } => write!(f, "faked contention"),
         }
     }
 }
+
+#[derive(Debug)]
+pub enum ConfigErrorType {
+    InvalidWorkload,
+}
+
+impl Display for ConfigErrorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigErrorType::InvalidWorkload => write!(f, "Invalid workload type provided."),
+        }
+    }
+}
+
+impl Error for ConfigErrorType {}
 
 /// The configuration for the benchmark.
 #[derive(Serialize, Deserialize, Clone)]
