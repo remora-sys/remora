@@ -13,6 +13,10 @@ use sui_types::{
 };
 
 use crate::config::BenchmarkParameters;
+use super::{
+    sui::SuiExecutor,
+    fake::FakeExecutor,
+};
 
 /// A transaction that can be executed.
 pub trait ExecutableTransaction {
@@ -170,6 +174,8 @@ pub trait Executor: Clone {
         config: &BenchmarkParameters,
         working_directory: Option<PathBuf>,
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send;
+
+    fn init_store(&self) -> Self::Store;
 }
 
 /// Short for a transaction with a timestamp.
@@ -194,3 +200,8 @@ where
 }
 
 pub type ExecutorIndex = usize;
+
+pub enum ExecutorType {
+    Sui(SuiExecutor),
+    Fake(FakeExecutor),
+}

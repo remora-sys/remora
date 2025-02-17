@@ -63,7 +63,7 @@ pub fn fake_shared_object_with_id(version: u64, id: ObjectID) -> Object {
     Object::new_move(obj, owner, TransactionDigest::genesis_marker())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct FakeTransaction {
     pub digest: TransactionDigest,
     inputs: Vec<InputObjectKind>,
@@ -113,7 +113,7 @@ impl ExecutableTransaction for FakeTransaction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FakeTransactionEffects {
     transaction_digest: TransactionDigest,
     modified_at_versions: Vec<(ObjectID, SequenceNumber)>,
@@ -435,6 +435,10 @@ impl Executor for FakeExecutor {
         _working_directory: Option<std::path::PathBuf>,
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send {
         generate_fake_transactions(config)
+    }
+
+    fn init_store(&self) -> Self::Store {
+        FakeObjectStore::new()
     }
 }
 

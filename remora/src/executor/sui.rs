@@ -350,6 +350,10 @@ impl Executor for SuiExecutor {
         ) -> impl std::future::Future<Output = Vec<Self::Transaction>> + Send {
         generate_sui_transactions(config, working_directory)
     }
+
+    fn init_store(&self) -> Self::Store {
+        self.create_in_memory_store()
+    }
 }
 
 #[cfg(test)]

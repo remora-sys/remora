@@ -1,17 +1,21 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, sync::Arc};
-
+use std::{io, marker::PhantomData, sync::Arc};
+use serde::{
+    de::DeserializeOwned,
+    Serialize,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
-    config::{DEFAULT_CHANNEL_SIZE, ValidatorConfig}, error::NodeResult, executor::sui::SuiExecutor, metrics::Metrics,
+    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE}, error::NodeResult, executor::api::Executor, metrics::Metrics,
     networking::client::NetworkClient,
 };
 
-pub struct ProxyNode {
+pub struct ProxyNode<E: Executor> {
+    pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
     core_handles: Vec<std::thread::JoinHandle<NodeResult<()>>>,
     /// The handle for the network client.
@@ -20,13 +24,17 @@ pub struct ProxyNode {
     _metrics: Arc<Metrics>,
 }
 
-impl ProxyNode {
+impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
     pub async fn start(
         proxy_id: ProxyId,
-        executor: SuiExecutor,
+        executor: E,
         config: &ValidatorConfig,
         metrics: Arc<Metrics>,
-    ) -> Self {
+    ) -> Self where <E as Executor>::Store: Sync + Send,
+        <E as Executor>::Transaction: Send + Sync + 'static,
+        <E as Executor>::ExecutionContext: Send + Sync,
+        <E as Executor>::ExecutionResults: Send + Sync + Serialize + DeserializeOwned,
+    {
         let mut core_handles = Vec::new();
         let mut network_handles = Vec::new();
         let mode = match config.parallel_proxy {
@@ -39,7 +47,7 @@ impl ProxyNode {
             let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
             let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-            let store = Arc::new(executor.create_in_memory_store());
+            let store = Arc::new(executor.init_store());
             let core_handle = ProxyCore::new(
                 id,
                 executor.clone(),
@@ -63,6 +71,7 @@ impl ProxyNode {
         }
 
         Self {
+            phantom_data: PhantomData,
             core_handles,
             _network_handles: network_handles,
             _metrics: metrics,
