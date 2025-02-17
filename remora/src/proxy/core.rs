@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 use sui_types::transaction::InputObjectKind;
 use tokio::{
@@ -24,7 +24,8 @@ use crate::{
             StateStore,
             Store,
         },
-        dependency_controller::DependencyController, sui::get_object_ids_for_dependency_tracking,
+        dependency_controller::DependencyController,
+        sui::get_object_ids_for_dependency_tracking,
     },
     metrics::Metrics,
 };
@@ -100,6 +101,11 @@ impl<E: Executor> ProxyCore<E> {
                 while let Some(message) = self.rx_transactions.recv().await {
                     match message {
                         PrimaryToProxyMessage::Txn(transaction) => {
+                            // Assign shared objects version.
+                            self.executor
+                                .assign_shared_object_versions(&[transaction.deref().clone()])
+                                .await;
+
                             self.metrics.increase_proxy_load(&self.id);
                             let execution_result = E::execute(
                                 self.executor.context(),
@@ -131,6 +137,10 @@ impl<E: Executor> ProxyCore<E> {
                         Some(message) = self.rx_transactions.recv() => {
                             match message {
                                 PrimaryToProxyMessage::Txn(transaction) => {
+
+                                    // Assign shared objects version.
+                                    self.executor.assign_shared_object_versions(&[transaction.deref().clone()]).await;
+
                                     if task_id == 0 {
                                         self.metrics.register_start_time();
                                     }
@@ -232,6 +242,7 @@ impl<E: Executor> ProxyCore<E> {
         RemoraTransaction<E>: Send + Sync,
         ExecutionResults<E>: Send + Sync,
         <E as Executor>::ExecutionContext: Send + Sync,
+        <E as Executor>::Transaction: Send,
     {
         tokio::spawn(async move { self.run().await })
     }

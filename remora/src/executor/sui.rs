@@ -22,9 +22,9 @@ use sui_types::{
     effects::{TransactionEffects, TransactionEffectsAPI},
     object::Object,
     storage::ObjectStore,
-    transaction::{CheckedInputObjects, InputObjectKind, TransactionDataAPI, Transaction},
+    transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
 };
-use tokio::time::Instant;
+use tokio::{sync::Mutex, time::Instant};
 
 use super::api::{
     ExecutableTransaction,
@@ -74,6 +74,9 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<BenchmarkContext>,
+    /// Lock ensuring at most one proxy (or the primary) assigns the shared object transaction locks.
+    /// This is likely not the best design, but the Sui epoch store is not very forgiving.
+    shared_object_versions_assignment_lock: Arc<Mutex<()>>,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -196,7 +199,9 @@ pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) 
     tracing::info!("Finish generating and exporting");
 }
 
-pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTransaction<E>) -> Vec<ObjectID> {
+pub fn get_object_ids_for_dependency_tracking<E: Executor>(
+    transaction: RemoraTransaction<E>,
+) -> Vec<ObjectID> {
     // filter pkg id from the obj_id
     transaction
         .input_objects()
@@ -212,7 +217,7 @@ pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTr
                 _ => None, // filter out move package
             }
         })
-    .collect::<Vec<_>>()
+        .collect::<Vec<_>>()
 }
 
 pub const LOG_DIR: &str = "/tmp/";
@@ -231,7 +236,10 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
-        Self { ctx: Arc::new(ctx) }
+        Self {
+            ctx: Arc::new(ctx),
+            shared_object_versions_assignment_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
@@ -335,6 +343,7 @@ impl Executor for SuiExecutor {
     }
 
     async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
+        let _guard = self.shared_object_versions_assignment_lock.lock().await;
         self.context()
             .validator()
             .assigned_shared_object_versions_on_transaction_not_idempotent(transactions)
