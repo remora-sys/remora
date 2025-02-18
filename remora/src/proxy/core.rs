@@ -267,14 +267,18 @@ impl<E: Executor> ProxyCore<E> {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
 
     use tokio::sync::mpsc;
 
     use crate::{
         config::BenchmarkParameters,
         executor::{
-            api::PrimaryToProxyMessage,
+            api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
+            fake::{generate_fake_transactions, FakeExecutionContext, FakeExecutor},
             sui::{generate_sui_transactions, SuiExecutor, SuiTransaction},
         },
         metrics::Metrics,
@@ -310,6 +314,43 @@ mod tests {
         assert!(results.success());
     }
 
+    // need to unify this in the executor/fake.rs
+    pub type RFakeTransaction = RemoraTransaction<FakeExecutor>;
+
+    async fn pre_execute_fake(mode: ProxyMode) {
+        let (tx_proxy, rx_proxy) = mpsc::channel(100);
+        let (tx_results, mut rx_results) = mpsc::channel(100);
+
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let execution_duration = Duration::from_micros(500);
+        let checks_duration = Duration::from_micros(500);
+        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
+
+        let executor = FakeExecutor::new(execution_context);
+        let store = Arc::new(executor.init_store());
+        let metrics = Arc::new(Metrics::new_for_tests());
+        let proxy_id = "0".to_string();
+        let proxy = ProxyCore::new(
+            proxy_id, executor, mode, store, rx_proxy, tx_results, metrics,
+        );
+
+        // Send transactions to the proxy.
+        let transactions = generate_fake_transactions(&config).await;
+        for tx in transactions {
+            let transaction = RFakeTransaction::new_for_tests(tx);
+            let message = PrimaryToProxyMessage::Txn(transaction);
+            tx_proxy.send(message).await.unwrap();
+        }
+
+        // Spawn the proxy.
+        proxy.spawn();
+
+        // Receive the results.
+        let results = rx_results.recv().await.unwrap();
+        assert!(results.success());
+    }
+
+
     #[tokio::test]
     async fn test_single_threaded_proxy() {
         pre_execute(ProxyMode::SingleThreaded).await;
@@ -318,5 +359,10 @@ mod tests {
     #[tokio::test]
     async fn test_multi_threaded_proxy() {
         pre_execute(ProxyMode::MultiThreaded).await;
+    }
+
+    #[tokio::test]
+    async fn test_single_threaded_proxy_fake_transactions() {
+        pre_execute_fake(ProxyMode::SingleThreaded).await;
     }
 }

@@ -227,6 +227,15 @@ impl BenchmarkParameters {
             workload: WorkloadType::Transfers,
         }
     }
+
+    /// Create a new benchmark configuration for tests.
+    pub fn new_for_fake_tests() -> Self {
+        BenchmarkParameters {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::FakedNoContention { number_of_inputs: 1 },
+        }
+    }
 }
 
 mod default_benchmark_config {
