@@ -155,7 +155,7 @@ impl<E: Executor> LoadGenerator<E> {
         // spawn for each client
         let mut handles = vec![];
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
-            let arrival = self.arrival.clone();
+            let arrival = self.arrival;
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_secs(1)).await;
                 Self::submit_transactions(tx_chunk, tx, arrival).await;

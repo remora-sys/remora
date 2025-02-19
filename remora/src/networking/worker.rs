@@ -62,7 +62,7 @@ where
     ) -> io::Result<()> {
         use futures::{stream, StreamExt};
 
-        let buffer_size = Self::MAX_MESSAGE_SIZE as usize;
+        let buffer_size = Self::MAX_MESSAGE_SIZE;
 
         // Create an stream using unfold.
         let message_stream = stream::unfold(&mut reader, move |reader| async move {

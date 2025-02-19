@@ -19,7 +19,6 @@ use sui_types::{
     transaction::InputObjectKind,
 };
 
-use super::{fake::FakeExecutor, sui::SuiExecutor};
 use crate::config::BenchmarkParameters;
 
 /// A transaction that can be executed.

@@ -410,7 +410,7 @@ impl Executor for FakeExecutor {
             let input_object = store
                 .read_object(&id)
                 .expect("Failed to access store")
-                .expect(&format!("Unknown object {id}"));
+                .unwrap_or_else(|| panic!("Unknown object {id}"));
             modified_at_versions.push((id, input_object.version()));
 
             // Create output objects.
