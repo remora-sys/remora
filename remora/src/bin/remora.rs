@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
-    executor::{fake::{FakeExecutor, FakeExecutionContext}, sui::SuiExecutor, api::ExecutorType},
+    executor::{api::ExecutorType, fake::FakeExecutor, sui::SuiExecutor},
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
     proxy::{core::ProxyId, node::ProxyNode},
@@ -69,12 +69,9 @@ async fn main() -> anyhow::Result<()> {
     let executor = match benchmark_config.workload {
         WorkloadType::Transfers | WorkloadType::SharedObjects { .. } => {
             ExecutorType::Sui(SuiExecutor::new(&benchmark_config).await)
-        },
+        }
         WorkloadType::FakedNoContention { .. } | WorkloadType::FakedContention { .. } => {
-            let execution_duration = Duration::from_micros(500);
-            let checks_duration = Duration::from_micros(500);
-            let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-            ExecutorType::Fake(FakeExecutor::new(execution_context))
+            ExecutorType::Fake(FakeExecutor::new(&benchmark_config).await)
         }
     };
 
@@ -105,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .collect_results()
                         .await;
-                },
+                }
                 ExecutorType::Fake(exec) => {
                     PrimaryNode::start(exec, &validator_config, metrics)
                         .await
@@ -125,12 +122,12 @@ async fn main() -> anyhow::Result<()> {
                     ProxyNode::start(proxy_id, exec, &validator_config, metrics)
                         .await
                         .await_completion()
-                },
+                }
                 ExecutorType::Fake(exec) => {
                     ProxyNode::start(proxy_id, exec, &validator_config, metrics)
                         .await
                         .await_completion()
-                },
+                }
             }
         }
     }

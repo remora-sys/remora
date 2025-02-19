@@ -159,14 +159,18 @@ pub enum WorkloadType {
         txs_per_counter: usize,
     },
     FakedNoContention {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
     },
     FakedContention {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
         #[serde(default = "default_contention_level")]
-        contention: u64
+        contention: u64,
     },
 }
 
@@ -176,6 +180,10 @@ fn default_cont_level_for_shared_obj() -> usize {
 
 fn default_contention_level() -> u64 {
     100
+}
+
+pub fn default_fake_execution_duration() -> Duration {
+    Duration::from_micros(500)
 }
 
 impl Debug for WorkloadType {
@@ -228,12 +236,15 @@ impl BenchmarkParameters {
         }
     }
 
-    /// Create a new benchmark configuration for tests.
+    /// Create a new benchmark configuration for fake txn tests.
     pub fn new_for_fake_tests() -> Self {
         BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
-            workload: WorkloadType::FakedNoContention { number_of_inputs: 1 },
+            workload: WorkloadType::FakedNoContention {
+                execution_duration: default_fake_execution_duration(),
+                number_of_inputs: 1,
+            },
         }
     }
 }

@@ -8,7 +8,8 @@ use clap::Parser;
 use remora::{
     //executor::sui::{check_logs_for_shared_object, import_from_files},
     client::load_generator::{default_metrics_address, LoadGenerator},
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType}, executor::sui::SuiExecutor,
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
+    executor::sui::SuiExecutor,
 };
 use sui_types::transaction::TransactionDataAPI;
 
@@ -45,7 +46,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create genesis and generate transactions.
     let primary_address = validator_config.client_server_address;
-    let mut load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
+    let mut load_generator =
+        LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
 
     let transactions;
     match benchmark_config.workload {

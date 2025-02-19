@@ -13,11 +13,12 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutionResults, Executor, RemoraTransaction, StateStore, Store, Timestamp, TransactionWithTimestamp
+            ExecutionResults, Executor, RemoraTransaction, StateStore, Store, Timestamp,
+            TransactionWithTimestamp,
         },
         dependency_controller::DependencyController,
         sui::get_object_ids_for_dependency_tracking,
-    }
+    },
 };
 
 /// The primary executor is responsible for executing transactions and merging the results
@@ -99,7 +100,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
     {
         let mut skip = true;
 
-        let obj_ids = get_object_ids_for_dependency_tracking::<E>(proxy_result.transaction.clone()); 
+        let obj_ids = get_object_ids_for_dependency_tracking::<E>(proxy_result.transaction.clone());
 
         // FIXME: ad-hoc passing test to ensure the object is created on the primary
         // Should impl the part for load-gen and primary to import from a same workload
@@ -108,7 +109,8 @@ impl<E: Executor + Sync> PrimaryCore<E> {
             E::optimistically_pre_generate_objects(store.clone(), &proxy_result.transaction);
         }
 
-        let (prior_handles, current_handles) = self.dependency_controller
+        let (prior_handles, current_handles) = self
+            .dependency_controller
             .get_dependencies(task_id, obj_ids.clone());
 
         tokio::spawn(async move {
@@ -122,7 +124,12 @@ impl<E: Executor + Sync> PrimaryCore<E> {
                     .get(id)
                     .expect("Transaction's inputs already checked");
                 if v != vid {
-                    tracing::warn!("Failed to apply result due to obj: {}, vid: {} while current v is {}", id, vid, v);
+                    tracing::warn!(
+                        "Failed to apply result due to obj: {}, vid: {} while current v is {}",
+                        id,
+                        vid,
+                        v
+                    );
                     skip = false;
                 }
             }
@@ -154,8 +161,11 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         });
     }
 
-    async fn local_execute(&mut self, transaction: TransactionWithTimestamp<E::Transaction>, task_id: u64)
-    where
+    async fn local_execute(
+        &mut self,
+        transaction: TransactionWithTimestamp<E::Transaction>,
+        task_id: u64,
+    ) where
         E: Send + 'static,
         Store<E>: Send + Sync,
         RemoraTransaction<E>: Send + Sync,
@@ -167,9 +177,10 @@ impl<E: Executor + Sync> PrimaryCore<E> {
         let tx_output = self.tx_output.clone();
         let tx_states_sync = self.tx_states_sync.clone();
 
-        let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction.clone()); 
+        let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction.clone());
 
-        let (prior_handles, current_handles) = self.dependency_controller
+        let (prior_handles, current_handles) = self
+            .dependency_controller
             .get_dependencies(task_id, obj_ids);
 
         tokio::spawn(async move {
@@ -189,7 +200,9 @@ impl<E: Executor + Sync> PrimaryCore<E> {
 
             // Sends the sync updates after each local execution
             if tx_states_sync.send(txn_result.clone()).await.is_err() {
-                tracing::warn!("Failed to send execution results of local executor to load balancer");
+                tracing::warn!(
+                    "Failed to send execution results of local executor to load balancer"
+                );
             }
 
             for notify in current_handles {

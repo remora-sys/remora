@@ -13,13 +13,8 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        ExecutorIndex,
-        NewStates,
-        PrimaryToProxyMessage,
-        RemoraTransaction,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
+        PrimaryToProxyMessage, RemoraTransaction,
     },
     metrics::Metrics,
 };

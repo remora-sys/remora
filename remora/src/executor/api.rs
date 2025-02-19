@@ -1,7 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc, path::PathBuf};
+use std::{
+    collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, path::PathBuf, sync::Arc,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sui_types::{
@@ -12,11 +14,8 @@ use sui_types::{
     transaction::InputObjectKind,
 };
 
+use super::{fake::FakeExecutor, sui::SuiExecutor};
 use crate::config::BenchmarkParameters;
-use super::{
-    sui::SuiExecutor,
-    fake::FakeExecutor,
-};
 
 /// A transaction that can be executed.
 pub trait ExecutableTransaction {

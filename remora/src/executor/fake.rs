@@ -11,8 +11,8 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use serde::{Deserialize, Serialize};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
     committee::EpochId,
@@ -26,18 +26,12 @@ use sui_types::{
 use tokio::time::Instant;
 
 use super::{
+    super::config::{BenchmarkParameters, WorkloadType},
     api::{
-    ExecutableTransaction,
-    ExecutionResultsAndEffects,
-    Executor,
-    StateStore,
-    TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
+        TransactionWithTimestamp,
     },
     sui::get_object_ids_for_dependency_tracking,
-    super::config::{
-        BenchmarkParameters,
-        WorkloadType,
-    },
 };
 
 /// A fake owned object for testing.
@@ -93,7 +87,7 @@ impl FakeTransaction {
                 let object = store
                     .read_object(id)
                     .expect("Failed to access store")
-                    .expect(&format!("Unknown object {id}"));
+                    .unwrap_or_else(|| panic!("Unknown object {id}"));
                 if object.is_shared() {
                     InputObjectKind::SharedMoveObject {
                         id: object.id(),
@@ -251,6 +245,12 @@ impl FakeObjectStore<FakeTransactionEffects> {
     }
 }
 
+impl Default for FakeObjectStore<FakeTransactionEffects> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
     for FakeObjectStore<FakeTransactionEffects>
 {
@@ -281,15 +281,12 @@ impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
 pub struct FakeExecutionContext {
     /// The duration of the transaction execution (in number of spins).
     pub execution_spins: u64,
-    /// The duration of the checks that are done before executing the transaction (in number of spins).
-    pub checks_spins: u64,
 }
 
 impl FakeExecutionContext {
-    pub fn new(execution_duration: Duration, checks_duration: Duration) -> Self {
+    pub fn new(execution_duration: Duration) -> Self {
         Self {
             execution_spins: Self::calibrate(execution_duration),
-            checks_spins: Self::calibrate(checks_duration),
         }
     }
 
@@ -302,7 +299,7 @@ impl FakeExecutionContext {
 
     /// Calibrate the fake executor to run for the target_duration
     fn calibrate(target_duration: Duration) -> u64 {
-        let mut iterations = 10_00_000;
+        let mut iterations = 1_000_000;
         let mut step_size = iterations;
 
         loop {
@@ -344,9 +341,24 @@ pub struct FakeExecutor {
 }
 
 impl FakeExecutor {
-    pub fn new(execution_context: FakeExecutionContext) -> Self {
+    pub async fn new(config: &BenchmarkParameters) -> Self {
+        let execution_duration = match config.workload {
+            WorkloadType::FakedNoContention {
+                execution_duration,
+                number_of_inputs: _,
+            } => execution_duration,
+            WorkloadType::FakedContention {
+                execution_duration,
+                number_of_inputs: _,
+                contention: _,
+            } => execution_duration,
+            _ => {
+                panic!("Error: Unsupported workload type for fake executor")
+            }
+        };
+        let ctx = FakeExecutionContext::new(execution_duration);
         Self {
-            execution_context: Arc::new(execution_context),
+            execution_context: Arc::new(ctx),
         }
     }
 
@@ -383,7 +395,8 @@ impl Executor for FakeExecutor {
         ctx: Arc<FakeExecutionContext>,
         store: Arc<FakeObjectStore<FakeTransactionEffects>>,
         transaction: TransactionWithTimestamp<Self::Transaction>,
-    ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send {
+    ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
+    {
         // Simulate execution
         for _ in 0..ctx.execution_spins {
             std::hint::spin_loop();
@@ -407,7 +420,7 @@ impl Executor for FakeExecutor {
 
         // Update the store.
         let updates = FakeTransactionEffects {
-            transaction_digest: transaction.digest().clone(),
+            transaction_digest: *transaction.digest(),
             modified_at_versions,
         };
         store.commit_objects(updates.clone(), new_state.clone());
@@ -416,13 +429,10 @@ impl Executor for FakeExecutor {
     }
 
     fn pre_execute_check(
-        ctx: Arc<FakeExecutionContext>,
+        _ctx: Arc<FakeExecutionContext>,
         _store: Arc<Self::Store>,
         _transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
-        for _ in 0..ctx.checks_spins {
-            std::hint::spin_loop();
-        }
         true
     }
 
@@ -432,7 +442,11 @@ impl Executor for FakeExecutor {
     ) -> bool {
         for reference in &transaction.inputs {
             let id = reference.object_id();
-            if !store.read_object(&id).expect("failed to access store").is_some() {
+            if store
+                .read_object(&id)
+                .expect("failed to access store")
+                .is_none()
+            {
                 return false;
             }
         }
@@ -440,13 +454,11 @@ impl Executor for FakeExecutor {
     }
 
     /// Assign a shared object version.
-    fn assign_shared_object_versions(
+    async fn assign_shared_object_versions(
         &self,
         _transactions: &[Self::Transaction],
-    ) -> impl Future<Output = ()> + std::marker::Send {
-        async move {
-            //todo!()
-        }
+    ) {
+        //todo!()
     }
 
     fn generate_transactions(
@@ -464,16 +476,14 @@ impl Executor for FakeExecutor {
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) {
-        let obj_ids = get_object_ids_for_dependency_tracking::<FakeExecutor>(transaction.clone()); 
+        let obj_ids = get_object_ids_for_dependency_tracking::<FakeExecutor>(transaction.clone());
         for obj_id in obj_ids {
             store.write_object(fake_owned_object_with_id(0, obj_id));
         }
     }
 }
 
-pub fn generate_fake_owned_object_transaction(
-    number_of_inputs: usize
-) -> FakeTransaction {
+pub fn generate_fake_owned_object_transaction(number_of_inputs: usize) -> FakeTransaction {
     let inputs: Vec<_> = (0..number_of_inputs)
         .map(|_| {
             let object = fake_owned_object(0);
@@ -510,45 +520,57 @@ pub fn generate_fake_shared_object_transaction(
     FakeTransaction::new(inputs)
 }
 
-pub async fn parallel_generate_transaction<F>(cnt: u64, number_of_inputs: usize, func: F)
--> Vec<FakeTransaction>
-where F: Fn(usize) -> FakeTransaction + Send + 'static + Copy {
-
+pub async fn parallel_generate_transaction<F>(
+    cnt: u64,
+    number_of_inputs: usize,
+    func: F,
+) -> Vec<FakeTransaction>
+where
+    F: Fn(usize) -> FakeTransaction + Send + 'static + Copy,
+{
     let tasks: FuturesUnordered<_> = Default::default();
     for _ in 0..cnt {
-        tasks.push(
-            tokio::spawn(async move {
-                func(number_of_inputs)
-            })
-        );
+        tasks.push(tokio::spawn(async move { func(number_of_inputs) }));
     }
     let results: Vec<_> = tasks.collect().await;
-    results.into_iter().filter_map(|res| match res {
-        Ok(tx) => Some(tx),
-        Err(err) => {
-            eprintln!("Faked Transaction generation faild {:?}", err);
-            None
-        }
-    }).collect()
+    results
+        .into_iter()
+        .filter_map(|res| match res {
+            Ok(tx) => Some(tx),
+            Err(err) => {
+                eprintln!("Faked Transaction generation faild {:?}", err);
+                None
+            }
+        })
+        .collect()
 }
 
-pub async fn generate_fake_transactions(
-    config: &BenchmarkParameters,
-) -> Vec<FakeTransaction> {
+pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<FakeTransaction> {
     let pre_generation = config.load * config.duration.as_secs();
 
     match config.workload {
-        WorkloadType::FakedNoContention { number_of_inputs } => {
+        WorkloadType::FakedNoContention {
+            execution_duration: _,
+            number_of_inputs,
+        } => {
             parallel_generate_transaction(
-                pre_generation, number_of_inputs,
-                generate_fake_owned_object_transaction).await
-        },
+                pre_generation,
+                number_of_inputs,
+                generate_fake_owned_object_transaction,
+            )
+            .await
+        }
 
-        WorkloadType::FakedContention { number_of_inputs, contention } => {
-            parallel_generate_transaction(
-                pre_generation, number_of_inputs,
-                move |x| generate_fake_shared_object_transaction(x, contention)).await
-        },
+        WorkloadType::FakedContention {
+            execution_duration: _,
+            number_of_inputs,
+            contention,
+        } => {
+            parallel_generate_transaction(pre_generation, number_of_inputs, move |x| {
+                generate_fake_shared_object_transaction(x, contention)
+            })
+            .await
+        }
 
         _ => {
             panic!("Error: Unsupported workloadtype in the fake executor");
@@ -558,59 +580,28 @@ pub async fn generate_fake_transactions(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
-    use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
+    use sui_types::base_types::ObjectID;
     use tokio::time::Instant;
 
-    use crate::executor::{
-        api::{Executor, TransactionWithTimestamp},
-        fake::{
-            fake_owned_object,
-            fake_shared_object,
-            fake_shared_object_with_id,
-            generate_fake_shared_object_transaction,
-            FakeExecutionContext,
-            FakeExecutor,
-            FakeObjectStore,
-            FakeTransaction,
+    use crate::{
+        config::{default_fake_execution_duration, BenchmarkParameters},
+        executor::{
+            api::{Executor, TransactionWithTimestamp},
+            fake::{
+                fake_owned_object, fake_shared_object, fake_shared_object_with_id,
+                generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
+                FakeTransaction,
+            },
         },
     };
 
     #[tokio::test]
-    async fn check_fake_transaction() {
-        let store = Arc::new(FakeObjectStore::new());
-        let execution_duration = Duration::from_millis(3);
-        let checks_duration = Duration::from_millis(1);
-        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-        let executor = FakeExecutor::new(execution_context);
-        let ctx = executor.context();
-
-        let inputs: Vec<_> = (0..2)
-            .map(|_| {
-                let object = fake_owned_object(0);
-                let reference = object.compute_object_reference();
-                InputObjectKind::ImmOrOwnedMoveObject(reference)
-            })
-            .collect();
-        let transaction = FakeTransaction::new(inputs);
-        let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
-
-        let start = Instant::now();
-        let result = FakeExecutor::pre_execute_check(ctx, store, &transaction_with_timestamp);
-        let duration = start.elapsed();
-
-        assert!(result);
-        assert!(duration >= checks_duration);
-    }
-
-    #[tokio::test]
     async fn execute_fake_owned_object_transaction() {
         let store = Arc::new(FakeObjectStore::new());
-        let execution_duration = Duration::from_millis(3);
-        let checks_duration = Duration::from_millis(1);
-        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-        let executor = FakeExecutor::new(execution_context);
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let executor = FakeExecutor::new(&config).await;
         let ctx = executor.context();
 
         let inputs: Vec<_> = (0..2)
@@ -629,16 +620,14 @@ mod tests {
         let duration = start.elapsed();
 
         assert!(result.success());
-        assert!(duration >= execution_duration);
+        assert!(duration >= default_fake_execution_duration());
     }
 
     #[tokio::test]
     async fn execute_fake_shared_object_transaction() {
         let store = Arc::new(FakeObjectStore::new());
-        let execution_duration = Duration::from_millis(3);
-        let checks_duration = Duration::from_millis(1);
-        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-        let executor = FakeExecutor::new(execution_context);
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let executor = FakeExecutor::new(&config).await;
         let ctx = executor.context();
 
         let inputs: Vec<_> = (0..2)
@@ -657,16 +646,14 @@ mod tests {
         let duration = start.elapsed();
 
         assert!(result.success());
-        assert!(duration >= execution_duration);
+        assert!(duration >= default_fake_execution_duration());
     }
 
     #[tokio::test]
     async fn execute_fake_shared_object_transaction_with_contention() {
         let store = Arc::new(FakeObjectStore::new());
-        let execution_duration = Duration::from_millis(3);
-        let checks_duration = Duration::from_millis(1);
-        let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-        let executor = FakeExecutor::new(execution_context);
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let executor = FakeExecutor::new(&config).await;
         let ctx = executor.context();
 
         // Write the object to the store
@@ -680,12 +667,11 @@ mod tests {
 
             let start = Instant::now();
             let result =
-                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp)
-                    .await;
+                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp).await;
             let duration = start.elapsed();
 
             assert!(result.success());
-            assert!(duration >= execution_duration);
+            assert!(duration >= default_fake_execution_duration());
         }
     }
 }
