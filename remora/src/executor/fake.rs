@@ -427,7 +427,6 @@ impl Executor for FakeExecutor {
     }
 
     fn pre_execute_check_objects(
-        _ctx: Arc<FakeExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
@@ -446,7 +445,7 @@ impl Executor for FakeExecutor {
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send {
         async move {
-            todo!()
+            //todo!()
         }
     }
 

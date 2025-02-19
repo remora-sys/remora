@@ -101,6 +101,13 @@ impl<E: Executor + Sync> PrimaryCore<E> {
 
         let obj_ids = get_object_ids_for_dependency_tracking::<E>(proxy_result.transaction.clone()); 
 
+        // FIXME: ad-hoc passing test to ensure the object is created on the primary
+        // Should impl the part for load-gen and primary to import from a same workload
+        // trace to init the same store context
+        if !E::pre_execute_check_objects(store.clone(), &proxy_result.transaction) {
+            E::optimistically_pre_generate_objects(store.clone(), &proxy_result.transaction);
+        }
+
         let (prior_handles, current_handles) = self.dependency_controller
             .get_dependencies(task_id, obj_ids.clone());
 

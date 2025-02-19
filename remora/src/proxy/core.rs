@@ -104,7 +104,7 @@ impl<E: Executor> ProxyCore<E> {
 
                             let ctx = self.executor.context().clone();
                             let store = self.store.clone();
-                            if !E::pre_execute_check_objects(ctx.clone(), store.clone(), &transaction) {
+                            if !E::pre_execute_check_objects(store.clone(), &transaction) {
                                 E::optimistically_pre_generate_objects(store.clone(), &transaction);
                             }
 
@@ -140,7 +140,7 @@ impl<E: Executor> ProxyCore<E> {
                                     task_id += 1;
                                     self.metrics.increase_proxy_load(&self.id);
                                     
-                                    if !E::pre_execute_check_objects(self.executor.context(), self.store.clone(), &transaction) {
+                                    if !E::pre_execute_check_objects(self.store.clone(), &transaction) {
                                         E::optimistically_pre_generate_objects(self.store.clone(), &transaction);
                                     }
 

@@ -338,7 +338,6 @@ impl Executor for SuiExecutor {
     }
 
     fn pre_execute_check_objects(
-        _ctx: Arc<BenchmarkContext>,
         _store: Arc<Self::Store>,
         _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {

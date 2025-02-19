@@ -166,7 +166,6 @@ pub trait Executor: Clone {
 
     /// Check object existence
     fn pre_execute_check_objects(
-        ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool;
