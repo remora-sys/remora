@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    marker::PhantomData, net::{IpAddr, Ipv4Addr, SocketAddr}, time::Duration
+    marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
 };
 
 use rand::Rng;
@@ -61,7 +63,9 @@ impl<E: Executor> LoadGenerator<E> {
         transactions: Vec<E::Transaction>,
         sender: Sender<RemoraTransaction<E>>,
         arrival: Distribution,
-    ) where <E as Executor>::Transaction: std::marker::Send + 'static {
+    ) where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
         let mut next_ts = Instant::now();
 
@@ -92,7 +96,9 @@ impl<E: Executor> LoadGenerator<E> {
     }
 
     async fn connect_and_spawn_network_client(&mut self) -> Vec<Sender<RemoraTransaction<E>>>
-    where <E as Executor>::Transaction: std::marker::Send + 'static {
+    where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
         let mut senders = Vec::with_capacity(NUM_CLIENTS);
 
         for _ in 0..NUM_CLIENTS {
@@ -115,12 +121,17 @@ impl<E: Executor> LoadGenerator<E> {
     }
 
     pub async fn run(&mut self, transactions: Vec<E::Transaction>)
-    where <E as Executor>::Transaction: std::marker::Send + 'static {
+    where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
         let tx_transactions = self.connect_and_spawn_network_client().await;
         self.real_run(transactions, tx_transactions).await;
     }
 
-    pub fn split_transactions(&self, transactions: Vec<E::Transaction>) -> Vec<Vec<E::Transaction>> {
+    pub fn split_transactions(
+        &self,
+        transactions: Vec<E::Transaction>,
+    ) -> Vec<Vec<E::Transaction>> {
         let chunk_size = (transactions.len() + NUM_CLIENTS - 1) / NUM_CLIENTS; // Ceiling division
         transactions
             .chunks(chunk_size)
@@ -132,7 +143,9 @@ impl<E: Executor> LoadGenerator<E> {
         &mut self,
         transactions: Vec<E::Transaction>,
         senders: Vec<Sender<RemoraTransaction<E>>>,
-    ) where <E as Executor>::Transaction: std::marker::Send + 'static {
+    ) where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
         let real_load = self.config.load;
         tracing::info!("Starting run at {} load...", real_load);
 

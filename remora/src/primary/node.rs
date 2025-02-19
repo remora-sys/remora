@@ -13,7 +13,7 @@ use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::Mock
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{Timestamp, Executor, ExecutionResults},
+    executor::api::{ExecutionResults, Executor, Timestamp},
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
@@ -38,11 +38,9 @@ pub struct PrimaryNode<E: Executor> {
 
 impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     /// Start the single machine validator.
-    pub async fn start(
-        executor: E,
-        config: &ValidatorConfig,
-        metrics: Arc<Metrics>,
-    ) -> Self where <E as Executor>::Store: Sync + Send,
+    pub async fn start(executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
+    where
+        <E as Executor>::Store: Sync + Send,
         <E as Executor>::Transaction: Send + Sync + 'static,
         <E as Executor>::ExecutionContext: Send + Sync,
         <E as Executor>::ExecutionResults: Send + Sync + DeserializeOwned,
@@ -153,7 +151,10 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     }
 
     /// Collect the results from the validator.
-    pub async fn collect_results(mut self) where <E as Executor>::Transaction: std::fmt::Debug {
+    pub async fn collect_results(mut self)
+    where
+        <E as Executor>::Transaction: std::fmt::Debug,
+    {
         // Collect client connections.
         // TODO: In a real system, these connections would be used to reply to the clients, acknowledging
         // the receipt of the transaction and its final execution status.
@@ -188,10 +189,7 @@ mod tests {
     use crate::{
         client::load_generator::LoadGenerator,
         config::{
-            BenchmarkParameters,
-            CollocatedPreExecutors,
-            ValidatorConfig,
-            ValidatorParameters,
+            BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters,
         },
         executor::sui::SuiExecutor,
         metrics::Metrics,
@@ -213,7 +211,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
+        let mut load_generator =
+            LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
@@ -252,7 +251,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
+        let mut load_generator =
+            LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();

@@ -1,16 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use serde::{de::DeserializeOwned, Serialize};
 use std::{io, marker::PhantomData, sync::Arc};
-use serde::{
-    de::DeserializeOwned,
-    Serialize,
-};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
-    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE}, error::NodeResult, executor::api::Executor, metrics::Metrics,
+    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
+    error::NodeResult,
+    executor::api::Executor,
+    metrics::Metrics,
     networking::client::NetworkClient,
 };
 
@@ -30,7 +30,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         executor: E,
         config: &ValidatorConfig,
         metrics: Arc<Metrics>,
-    ) -> Self where <E as Executor>::Store: Sync + Send,
+    ) -> Self
+    where
+        <E as Executor>::Store: Sync + Send,
         <E as Executor>::Transaction: Send + Sync + 'static,
         <E as Executor>::ExecutionContext: Send + Sync,
         <E as Executor>::ExecutionResults: Send + Sync + Serialize + DeserializeOwned,

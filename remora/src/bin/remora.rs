@@ -7,11 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
-    executor::{
-        api::Executor,
-        fake::{FakeExecutionContext, FakeExecutor},
-        sui::SuiExecutor,
-    },
+    executor::{api::Executor, fake::FakeExecutor, sui::SuiExecutor},
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
     proxy::{core::ProxyId, node::ProxyNode},
@@ -84,10 +80,7 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         WorkloadType::FakedNoContention { .. } | WorkloadType::FakedContention { .. } => {
-            let execution_duration = Duration::from_micros(500);
-            let checks_duration = Duration::from_micros(500);
-            let execution_context = FakeExecutionContext::new(execution_duration, checks_duration);
-            let executor = FakeExecutor::new(execution_context);
+            let executor = FakeExecutor::new(&benchmark_config).await;
             start_node(
                 args.role,
                 executor,
@@ -134,7 +127,6 @@ async fn start_node<E>(
                     .client_server_address
                     .set_ip(binding_address);
             }
-
             PrimaryNode::start(executor, &validator_config, metrics)
                 .await
                 .collect_results()
@@ -148,6 +140,7 @@ async fn start_node<E>(
             ProxyNode::start(proxy_id, executor, &validator_config, metrics)
                 .await
                 .await_completion()
+
         }
     }
 }

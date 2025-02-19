@@ -22,16 +22,12 @@ use sui_types::{
     effects::{TransactionEffects, TransactionEffectsAPI},
     object::Object,
     storage::ObjectStore,
-    transaction::{CheckedInputObjects, InputObjectKind, TransactionDataAPI, Transaction},
+    transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
 };
 use tokio::time::Instant;
 
 use super::api::{
-    ExecutableTransaction,
-    ExecutionResults,
-    Executor,
-    RemoraTransaction,
-    StateStore,
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
 };
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
@@ -94,9 +90,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         WorkloadType::SharedObjects { txs_per_counter } => Ok(WorkloadKind::Counter {
             txs_per_counter: txs_per_counter as u64,
         }),
-        _ => {
-            Err(ConfigErrorType::InvalidWorkload)
-        }
+        _ => Err(ConfigErrorType::InvalidWorkload),
     };
 
     // Create genesis.
@@ -199,7 +193,9 @@ pub async fn pre_generate_txn_log(config: &BenchmarkParameters, log_path: &str) 
     tracing::info!("Finish generating and exporting");
 }
 
-pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTransaction<E>) -> Vec<ObjectID> {
+pub fn get_object_ids_for_dependency_tracking<E: Executor>(
+    transaction: RemoraTransaction<E>,
+) -> Vec<ObjectID> {
     // filter pkg id from the obj_id
     transaction
         .input_objects()
@@ -215,7 +211,7 @@ pub fn get_object_ids_for_dependency_tracking<E: Executor>(transaction: RemoraTr
                 _ => None, // filter out move package
             }
         })
-    .collect::<Vec<_>>()
+        .collect::<Vec<_>>()
 }
 
 pub const LOG_DIR: &str = "/tmp/";
@@ -337,6 +333,14 @@ impl Executor for SuiExecutor {
             .is_ok()
     }
 
+    fn pre_execute_check_objects(
+        _store: Arc<Self::Store>,
+        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        // FIXME
+        true
+    }
+
     async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
         self.context()
             .validator()
@@ -345,14 +349,21 @@ impl Executor for SuiExecutor {
     }
 
     fn generate_transactions(
-            config: &BenchmarkParameters,
-            working_directory: Option<PathBuf>,
-        ) -> impl std::future::Future<Output = Vec<Self::Transaction>> + Send {
+        config: &BenchmarkParameters,
+        working_directory: Option<PathBuf>,
+    ) -> impl std::future::Future<Output = Vec<Self::Transaction>> + Send {
         generate_sui_transactions(config, working_directory)
     }
 
     fn init_store(&self) -> Self::Store {
         self.create_in_memory_store()
+    }
+
+    fn optimistically_pre_generate_objects(
+        _store: Arc<Self::Store>,
+        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) {
+        todo!()
     }
 }
 
