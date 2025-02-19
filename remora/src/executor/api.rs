@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, path::PathBuf, sync::Arc,
+    collections::BTreeMap,
+    fmt::Debug,
+    future::Future,
+    ops::Deref,
+    path::PathBuf,
+    sync::Arc,
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -210,8 +215,3 @@ where
 }
 
 pub type ExecutorIndex = usize;
-
-pub enum ExecutorType {
-    Sui(SuiExecutor),
-    Fake(FakeExecutor),
-}
