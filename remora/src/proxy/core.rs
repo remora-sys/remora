@@ -104,8 +104,8 @@ impl<E: Executor> ProxyCore<E> {
 
                             let ctx = self.executor.context().clone();
                             let store = self.store.clone();
-                            if !E::pre_execute_check_objects(ctx, store.clone(), &transaction) {
-                                E::optimistically_pre_generate_objects(store, &transaction);
+                            if !E::pre_execute_check_objects(ctx.clone(), store.clone(), &transaction) {
+                                E::optimistically_pre_generate_objects(store.clone(), &transaction);
                             }
 
                             let execution_result = E::execute(ctx, store.clone(), transaction).await;
@@ -139,6 +139,11 @@ impl<E: Executor> ProxyCore<E> {
                                     }
                                     task_id += 1;
                                     self.metrics.increase_proxy_load(&self.id);
+                                    
+                                    if !E::pre_execute_check_objects(self.executor.context(), self.store.clone(), &transaction) {
+                                        E::optimistically_pre_generate_objects(self.store.clone(), &transaction);
+                                    }
+
                                     let (prior_handles, current_handles) = self.get_dependencies(transaction.clone(), task_id);
                                     self.schedule_txn_parallel(transaction, prior_handles, current_handles).await.expect("Failed to schedule transaction");
                                 }
@@ -368,5 +373,10 @@ mod tests {
     #[tokio::test]
     async fn test_single_threaded_proxy_fake_transactions() {
         pre_execute_fake(ProxyMode::SingleThreaded).await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_threaded_proxy_fake_transactions() {
+        pre_execute_fake(ProxyMode::MultiThreaded).await;
     }
 }
