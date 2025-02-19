@@ -101,12 +101,15 @@ impl<E: Executor> ProxyCore<E> {
                     match message {
                         PrimaryToProxyMessage::Txn(transaction) => {
                             self.metrics.increase_proxy_load(&self.id);
-                            let execution_result = E::execute(
-                                self.executor.context(),
-                                self.store.clone(),
-                                transaction,
-                            )
-                            .await;
+
+                            let ctx = self.executor.context().clone();
+                            let store = self.store.clone();
+                            if !E::pre_execute_check_objects(ctx, store.clone(), &transaction) {
+                                E::optimistically_pre_generate_objects(store, &transaction);
+                            }
+
+                            let execution_result = E::execute(ctx, store.clone(), transaction).await;
+
                             self.metrics.decrease_proxy_load(&self.id);
                             if self.tx_results.send(execution_result).await.is_err() {
                                 tracing::warn!(
@@ -203,6 +206,7 @@ impl<E: Executor> ProxyCore<E> {
                     )
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
+            // FIXME: should still forward to primary to tell the txn
             if ready_to_execute {
                 let execution_result = E::execute(ctx, store, transaction.clone()).await;
                 tx_results

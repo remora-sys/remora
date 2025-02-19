@@ -337,6 +337,15 @@ impl Executor for SuiExecutor {
             .is_ok()
     }
 
+    fn pre_execute_check_objects(
+        _ctx: Arc<BenchmarkContext>,
+        _store: Arc<Self::Store>,
+        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        // FIXME
+        true
+    }
+
     async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
         self.context()
             .validator()
@@ -353,6 +362,13 @@ impl Executor for SuiExecutor {
 
     fn init_store(&self) -> Self::Store {
         self.create_in_memory_store()
+    }
+
+    fn optimistically_pre_generate_objects(
+        _store: Arc<Self::Store>,
+        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) {
+        todo!()
     }
 }
 

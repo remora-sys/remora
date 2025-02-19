@@ -33,6 +33,7 @@ use super::{
     StateStore,
     TransactionWithTimestamp,
     },
+    sui::get_object_ids_for_dependency_tracking,
     super::config::{
         BenchmarkParameters,
         WorkloadType,
@@ -42,6 +43,11 @@ use super::{
 /// A fake owned object for testing.
 pub fn fake_owned_object(version: u64) -> Object {
     let id = ObjectID::random();
+    fake_owned_object_with_id(version, id)
+}
+
+/// A fake owned object for testing.
+pub fn fake_owned_object_with_id(version: u64, id: ObjectID) -> Object {
     let object_version = SequenceNumber::from_u64(version);
     let owner = SuiAddress::random_for_testing_only();
     Object::with_id_owner_version_for_testing(id, object_version, owner)
@@ -420,6 +426,20 @@ impl Executor for FakeExecutor {
         true
     }
 
+    fn pre_execute_check_objects(
+        _ctx: Arc<FakeExecutionContext>,
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        for reference in &transaction.inputs {
+            let id = reference.object_id();
+            if !store.read_object(&id).expect("failed to access store").is_some() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Assign a shared object version.
     fn assign_shared_object_versions(
         &self,
@@ -439,6 +459,16 @@ impl Executor for FakeExecutor {
 
     fn init_store(&self) -> Self::Store {
         FakeObjectStore::new()
+    }
+
+    fn optimistically_pre_generate_objects(
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) {
+        let obj_ids = get_object_ids_for_dependency_tracking::<FakeExecutor>(transaction.clone()); 
+        for obj_id in obj_ids {
+            store.write_object(fake_owned_object_with_id(0, obj_id));
+        }
     }
 }
 

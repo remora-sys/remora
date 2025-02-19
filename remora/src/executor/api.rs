@@ -157,8 +157,15 @@ pub trait Executor: Clone {
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send;
 
-    /// Check version ID check prior to execution
+    /// Check version ID prior to execution
     fn pre_execute_check(
+        ctx: Arc<Self::ExecutionContext>,
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool;
+
+    /// Check object existence
+    fn pre_execute_check_objects(
         ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
@@ -176,6 +183,11 @@ pub trait Executor: Clone {
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 
     fn init_store(&self) -> Self::Store;
+
+    fn optimistically_pre_generate_objects(
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    );
 }
 
 /// Short for a transaction with a timestamp.
