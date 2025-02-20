@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, sync::Arc};
+use std::{io, marker::PhantomData, sync::Arc};
 
+use serde::de::DeserializeOwned;
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -12,17 +13,15 @@ use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::Mock
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::{
-        api::Timestamp,
-        sui::{SuiExecutionResults, SuiExecutor},
-    },
+    executor::api::{ExecutionResults, Executor, Timestamp},
     metrics::Metrics,
     networking::server::NetworkServer,
     proxy::core::{ProxyCore, ProxyMode},
 };
 
 /// The single machine validator is a simple validator that runs all components.
-pub struct PrimaryNode {
+pub struct PrimaryNode<E: Executor> {
+    pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
     pub primary_handles: Vec<JoinHandle<NodeResult<()>>>,
     /// The handle for the (mock) consensus.
@@ -30,20 +29,22 @@ pub struct PrimaryNode {
     /// The handles for the network servers.
     pub network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The receiver for the final execution results.
-    pub rx_output: Receiver<(Timestamp, SuiExecutionResults)>,
+    pub rx_output: Receiver<(Timestamp, ExecutionResults<E>)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
     pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
     pub metrics: Arc<Metrics>,
 }
 
-impl PrimaryNode {
+impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     /// Start the single machine validator.
-    pub async fn start(
-        executor: SuiExecutor,
-        config: &ValidatorConfig,
-        metrics: Arc<Metrics>,
-    ) -> Self {
+    pub async fn start(executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
+    where
+        <E as Executor>::Store: Sync + Send,
+        <E as Executor>::Transaction: Send + Sync + 'static,
+        <E as Executor>::ExecutionContext: Send + Sync,
+        <E as Executor>::ExecutionResults: Send + Sync + DeserializeOwned,
+    {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -57,7 +58,7 @@ impl PrimaryNode {
         let mut network_handles = Vec::new();
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
-        let load_balancer_handle = LoadBalancer::<SuiExecutor>::new(
+        let load_balancer_handle = LoadBalancer::<E>::new(
             executor.clone(),
             rx_proxy_connections,
             rx_committed_txns,
@@ -88,7 +89,7 @@ impl PrimaryNode {
         for i in 0..config.validator_parameters.collocated_pre_executors.primary {
             let proxy_id = format!("primary-{i}");
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let store = Arc::new(executor.create_in_memory_store());
+            let store = Arc::new(executor.init_store());
             ProxyCore::new(
                 proxy_id,
                 executor.clone(),
@@ -115,7 +116,7 @@ impl PrimaryNode {
         // Boot the primary executor. This component receives ordered transactions from consensus.
         // It then combines the pre-execution results from the proxies and re-executes the transactions
         // only if necessary.
-        let store = Arc::new(executor.create_in_memory_store());
+        let store = Arc::new(executor.init_store());
         let primary_handle = PrimaryCore::new(
             executor,
             store,
@@ -139,6 +140,7 @@ impl PrimaryNode {
         network_handles.push(transactions_network_handle);
 
         Self {
+            phantom_data: PhantomData,
             primary_handles,
             consensus_handle,
             network_handles,
@@ -149,7 +151,10 @@ impl PrimaryNode {
     }
 
     /// Collect the results from the validator.
-    pub async fn collect_results(mut self) {
+    pub async fn collect_results(mut self)
+    where
+        <E as Executor>::Transaction: std::fmt::Debug,
+    {
         // Collect client connections.
         // TODO: In a real system, these connections would be used to reply to the clients, acknowledging
         // the receipt of the transaction and its final execution status.
@@ -184,10 +189,7 @@ mod tests {
     use crate::{
         client::load_generator::LoadGenerator,
         config::{
-            BenchmarkParameters,
-            CollocatedPreExecutors,
-            ValidatorConfig,
-            ValidatorParameters,
+            BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters,
         },
         executor::sui::SuiExecutor,
         metrics::Metrics,
@@ -209,7 +211,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::new(benchmark_config, config.client_server_address);
+        let mut load_generator =
+            LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();
@@ -248,7 +251,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Generate transactions.
-        let mut load_generator = LoadGenerator::new(benchmark_config, primary_address);
+        let mut load_generator =
+            LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
 
         let transactions = load_generator.initialize().await;
         let total_transactions = transactions.len();

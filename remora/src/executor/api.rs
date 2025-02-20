@@ -1,7 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+    future::Future,
+    ops::Deref,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sui_types::{
@@ -11,6 +18,8 @@ use sui_types::{
     object::Object,
     transaction::InputObjectKind,
 };
+
+use crate::config::BenchmarkParameters;
 
 /// A transaction that can be executed.
 pub trait ExecutableTransaction {
@@ -151,9 +160,15 @@ pub trait Executor: Clone {
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send;
 
-    /// Check version ID check prior to execution
+    /// Check version ID prior to execution
     fn pre_execute_check(
         ctx: Arc<Self::ExecutionContext>,
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool;
+
+    /// Check object existence
+    fn pre_execute_check_objects(
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool;
@@ -163,6 +178,18 @@ pub trait Executor: Clone {
         &self,
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send;
+
+    fn generate_transactions(
+        config: &BenchmarkParameters,
+        working_directory: Option<PathBuf>,
+    ) -> impl Future<Output = Vec<Self::Transaction>> + Send;
+
+    fn init_store(&self) -> Self::Store;
+
+    fn optimistically_pre_generate_objects(
+        store: Arc<Self::Store>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    );
 }
 
 /// Short for a transaction with a timestamp.

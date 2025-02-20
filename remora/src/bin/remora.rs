@@ -1,17 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{fmt::Debug, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig},
-    executor::sui::SuiExecutor,
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
+    executor::{api::Executor, fake::FakeExecutor, sui::SuiExecutor},
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
     proxy::{core::ProxyId, node::ProxyNode},
 };
+use serde::{de::DeserializeOwned, Serialize};
 
 #[derive(Parser)]
 #[clap(rename_all = "kebab-case")]
@@ -66,10 +67,49 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the executor.
     tracing::info!("Loading executor");
-    let executor = SuiExecutor::new(&benchmark_config).await;
+    match benchmark_config.workload {
+        WorkloadType::Transfers | WorkloadType::SharedObjects { .. } => {
+            let executor = SuiExecutor::new(&benchmark_config).await;
+            start_node(
+                args.role,
+                executor,
+                validator_config,
+                metrics,
+                args.binding_address,
+            )
+            .await;
+        }
+        WorkloadType::FakedNoContention { .. } | WorkloadType::FakedContention { .. } => {
+            let executor = FakeExecutor::new(&benchmark_config).await;
+            start_node(
+                args.role,
+                executor,
+                validator_config,
+                metrics,
+                args.binding_address,
+            )
+            .await;
+        }
+    };
 
+    Ok(())
+}
+
+async fn start_node<E>(
+    role: Role,
+    executor: E,
+    mut validator_config: ValidatorConfig,
+    metrics: Arc<Metrics>,
+    binding_address: Option<IpAddr>,
+) where
+    E: Executor + Send + Sync + 'static,
+    <E as Executor>::Store: Send + Sync,
+    <E as Executor>::Transaction: Send + Sync + Debug,
+    <E as Executor>::ExecutionContext: Send + Sync,
+    <E as Executor>::ExecutionResults: Send + Sync + DeserializeOwned + Serialize,
+{
     // Start the node.
-    match args.role {
+    match role {
         Role::Primary => {
             tracing::info!(
                 "Primary accepting proxy connections on {}",
@@ -79,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
-            if let Some(binding_address) = args.binding_address {
+            if let Some(binding_address) = binding_address {
                 validator_config
                     .proxy_server_address
                     .set_ip(binding_address);
@@ -100,8 +140,7 @@ async fn main() -> anyhow::Result<()> {
             ProxyNode::start(proxy_id, executor, &validator_config, metrics)
                 .await
                 .await_completion()
+
         }
     }
-
-    Ok(())
 }

@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
 use rustc_hash::FxHashMap;
 use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
@@ -13,13 +13,8 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction,
-        ExecutionResults,
-        Executor,
-        ExecutorIndex,
-        NewStates,
-        PrimaryToProxyMessage,
-        RemoraTransaction,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
+        PrimaryToProxyMessage, RemoraTransaction,
     },
     metrics::Metrics,
 };
@@ -131,7 +126,7 @@ impl<E: Executor> LoadBalancer<E> {
                 // Get or create the BTreeMap for this executor
                 let entry = updates_by_executor
                     .entry(executor_id)
-                    .or_insert_with(BTreeMap::new);
+                    .or_default();
                 entry.insert(object_id, object);
             } else {
                 eprintln!("Warning: No executor found for ObjectID {}", object_id);
@@ -219,7 +214,7 @@ impl<E: Executor> LoadBalancer<E> {
 
                 Some(result) = self.rx_states_sync.recv() => {
                     // send states updates to the proxy
-                    if self.proxy_connections.len() == 0 {
+                    if self.proxy_connections.is_empty() {
                         tracing::debug!("Skip states updating given no available other executors");
                         continue;
                     }

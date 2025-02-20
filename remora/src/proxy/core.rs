@@ -16,13 +16,8 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction,
-            ExecutionResults,
-            Executor,
-            PrimaryToProxyMessage,
-            RemoraTransaction,
-            StateStore,
-            Store,
+            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
+            RemoraTransaction, StateStore, Store,
         },
         dependency_controller::DependencyController,
         sui::get_object_ids_for_dependency_tracking,
@@ -107,12 +102,16 @@ impl<E: Executor> ProxyCore<E> {
                                 .await;
 
                             self.metrics.increase_proxy_load(&self.id);
-                            let execution_result = E::execute(
-                                self.executor.context(),
-                                self.store.clone(),
-                                transaction,
-                            )
-                            .await;
+
+                            let ctx = self.executor.context().clone();
+                            let store = self.store.clone();
+                            if !E::pre_execute_check_objects(store.clone(), &transaction) {
+                                E::optimistically_pre_generate_objects(store.clone(), &transaction);
+                            }
+
+                            let execution_result =
+                                E::execute(ctx, store.clone(), transaction).await;
+
                             self.metrics.decrease_proxy_load(&self.id);
                             if self.tx_results.send(execution_result).await.is_err() {
                                 tracing::warn!(
@@ -146,6 +145,11 @@ impl<E: Executor> ProxyCore<E> {
                                     }
                                     task_id += 1;
                                     self.metrics.increase_proxy_load(&self.id);
+
+                                    if !E::pre_execute_check_objects(self.store.clone(), &transaction) {
+                                        E::optimistically_pre_generate_objects(self.store.clone(), &transaction);
+                                    }
+
                                     let (prior_handles, current_handles) = self.get_dependencies(transaction.clone(), task_id);
                                     self.schedule_txn_parallel(transaction, prior_handles, current_handles).await.expect("Failed to schedule transaction");
                                 }
@@ -213,6 +217,7 @@ impl<E: Executor> ProxyCore<E> {
                     )
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
+            // FIXME: should still forward to primary to tell the txn
             if ready_to_execute {
                 let execution_result = E::execute(ctx, store, transaction.clone()).await;
                 tx_results
@@ -285,30 +290,38 @@ mod tests {
     use crate::{
         config::BenchmarkParameters,
         executor::{
-            api::PrimaryToProxyMessage,
-            sui::{generate_transactions, SuiExecutor, SuiTransaction},
+            api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
+            fake::FakeExecutor,
+            sui::SuiExecutor,
         },
         metrics::Metrics,
         proxy::core::{ProxyCore, ProxyMode},
     };
 
-    async fn pre_execute(mode: ProxyMode) {
+    async fn pre_execute<E: Executor + Send + 'static>(
+        mode: ProxyMode,
+        executor: E,
+        config: BenchmarkParameters,
+    ) where
+        <E as Executor>::ExecutionResults: Send + Sync,
+        <E as Executor>::Transaction: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
+        <E as Executor>::Store: Send + Sync,
+    {
         let (tx_proxy, rx_proxy) = mpsc::channel(100);
         let (tx_results, mut rx_results) = mpsc::channel(100);
 
-        let config = BenchmarkParameters::new_for_tests();
-        let executor = SuiExecutor::new(&config).await;
-        let store = Arc::new(executor.create_in_memory_store());
+        let store = Arc::new(executor.init_store());
         let metrics = Arc::new(Metrics::new_for_tests());
         let proxy_id = "0".to_string();
-        let proxy = ProxyCore::new(
+        let proxy = ProxyCore::<E>::new(
             proxy_id, executor, mode, store, rx_proxy, tx_results, metrics,
         );
 
         // Send transactions to the proxy.
-        let transactions = generate_transactions(&config, None).await;
+        let transactions = E::generate_transactions(&config, None).await;
         for tx in transactions {
-            let transaction = SuiTransaction::new_for_tests(tx);
+            let transaction = RemoraTransaction::<E>::new_for_tests(tx);
             let message = PrimaryToProxyMessage::Txn(transaction);
             tx_proxy.send(message).await.unwrap();
         }
@@ -323,11 +336,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_threaded_proxy() {
-        pre_execute(ProxyMode::SingleThreaded).await;
+        let config = BenchmarkParameters::new_for_tests();
+        let executor = SuiExecutor::new(&config).await;
+        pre_execute::<SuiExecutor>(ProxyMode::SingleThreaded, executor, config).await;
     }
 
     #[tokio::test]
     async fn test_multi_threaded_proxy() {
-        pre_execute(ProxyMode::MultiThreaded).await;
+        let config = BenchmarkParameters::new_for_tests();
+        let executor = SuiExecutor::new(&config).await;
+        pre_execute::<SuiExecutor>(ProxyMode::MultiThreaded, executor, config).await;
+    }
+
+    #[tokio::test]
+    async fn test_single_threaded_proxy_fake_transactions() {
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::SingleThreaded, executor, config).await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_threaded_proxy_fake_transactions() {
+        let config = BenchmarkParameters::new_for_fake_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
+    }
+
+    #[tokio::test]
+    async fn test_single_threaded_proxy_fake_transactions_contention() {
+        let config = BenchmarkParameters::new_for_fake_contention_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::SingleThreaded, executor, config).await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_threaded_proxy_fake_transactions_contention() {
+        let config = BenchmarkParameters::new_for_fake_contention_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
     }
 }
