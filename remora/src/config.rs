@@ -247,6 +247,19 @@ impl BenchmarkParameters {
             },
         }
     }
+
+    /// Create a new benchmark configuration for fake txn tests.
+    pub fn new_for_fake_contention_tests() -> Self {
+        BenchmarkParameters {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::FakedContention {
+                execution_duration: default_fake_execution_duration(),
+                number_of_inputs: 1,
+                contention: 100,
+            },
+        }
+    }
 }
 
 mod default_benchmark_config {

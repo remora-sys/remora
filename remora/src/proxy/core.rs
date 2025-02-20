@@ -351,4 +351,18 @@ mod tests {
         let executor = FakeExecutor::new(&config).await;
         pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
     }
+
+    #[tokio::test]
+    async fn test_single_threaded_proxy_fake_transactions_contention() {
+        let config = BenchmarkParameters::new_for_fake_contention_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::SingleThreaded, executor, config).await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_threaded_proxy_fake_transactions_contention() {
+        let config = BenchmarkParameters::new_for_fake_contention_tests();
+        let executor = FakeExecutor::new(&config).await;
+        pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
+    }
 }
