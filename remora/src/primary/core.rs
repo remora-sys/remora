@@ -188,30 +188,32 @@ impl<E: Executor + Sync> PrimaryCore<E> {
             .dependency_controller
             .get_dependencies(task_id, obj_ids);
 
-        // tokio::spawn(async move {
-        for prior_notify in prior_handles {
-            prior_notify.notified().await;
-        }
+        tokio::spawn(async move {
+            for prior_notify in prior_handles {
+                prior_notify.notified().await;
+            }
 
-        let txn_result = E::execute(ctx, store, transaction.clone()).await;
+            let txn_result = E::execute(ctx, store, transaction.clone()).await;
 
-        if tx_output
-            .send((transaction.timestamp(), txn_result.clone()))
-            .await
-            .is_err()
-        {
-            tracing::warn!("Failed to output execution result, stopping primary executor");
-        }
+            if tx_output
+                .send((transaction.timestamp(), txn_result.clone()))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to output execution result, stopping primary executor");
+            }
 
-        // Sends the sync updates after each local execution
-        if tx_states_sync.send(txn_result.clone()).await.is_err() {
-            tracing::warn!("Failed to send execution results of local executor to load balancer");
-        }
+            // Sends the sync updates after each local execution
+            if tx_states_sync.send(txn_result.clone()).await.is_err() {
+                tracing::warn!(
+                    "Failed to send execution results of local executor to load balancer"
+                );
+            }
 
-        for notify in current_handles {
-            notify.notify_one();
-        }
-        // });
+            for notify in current_handles {
+                notify.notify_one();
+            }
+        });
     }
 
     /// Run the primary executor.

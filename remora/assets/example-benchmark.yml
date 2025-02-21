@@ -1,5 +1,5 @@
-load: 1
+load: 3
 duration:
-  secs: 10
+  secs: 60
   nanos: 0
 workload: !SolanaTransactions
