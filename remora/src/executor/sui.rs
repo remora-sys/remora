@@ -98,6 +98,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
             txs_per_counter: txs_per_counter as u64,
         }),
         WorkloadType::SolanaTransactions => Ok(WorkloadKind::SolanaTransactions),
+        WorkloadType::EthereumTransfers => Ok(WorkloadKind::EthereumTransfers),
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 

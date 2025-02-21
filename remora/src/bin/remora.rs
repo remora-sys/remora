@@ -70,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
     match benchmark_config.workload {
         WorkloadType::Transfers
         | WorkloadType::SharedObjects { .. }
-        | WorkloadType::SolanaTransactions => {
+        | WorkloadType::SolanaTransactions
+        | WorkloadType::EthereumTransfers => {
             let executor = SuiExecutor::new(&benchmark_config).await;
             start_node(
                 args.role,

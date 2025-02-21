@@ -174,6 +174,7 @@ pub enum WorkloadType {
         contention: u64,
     },
     SolanaTransactions,
+    EthereumTransfers,
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -196,6 +197,7 @@ impl Debug for WorkloadType {
             WorkloadType::FakedNoContention { .. } => write!(f, "faked no contention"),
             WorkloadType::FakedContention { .. } => write!(f, "faked contention"),
             WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
+            WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
         }
     }
 }
