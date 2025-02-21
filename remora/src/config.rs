@@ -176,6 +176,8 @@ pub enum WorkloadType {
     SolanaTransactions,
     EthereumTransfers,
     EthereumNftMint,
+    UniswapNormal,
+    UniswapPeak,
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -200,6 +202,8 @@ impl Debug for WorkloadType {
             WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
             WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
+            WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
+            WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
         }
     }
 }
