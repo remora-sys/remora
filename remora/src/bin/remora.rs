@@ -71,7 +71,8 @@ async fn main() -> anyhow::Result<()> {
         WorkloadType::Transfers
         | WorkloadType::SharedObjects { .. }
         | WorkloadType::SolanaTransactions
-        | WorkloadType::EthereumTransfers => {
+        | WorkloadType::EthereumTransfers
+        | WorkloadType::EthereumNftMint => {
             let executor = SuiExecutor::new(&benchmark_config).await;
             start_node(
                 args.role,

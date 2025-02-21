@@ -99,6 +99,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         }),
         WorkloadType::SolanaTransactions => Ok(WorkloadKind::SolanaTransactions),
         WorkloadType::EthereumTransfers => Ok(WorkloadKind::EthereumTransfers),
+        WorkloadType::EthereumNftMint => Ok(WorkloadKind::EthereumNftMint),
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 

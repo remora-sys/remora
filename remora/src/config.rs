@@ -175,6 +175,7 @@ pub enum WorkloadType {
     },
     SolanaTransactions,
     EthereumTransfers,
+    EthereumNftMint,
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -198,6 +199,7 @@ impl Debug for WorkloadType {
             WorkloadType::FakedContention { .. } => write!(f, "faked contention"),
             WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
             WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
+            WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
         }
     }
 }
