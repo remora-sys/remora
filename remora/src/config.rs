@@ -4,7 +4,8 @@
 use std::{
     error::Error,
     fmt::{Debug, Display},
-    fs, io,
+    fs,
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     time::Duration,
@@ -172,6 +173,7 @@ pub enum WorkloadType {
         #[serde(default = "default_contention_level")]
         contention: u64,
     },
+    SolanaTransactions,
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -193,6 +195,7 @@ impl Debug for WorkloadType {
             WorkloadType::SharedObjects { .. } => write!(f, "shared objects"),
             WorkloadType::FakedNoContention { .. } => write!(f, "faked no contention"),
             WorkloadType::FakedContention { .. } => write!(f, "faked contention"),
+            WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
         }
     }
 }

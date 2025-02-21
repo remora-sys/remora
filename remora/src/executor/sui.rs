@@ -27,7 +27,11 @@ use sui_types::{
 use tokio::{sync::Mutex, time::Instant};
 
 use super::api::{
-    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+    ExecutableTransaction,
+    ExecutionResults,
+    Executor,
+    RemoraTransaction,
+    StateStore,
 };
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
@@ -93,6 +97,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         WorkloadType::SharedObjects { txs_per_counter } => Ok(WorkloadKind::Counter {
             txs_per_counter: txs_per_counter as u64,
         }),
+        WorkloadType::SolanaTransactions => Ok(WorkloadKind::SolanaTransactions),
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 
@@ -307,7 +312,13 @@ impl Executor for SuiExecutor {
                 signer,
                 *transaction.digest(),
             );
-        debug_assert!(effects.status().is_ok());
+        if effects.status().is_err() {
+            tracing::error!(
+                "[{tx_id}] Transaction failed ({:?}): {effects:?}",
+                effects.status()
+            );
+            panic!("Transaction failed: {:?}", effects.status());
+        }
 
         let written = inner_temp_store.written.clone();
 

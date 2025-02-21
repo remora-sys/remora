@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         WorkloadType::Transfers => {
             transactions = load_generator.initialize().await;
         }
-        WorkloadType::SharedObjects { .. } => {
+        WorkloadType::SharedObjects { .. } | WorkloadType::SolanaTransactions => {
             transactions = load_generator.initialize().await;
             tracing::debug!(
                 "Transactions: {:?}",

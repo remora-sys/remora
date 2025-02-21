@@ -68,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
     // Build the executor.
     tracing::info!("Loading executor");
     match benchmark_config.workload {
-        WorkloadType::Transfers | WorkloadType::SharedObjects { .. } => {
+        WorkloadType::Transfers
+        | WorkloadType::SharedObjects { .. }
+        | WorkloadType::SolanaTransactions => {
             let executor = SuiExecutor::new(&benchmark_config).await;
             start_node(
                 args.role,
@@ -140,7 +142,6 @@ async fn start_node<E>(
             ProxyNode::start(proxy_id, executor, &validator_config, metrics)
                 .await
                 .await_completion()
-
         }
     }
 }
