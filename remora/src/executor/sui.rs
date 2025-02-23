@@ -98,6 +98,10 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
             txs_per_counter: txs_per_counter as u64,
         }),
         WorkloadType::SolanaTransactions => Ok(WorkloadKind::SolanaTransactions),
+        WorkloadType::EthereumTransfers => Ok(WorkloadKind::EthereumTransfers),
+        WorkloadType::EthereumNftMint => Ok(WorkloadKind::EthereumNftMint),
+        WorkloadType::UniswapNormal => Ok(WorkloadKind::UniswapNormal),
+        WorkloadType::UniswapPeak => Ok(WorkloadKind::UniswapPeak),
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 

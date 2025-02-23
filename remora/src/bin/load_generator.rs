@@ -54,7 +54,12 @@ async fn main() -> anyhow::Result<()> {
         WorkloadType::Transfers => {
             transactions = load_generator.initialize().await;
         }
-        WorkloadType::SharedObjects { .. } | WorkloadType::SolanaTransactions => {
+        WorkloadType::SharedObjects { .. }
+        | WorkloadType::SolanaTransactions
+        | WorkloadType::EthereumTransfers
+        | WorkloadType::EthereumNftMint
+        | WorkloadType::UniswapNormal
+        | WorkloadType::UniswapPeak => {
             transactions = load_generator.initialize().await;
             tracing::debug!(
                 "Transactions: {:?}",
