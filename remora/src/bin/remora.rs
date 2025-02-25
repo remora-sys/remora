@@ -6,7 +6,7 @@ use std::{fmt::Debug, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig},
     executor::{api::Executor, fake::FakeExecutor, sui::SuiExecutor},
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
@@ -67,38 +67,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the executor.
     tracing::info!("Loading executor");
-    match benchmark_config.workload {
-        WorkloadType::Transfers
-        | WorkloadType::SharedObjects { .. }
-        | WorkloadType::SolanaTransactions
-        | WorkloadType::EthereumTransfers
-        | WorkloadType::EthereumNftMint
-        | WorkloadType::UniswapNormal
-        | WorkloadType::UniswapPeak => {
-            let executor = SuiExecutor::new(&benchmark_config).await;
-            start_node(
-                args.role,
-                executor,
-                validator_config,
-                metrics,
-                args.binding_address,
-            )
-            .await;
-        }
-        WorkloadType::FakedNoContention { .. }
-        | WorkloadType::FakedContention { .. }
-        | WorkloadType::FakeSolanaTransactions { .. } => {
-            let executor = FakeExecutor::new(&benchmark_config).await;
-            start_node(
-                args.role,
-                executor,
-                validator_config,
-                metrics,
-                args.binding_address,
-            )
-            .await;
-        }
-    };
+    if benchmark_config.workload.is_fake() {
+        let executor = FakeExecutor::new(&benchmark_config).await;
+        start_node(
+            args.role,
+            executor,
+            validator_config,
+            metrics,
+            args.binding_address,
+        )
+        .await;
+    } else {
+        let executor = SuiExecutor::new(&benchmark_config).await;
+        start_node(
+            args.role,
+            executor,
+            validator_config,
+            metrics,
+            args.binding_address,
+        )
+        .await;
+    }
 
     Ok(())
 }

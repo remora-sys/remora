@@ -8,7 +8,7 @@ use clap::Parser;
 use remora::{
     //executor::sui::{check_logs_for_shared_object, import_from_files},
     client::load_generator::{default_metrics_address, LoadGenerator},
-    config::{BenchmarkParameters, ImportExport, ValidatorConfig, WorkloadType},
+    config::{BenchmarkParameters, ImportExport, ValidatorConfig},
     executor::sui::SuiExecutor,
 };
 use sui_types::transaction::TransactionDataAPI;
@@ -50,30 +50,18 @@ async fn main() -> anyhow::Result<()> {
         LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
 
     let transactions;
-    match benchmark_config.workload {
-        WorkloadType::Transfers => {
-            transactions = load_generator.initialize().await;
-        }
-        WorkloadType::SharedObjects { .. }
-        | WorkloadType::SolanaTransactions
-        | WorkloadType::EthereumTransfers
-        | WorkloadType::EthereumNftMint
-        | WorkloadType::UniswapNormal
-        | WorkloadType::UniswapPeak => {
-            transactions = load_generator.initialize().await;
-            tracing::debug!(
-                "Transactions: {:?}",
-                transactions
-                    .iter()
-                    .map(|tx| tx.transaction_data().input_objects())
-                    .collect::<Vec<_>>()
-            );
-        }
-        WorkloadType::FakedNoContention { .. }
-        | WorkloadType::FakedContention { .. }
-        | WorkloadType::FakeSolanaTransactions { .. } => {
-            todo!()
-        }
+    if benchmark_config.workload.is_fake() {
+        todo!()
+    } else {
+        // Sui load.
+        transactions = load_generator.initialize().await;
+        tracing::debug!(
+            "Transactions: {:?}",
+            transactions
+                .iter()
+                .map(|tx| tx.transaction_data().input_objects())
+                .collect::<Vec<_>>()
+        );
     };
 
     // Submit transactions to the server.
