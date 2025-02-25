@@ -178,6 +178,41 @@ pub enum WorkloadType {
     EthereumNftMint,
     UniswapNormal,
     UniswapPeak,
+    FakeSolanaTransactions {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeEthereumTransfers {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeEthereumNftMint {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeUniswapNormal {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeUniswapPeak {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+}
+
+impl WorkloadType {
+    pub fn is_fake(&self) -> bool {
+        match self {
+            WorkloadType::FakedNoContention { .. }
+            | WorkloadType::FakedContention { .. }
+            | WorkloadType::FakeSolanaTransactions { .. }
+            | WorkloadType::FakeEthereumTransfers { .. }
+            | WorkloadType::FakeEthereumNftMint { .. }
+            | WorkloadType::FakeUniswapNormal { .. }
+            | WorkloadType::FakeUniswapPeak { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -204,6 +239,11 @@ impl Debug for WorkloadType {
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
             WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
             WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
+            WorkloadType::FakeSolanaTransactions { .. } => write!(f, "Fake Solana transactions"),
+            WorkloadType::FakeEthereumTransfers { .. } => write!(f, "Fake Ethereum transfers"),
+            WorkloadType::FakeEthereumNftMint { .. } => write!(f, "Fake Ethereum NFT mint"),
+            WorkloadType::FakeUniswapNormal { .. } => write!(f, "Fake Uniswap normal"),
+            WorkloadType::FakeUniswapPeak { .. } => write!(f, "Fake Uniswap peak"),
         }
     }
 }

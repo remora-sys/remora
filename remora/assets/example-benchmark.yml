@@ -1,5 +1,0 @@
-load: 3
-duration:
-  secs: 60
-  nanos: 0
-workload: !UniswapPeak
