@@ -141,7 +141,7 @@ impl<E: Executor + Sync> PrimaryCore<E> {
 
             if skip {
                 let effects = proxy_result.clone();
-                store.commit_objects(effects.updates, effects.new_state);
+                store.commit_objects(effects.updates.unwrap(), effects.new_state.unwrap());
                 if tx_output
                     .send((proxy_result.transaction.timestamp(), proxy_result))
                     .await
@@ -232,6 +232,17 @@ impl<E: Executor + Sync> PrimaryCore<E> {
                 // Receive an execution result from a proxy.
                 Some(proxy_result) = self.rx_proxies.recv() => {
                     tracing::debug!("Received proxy result");
+
+                    // Proxy skipped the execution
+                    if proxy_result.updates.is_none() {
+                        if self.tx_executor_local.send(proxy_result.transaction).await
+                            .is_err()
+                        {
+                            tracing::warn!("Failed to send transaction to the local executor");
+                        }
+                        continue;
+                    }
+
                     task_id += 1;
                     let store = self.store.clone();
                     let tx_output = self.tx_output.clone();

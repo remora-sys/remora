@@ -120,7 +120,7 @@ impl<E: Executor> LoadBalancer<E> {
         // HashMap to hold the updates for each executor
         let mut updates_by_executor: FxHashMap<ExecutorIndex, NewStates> = FxHashMap::default();
 
-        for (object_id, object) in execution_result.new_state {
+        for (object_id, object) in execution_result.new_state.unwrap() {
             // Determine the target executor for this object
             if let Some(&executor_id) = self.shared_object_shards.get(&object_id) {
                 // Get or create the BTreeMap for this executor

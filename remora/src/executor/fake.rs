@@ -3,7 +3,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     marker::PhantomData,
     sync::{Arc, RwLock},
@@ -11,7 +11,7 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
@@ -28,7 +28,10 @@ use tokio::time::Instant;
 use super::{
     super::config::{BenchmarkParameters, WorkloadType},
     api::{
-        ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
+        ExecutableTransaction,
+        ExecutionResultsAndEffects,
+        Executor,
+        StateStore,
         TransactionWithTimestamp,
     },
     sui::get_object_ids_for_dependency_tracking,
@@ -48,14 +51,14 @@ pub fn fake_owned_object_with_id(version: u64, id: ObjectID) -> Object {
 }
 
 /// A fake shared object for testing.
-pub fn fake_shared_object(version: u64) -> Object {
+pub fn fake_shared_object(initial_version: u64) -> Object {
     let id = ObjectID::random();
-    fake_shared_object_with_id(version, id)
+    fake_shared_object_with_id(initial_version, id)
 }
 
 /// A fake shared object with a fixed Id for testing.
-pub fn fake_shared_object_with_id(version: u64, id: ObjectID) -> Object {
-    let object_version = SequenceNumber::from_u64(version);
+pub fn fake_shared_object_with_id(initial_version: u64, id: ObjectID) -> Object {
+    let object_version = SequenceNumber::from_u64(initial_version);
     let obj = MoveObject::new_gas_coin(object_version, id, 10);
     let owner = Owner::Shared {
         initial_shared_version: obj.version(),
@@ -352,6 +355,7 @@ impl FakeExecutor {
                 number_of_inputs: _,
                 contention: _,
             } => execution_duration,
+            WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
@@ -425,7 +429,7 @@ impl Executor for FakeExecutor {
         };
         store.commit_objects(updates.clone(), new_state.clone());
 
-        async move { ExecutionResultsAndEffects::new(transaction, updates, new_state) }
+        async move { ExecutionResultsAndEffects::new(transaction, Some(updates), Some(new_state)) }
     }
 
     fn pre_execute_check(
@@ -454,10 +458,7 @@ impl Executor for FakeExecutor {
     }
 
     /// Assign a shared object version.
-    async fn assign_shared_object_versions(
-        &self,
-        _transactions: &[Self::Transaction],
-    ) {
+    async fn assign_shared_object_versions(&self, _transactions: &[Self::Transaction]) {
         //todo!()
     }
 
@@ -560,7 +561,6 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
             )
             .await
         }
-
         WorkloadType::FakedContention {
             execution_duration: _,
             number_of_inputs,
@@ -571,6 +571,51 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
             })
             .await
         }
+        WorkloadType::FakeSolanaTransactions { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            let (_, transactions) = generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                solana_load,
+            );
+            transactions
+        }
+        WorkloadType::FakeEthereumTransfers { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            let (_, transactions) = generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                eth_transfers,
+            );
+            transactions
+        }
+        WorkloadType::FakeEthereumNftMint { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            let (_, transactions) = generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                eth_mint,
+            );
+            transactions
+        }
+        WorkloadType::FakeUniswapNormal { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            let (_, transactions) = generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                uniswap_normal,
+            );
+            transactions
+        }
+        WorkloadType::FakeUniswapPeak { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            let (_, transactions) = generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                uniswap_peak,
+            );
+            transactions
+        }
 
         _ => {
             panic!("Error: Unsupported workloadtype in the fake executor");
@@ -578,20 +623,83 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
     }
 }
 
+pub fn generate_fake_load_objects_and_transactions<R, F>(
+    rng: &mut R,
+    tx_count: usize,
+    load: F,
+) -> (HashSet<Object>, Vec<FakeTransaction>)
+where
+    R: Rng,
+    F: Fn(&mut R) -> Vec<usize>,
+{
+    let mut objects = HashSet::new();
+    let mut transactions = Vec::new();
+    for _ in 0..tx_count {
+        let objects = load(rng)
+            .into_iter()
+            .map(|id| {
+                let mut bytes = [0u8; ObjectID::LENGTH];
+                let n_bytes = id.to_le_bytes();
+                let copy_len = n_bytes.len().min(ObjectID::LENGTH);
+                bytes[..copy_len].copy_from_slice(&n_bytes[..copy_len]);
+
+                let object_id = ObjectID::from_bytes(bytes).expect("Cannot convert bytes");
+                let object = fake_shared_object_with_id(0, object_id);
+                objects.insert(object.clone());
+                let reference = object.compute_object_reference();
+                InputObjectKind::ImmOrOwnedMoveObject(reference)
+            })
+            .collect();
+        transactions.push(FakeTransaction::new(objects));
+    }
+    (objects, transactions)
+}
+
+pub fn solana_load(rng: &mut StdRng) -> Vec<usize> {
+    let (inputs, _) = sui_single_node_benchmark::load_statistics::solana_concurrency(rng);
+    inputs
+}
+
+pub fn eth_transfers(rng: &mut StdRng) -> Vec<usize> {
+    let (sender, recipient) = sui_single_node_benchmark::load_statistics::ethereum_transfers(rng);
+    vec![sender, recipient]
+}
+
+pub fn eth_mint(rng: &mut StdRng) -> Vec<usize> {
+    let (nft, minter) = sui_single_node_benchmark::load_statistics::ethereum_nft_mint(rng);
+    vec![nft, minter]
+}
+
+pub fn uniswap_normal(rng: &mut StdRng) -> Vec<usize> {
+    let coin_pair = sui_single_node_benchmark::load_statistics::ethereum_uniswap_normal(rng);
+    vec![coin_pair]
+}
+
+pub fn uniswap_peak(rng: &mut StdRng) -> Vec<usize> {
+    let coin_pair = sui_single_node_benchmark::load_statistics::ethereum_uniswap_peak(rng);
+    vec![coin_pair]
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
+    use rand::{rngs::StdRng, SeedableRng};
     use sui_types::base_types::ObjectID;
     use tokio::time::Instant;
 
     use crate::{
-        config::{default_fake_execution_duration, BenchmarkParameters},
+        config::{default_fake_execution_duration, BenchmarkParameters, WorkloadType},
         executor::{
             api::{Executor, TransactionWithTimestamp},
             fake::{
-                fake_owned_object, fake_shared_object, fake_shared_object_with_id,
-                generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
+                fake_owned_object,
+                fake_shared_object,
+                fake_shared_object_with_id,
+                generate_fake_load_objects_and_transactions,
+                generate_fake_shared_object_transaction,
+                FakeExecutor,
+                FakeObjectStore,
                 FakeTransaction,
             },
         },
@@ -663,6 +771,91 @@ mod tests {
         for _ in 0..10 {
             let contention = 100;
             let transaction = generate_fake_shared_object_transaction(1, contention);
+            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+
+            let start = Instant::now();
+            let result =
+                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp).await;
+            let duration = start.elapsed();
+
+            assert!(result.success());
+            assert!(duration >= default_fake_execution_duration());
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_fake_solana_transactions() {
+        let store = Arc::new(FakeObjectStore::new());
+        let config = BenchmarkParameters {
+            workload: WorkloadType::FakeSolanaTransactions {
+                execution_duration: default_fake_execution_duration(),
+            },
+            ..BenchmarkParameters::new_for_fake_tests()
+        };
+        let executor = FakeExecutor::new(&config).await;
+        let ctx = executor.context();
+
+        // Generate objects and transactions.
+        let mut rng = StdRng::seed_from_u64(0);
+        let (objects, transactions) = generate_fake_load_objects_and_transactions(
+            &mut rng,
+            10,
+            crate::executor::fake::solana_load,
+        );
+
+        // Write the object to the store.
+        for object in objects {
+            store.write_object(object);
+        }
+
+        for transaction in transactions {
+            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+
+            let start = Instant::now();
+            let result =
+                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp).await;
+            let duration = start.elapsed();
+
+            assert!(result.success());
+            assert!(duration >= default_fake_execution_duration());
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_fake_ethereum_transactions() {
+        let store = Arc::new(FakeObjectStore::new());
+        let config = BenchmarkParameters {
+            workload: WorkloadType::FakeSolanaTransactions {
+                execution_duration: default_fake_execution_duration(),
+            },
+            ..BenchmarkParameters::new_for_fake_tests()
+        };
+        let executor = FakeExecutor::new(&config).await;
+        let ctx = executor.context();
+
+        // Generate objects and transactions.
+        let mut rng = StdRng::seed_from_u64(0);
+        let loads = [
+            crate::executor::fake::eth_transfers,
+            crate::executor::fake::eth_mint,
+            crate::executor::fake::uniswap_normal,
+            crate::executor::fake::uniswap_peak,
+        ];
+
+        let mut objects = HashSet::new();
+        let mut transactions = Vec::new();
+        for load in loads {
+            let (os, txs) = generate_fake_load_objects_and_transactions(&mut rng, 3, load);
+            objects.extend(os);
+            transactions.extend(txs);
+        }
+
+        // Write the object to the store.
+        for object in objects {
+            store.write_object(object);
+        }
+
+        for transaction in transactions {
             let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
 
             let start = Instant::now();

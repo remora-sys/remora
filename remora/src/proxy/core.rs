@@ -217,16 +217,17 @@ impl<E: Executor> ProxyCore<E> {
                     )
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
 
-            // FIXME: should still forward to primary to tell the txn
-            if ready_to_execute {
-                let execution_result = E::execute(ctx, store, transaction.clone()).await;
-                tx_results
-                    .send(execution_result)
-                    .await
-                    .map_err(|_| NodeError::ShuttingDown)?;
+            let execution_result = if ready_to_execute {
+                E::execute(ctx, store, transaction.clone()).await
             } else {
                 tracing::warn!("Proxy skipped execution");
-            }
+                ExecutionResults::<E>::new(transaction.clone(), None, None)
+            };
+    
+            tx_results
+                .send(execution_result)
+                .await
+                .map_err(|_| NodeError::ShuttingDown)?;
 
             for notify in current_handles {
                 notify.notify_one();

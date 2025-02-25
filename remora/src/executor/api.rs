@@ -87,8 +87,8 @@ where
     U: Clone + Debug,
 {
     pub transaction: TransactionWithTimestamp<T>,
-    pub updates: U,
-    pub new_state: BTreeMap<ObjectID, Object>,
+    pub updates: Option<U>,
+    pub new_state: Option<BTreeMap<ObjectID, Object>>,
 }
 
 impl<T, U> ExecutionResultsAndEffects<T, U>
@@ -98,8 +98,8 @@ where
 {
     pub fn new(
         transaction: TransactionWithTimestamp<T>, // Include the transaction here
-        updates: U,
-        new_state: BTreeMap<ObjectID, Object>,
+        updates: Option<U>,
+        new_state: Option<BTreeMap<ObjectID, Object>>,
     ) -> Self {
         Self {
             transaction,
@@ -109,15 +109,15 @@ where
     }
 
     pub fn success(&self) -> bool {
-        self.updates.status().is_ok()
+        self.updates.as_ref().unwrap().status().is_ok()
     }
 
     pub fn transaction_digest(&self) -> &TransactionDigest {
-        self.updates.transaction_digest()
+        self.updates.as_ref().unwrap().transaction_digest()
     }
 
     pub fn modified_at_versions(&self) -> Vec<(ObjectID, SequenceNumber)> {
-        self.updates.modified_at_versions()
+        self.updates.as_ref().unwrap().modified_at_versions()
     }
 
     pub fn transaction_with_timestamp(&self) -> &TransactionWithTimestamp<T> {
