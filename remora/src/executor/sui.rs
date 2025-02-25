@@ -337,7 +337,7 @@ impl Executor for SuiExecutor {
         );
         store.commit_objects(inner_temp_store);
 
-        SuiExecutionResults::new(transaction, effects, written)
+        SuiExecutionResults::new(transaction, Some(effects), Some(written))
     }
 
     fn pre_execute_check(

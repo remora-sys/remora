@@ -429,7 +429,7 @@ impl Executor for FakeExecutor {
         };
         store.commit_objects(updates.clone(), new_state.clone());
 
-        async move { ExecutionResultsAndEffects::new(transaction, updates, new_state) }
+        async move { ExecutionResultsAndEffects::new(transaction, Some(updates), Some(new_state)) }
     }
 
     fn pre_execute_check(
