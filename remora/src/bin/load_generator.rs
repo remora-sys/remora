@@ -69,7 +69,9 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
             );
         }
-        WorkloadType::FakedNoContention { .. } | WorkloadType::FakedContention { .. } => {
+        WorkloadType::FakedNoContention { .. }
+        | WorkloadType::FakedContention { .. }
+        | WorkloadType::FakeSolanaTransactions { .. } => {
             todo!()
         }
     };

@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
         }
-        WorkloadType::FakedNoContention { .. } | WorkloadType::FakedContention { .. } => {
+        WorkloadType::FakedNoContention { .. }
+        | WorkloadType::FakedContention { .. }
+        | WorkloadType::FakeSolanaTransactions { .. } => {
             let executor = FakeExecutor::new(&benchmark_config).await;
             start_node(
                 args.role,

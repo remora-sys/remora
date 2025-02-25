@@ -178,6 +178,10 @@ pub enum WorkloadType {
     EthereumNftMint,
     UniswapNormal,
     UniswapPeak,
+    FakeSolanaTransactions {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -204,6 +208,7 @@ impl Debug for WorkloadType {
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
             WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
             WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
+            WorkloadType::FakeSolanaTransactions { .. } => write!(f, "Fake Solana transactions"),
         }
     }
 }
