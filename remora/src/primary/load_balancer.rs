@@ -33,8 +33,6 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
-    /// Keeps track of shared-objects and its shards (proxy)
-    shared_object_shards: FxHashMap<ObjectID, ExecutorIndex>,
     /// The sender to a local executor if no pre-executor is available.
     tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
@@ -42,6 +40,8 @@ pub struct LoadBalancer<E: Executor> {
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
+
+const FIB_CONSTANT: u64 = 11400714819323198485; // Golden ratio * 2^64
 
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
@@ -59,7 +59,6 @@ impl<E: Executor> LoadBalancer<E> {
             proxy_connections: Vec::new(),
             rx_committed_txns,
             index: 0,
-            shared_object_shards: FxHashMap::default(),
             tx_executor_local,
             rx_states_sync,
             metrics,
@@ -81,19 +80,27 @@ impl<E: Executor> LoadBalancer<E> {
             .collect()
     }
 
-    /// Helper function to get the proxies assigned to all shared objects in a transaction.
+    /// Fibonacci Hashing for ObjectID → Proxy Index Mapping (Fast & Even Distribution)
+    fn fast_fibonacci_hash(&self, object_id: &ObjectID) -> ExecutorIndex {
+        let mut hash = 0u64;
+        for chunk in object_id.chunks(8) {
+            let mut chunk_array = [0u8; 8];
+            chunk_array[..chunk.len()].copy_from_slice(chunk);
+            let num = u64::from_ne_bytes(chunk_array);
+            hash ^= num; // XOR to spread entropy
+        }
+
+        // Apply Fibonacci hashing for fast and even distribution
+        let proxy_count = self.proxy_connections.len().max(1); // Avoid div by zero
+        ((hash.wrapping_mul(FIB_CONSTANT)) >> (64 - proxy_count.ilog2())) as usize % proxy_count
+    }
+
+    /// Get assigned proxies for shared objects in a transaction.
     fn get_proxies_for_shared_objects(&self, shared_object_ids: &[ObjectID]) -> HashSet<ExecutorIndex> {
         shared_object_ids
             .iter()
-            .filter_map(|id| self.shared_object_shards.get(id).cloned())
+            .map(|id| self.fast_fibonacci_hash(id))
             .collect()
-    }
-
-    /// Helper function to assign all shared objects in a transaction to a proxy.
-    fn assign_shared_objects_to_proxy(&mut self, shared_object_ids: &[ObjectID], proxy_index: ExecutorIndex) {
-        for id in shared_object_ids {
-            self.shared_object_shards.insert(*id, proxy_index);
-        }
     }
 
     /// Prepare state updates based on sharding
@@ -105,16 +112,11 @@ impl<E: Executor> LoadBalancer<E> {
         let mut updates_by_executor: FxHashMap<ExecutorIndex, NewStates> = FxHashMap::default();
 
         for (object_id, object) in execution_result.new_state.unwrap() {
-            // Determine the target executor for this object
-            if let Some(&executor_id) = self.shared_object_shards.get(&object_id) {
-                // Get or create the BTreeMap for this executor
-                let entry = updates_by_executor
-                    .entry(executor_id)
-                    .or_default();
-                entry.insert(object_id, object);
-            } else {
-                eprintln!("Warning: No executor found for ObjectID {}", object_id);
-            }
+            let executor_id = self.fast_fibonacci_hash(&object_id);
+            let entry = updates_by_executor
+                .entry(executor_id)
+                .or_default();
+            entry.insert(object_id, object);
         }
 
         updates_by_executor
@@ -155,53 +157,18 @@ impl<E: Executor> LoadBalancer<E> {
 
         let assigned_proxies = self.get_proxies_for_shared_objects(&shared_object_ids);
 
-        match assigned_proxies.len() {
-            0 => {
-                // Case 1: None of the shared objects are assigned yet → Round-robin proxy assignment
-                let proxy_index = self.index % self.proxy_connections.len();
-                self.index += 1;
-
-                self.assign_shared_objects_to_proxy(&shared_object_ids, proxy_index);
-
-                if self.proxy_connections[proxy_index]
-                    .send(PrimaryToProxyMessage::Txn(transaction))
-                    .await
-                    .is_ok()
-                {
-                    tracing::debug!("Assigned and sent transaction to proxy {}", proxy_index);
-                } else {
-                    tracing::warn!(
-                        "Failed to send transaction to proxy {}, trying other proxies",
-                        proxy_index
-                    );
-                    self.proxy_connections.swap_remove(proxy_index);
-                }
-            }
+         match assigned_proxies.len() {
             1 => {
-                // Case 2: One shared object is assigned; assign the rest to the same proxy
                 let proxy_index = *assigned_proxies.iter().next().unwrap();
-                self.assign_shared_objects_to_proxy(&shared_object_ids, proxy_index);
-
-                if self.proxy_connections[proxy_index]
+                self.proxy_connections[proxy_index]
                     .send(PrimaryToProxyMessage::Txn(transaction))
                     .await
-                    .is_ok()
-                {
-                    tracing::debug!("Sent transaction to assigned proxy {}", proxy_index);
-                } else {
-                    tracing::warn!(
-                        "Failed to send transaction to proxy {}, trying other proxies",
-                        proxy_index
-                    );
-                    self.proxy_connections.swap_remove(proxy_index);
-                }
+                    .ok();
             }
             _ => {
-                // Case 3: Multiple shared objects are assigned to different proxies → Send to local executor
                 if self.tx_executor_local.send(transaction).await.is_err() {
-                    tracing::warn!("Failed to send transaction to the local executor");
+                    tracing::warn!("Failed to send transaction to local executor");
                 }
-                tracing::debug!("Transaction has shared objects across multiple proxies, sent to local executor");
             }
         }
     }
