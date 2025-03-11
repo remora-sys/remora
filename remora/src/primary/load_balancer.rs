@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{ops::Deref, sync::Arc};
+use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use rustc_hash::FxHashMap;
 use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
@@ -33,8 +33,6 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
-    /// Keeps track of shared-objects and its shards (proxy)
-    shared_object_shards: FxHashMap<ObjectID, ExecutorIndex>,
     /// The sender to a local executor if no pre-executor is available.
     tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
@@ -42,6 +40,8 @@ pub struct LoadBalancer<E: Executor> {
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
+
+const FIB_CONSTANT: u64 = 11400714819323198485; // Golden ratio * 2^64
 
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
@@ -59,57 +59,48 @@ impl<E: Executor> LoadBalancer<E> {
             proxy_connections: Vec::new(),
             rx_committed_txns,
             index: 0,
-            shared_object_shards: FxHashMap::default(),
             tx_executor_local,
             rx_states_sync,
             metrics,
         }
     }
 
-    // TODO: a bit verbose and duplicated
-    /// Helper to check if tx contains shared-objects
-    fn check_shared_objects(&self, transaction: &E::Transaction) -> bool {
-        transaction.input_objects().iter().any(|input_object| {
-            matches!(
-                input_object,
-                InputObjectKind::SharedMoveObject {
-                    id: _,
-                    initial_shared_version: _,
-                    mutable: _
-                }
-            )
-        })
-    }
-
-    /// Helper function to get proxy for a shared object (if it exists).
-    fn get_proxy_for_shared_object(&self, transaction: &E::Transaction) -> Option<&ExecutorIndex> {
-        transaction.input_objects().iter().find_map(|input_object| {
-            if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
-                self.shared_object_shards.get(id)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Helper function to assign a shared object to a proxy and update the map.
-    fn assign_shared_object_to_proxy(
-        &mut self,
-        transaction: &E::Transaction,
-        proxy_index: ExecutorIndex,
-    ) {
-        if let Some(shared_object_id) =
-            transaction.input_objects().iter().find_map(|input_object| {
+    /// Helper to get all shared object IDs from a transaction.
+    fn get_shared_object_ids(&self, transaction: &E::Transaction) -> Vec<ObjectID> {
+        transaction
+            .input_objects()
+            .iter()
+            .filter_map(|input_object| {
                 if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
                     Some(*id)
                 } else {
                     None
                 }
             })
-        {
-            self.shared_object_shards
-                .insert(shared_object_id, proxy_index);
+            .collect()
+    }
+
+    /// Fibonacci Hashing for ObjectID → Proxy Index Mapping (Fast & Even Distribution)
+    fn fast_fibonacci_hash(&self, object_id: &ObjectID) -> ExecutorIndex {
+        let mut hash = 0u64;
+        for chunk in object_id.chunks(8) {
+            let mut chunk_array = [0u8; 8];
+            chunk_array[..chunk.len()].copy_from_slice(chunk);
+            let num = u64::from_ne_bytes(chunk_array);
+            hash ^= num; // XOR to spread entropy
         }
+
+        // Apply Fibonacci hashing for fast and even distribution
+        let proxy_count = self.proxy_connections.len().max(1); // Avoid div by zero
+        ((hash.wrapping_mul(FIB_CONSTANT)) >> (64 - proxy_count.ilog2())) as usize % proxy_count
+    }
+
+    /// Get assigned proxies for shared objects in a transaction.
+    fn get_proxies_for_shared_objects(&self, shared_object_ids: &[ObjectID]) -> HashSet<ExecutorIndex> {
+        shared_object_ids
+            .iter()
+            .map(|id| self.fast_fibonacci_hash(id))
+            .collect()
     }
 
     /// Prepare state updates based on sharding
@@ -121,62 +112,63 @@ impl<E: Executor> LoadBalancer<E> {
         let mut updates_by_executor: FxHashMap<ExecutorIndex, NewStates> = FxHashMap::default();
 
         for (object_id, object) in execution_result.new_state.unwrap() {
-            // Determine the target executor for this object
-            if let Some(&executor_id) = self.shared_object_shards.get(&object_id) {
-                // Get or create the BTreeMap for this executor
-                let entry = updates_by_executor
-                    .entry(executor_id)
-                    .or_default();
-                entry.insert(object_id, object);
-            } else {
-                eprintln!("Warning: No executor found for ObjectID {}", object_id);
-            }
+            let executor_id = self.fast_fibonacci_hash(&object_id);
+            let entry = updates_by_executor
+                .entry(executor_id)
+                .or_default();
+            entry.insert(object_id, object);
         }
 
         updates_by_executor
     }
 
-    pub async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
-        // forward to proxies if exist else to the local executor
+     /// Determines the correct forwarding target for a transaction.
+    async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
+        // If no proxies exist, send to the local executor.
         if self.proxy_connections.is_empty() {
-            // send to primary local executor
             if self.tx_executor_local.send(transaction).await.is_err() {
                 tracing::warn!("Failed to send transaction to the local executor");
             }
             return;
         }
 
-        // Determine proxy_index based on shared object or round-robin.
-        let proxy_index = if self.check_shared_objects(transaction.deref()) {
-            // If a shared object is found, check the hashmap for proxy assignment
-            if let Some(&proxy_index) = self.get_proxy_for_shared_object(&transaction) {
-                proxy_index
-            } else {
-                // If no proxy is assigned to this shared object, assign one in a round-robin fashion
-                let proxy_index = self.index % self.proxy_connections.len();
-                self.assign_shared_object_to_proxy(&transaction, proxy_index);
-                proxy_index
-            }
-        } else {
-            // No shared object, use round-robin to select proxy
-            self.index % self.proxy_connections.len()
-        };
+        let shared_object_ids = self.get_shared_object_ids(transaction.deref());
 
-        // Send the transaction to the selected proxy
-        match self.proxy_connections[proxy_index]
-            .send(PrimaryToProxyMessage::Txn(transaction))
-            .await
-        {
-            Ok(()) => {
+        if shared_object_ids.is_empty() {
+            // No shared objects, use round-robin for proxy selection.
+            let proxy_index = self.index % self.proxy_connections.len();
+            self.index += 1;
+
+            if self.proxy_connections[proxy_index]
+                .send(PrimaryToProxyMessage::Txn(transaction))
+                .await
+                .is_ok()
+            {
                 tracing::debug!("Sent transaction to proxy {}", proxy_index);
-                self.index += 1;
-            }
-            Err(_) => {
+            } else {
                 tracing::warn!(
                     "Failed to send transaction to proxy {}, trying other proxies",
                     proxy_index
                 );
                 self.proxy_connections.swap_remove(proxy_index);
+            }
+            return;
+        }
+
+        let assigned_proxies = self.get_proxies_for_shared_objects(&shared_object_ids);
+
+         match assigned_proxies.len() {
+            1 => {
+                let proxy_index = *assigned_proxies.iter().next().unwrap();
+                self.proxy_connections[proxy_index]
+                    .send(PrimaryToProxyMessage::Txn(transaction))
+                    .await
+                    .ok();
+            }
+            _ => {
+                if self.tx_executor_local.send(transaction).await.is_err() {
+                    tracing::warn!("Failed to send transaction to local executor");
+                }
             }
         }
     }
