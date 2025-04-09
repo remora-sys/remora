@@ -12,7 +12,7 @@ use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
+    executor::api::{Executor, ProxyToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
 };
@@ -20,7 +20,7 @@ use crate::{
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
-    core_handles: Vec<std::thread::JoinHandle<NodeResult<()>>>,
+    core_handles: Vec<JoinHandle<NodeResult<()>>>,
     /// The handle for the network client.
     _network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The  metrics for the proxy
@@ -128,8 +128,10 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
     /// Collect the results from the validator.
     pub fn await_completion(self) {
         for handle in self.core_handles {
-            match handle.join() {
-                Ok(_) => println!("Thread completed successfully!"),
+            // tokio::task::JoinHandle requires awaiting in an async context
+            match tokio::runtime::Handle::current().block_on(handle) {
+                Ok(Ok(_)) => println!("Thread completed successfully!"),
+                Ok(Err(e)) => println!("Thread failed with error: {:?}", e),
                 Err(e) => println!("Thread panicked: {:?}", e),
             }
         }

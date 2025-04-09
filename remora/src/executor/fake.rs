@@ -281,12 +281,15 @@ impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
 pub struct FakeExecutionContext {
     /// The duration of the transaction execution (in number of spins).
     pub execution_spins: u64,
+    /// The duraiton of the verification (in number of spins).
+    pub verification_spins: u64,
 }
 
 impl FakeExecutionContext {
-    pub fn new(execution_duration: Duration) -> Self {
+    pub fn new(execution_duration: Duration, verification_duration: Duration) -> Self {
         Self {
             execution_spins: Self::calibrate(execution_duration),
+            verification_spins: Self::calibrate(verification_duration),
         }
     }
 
@@ -342,22 +345,27 @@ pub struct FakeExecutor {
 
 impl FakeExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
-        let execution_duration = match config.workload {
+        let (execution_duration, verification_duration) = match config.workload {
             WorkloadType::FakedNoContention {
                 execution_duration,
+                verification_duration,
                 number_of_inputs: _,
-            } => execution_duration,
+            } => (execution_duration, verification_duration),
             WorkloadType::FakedContention {
                 execution_duration,
+                verification_duration,
                 number_of_inputs: _,
                 contention: _,
-            } => execution_duration,
-            WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
+            } => (execution_duration, verification_duration),
+            WorkloadType::FakeSolanaTransactions {
+                execution_duration,
+                verification_duration,
+            } => (execution_duration, verification_duration),
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
         };
-        let ctx = FakeExecutionContext::new(execution_duration);
+        let ctx = FakeExecutionContext::new(execution_duration, verification_duration);
         Self {
             execution_context: Arc::new(ctx),
         }
@@ -479,6 +487,17 @@ impl Executor for FakeExecutor {
             store.write_object(fake_owned_object_with_id(0, obj_id));
         }
     }
+
+    fn verify_transaction(
+        ctx: Arc<Self::ExecutionContext>,
+        _transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        // Simulate verification
+        for _ in 0..ctx.verification_spins {
+            std::hint::spin_loop();
+        }
+        true
+    }
 }
 
 pub fn generate_fake_owned_object_transaction(number_of_inputs: usize) -> FakeTransaction {
@@ -549,6 +568,7 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
     match config.workload {
         WorkloadType::FakedNoContention {
             execution_duration: _,
+            verification_duration: _,
             number_of_inputs,
         } => {
             parallel_generate_transaction(
@@ -560,6 +580,7 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
         }
         WorkloadType::FakedContention {
             execution_duration: _,
+            verification_duration: _,
             number_of_inputs,
             contention,
         } => {
@@ -686,7 +707,10 @@ mod tests {
     use tokio::time::Instant;
 
     use crate::{
-        config::{default_fake_execution_duration, BenchmarkParameters, WorkloadType},
+        config::{
+            default_fake_execution_duration, default_fake_verification_duration,
+            BenchmarkParameters, WorkloadType,
+        },
         executor::{
             api::{Executor, TransactionWithTimestamp},
             fake::{
@@ -781,6 +805,7 @@ mod tests {
         let store = Arc::new(FakeObjectStore::new());
         let config = BenchmarkParameters {
             workload: WorkloadType::FakeSolanaTransactions {
+                verification_duration: default_fake_verification_duration(),
                 execution_duration: default_fake_execution_duration(),
             },
             ..BenchmarkParameters::new_for_fake_tests()
@@ -818,8 +843,9 @@ mod tests {
     async fn execute_fake_ethereum_transactions() {
         let store = Arc::new(FakeObjectStore::new());
         let config = BenchmarkParameters {
-            workload: WorkloadType::FakeSolanaTransactions {
+            workload: WorkloadType::FakeEthereumTransfers {
                 execution_duration: default_fake_execution_duration(),
+                verification_duration: default_fake_verification_duration(),
             },
             ..BenchmarkParameters::new_for_fake_tests()
         };

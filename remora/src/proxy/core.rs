@@ -1,9 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use dashmap::DashMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+    sync::Arc,
+};
 
-use sui_types::transaction::InputObjectKind;
+use sui_types::{
+    base_types::{ObjectID, SequenceNumber},
+    digests::TransactionDigest,
+    transaction::InputObjectKind,
+};
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
@@ -53,11 +62,13 @@ pub struct ProxyCore<E: Executor> {
     tx_inter_proxy_replies: HashMap<ProxyId, Sender<InterProxyReply>>,
     /// The dependency controller for multi-core tx execution.
     dependency_controller: Option<DependencyController>,
+    /// The buffer of stateless transactions.
+    stateless_txn_results: DashMap<TransactionDigest, bool>,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor> ProxyCore<E> {
+impl<E: Executor + Send + Sync> ProxyCore<E> {
     /// Create a new proxy.
     pub fn new(
         id: ProxyId,
@@ -85,6 +96,7 @@ impl<E: Executor> ProxyCore<E> {
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
             dependency_controller,
+            stateless_txn_results: DashMap::new(),
             metrics,
         }
     }
@@ -114,19 +126,122 @@ impl<E: Executor> ProxyCore<E> {
         ExecutionResults<E>: Send + Sync,
         <E as Executor>::ExecutionContext: Send + Sync,
     {
-        while let Some(message) = self.rx_transactions.recv().await {
-            match message {
-                PrimaryToProxyMessage::Txn(transaction) => {
-                    if !self.process_transaction_single_threaded(transaction).await {
+        loop {
+            tokio::select! {
+                // handle transactions from the primary
+                Some(message) = self.rx_transactions.recv() => {
+                    if !self.handle_primary_message(message).await {
                         break;
                     }
                 }
-                PrimaryToProxyMessage::States(states) => {
-                    self.store.commit_new_objects(states);
+
+                // handle inter-proxy requests
+                Some(message) = self.rx_inter_proxy_requests.recv() => {
+                    self.handle_inter_proxy_request(message).await;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn handle_primary_message(
+        &mut self,
+        message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
+    ) -> bool
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
+        ExecutionResults<E>: Send + Sync,
+        <E as Executor>::ExecutionContext: Send + Sync,
+    {
+        match message {
+            PrimaryToProxyMessage::Txn(transaction) => {
+                self.process_transaction_single_threaded(transaction).await
+            }
+            PrimaryToProxyMessage::StatelessTxn(transaction) => {
+                self.process_stateless_transaction(transaction);
+                true
+            }
+            _ => {
+                tracing::warn!("Received unexpected message");
+                true
+            }
+        }
+    }
+
+    fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) -> bool
+    where
+        <E as Executor>::ExecutionContext: Send + Sync,
+    {
+        let res = E::verify_transaction(self.executor.context().clone(), &transaction);
+        self.stateless_txn_results
+            .insert(*transaction.digest(), res);
+        true
+    }
+
+    async fn handle_inter_proxy_request(&mut self, message: InterProxyRequest)
+    where
+        Store<E>: Send + Sync,
+    {
+        match message {
+            InterProxyRequest::Stateful(proxy_id, requested_states) => {
+                self.handle_stateful_request(proxy_id, requested_states)
+                    .await;
+            }
+            InterProxyRequest::Stateless(proxy_id, txn_digest) => {
+                self.handle_stateless_request(proxy_id, txn_digest).await;
+            }
+        }
+    }
+
+    async fn handle_stateful_request(
+        &mut self,
+        proxy_id: ProxyId,
+        requested_states: Vec<(ObjectID, SequenceNumber)>,
+    ) where
+        Store<E>: Send + Sync,
+    {
+        let mut objects = BTreeMap::new();
+        for state in requested_states {
+            let object = match self.store.read_object(&state.0) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    tracing::warn!("Failed to read object: {:?}", e);
+                    None
+                }
+            };
+            // TODO: check version
+            if let Some(obj) = object {
+                objects.insert(state.0, obj);
+            }
+        }
+
+        let reply = InterProxyReply::Stateful(objects);
+        self.send_reply_to_proxy(proxy_id, reply).await;
+    }
+
+    async fn handle_stateless_request(&mut self, proxy_id: ProxyId, txn_digest: TransactionDigest) {
+        let verification_result = self
+            .stateless_txn_results
+            .remove(&txn_digest)
+            .unwrap_or((txn_digest, false));
+
+        let reply = InterProxyReply::Stateless(verification_result.0, verification_result.1);
+        self.send_reply_to_proxy(proxy_id, reply).await;
+    }
+
+    async fn send_reply_to_proxy(&self, proxy_id: ProxyId, reply: InterProxyReply) {
+        if let Some(tx) = self.tx_inter_proxy_replies.get(&proxy_id) {
+            if tx.send(reply).await.is_err() {
+                tracing::warn!(
+                    "Failed to send reply to proxy {}, connection may be lost",
+                    proxy_id
+                );
+            }
+        } else {
+            tracing::warn!("No connection found for proxy {}", proxy_id);
+        }
     }
 
     /// Process a single transaction in single-threaded mode.
@@ -191,6 +306,9 @@ impl<E: Executor> ProxyCore<E> {
                         }
                         PrimaryToProxyMessage::States(states) => {
                             self.store.commit_new_objects(states);
+                        }
+                        PrimaryToProxyMessage::StatelessTxn(transaction) => {
+                            todo!()
                         }
                     }
                 }
@@ -359,7 +477,7 @@ impl<E: Executor> ProxyCore<E> {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use tokio::sync::mpsc;
 
@@ -374,7 +492,7 @@ mod tests {
         proxy::core::{ProxyCore, ProxyMode},
     };
 
-    async fn pre_execute<E: Executor + Send + 'static>(
+    async fn pre_execute<E: Executor + Send + Sync + 'static>(
         mode: ProxyMode,
         executor: E,
         config: BenchmarkParameters,
@@ -386,12 +504,22 @@ mod tests {
     {
         let (tx_proxy, rx_proxy) = mpsc::channel(100);
         let (tx_results, mut rx_results) = mpsc::channel(100);
+        let (tx_inter_proxy_requests, rx_inter_proxy_requests) = mpsc::channel(100);
+        let tx_inter_proxy_replies = HashMap::new();
 
-        let store = Arc::new(executor.init_store());
+        let store = executor.init_store();
         let metrics = Arc::new(Metrics::new_for_tests());
         let proxy_id = "0".to_string();
         let proxy = ProxyCore::<E>::new(
-            proxy_id, executor, mode, store, rx_proxy, tx_results, metrics,
+            proxy_id,
+            executor,
+            mode,
+            store.into(),
+            rx_proxy,
+            tx_results,
+            rx_inter_proxy_requests,
+            tx_inter_proxy_replies,
+            metrics,
         );
 
         // Send transactions to the proxy.

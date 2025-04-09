@@ -383,6 +383,13 @@ impl Executor for SuiExecutor {
     ) {
         todo!()
     }
+
+    fn verify_transaction(
+        _ctx: Arc<Self::ExecutionContext>,
+        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool {
+        todo!()
+    }
 }
 
 #[cfg(test)]

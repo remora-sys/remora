@@ -174,12 +174,16 @@ pub enum WorkloadType {
     FakedNoContention {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
     },
     FakedContention {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
         #[serde(default = "default_contention_level")]
@@ -193,22 +197,32 @@ pub enum WorkloadType {
     FakeSolanaTransactions {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
     },
     FakeEthereumTransfers {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
     },
     FakeEthereumNftMint {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
     },
     FakeUniswapNormal {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
     },
     FakeUniswapPeak {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
+        #[serde(default = "default_fake_verification_duration")]
+        verification_duration: Duration,
     },
 }
 
@@ -237,6 +251,10 @@ fn default_contention_level() -> u64 {
 
 pub fn default_fake_execution_duration() -> Duration {
     Duration::from_micros(500)
+}
+
+pub fn default_fake_verification_duration() -> Duration {
+    Duration::from_micros(2000)
 }
 
 impl Debug for WorkloadType {
@@ -306,6 +324,7 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(1),
             workload: WorkloadType::FakedNoContention {
                 execution_duration: default_fake_execution_duration(),
+                verification_duration: default_fake_verification_duration(),
                 number_of_inputs: 1,
             },
         }
@@ -318,6 +337,7 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(1),
             workload: WorkloadType::FakedContention {
                 execution_duration: default_fake_execution_duration(),
+                verification_duration: default_fake_verification_duration(),
                 number_of_inputs: 1,
                 contention: 100,
             },

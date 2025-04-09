@@ -186,6 +186,12 @@ pub trait Executor: Clone {
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     );
+
+    /// Verify the transaction authentication prior to execution
+    fn verify_transaction(
+        ctx: Arc<Self::ExecutionContext>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
+    ) -> bool;
 }
 
 /// Short for a transaction with a timestamp.
@@ -207,23 +213,25 @@ pub enum PrimaryToProxyMessage<T>
 where
     T: ExecutableTransaction + Clone,
 {
+    /// Stateful transaction that requires object access and execution
     Txn(TransactionWithTimestamp<T>),
+    /// Stateless transaction that only requires signature verification
+    StatelessTxn(TransactionWithTimestamp<T>),
+    /// New object states to be committed to the store
     States(NewStates),
 }
 
-pub enum InterProxyRequestType {
-    Stateful(Vec<(ObjectID, SequenceNumber)>),
-    Stateless(TransactionDigest),
+#[derive(Clone, Serialize, Deserialize)]
+pub enum InterProxyRequest {
+    Stateful(ProxyId, Vec<(ObjectID, SequenceNumber)>),
+    Stateless(ProxyId, TransactionDigest),
 }
 
-pub type InterProxyRequest = (ProxyId, InterProxyRequestType);
-
-pub enum InterProxyReplyType {
+#[derive(Clone, Serialize, Deserialize)]
+pub enum InterProxyReply {
     Stateful(NewStates),
     Stateless(TransactionDigest, bool),
 }
-
-pub type InterProxyReply = (ProxyId, InterProxyReplyType);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ProxyToProxyMessage {

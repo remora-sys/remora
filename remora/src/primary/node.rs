@@ -187,9 +187,7 @@ mod tests {
 
     use crate::{
         client::load_generator::LoadGenerator,
-        config::{
-            BenchmarkParameters, CollocatedPreExecutors, ValidatorConfig, ValidatorParameters,
-        },
+        config::{BenchmarkParameters, ValidatorConfig, ValidatorParameters},
         executor::sui::SuiExecutor,
         metrics::Metrics,
         primary::node::PrimaryNode,
