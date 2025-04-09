@@ -96,7 +96,10 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Get assigned proxies for shared objects in a transaction.
-    fn get_proxies_for_shared_objects(&self, shared_object_ids: &[ObjectID]) -> HashSet<ExecutorIndex> {
+    fn get_proxies_for_shared_objects(
+        &self,
+        shared_object_ids: &[ObjectID],
+    ) -> HashSet<ExecutorIndex> {
         shared_object_ids
             .iter()
             .map(|id| self.fast_fibonacci_hash(id))
@@ -113,16 +116,14 @@ impl<E: Executor> LoadBalancer<E> {
 
         for (object_id, object) in execution_result.new_state.unwrap() {
             let executor_id = self.fast_fibonacci_hash(&object_id);
-            let entry = updates_by_executor
-                .entry(executor_id)
-                .or_default();
+            let entry = updates_by_executor.entry(executor_id).or_default();
             entry.insert(object_id, object);
         }
 
         updates_by_executor
     }
 
-     /// Determines the correct forwarding target for a transaction.
+    /// Determines the correct forwarding target for a transaction.
     async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
         // If no proxies exist, send to the local executor.
         if self.proxy_connections.is_empty() {
@@ -157,7 +158,7 @@ impl<E: Executor> LoadBalancer<E> {
 
         let assigned_proxies = self.get_proxies_for_shared_objects(&shared_object_ids);
 
-         match assigned_proxies.len() {
+        match assigned_proxies.len() {
             1 => {
                 let proxy_index = *assigned_proxies.iter().next().unwrap();
                 self.proxy_connections[proxy_index]

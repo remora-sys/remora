@@ -4,8 +4,7 @@
 use std::{
     error::Error,
     fmt::{Debug, Display},
-    fs,
-    io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     time::Duration,
@@ -69,10 +68,6 @@ pub struct CollocatedPreExecutors {
 /// The parameters for the validator.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ValidatorParameters {
-    /// The number of collocated pre-executors to use. That is, the number of pre-executor running on
-    /// the same machine as the primary and on the same machine as each proxy.
-    #[serde(default = "default_validator_config::default_collocated_pre_executors")]
-    pub collocated_pre_executors: CollocatedPreExecutors,
     /// The consensus delay model.
     #[serde(default = "default_validator_config::default_consensus_delay_model")]
     pub consensus_delay_model: FixedDelay,
@@ -89,15 +84,7 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
-    use super::CollocatedPreExecutors;
     use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
-
-    pub fn default_collocated_pre_executors() -> CollocatedPreExecutors {
-        CollocatedPreExecutors {
-            primary: 1,
-            proxy: 0,
-        }
-    }
 
     pub fn default_consensus_delay_model() -> FixedDelay {
         FixedDelay::default()
@@ -111,7 +98,6 @@ mod default_validator_config {
 impl Default for ValidatorParameters {
     fn default() -> Self {
         ValidatorParameters {
-            collocated_pre_executors: default_validator_config::default_collocated_pre_executors(),
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
         }
@@ -120,14 +106,25 @@ impl Default for ValidatorParameters {
 
 impl ImportExport for ValidatorParameters {}
 
-/// The configuration for the validator, containing network addresses. This structure
-/// is designed to be used by the orchestrator to configure the validator.
+/// Represents a proxy's fixed configuration.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProxyInfo {
+    /// Unique identifier for the proxy.
+    pub proxy_id: String,
+    /// The listening address for the proxy's P2P network.
+    pub listen_address: SocketAddr,
+}
+
+/// The configuration for the validator, containing network addresses.
+/// Note: This now includes a vector of proxy configurations.
 #[derive(Serialize, Deserialize)]
 pub struct ValidatorConfig {
     /// The address of the primary server where the proxies connect.
     pub proxy_server_address: SocketAddr,
     /// The address of the primary server where the clients connect.
     pub client_server_address: SocketAddr,
+    /// Fixed configuration for all proxy instances.
+    pub proxies: Vec<ProxyInfo>,
     /// The address of the primary server where validator exposes metrics.
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
@@ -139,9 +136,24 @@ pub struct ValidatorConfig {
 impl ValidatorConfig {
     /// Create a new validator configuration for tests.
     pub fn new_for_tests() -> Self {
+        // Example: setting up 3 proxies with incremental port numbers.
+        let base_addr = get_test_address(); // assuming get_test_address() returns e.g., "127.0.0.1:8000"
+        let proxies = vec![
+            ProxyInfo {
+                proxy_id: "proxy-0".to_string(),
+                // Derive a unique port number from the base address.
+                listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
+            },
+            ProxyInfo {
+                proxy_id: "proxy-1".to_string(),
+                listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
+            },
+        ];
+
         ValidatorConfig {
             proxy_server_address: get_test_address(),
             client_server_address: get_test_address(),
+            proxies,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
             parallel_proxy: true,

@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{de::DeserializeOwned, Serialize};
-use std::{io, marker::PhantomData, sync::Arc};
-use tokio::{sync::mpsc, task::JoinHandle};
+use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
+use tokio::{
+    sync::mpsc::{self, Sender},
+    task::JoinHandle,
+};
 
 use super::core::{ProxyCore, ProxyId, ProxyMode};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::Executor,
+    executor::api::{Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
     metrics::Metrics,
-    networking::client::NetworkClient,
+    networking::{client::NetworkClient, server::NetworkServer},
 };
 
 pub struct ProxyNode<E: Executor> {
@@ -44,33 +47,75 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             true => ProxyMode::MultiThreaded,
         };
 
-        for i in 0..config.validator_parameters.collocated_pre_executors.proxy {
-            let id = format!("{proxy_id}-{i}");
-            let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let id = proxy_id;
+        let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-            let store = Arc::new(executor.init_store());
-            let core_handle = ProxyCore::new(
-                id,
-                executor.clone(),
-                mode,
-                store,
-                rx_transactions,
-                tx_proxy_results,
-                metrics.clone(),
-            )
-            .spawn_with_threads();
-            core_handles.push(core_handle);
+        // Create channels for inter-proxy communication
+        let (tx_inter_proxy_requests, rx_inter_proxy_requests) =
+            mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let mut tx_inter_proxy_replies = HashMap::new();
 
-            // communication for distributed transactions from the load balancer in the primary
-            let network_handle = NetworkClient::new(
-                config.proxy_server_address,
-                tx_transactions,
-                rx_proxy_results,
-            )
-            .spawn();
-            network_handles.push(network_handle);
+        // Find our proxy info from the config
+        let our_proxy_info = config
+            .proxies
+            .iter()
+            .find(|p| p.proxy_id == id)
+            .expect("Could not find our proxy in the config");
+
+        // Create connections to other proxies
+        for proxy_info in &config.proxies {
+            // Skip creating a connection to self
+            if proxy_info.proxy_id != id {
+                let (tx_replies, rx_replies) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+                tx_inter_proxy_replies.insert(proxy_info.proxy_id.clone(), tx_replies);
+
+                // ignore the outgoing direction
+                let (tx_placeholder, _) =
+                    mpsc::channel::<ProxyToProxyMessage>(DEFAULT_CHANNEL_SIZE);
+                // Create network client to connect to other proxy
+                let client_handle =
+                    NetworkClient::new(proxy_info.listen_address, tx_placeholder, rx_replies)
+                        .spawn();
+                network_handles.push(client_handle);
+            }
         }
+
+        let store = Arc::new(executor.init_store());
+        let core_handle = ProxyCore::new(
+            id,
+            executor.clone(),
+            mode,
+            store,
+            rx_transactions,
+            tx_proxy_results,
+            rx_inter_proxy_requests,
+            tx_inter_proxy_replies,
+            metrics.clone(),
+        )
+        .spawn();
+        core_handles.push(core_handle);
+
+        // communication for distributed transactions from the load balancer in the primary
+        let network_handle = NetworkClient::new(
+            config.proxy_server_address,
+            tx_transactions,
+            rx_proxy_results,
+        )
+        .spawn();
+        network_handles.push(network_handle);
+
+        // ignore the outgoing direction
+        let (tx_placeholder, _) =
+            mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
+        // Create a server that listens for connections from other proxies
+        let inter_proxy_server_handle = NetworkServer::new(
+            our_proxy_info.listen_address,
+            tx_placeholder,
+            tx_inter_proxy_requests.clone(),
+        )
+        .spawn();
+        network_handles.push(inter_proxy_server_handle);
 
         Self {
             phantom_data: PhantomData,

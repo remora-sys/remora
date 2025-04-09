@@ -28,10 +28,7 @@ use tokio::time::Instant;
 use super::{
     super::config::{BenchmarkParameters, WorkloadType},
     api::{
-        ExecutableTransaction,
-        ExecutionResultsAndEffects,
-        Executor,
-        StateStore,
+        ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
         TransactionWithTimestamp,
     },
     sui::get_object_ids_for_dependency_tracking,
@@ -693,13 +690,9 @@ mod tests {
         executor::{
             api::{Executor, TransactionWithTimestamp},
             fake::{
-                fake_owned_object,
-                fake_shared_object,
-                fake_shared_object_with_id,
+                fake_owned_object, fake_shared_object, fake_shared_object_with_id,
                 generate_fake_load_objects_and_transactions,
-                generate_fake_shared_object_transaction,
-                FakeExecutor,
-                FakeObjectStore,
+                generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
                 FakeTransaction,
             },
         },

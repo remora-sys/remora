@@ -27,11 +27,7 @@ use sui_types::{
 use tokio::{sync::Mutex, time::Instant};
 
 use super::api::{
-    ExecutableTransaction,
-    ExecutionResults,
-    Executor,
-    RemoraTransaction,
-    StateStore,
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
 };
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 

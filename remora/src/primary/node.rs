@@ -16,7 +16,6 @@ use crate::{
     executor::api::{ExecutionResults, Executor, Timestamp},
     metrics::Metrics,
     networking::server::NetworkServer,
-    proxy::core::{ProxyCore, ProxyMode},
 };
 
 /// The single machine validator is a simple validator that runs all components.
@@ -79,29 +78,29 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         )
         .spawn();
 
-        let mode = match config.parallel_proxy {
-            false => ProxyMode::SingleThreaded,
-            true => ProxyMode::MultiThreaded,
-        };
+        // let mode = match config.parallel_proxy {
+        //     false => ProxyMode::SingleThreaded,
+        //     true => ProxyMode::MultiThreaded,
+        // };
 
-        // Boot the local proxies. Additional proxies can still remotely connect. Proxies
-        // receive transactions in parallel with the consensus for pre-execution.
-        for i in 0..config.validator_parameters.collocated_pre_executors.primary {
-            let proxy_id = format!("primary-{i}");
-            let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let store = Arc::new(executor.init_store());
-            ProxyCore::new(
-                proxy_id,
-                executor.clone(),
-                mode,
-                store,
-                rx,
-                tx_proxy_results.clone(),
-                metrics.clone(),
-            )
-            .spawn_with_threads();
-            tx_proxy_connections.send(tx).await.expect("Channel open");
-        }
+        // // Boot the local proxies. Additional proxies can still remotely connect. Proxies
+        // // receive transactions in parallel with the consensus for pre-execution.
+        // for i in 0..config.validator_parameters.collocated_pre_executors.primary {
+        //     let proxy_id = format!("primary-{i}");
+        //     let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        //     let store = Arc::new(executor.init_store());
+        //     ProxyCore::new(
+        //         proxy_id,
+        //         executor.clone(),
+        //         mode,
+        //         store,
+        //         rx,
+        //         tx_proxy_results.clone(),
+        //         metrics.clone(),
+        //     )
+        //     .spawn_with_threads();
+        //     tx_proxy_connections.send(tx).await.expect("Channel open");
+        // }
 
         // Boot another server handling connections from (additional) remote proxies. These remote
         // proxies perform the same functions as the local proxies.
@@ -228,13 +227,7 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn no_proxies() {
-        let validator_parameters = ValidatorParameters {
-            collocated_pre_executors: CollocatedPreExecutors {
-                primary: 0,
-                proxy: 0,
-            },
-            ..ValidatorParameters::new_for_tests()
-        };
+        let validator_parameters = ValidatorParameters::new_for_tests();
         let config = ValidatorConfig {
             validator_parameters,
             ..ValidatorConfig::new_for_tests()

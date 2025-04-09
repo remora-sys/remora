@@ -2,12 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::BTreeMap,
-    fmt::Debug,
-    future::Future,
-    ops::Deref,
-    path::PathBuf,
-    sync::Arc,
+    collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, path::PathBuf, sync::Arc,
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -20,6 +15,7 @@ use sui_types::{
 };
 
 use crate::config::BenchmarkParameters;
+use crate::proxy::core::ProxyId;
 
 /// A transaction that can be executed.
 pub trait ExecutableTransaction {
@@ -204,6 +200,8 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
+pub type ExecutorIndex = usize;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum PrimaryToProxyMessage<T>
 where
@@ -213,4 +211,22 @@ where
     States(NewStates),
 }
 
-pub type ExecutorIndex = usize;
+pub enum InterProxyRequestType {
+    Stateful(Vec<(ObjectID, SequenceNumber)>),
+    Stateless(TransactionDigest),
+}
+
+pub type InterProxyRequest = (ProxyId, InterProxyRequestType);
+
+pub enum InterProxyReplyType {
+    Stateful(NewStates),
+    Stateless(TransactionDigest, bool),
+}
+
+pub type InterProxyReply = (ProxyId, InterProxyReplyType);
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ProxyToProxyMessage {
+    Request(InterProxyRequest),
+    Reply(InterProxyReply),
+}
