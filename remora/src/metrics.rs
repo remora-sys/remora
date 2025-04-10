@@ -170,13 +170,17 @@ impl Metrics {
     }
 
     /// Increase the proxy load.
-    pub fn increase_proxy_load(&self, proxy_id: &ProxyId) {
-        self.proxy_load.with_label_values(&[proxy_id]).inc();
+    pub fn increase_proxy_load(&self, proxy_id: ProxyId) {
+        self.proxy_load
+            .with_label_values(&[proxy_id.to_string().as_str()])
+            .inc();
     }
 
     /// Decrease the proxy load.
     pub fn decrease_proxy_load(&self, proxy_id: &ProxyId) {
-        self.proxy_load.with_label_values(&[proxy_id]).dec();
+        self.proxy_load
+            .with_label_values(&[proxy_id.to_string().as_str()])
+            .dec();
     }
 }
 

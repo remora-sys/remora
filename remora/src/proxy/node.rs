@@ -8,7 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::core::{ProxyCore, ProxyId, ProxyMode};
+use super::core::{ProxyCore, ProxyId};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -42,10 +42,6 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
     {
         let mut core_handles = Vec::new();
         let mut network_handles = Vec::new();
-        let mode = match config.parallel_proxy {
-            false => ProxyMode::SingleThreaded,
-            true => ProxyMode::MultiThreaded,
-        };
 
         let id = proxy_id;
         let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -85,7 +81,6 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         let core_handle = ProxyCore::new(
             id,
             executor.clone(),
-            mode,
             store,
             rx_transactions,
             tx_proxy_results,

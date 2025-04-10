@@ -12,7 +12,10 @@ use std::{
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
+use crate::{
+    primary::mock_consensus::{models::FixedDelay, MockConsensusParameters},
+    proxy::core::ProxyId,
+};
 
 /// Default channel size for communication between components.
 pub const DEFAULT_CHANNEL_SIZE: usize = 100_000;
@@ -110,7 +113,7 @@ impl ImportExport for ValidatorParameters {}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProxyInfo {
     /// Unique identifier for the proxy.
-    pub proxy_id: String,
+    pub proxy_id: ProxyId,
     /// The listening address for the proxy's P2P network.
     pub listen_address: SocketAddr,
 }
@@ -129,8 +132,6 @@ pub struct ValidatorConfig {
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
     pub validator_parameters: ValidatorParameters,
-    /// The execution mode of proxy.
-    pub parallel_proxy: bool,
 }
 
 impl ValidatorConfig {
@@ -140,12 +141,12 @@ impl ValidatorConfig {
         let base_addr = get_test_address(); // assuming get_test_address() returns e.g., "127.0.0.1:8000"
         let proxies = vec![
             ProxyInfo {
-                proxy_id: "proxy-0".to_string(),
+                proxy_id: 0,
                 // Derive a unique port number from the base address.
                 listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
             },
             ProxyInfo {
-                proxy_id: "proxy-1".to_string(),
+                proxy_id: 1,
                 listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
             },
         ];
@@ -156,7 +157,6 @@ impl ValidatorConfig {
             proxies,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
-            parallel_proxy: true,
         }
     }
 }

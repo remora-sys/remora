@@ -9,7 +9,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{core::PrimaryCore, load_balancer::LoadBalancer, mock_consensus::MockConsensus};
+use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -47,10 +47,11 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_proxy_results, rx_proxy_results) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_proxy_results, rx_proxy_results) =
+            mpsc::channel::<ExecutionResults<E>>(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_executor_local, rx_executor_local) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        // let (tx_executor_local, rx_executor_local) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_states_sync, rx_states_sync) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
@@ -61,7 +62,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             executor.clone(),
             rx_proxy_connections,
             rx_committed_txns,
-            tx_executor_local.clone(),
             rx_states_sync,
             metrics.clone(),
         )
@@ -112,21 +112,21 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         .spawn();
         network_handles.push(proxy_network_handle);
 
-        // Boot the primary executor. This component receives ordered transactions from consensus.
-        // It then combines the pre-execution results from the proxies and re-executes the transactions
-        // only if necessary.
-        let store = Arc::new(executor.init_store());
-        let primary_handle = PrimaryCore::new(
-            executor,
-            store,
-            rx_proxy_results,
-            tx_output,
-            tx_executor_local,
-            rx_executor_local,
-            tx_states_sync,
-        )
-        .spawn();
-        primary_handles.push(primary_handle);
+        // // Boot the primary executor. This component receives ordered transactions from consensus.
+        // // It then combines the pre-execution results from the proxies and re-executes the transactions
+        // // only if necessary.
+        // let store = Arc::new(executor.init_store());
+        // let primary_handle = PrimaryCore::new(
+        //     executor,
+        //     store,
+        //     rx_proxy_results,
+        //     tx_output,
+        //     tx_executor_local,
+        //     rx_executor_local,
+        //     tx_states_sync,
+        // )
+        // .spawn();
+        // primary_handles.push(primary_handle);
 
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.

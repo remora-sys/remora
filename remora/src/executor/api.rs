@@ -191,7 +191,7 @@ pub trait Executor: Clone {
     fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool;
+    ) -> impl Future<Output = bool> + Send;
 }
 
 /// Short for a transaction with a timestamp.
@@ -206,6 +206,8 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
+pub type MissingStates = BTreeMap<(ObjectID, SequenceNumber), ProxyId>;
+
 pub type ExecutorIndex = usize;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -214,11 +216,9 @@ where
     T: ExecutableTransaction + Clone,
 {
     /// Stateful transaction that requires object access and execution
-    Txn(TransactionWithTimestamp<T>),
+    Txn(TransactionWithTimestamp<T>, ProxyId, MissingStates),
     /// Stateless transaction that only requires signature verification
     StatelessTxn(TransactionWithTimestamp<T>),
-    /// New object states to be committed to the store
-    States(NewStates),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -4,7 +4,7 @@
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use rustc_hash::FxHashMap;
-use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
+use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -33,10 +33,12 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
-    /// The sender to a local executor if no pre-executor is available.
-    tx_executor_local: Sender<RemoraTransaction<E>>,
     /// The receiver of new effects from local executor and needs to forward to proxies.
     rx_states_sync: Receiver<ExecutionResults<E>>,
+    /// The mapping of the states and the proxy index.
+    states_to_proxy: FxHashMap<ObjectID, ExecutorIndex>,
+    /// The routing information of stateless.
+    stateless_routing: FxHashMap<TransactionDigest, ExecutorIndex>,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -49,7 +51,6 @@ impl<E: Executor> LoadBalancer<E> {
         executor: E,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        tx_executor_local: Sender<RemoraTransaction<E>>,
         rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -59,8 +60,9 @@ impl<E: Executor> LoadBalancer<E> {
             proxy_connections: Vec::new(),
             rx_committed_txns,
             index: 0,
-            tx_executor_local,
             rx_states_sync,
+            states_to_proxy: FxHashMap::default(),
+            stateless_routing: FxHashMap::default(),
             metrics,
         }
     }
@@ -106,6 +108,7 @@ impl<E: Executor> LoadBalancer<E> {
             .collect()
     }
 
+    #[deprecated]
     /// Prepare state updates based on sharding
     fn prepare_state_updates(
         &mut self,
@@ -127,49 +130,101 @@ impl<E: Executor> LoadBalancer<E> {
     async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
         // If no proxies exist, send to the local executor.
         if self.proxy_connections.is_empty() {
-            if self.tx_executor_local.send(transaction).await.is_err() {
-                tracing::warn!("Failed to send transaction to the local executor");
-            }
+            tracing::error!("No proxies available");
             return;
         }
 
         let shared_object_ids = self.get_shared_object_ids(transaction.deref());
 
         if shared_object_ids.is_empty() {
-            // No shared objects, use round-robin for proxy selection.
-            let proxy_index = self.index % self.proxy_connections.len();
-            self.index += 1;
+            self.forward_owned_object_only_txn(transaction).await;
+        } else {
+            self.forward_shared_object_txn(transaction, shared_object_ids)
+                .await;
+        }
+    }
 
-            if self.proxy_connections[proxy_index]
-                .send(PrimaryToProxyMessage::Txn(transaction))
-                .await
-                .is_ok()
-            {
-                tracing::debug!("Sent transaction to proxy {}", proxy_index);
-            } else {
-                tracing::warn!(
-                    "Failed to send transaction to proxy {}, trying other proxies",
-                    proxy_index
-                );
-                self.proxy_connections.swap_remove(proxy_index);
+    /// Helper method to determine missing states for a transaction
+    // TODO: fix this
+    fn get_missing_states_for_transaction(
+        &self,
+        transaction: &RemoraTransaction<E>,
+    ) -> MissingStates {
+        // Create a collection to track missing states
+        let mut missing_states = HashSet::new();
+
+        let object_ids = get_object_ids_for_dependency_tracking::<E>(transaction);
+
+        for object_id in object_ids {
+            // If this object is not in our states_to_proxy map, it's missing
+            if !self.states_to_proxy.contains_key(&object_id) {
+                missing_states.insert((object_id, 0));
             }
-            return;
         }
 
+        missing_states
+    }
+
+    /// Sends a transaction to a specific proxy and handles connection failures.
+    async fn send_transaction_to_proxy(
+        &mut self,
+        proxy_index: usize,
+        transaction: RemoraTransaction<E>,
+        is_stateful: bool,
+    ) -> bool {
+        let message = if is_stateful {
+            let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
+            let missing_states = self.get_missing_states_for_transaction(transaction.deref());
+            PrimaryToProxyMessage::Txn(transaction, stateless_proxy_id, missing_states)
+        } else {
+            self.stateless_routing
+                .insert(*transaction.digest(), proxy_index);
+            PrimaryToProxyMessage::StatelessTxn(transaction)
+        };
+
+        if self.proxy_connections[proxy_index]
+            .send(message)
+            .await
+            .is_ok()
+        {
+            tracing::debug!("Sent transaction to proxy {}", proxy_index);
+            true
+        } else {
+            tracing::warn!(
+                "Failed to send transaction to proxy {}, removing connection",
+                proxy_index
+            );
+            self.proxy_connections.swap_remove(proxy_index);
+            false
+        }
+    }
+
+    /// Forwards transactions with owned-object only using round-robin.
+    async fn forward_owned_object_only_txn(&mut self, transaction: RemoraTransaction<E>) {
+        let proxy_index = self.index % self.proxy_connections.len();
+        self.index += 1;
+
+        self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
+            .await;
+        self.send_transaction_to_proxy(proxy_index, transaction, true)
+            .await;
+    }
+
+    /// Forwards transactions with shared objects to the appropriate proxy.
+    async fn forward_shared_object_txn(
+        &mut self,
+        transaction: RemoraTransaction<E>,
+        shared_object_ids: Vec<ObjectID>,
+    ) {
         let assigned_proxies = self.get_proxies_for_shared_objects(&shared_object_ids);
 
         match assigned_proxies.len() {
             1 => {
                 let proxy_index = *assigned_proxies.iter().next().unwrap();
-                self.proxy_connections[proxy_index]
-                    .send(PrimaryToProxyMessage::Txn(transaction))
-                    .await
-                    .ok();
-            }
-            _ => {
-                if self.tx_executor_local.send(transaction).await.is_err() {
-                    tracing::warn!("Failed to send transaction to local executor");
-                }
+                self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
+                    .await;
+                self.send_transaction_to_proxy(proxy_index, transaction, true)
+                    .await;
             }
         }
     }
@@ -194,7 +249,6 @@ impl<E: Executor> LoadBalancer<E> {
                         )
                         .await;
 
-
                     txn_cnt += 1;
                     if txn_cnt == 1 {
                         self.metrics.register_start_time();
@@ -205,7 +259,7 @@ impl<E: Executor> LoadBalancer<E> {
                     }
                 }
 
-                Some(result) = self.rx_states_sync.recv() => {
+                /*Some(result) = self.rx_states_sync.recv() => {
                     // send states updates to the proxy
                     if self.proxy_connections.is_empty() {
                         tracing::debug!("Skip states updating given no available other executors");
@@ -224,7 +278,7 @@ impl<E: Executor> LoadBalancer<E> {
                             }
                         }
                     }
-                }
+                }*/
 
                 else => Err(NodeError::ShuttingDown)?,
             }

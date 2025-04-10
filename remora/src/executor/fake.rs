@@ -488,7 +488,7 @@ impl Executor for FakeExecutor {
         }
     }
 
-    fn verify_transaction(
+    async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
         _transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {

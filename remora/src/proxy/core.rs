@@ -11,6 +11,7 @@ use std::{
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
+    object::Object,
     transaction::InputObjectKind,
 };
 use tokio::{
@@ -25,8 +26,9 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction, ExecutionResults, Executor, InterProxyReply, InterProxyRequest,
-            PrimaryToProxyMessage, RemoraTransaction, StateStore, Store,
+            ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, InterProxyReply,
+            InterProxyRequest, PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction,
+            StateStore, Store,
         },
         dependency_controller::DependencyController,
         sui::get_object_ids_for_dependency_tracking,
@@ -34,13 +36,7 @@ use crate::{
     metrics::Metrics,
 };
 
-pub type ProxyId = String;
-
-#[derive(Clone, Copy)]
-pub enum ProxyMode {
-    SingleThreaded,
-    MultiThreaded,
-}
+pub type ProxyId = ExecutorIndex;
 
 /// A proxy is responsible for pre-executing transactions.
 pub struct ProxyCore<E: Executor> {
@@ -48,8 +44,6 @@ pub struct ProxyCore<E: Executor> {
     id: ProxyId,
     /// The executor for the transactions.
     executor: E,
-    /// The mode of proxy (parallel or sequential).
-    mode: ProxyMode,
     /// The object store.
     store: Store<E>,
     /// The receiver for transactions.
@@ -57,140 +51,144 @@ pub struct ProxyCore<E: Executor> {
     /// The sender for transactions with results.
     tx_results: Sender<ExecutionResults<E>>,
     /// The receiver for inter-proxy requests.
-    rx_inter_proxy_requests: Receiver<InterProxyRequest>,
+    rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
     /// The sender for inter-proxy replies.
-    tx_inter_proxy_replies: HashMap<ProxyId, Sender<InterProxyReply>>,
+    tx_inter_proxy_replies: HashMap<ProxyId, Sender<ProxyToProxyMessage>>,
     /// The dependency controller for multi-core tx execution.
-    dependency_controller: Option<DependencyController>,
+    dependency_controller: DependencyController,
     /// The buffer of stateless transactions.
     stateless_txn_results: DashMap<TransactionDigest, bool>,
+    /// The buffer of pending stateful transactions which are waiting for the stateless results.
+    pending_stateful_txns: DashMap<TransactionDigest, RemoraTransaction<E>>,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor + Send + Sync> ProxyCore<E> {
+impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
+where
+    E: Send + 'static,
+    Store<E>: Send + Sync,
+    RemoraTransaction<E>: Send + Sync,
+    ExecutionResults<E>: Send + Sync,
+    <E as Executor>::ExecutionContext: Send + Sync,
+{
     /// Create a new proxy.
     pub fn new(
         id: ProxyId,
         executor: E,
-        mode: ProxyMode,
         store: Store<E>,
         rx_transactions: Receiver<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         tx_results: Sender<ExecutionResults<E>>,
-        rx_inter_proxy_requests: Receiver<InterProxyRequest>,
-        tx_inter_proxy_replies: HashMap<ProxyId, Sender<InterProxyReply>>,
+        rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
+        tx_inter_proxy_replies: HashMap<ProxyId, Sender<ProxyToProxyMessage>>,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let dependency_controller = match mode {
-            ProxyMode::MultiThreaded => Some(DependencyController::new()),
-            ProxyMode::SingleThreaded => None,
-        };
-
         Self {
             id,
             executor,
-            mode,
             store,
             rx_transactions,
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
-            dependency_controller,
+            dependency_controller: DependencyController::new(),
             stateless_txn_results: DashMap::new(),
+            pending_stateful_txns: DashMap::new(),
             metrics,
         }
     }
 
     /// Run the proxy.
-    pub async fn run(&mut self) -> NodeResult<()>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
+    async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Proxy {} started", self.id);
-        match self.mode {
-            ProxyMode::SingleThreaded => self.run_single_threaded().await,
-            ProxyMode::MultiThreaded => self.run_multi_threaded().await,
-        }
-    }
-
-    /// Run the proxy in single-threaded mode.
-    async fn run_single_threaded(&mut self) -> NodeResult<()>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
         loop {
             tokio::select! {
                 // handle transactions from the primary
                 Some(message) = self.rx_transactions.recv() => {
-                    if !self.handle_primary_message(message).await {
-                        break;
-                    }
+                    self.handle_primary_message(message).await;
                 }
 
-                // handle inter-proxy requests
+                // handle inter-proxy messages (request or reply)
                 Some(message) = self.rx_inter_proxy_requests.recv() => {
-                    self.handle_inter_proxy_request(message).await;
+                    self.handle_proxy_message(message).await;
                 }
             }
         }
-        Ok(())
     }
 
     async fn handle_primary_message(
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
-    ) -> bool
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
+    ) {
         match message {
-            PrimaryToProxyMessage::Txn(transaction) => {
-                self.process_transaction_single_threaded(transaction).await
+            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id) => {
+                if stateless_res_proxy_id == self.id {
+                    return self.process_stateful_transaction(transaction).await;
+                }
+
+                // Send stateless request to the appropriate proxy
+                let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
+                let tx = self
+                    .tx_inter_proxy_replies
+                    .get(&stateless_res_proxy_id)
+                    .unwrap();
+                if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
+                    tracing::error!("Failed to send stateless request: {}", e);
+                }
+
+                self.pending_stateful_txns
+                    .insert(*transaction.digest(), transaction);
             }
+
             PrimaryToProxyMessage::StatelessTxn(transaction) => {
-                self.process_stateless_transaction(transaction);
-                true
+                self.process_stateless_transaction(transaction).await
             }
+
             _ => {
                 tracing::warn!("Received unexpected message");
-                true
             }
         }
     }
 
-    fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) -> bool
-    where
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
-        let res = E::verify_transaction(self.executor.context().clone(), &transaction);
+    async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
+        let res = E::verify_transaction(self.executor.context().clone(), &transaction).await;
         self.stateless_txn_results
             .insert(*transaction.digest(), res);
-        true
     }
 
-    async fn handle_inter_proxy_request(&mut self, message: InterProxyRequest)
-    where
-        Store<E>: Send + Sync,
-    {
+    async fn handle_proxy_message(&mut self, message: ProxyToProxyMessage) {
         match message {
-            InterProxyRequest::Stateful(proxy_id, requested_states) => {
-                self.handle_stateful_request(proxy_id, requested_states)
-                    .await;
-            }
-            InterProxyRequest::Stateless(proxy_id, txn_digest) => {
-                self.handle_stateless_request(proxy_id, txn_digest).await;
+            ProxyToProxyMessage::Request(request) => match request {
+                InterProxyRequest::Stateful(proxy_id, requested_states) => {
+                    self.handle_stateful_request(proxy_id, requested_states)
+                        .await;
+                }
+                InterProxyRequest::Stateless(proxy_id, txn_digest) => {
+                    self.handle_stateless_request(proxy_id, txn_digest).await;
+                }
+            },
+            ProxyToProxyMessage::Reply(reply) => match reply {
+                InterProxyReply::Stateful(objects) => {
+                    self.handle_stateful_reply(objects).await;
+                }
+                InterProxyReply::Stateless(digest, result) => {
+                    self.handle_stateless_reply(digest, result).await;
+                }
+            },
+        }
+    }
+
+    async fn handle_stateful_reply(&mut self, objects: BTreeMap<ObjectID, Object>) {
+        // TODO: schedule commit and notify
+        // Update local store with received objects
+        self.store.commit_new_objects(objects);
+    }
+
+    async fn handle_stateless_reply(&mut self, digest: TransactionDigest, result: bool) {
+        // Process the transaction if verification passed, otherwise just remove it
+        if let Some((_, transaction)) = self.pending_stateful_txns.remove(&digest) {
+            if result {
+                self.process_stateful_transaction(transaction).await;
             }
         }
     }
@@ -199,9 +197,7 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         &mut self,
         proxy_id: ProxyId,
         requested_states: Vec<(ObjectID, SequenceNumber)>,
-    ) where
-        Store<E>: Send + Sync,
-    {
+    ) {
         let mut objects = BTreeMap::new();
         for state in requested_states {
             let object = match self.store.read_object(&state.0) {
@@ -218,7 +214,8 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         }
 
         let reply = InterProxyReply::Stateful(objects);
-        self.send_reply_to_proxy(proxy_id, reply).await;
+        self.send_msg_to_proxy(proxy_id, ProxyToProxyMessage::Reply(reply))
+            .await;
     }
 
     async fn handle_stateless_request(&mut self, proxy_id: ProxyId, txn_digest: TransactionDigest) {
@@ -228,12 +225,13 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
             .unwrap_or((txn_digest, false));
 
         let reply = InterProxyReply::Stateless(verification_result.0, verification_result.1);
-        self.send_reply_to_proxy(proxy_id, reply).await;
+        self.send_msg_to_proxy(proxy_id, ProxyToProxyMessage::Reply(reply))
+            .await;
     }
 
-    async fn send_reply_to_proxy(&self, proxy_id: ProxyId, reply: InterProxyReply) {
+    async fn send_msg_to_proxy(&self, proxy_id: ProxyId, message: ProxyToProxyMessage) {
         if let Some(tx) = self.tx_inter_proxy_replies.get(&proxy_id) {
-            if tx.send(reply).await.is_err() {
+            if tx.send(message).await.is_err() {
                 tracing::warn!(
                     "Failed to send reply to proxy {}, connection may be lost",
                     proxy_id
@@ -244,24 +242,18 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         }
     }
 
+    #[deprecated]
     /// Process a single transaction in single-threaded mode.
     async fn process_transaction_single_threaded(
         &mut self,
         transaction: RemoraTransaction<E>,
-    ) -> bool
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
+    ) -> bool {
         // Assign shared objects version.
         self.executor
             .assign_shared_object_versions(&[transaction.deref().clone()])
             .await;
 
-        self.metrics.increase_proxy_load(&self.id);
+        self.metrics.increase_proxy_load(self.id);
 
         let ctx = self.executor.context().clone();
         let store = self.store.clone();
@@ -287,62 +279,25 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         true
     }
 
-    /// Run the proxy in multi-threaded mode.
-    async fn run_multi_threaded(&mut self) -> NodeResult<()>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
-        let mut task_id = 0;
-        loop {
-            tokio::select! {
-                Some(message) = self.rx_transactions.recv() => {
-                    match message {
-                        PrimaryToProxyMessage::Txn(transaction) => {
-                            task_id = self.process_transaction_multi_threaded(transaction, task_id).await?;
-                        }
-                        PrimaryToProxyMessage::States(states) => {
-                            self.store.commit_new_objects(states);
-                        }
-                        PrimaryToProxyMessage::StatelessTxn(transaction) => {
-                            todo!()
-                        }
-                    }
-                }
-                else => return Err(NodeError::ShuttingDown)
-            }
-        }
-    }
-
     /// Process a single transaction in multi-threaded mode.
-    async fn process_transaction_multi_threaded(
+    async fn process_stateful_transaction(
         &mut self,
         transaction: RemoraTransaction<E>,
-        task_id: u64,
-    ) -> NodeResult<u64>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
+        // task_id: u64,
+    ) {
         // Assign shared objects version.
         self.executor
             .assign_shared_object_versions(&[transaction.deref().clone()])
             .await;
 
-        let new_task_id = if task_id == 0 {
-            self.metrics.register_start_time();
-            1
-        } else {
-            task_id + 1
-        };
+        // let new_task_id = if task_id == 0 {
+        //     self.metrics.register_start_time();
+        //     1
+        // } else {
+        //     task_id + 1
+        // };
 
-        self.metrics.increase_proxy_load(&self.id);
+        self.metrics.increase_proxy_load(self.id);
 
         // Check and prepare objects
         if !E::pre_execute_check_objects(self.store.clone(), &transaction) {
@@ -350,13 +305,10 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         }
 
         // Get dependencies and schedule the transaction
-        let (prior_handles, current_handles) =
-            self.get_dependencies(transaction.clone(), new_task_id);
+        let (prior_handles, current_handles) = self.get_dependencies(transaction.clone(), 0);
         self.schedule_txn_parallel(transaction, prior_handles, current_handles)
             .await
             .expect("Failed to schedule transaction");
-
-        Ok(new_task_id)
     }
 
     pub fn get_dependencies(
@@ -367,8 +319,6 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction);
 
         self.dependency_controller
-            .as_mut()
-            .expect("DependencyController should be initialized")
             .get_dependencies(task_id, obj_ids)
     }
 
@@ -377,14 +327,7 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
         transaction: RemoraTransaction<E>,
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
-    ) -> NodeResult<()>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
+    ) -> NodeResult<()> {
         let store = self.store.clone();
         let id = self.id.clone();
         let tx_results = self.tx_results.clone();
@@ -433,44 +376,8 @@ impl<E: Executor + Send + Sync> ProxyCore<E> {
     }
 
     /// Sptransaction_awn the proxy in a new task.
-    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-        <E as Executor>::Transaction: Send,
-    {
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>> {
         tokio::spawn(async move { self.run().await })
-    }
-
-    #[deprecated]
-    pub fn spawn_with_threads(mut self) -> std::thread::JoinHandle<NodeResult<()>>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send + Sync,
-        <E as Executor>::ExecutionContext: Send + Sync,
-    {
-        let num_threads = num_cpus::get();
-
-        // spawn the custom runtime in a dedicated thread to ensure active
-        std::thread::spawn(move || {
-            // Build a custom Tokio runtime with the specified number of worker threads
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_threads)
-                .enable_all()
-                .build()
-                .unwrap();
-
-            // Block on the runtime to keep it alive and process tasks
-            rt.block_on(async move {
-                let _ = self.run().await;
-            });
-            Ok::<_, NodeError>(())
-        })
     }
 }
 
@@ -489,11 +396,10 @@ mod tests {
             sui::SuiExecutor,
         },
         metrics::Metrics,
-        proxy::core::{ProxyCore, ProxyMode},
+        proxy::core::ProxyCore,
     };
 
     async fn pre_execute<E: Executor + Send + Sync + 'static>(
-        mode: ProxyMode,
         executor: E,
         config: BenchmarkParameters,
     ) where
@@ -509,11 +415,10 @@ mod tests {
 
         let store = executor.init_store();
         let metrics = Arc::new(Metrics::new_for_tests());
-        let proxy_id = "0".to_string();
+        let proxy_id = 0;
         let proxy = ProxyCore::<E>::new(
             proxy_id,
             executor,
-            mode,
             store.into(),
             rx_proxy,
             tx_results,
@@ -539,44 +444,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_single_threaded_proxy() {
+    async fn test_proxy() {
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
-        pre_execute::<SuiExecutor>(ProxyMode::SingleThreaded, executor, config).await;
+        pre_execute::<SuiExecutor>(executor, config).await;
     }
 
     #[tokio::test]
-    async fn test_multi_threaded_proxy() {
-        let config = BenchmarkParameters::new_for_tests();
-        let executor = SuiExecutor::new(&config).await;
-        pre_execute::<SuiExecutor>(ProxyMode::MultiThreaded, executor, config).await;
-    }
-
-    #[tokio::test]
-    async fn test_single_threaded_proxy_fake_transactions() {
+    async fn test_proxy_fake_transactions() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
-        pre_execute::<FakeExecutor>(ProxyMode::SingleThreaded, executor, config).await;
+        pre_execute::<FakeExecutor>(executor, config).await;
     }
 
     #[tokio::test]
-    async fn test_multi_threaded_proxy_fake_transactions() {
-        let config = BenchmarkParameters::new_for_fake_tests();
-        let executor = FakeExecutor::new(&config).await;
-        pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
-    }
-
-    #[tokio::test]
-    async fn test_single_threaded_proxy_fake_transactions_contention() {
+    async fn test_proxy_fake_transactions_contention() {
         let config = BenchmarkParameters::new_for_fake_contention_tests();
         let executor = FakeExecutor::new(&config).await;
-        pre_execute::<FakeExecutor>(ProxyMode::SingleThreaded, executor, config).await;
-    }
-
-    #[tokio::test]
-    async fn test_multi_threaded_proxy_fake_transactions_contention() {
-        let config = BenchmarkParameters::new_for_fake_contention_tests();
-        let executor = FakeExecutor::new(&config).await;
-        pre_execute::<FakeExecutor>(ProxyMode::MultiThreaded, executor, config).await;
+        pre_execute::<FakeExecutor>(executor, config).await;
     }
 }
