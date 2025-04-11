@@ -192,6 +192,12 @@ pub trait Executor: Clone {
         ctx: Arc<Self::ExecutionContext>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = bool> + Send;
+
+    fn get_objects_for_dependency_tracking(
+        ctx: Arc<Self::ExecutionContext>,
+        store: Arc<Self::Store>,
+        transaction: TransactionWithTimestamp<Self::Transaction>,
+    ) -> Vec<(ObjectID, SequenceNumber)>;
 }
 
 /// Short for a transaction with a timestamp.
@@ -206,7 +212,7 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
-pub type MissingStates = BTreeMap<(ObjectID, SequenceNumber), ProxyId>;
+pub type MissingStates = BTreeMap<ObjectID, ProxyId>;
 
 pub type ExecutorIndex = usize;
 
@@ -223,7 +229,7 @@ where
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum InterProxyRequest {
-    Stateful(ProxyId, Vec<(ObjectID, SequenceNumber)>),
+    Stateful(ProxyId, Vec<ObjectID>),
     Stateless(ProxyId, TransactionDigest),
 }
 

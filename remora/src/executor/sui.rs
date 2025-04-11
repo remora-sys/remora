@@ -17,7 +17,7 @@ use sui_single_node_benchmark::{
     workload::Workload,
 };
 use sui_types::{
-    base_types::{ObjectID, SuiAddress},
+    base_types::{ObjectID, SequenceNumber, SuiAddress},
     digests::TransactionDigest,
     effects::{TransactionEffects, TransactionEffectsAPI},
     object::Object,
@@ -389,6 +389,19 @@ impl Executor for SuiExecutor {
         _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         todo!()
+    }
+
+    fn get_objects_for_dependency_tracking(
+        ctx: Arc<BenchmarkContext>,
+        store: Arc<InMemoryObjectStore>,
+        transaction: SuiTransaction,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        // filter pkg id from the obj_id
+        let input_objects = transaction.transaction_data().input_objects().unwrap();
+        let validator = ctx.validator();
+        let epoch_store = validator.get_epoch_store();
+
+        store.get_object_id_and_versions(&**epoch_store, &transaction.key(), &input_objects)
     }
 }
 

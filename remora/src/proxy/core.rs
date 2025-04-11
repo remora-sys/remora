@@ -27,11 +27,11 @@ use crate::{
     executor::{
         api::{
             ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, InterProxyReply,
-            InterProxyRequest, PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction,
-            StateStore, Store,
+            InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
+            RemoraTransaction, StateStore, Store,
         },
-        dependency_controller::DependencyController,
-        sui::get_object_ids_for_dependency_tracking,
+        dependency_controller,
+        versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
 };
@@ -53,13 +53,13 @@ pub struct ProxyCore<E: Executor> {
     /// The receiver for inter-proxy requests.
     rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
     /// The sender for inter-proxy replies.
-    tx_inter_proxy_replies: HashMap<ProxyId, Sender<ProxyToProxyMessage>>,
+    tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     /// The dependency controller for multi-core tx execution.
-    dependency_controller: DependencyController,
+    dependency_controller: Arc<VersionedDependencyController>,
     /// The buffer of stateless transactions.
     stateless_txn_results: DashMap<TransactionDigest, bool>,
     /// The buffer of pending stateful transactions which are waiting for the stateless results.
-    pending_stateful_txns: DashMap<TransactionDigest, RemoraTransaction<E>>,
+    pending_stateful_txns: DashMap<TransactionDigest, (RemoraTransaction<E>, MissingStates)>,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -80,7 +80,7 @@ where
         rx_transactions: Receiver<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         tx_results: Sender<ExecutionResults<E>>,
         rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
-        tx_inter_proxy_replies: HashMap<ProxyId, Sender<ProxyToProxyMessage>>,
+        tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -91,7 +91,7 @@ where
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
-            dependency_controller: DependencyController::new(),
+            dependency_controller: Arc::new(VersionedDependencyController::new()),
             stateless_txn_results: DashMap::new(),
             pending_stateful_txns: DashMap::new(),
             metrics,
@@ -121,9 +121,11 @@ where
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
         match message {
-            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id) => {
+            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
                 if stateless_res_proxy_id == self.id {
-                    return self.process_stateful_transaction(transaction).await;
+                    return self
+                        .schedule_stateful_transaction(transaction, missing_states)
+                        .await;
                 }
 
                 // Send stateless request to the appropriate proxy
@@ -137,7 +139,7 @@ where
                 }
 
                 self.pending_stateful_txns
-                    .insert(*transaction.digest(), transaction);
+                    .insert(*transaction.digest(), (transaction, missing_states));
             }
 
             PrimaryToProxyMessage::StatelessTxn(transaction) => {
@@ -179,16 +181,33 @@ where
     }
 
     async fn handle_stateful_reply(&mut self, objects: BTreeMap<ObjectID, Object>) {
-        // TODO: schedule commit and notify
-        // Update local store with received objects
-        self.store.commit_new_objects(objects);
+        // Mock the states update (oid, v) as a txn from (oid, v - 1) to (oid, v)
+        let objs: Vec<_> = objects
+            .iter()
+            .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
+            .collect();
+        let (prior_handles, current_handles) = self
+            .dependency_controller
+            .get_prior_dependency_and_update(0, objs, true, false);
+
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            // Newly migrated states can be committed directly
+            // without waiting for the prior dependencies
+            store.commit_new_objects(objects);
+            for notify in current_handles {
+                notify.notify_one();
+            }
+        });
     }
 
     async fn handle_stateless_reply(&mut self, digest: TransactionDigest, result: bool) {
         // Process the transaction if verification passed, otherwise just remove it
-        if let Some((_, transaction)) = self.pending_stateful_txns.remove(&digest) {
+        if let Some((_, (transaction, missing_states))) = self.pending_stateful_txns.remove(&digest)
+        {
             if result {
-                self.process_stateful_transaction(transaction).await;
+                self.schedule_stateful_transaction(transaction, missing_states)
+                    .await;
             }
         }
     }
@@ -196,26 +215,50 @@ where
     async fn handle_stateful_request(
         &mut self,
         proxy_id: ProxyId,
-        requested_states: Vec<(ObjectID, SequenceNumber)>,
+        requested_states: Vec<ObjectID>,
     ) {
-        let mut objects = BTreeMap::new();
-        for state in requested_states {
-            let object = match self.store.read_object(&state.0) {
-                Ok(obj) => obj,
-                Err(e) => {
-                    tracing::warn!("Failed to read object: {:?}", e);
-                    None
-                }
-            };
-            // TODO: check version
-            if let Some(obj) = object {
-                objects.insert(state.0, obj);
+        // Need to ensure that the latest transaction accessing the object is already committed
+        let mut prior_handles = Vec::new();
+        for obj_id in requested_states.iter() {
+            let latest_handle = self
+                .dependency_controller
+                .get_latest_handle_for_object(obj_id);
+
+            if latest_handle.is_none() {
+                tracing::warn!("No latest handle found for object {}", obj_id);
             }
+            prior_handles.push(latest_handle.unwrap());
         }
 
-        let reply = InterProxyReply::Stateful(objects);
-        self.send_msg_to_proxy(proxy_id, ProxyToProxyMessage::Reply(reply))
+        let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            for prior_notify in prior_handles {
+                prior_notify.notified().await;
+            }
+            let mut objects = BTreeMap::new();
+            for state in requested_states {
+                let object = match store.read_object(&state) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        tracing::warn!("Failed to read object: {:?}", e);
+                        None
+                    }
+                };
+                // TODO: check version
+                if let Some(obj) = object {
+                    objects.insert(state, obj);
+                }
+            }
+
+            let reply = InterProxyReply::Stateful(objects);
+            Self::send_msg_to_proxy(
+                tx_inter_proxy_replies,
+                proxy_id,
+                ProxyToProxyMessage::Reply(reply),
+            )
             .await;
+        });
     }
 
     async fn handle_stateless_request(&mut self, proxy_id: ProxyId, txn_digest: TransactionDigest) {
@@ -225,12 +268,20 @@ where
             .unwrap_or((txn_digest, false));
 
         let reply = InterProxyReply::Stateless(verification_result.0, verification_result.1);
-        self.send_msg_to_proxy(proxy_id, ProxyToProxyMessage::Reply(reply))
-            .await;
+        Self::send_msg_to_proxy(
+            self.tx_inter_proxy_replies.clone(),
+            proxy_id,
+            ProxyToProxyMessage::Reply(reply),
+        )
+        .await;
     }
 
-    async fn send_msg_to_proxy(&self, proxy_id: ProxyId, message: ProxyToProxyMessage) {
-        if let Some(tx) = self.tx_inter_proxy_replies.get(&proxy_id) {
+    async fn send_msg_to_proxy(
+        tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
+        proxy_id: ProxyId,
+        message: ProxyToProxyMessage,
+    ) {
+        if let Some(tx) = tx_inter_proxy_replies.get(&proxy_id) {
             if tx.send(message).await.is_err() {
                 tracing::warn!(
                     "Failed to send reply to proxy {}, connection may be lost",
@@ -242,49 +293,26 @@ where
         }
     }
 
-    #[deprecated]
-    /// Process a single transaction in single-threaded mode.
-    async fn process_transaction_single_threaded(
+    /// Schedule a stateful transaction in multi-threaded mode.
+    /// including sending requests for missing states to other proxies.
+    async fn schedule_stateful_transaction(
         &mut self,
         transaction: RemoraTransaction<E>,
-    ) -> bool {
-        // Assign shared objects version.
-        self.executor
-            .assign_shared_object_versions(&[transaction.deref().clone()])
-            .await;
-
-        self.metrics.increase_proxy_load(self.id);
-
-        let ctx = self.executor.context().clone();
-        let store = self.store.clone();
-
-        // Check and prepare objects
-        if !E::pre_execute_check_objects(store.clone(), &transaction) {
-            E::optimistically_pre_generate_objects(store.clone(), &transaction);
-        }
-
-        // Execute the transaction
-        let execution_result = E::execute(ctx, store.clone(), transaction).await;
-
-        self.metrics.decrease_proxy_load(&self.id);
-
-        // Send the result back
-        if self.tx_results.send(execution_result).await.is_err() {
-            tracing::warn!(
-                "Failed to send execution result, stopping proxy {}",
-                self.id
-            );
-            return false;
-        }
-        true
-    }
-
-    /// Process a single transaction in multi-threaded mode.
-    async fn process_stateful_transaction(
-        &mut self,
-        transaction: RemoraTransaction<E>,
+        missing_states: MissingStates,
         // task_id: u64,
     ) {
+        // Send requests for missing states to other proxies
+        for state in missing_states {
+            let request = InterProxyRequest::Stateful(self.id, vec![state.0]);
+            Self::send_msg_to_proxy(
+                self.tx_inter_proxy_replies.clone(),
+                state.1,
+                ProxyToProxyMessage::Request(request),
+            )
+            .await;
+        }
+
+        // TODO: check if assigning before all the states are received making sense
         // Assign shared objects version.
         self.executor
             .assign_shared_object_versions(&[transaction.deref().clone()])
@@ -305,8 +333,9 @@ where
         }
 
         // Get dependencies and schedule the transaction
-        let (prior_handles, current_handles) = self.get_dependencies(transaction.clone(), 0);
-        self.schedule_txn_parallel(transaction, prior_handles, current_handles)
+        let (obj_ids, prior_handles, current_handles) =
+            self.get_dependencies(transaction.clone(), 0);
+        self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles)
             .await
             .expect("Failed to schedule transaction");
     }
@@ -315,16 +344,28 @@ where
         &mut self,
         transaction: RemoraTransaction<E>,
         task_id: u64,
-    ) -> (Vec<Arc<Notify>>, Vec<Arc<Notify>>) {
-        let obj_ids = get_object_ids_for_dependency_tracking::<E>(transaction);
+    ) -> (
+        Vec<(ObjectID, SequenceNumber)>,
+        Vec<Arc<Notify>>,
+        Vec<Arc<Notify>>,
+    ) {
+        let obj_ids = E::get_objects_for_dependency_tracking(
+            self.executor.context().clone(),
+            self.store.clone(),
+            transaction,
+        );
 
-        self.dependency_controller
-            .get_dependencies(task_id, obj_ids)
+        let (prior_handles, current_handles) = self
+            .dependency_controller
+            .get_prior_dependency_and_update(0, obj_ids, false, false);
+
+        (obj_ids, prior_handles, current_handles)
     }
 
-    pub async fn schedule_txn_parallel(
+    pub async fn spawn_stateful_txn(
         &mut self,
         transaction: RemoraTransaction<E>,
+        obj_ids: Vec<(ObjectID, SequenceNumber)>,
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
     ) -> NodeResult<()> {
@@ -333,10 +374,12 @@ where
         let tx_results = self.tx_results.clone();
         let ctx = self.executor.context().clone();
         let metrics = self.metrics.clone();
+        let dependency_controller = self.dependency_controller.clone();
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
+            dependency_controller.remove_dependency(obj_ids.clone());
 
             // check the version ID for shared objects
             // skip if versions don't match
@@ -386,6 +429,7 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
+    use dashmap::DashMap;
     use tokio::sync::mpsc;
 
     use crate::{
@@ -411,7 +455,7 @@ mod tests {
         let (tx_proxy, rx_proxy) = mpsc::channel(100);
         let (tx_results, mut rx_results) = mpsc::channel(100);
         let (tx_inter_proxy_requests, rx_inter_proxy_requests) = mpsc::channel(100);
-        let tx_inter_proxy_replies = HashMap::new();
+        let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         let store = executor.init_store();
         let metrics = Arc::new(Metrics::new_for_tests());

@@ -1,7 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use rustc_hash::FxHashMap;
 use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
@@ -12,9 +16,12 @@ use tokio::{
 
 use crate::{
     error::{NodeError, NodeResult},
-    executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, NewStates,
-        PrimaryToProxyMessage, RemoraTransaction,
+    executor::{
+        api::{
+            ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, MissingStates,
+            NewStates, PrimaryToProxyMessage, RemoraTransaction,
+        },
+        sui::get_object_ids_for_dependency_tracking,
     },
     metrics::Metrics,
 };
@@ -145,20 +152,22 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Helper method to determine missing states for a transaction
-    // TODO: fix this
+    /// and update the states ownership map
     fn get_missing_states_for_transaction(
-        &self,
+        &mut self,
         transaction: &RemoraTransaction<E>,
+        proxy_index: ExecutorIndex,
     ) -> MissingStates {
-        // Create a collection to track missing states
-        let mut missing_states = HashSet::new();
+        let mut missing_states = BTreeMap::new();
 
-        let object_ids = get_object_ids_for_dependency_tracking::<E>(transaction);
+        let object_ids = get_object_ids_for_dependency_tracking::<E>(transaction.clone());
 
         for object_id in object_ids {
             // If this object is not in our states_to_proxy map, it's missing
-            if !self.states_to_proxy.contains_key(&object_id) {
-                missing_states.insert((object_id, 0));
+            let previous_owner = self.states_to_proxy.get(&object_id).unwrap();
+            if *previous_owner != proxy_index {
+                missing_states.insert(object_id, *previous_owner);
+                self.states_to_proxy.insert(object_id, proxy_index);
             }
         }
 
@@ -174,7 +183,7 @@ impl<E: Executor> LoadBalancer<E> {
     ) -> bool {
         let message = if is_stateful {
             let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
-            let missing_states = self.get_missing_states_for_transaction(transaction.deref());
+            let missing_states = self.get_missing_states_for_transaction(&transaction, proxy_index);
             PrimaryToProxyMessage::Txn(transaction, stateless_proxy_id, missing_states)
         } else {
             self.stateless_routing

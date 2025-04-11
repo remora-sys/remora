@@ -16,6 +16,7 @@ use crate::{
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
 };
+use dashmap::DashMap;
 
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
@@ -50,7 +51,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         // Create channels for inter-proxy communication
         let (tx_inter_proxy_requests, rx_inter_proxy_requests) =
             mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let mut tx_inter_proxy_replies = HashMap::new();
+        let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         // Find our proxy info from the config
         let our_proxy_info = config

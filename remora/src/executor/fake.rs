@@ -498,6 +498,14 @@ impl Executor for FakeExecutor {
         }
         true
     }
+
+    fn get_objects_for_dependency_tracking(
+        ctx: Arc<Self::ExecutionContext>,
+        store: Arc<Self::Store>,
+        transaction: TransactionWithTimestamp<Self::Transaction>,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        todo!()
+    }
 }
 
 pub fn generate_fake_owned_object_transaction(number_of_inputs: usize) -> FakeTransaction {

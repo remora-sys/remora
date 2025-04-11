@@ -1,0 +1,345 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use sui_types::base_types::{ObjectID, SequenceNumber};
+use tokio::sync::Notify;
+
+pub type TaskID = u64;
+/// Notify is similar to a channel but without sending any data.
+pub type TaskHandle = (TaskID, Arc<Notify>);
+pub type TaskEntry = Option<TaskHandle>;
+pub type ObjectTaskMap = DashMap<(ObjectID, SequenceNumber), TaskEntry>;
+
+/// The dependency controller is responsible for dynamically maintaining
+/// inter-task dependency graph due to overlapped resource accesses.
+pub struct VersionedDependencyController {
+    /// This map contains the tail task of all priors ones
+    /// which access the given object.
+    obj_task_map: ObjectTaskMap,
+    /// The initial version.
+    initial_version: SequenceNumber,
+}
+
+impl Default for VersionedDependencyController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VersionedDependencyController {
+    pub fn new() -> Self {
+        let obj_task_map: ObjectTaskMap = DashMap::new();
+
+        Self {
+            obj_task_map,
+            initial_version: SequenceNumber::from(2),
+        }
+    }
+
+    /// Checks if a given `(ObjectID, SequenceNumber)` has an associated task.
+    pub fn has_task_for_object(&self, obj_id: &ObjectID, seq_num: SequenceNumber) -> bool {
+        self.obj_task_map.contains_key(&(*obj_id, seq_num))
+    }
+
+    /// A helper function to check the existing entry in the map, else create one and fill there
+    fn entry_helper(
+        &self,
+        obj_id: ObjectID,
+        seq_num: SequenceNumber,
+        task_id: TaskID,
+    ) -> Arc<Notify> {
+        self.obj_task_map
+            .entry((obj_id, seq_num))
+            .or_insert_with(|| Some((task_id, Arc::new(Notify::new()))))
+            .as_ref()
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    /// Get handles for both current version and the next version
+    /// the current handles are those to await upon
+    /// the next handles are those to signal once completed
+    pub fn get_prior_dependency_and_update(
+        &self,
+        task_id: TaskID,
+        obj_versions: Vec<(ObjectID, SequenceNumber)>,
+        ignore_prior: bool,
+        ignore_next: bool,
+    ) -> (Vec<Arc<Notify>>, Vec<Arc<Notify>>) {
+        let mut current_handles = Vec::new();
+        let mut next_handles = Vec::new();
+
+        let next_v = obj_versions
+            .iter()
+            .map(|(_, seq_num)| *seq_num)
+            .max()
+            .expect("No max key found, obj_versions is empty")
+            .next();
+
+        for (obj_id, seq_num) in obj_versions.iter() {
+            if *seq_num > self.initial_version && !ignore_prior {
+                current_handles.push(self.entry_helper(*obj_id, *seq_num, task_id));
+            }
+            if !ignore_next {
+                next_handles.push(self.entry_helper(*obj_id, next_v, task_id));
+            }
+        }
+
+        (current_handles, next_handles)
+    }
+
+    /// Returns the task handle associated with the highest sequence number for a given object ID.
+    /// Returns None if no entries exist for the object ID.
+    pub fn get_latest_handle_for_object(&self, obj_id: &ObjectID) -> Option<Arc<Notify>> {
+        let mut latest_seq = None;
+        let mut latest_handle = None;
+
+        // Iterate through all entries to find the highest sequence number for this object ID
+        for entry in self.obj_task_map.iter() {
+            let ((entry_obj_id, seq_num), task_entry) = entry.pair();
+
+            if entry_obj_id == obj_id {
+                if latest_seq.is_none() || seq_num > &latest_seq.unwrap() {
+                    latest_seq = Some(*seq_num);
+                    if let Some((_, notify)) = task_entry.as_ref() {
+                        latest_handle = Some(notify.clone());
+                    }
+                }
+            }
+        }
+
+        // Remove the entry with the latest sequence number if found
+        if let Some(seq) = latest_seq {
+            self.obj_task_map.remove(&(*obj_id, seq));
+        }
+
+        latest_handle
+    }
+
+    /// Removes dependencies for the given object versions.
+    pub fn remove_dependency(&self, obj_versions: Vec<(ObjectID, SequenceNumber)>) {
+        for (obj_id, seq_num) in obj_versions {
+            self.obj_task_map.remove(&((*obj_id).into(), seq_num));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_no_prior_dependencies() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id = 1;
+        let obj_versions = vec![
+            (ObjectID::random(), SequenceNumber::from(1)),
+            (ObjectID::random(), SequenceNumber::from(1)),
+        ];
+
+        let (prior_tasks, current_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id,
+            obj_versions.clone(),
+            false,
+            false,
+        );
+
+        // **Correction:** Prior tasks should now be the same as current_tasks since they are inserted
+        assert_eq!(
+            prior_tasks.len(),
+            obj_versions.len(),
+            "Prior tasks should exist since they are created on first access."
+        );
+
+        assert_eq!(
+            current_tasks.len(),
+            obj_versions.len(),
+            "Should create a new notify for each versioned ObjectID."
+        );
+
+        // Ensure that each `(ObjectID, SequenceNumber)` now has a corresponding entry in the map
+        for (obj_id, seq_num) in obj_versions {
+            assert!(
+                dependency_controller.has_task_for_object(&obj_id, seq_num),
+                "The dependency controller should track this object version."
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_prior_dependencies_same_object_different_versions() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id1 = 1;
+        let task_id2 = 2;
+        let obj_id = ObjectID::random();
+
+        // First task accesses an object with version 1
+        let (prior_tasks1, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
+            task_id1,
+            vec![(obj_id, SequenceNumber::from(1))],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            prior_tasks1.len(),
+            1,
+            "Prior tasks should contain the same notify since it's created."
+        );
+
+        // Second task accesses the same object but version 2
+        let (prior_tasks2, current_tasks2) = dependency_controller.get_prior_dependency_and_update(
+            task_id2,
+            vec![(obj_id, SequenceNumber::from(2))], // Newer version
+            false,
+            false,
+        );
+
+        assert_eq!(
+            prior_tasks2.len(),
+            1,
+            "Prior tasks should contain the notify from the previous task."
+        );
+
+        assert!(
+            Arc::ptr_eq(&prior_tasks2[0], &current_tasks1[0]),
+            "The prior notify should match the first task's notify for version 1."
+        );
+
+        // Ensure a new notify is created for version 2
+        assert!(
+            !Arc::ptr_eq(&prior_tasks2[0], &current_tasks2[0]),
+            "New version should have a separate notify."
+        );
+
+        // Ensure both versions exist in the map
+        assert!(
+            dependency_controller.has_task_for_object(&obj_id, SequenceNumber::from(1)),
+            "The dependency controller should track the first version."
+        );
+        assert!(
+            dependency_controller.has_task_for_object(&obj_id, SequenceNumber::from(2)),
+            "The dependency controller should track the second version."
+        );
+    }
+
+    #[test]
+    fn test_partial_prior_dependencies_with_versions() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id1 = 1;
+        let task_id2 = 2;
+        let obj_id1 = ObjectID::random();
+        let obj_id2 = ObjectID::random();
+        let obj_versions1 = vec![
+            (obj_id1, SequenceNumber::from(1)),
+            (obj_id2, SequenceNumber::from(1)),
+        ];
+        let obj_versions2 = vec![
+            (obj_id1, SequenceNumber::from(2)),
+            (ObjectID::random(), SequenceNumber::from(2)),
+        ];
+
+        let (prior_tasks1, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
+            task_id1,
+            obj_versions1.clone(),
+            false,
+            false,
+        );
+
+        let (prior_tasks2, current_tasks2) = dependency_controller.get_prior_dependency_and_update(
+            task_id2,
+            obj_versions2.clone(),
+            false,
+            false,
+        );
+
+        // Only the first object should have a prior dependency
+        assert_eq!(
+            prior_tasks2.len(),
+            obj_versions2.len(),
+            "Each accessed version should have an existing prior notify."
+        );
+
+        // The first object's prior notify should be the same as the first task's notify
+        assert!(
+            Arc::ptr_eq(&prior_tasks2[0], &current_tasks1[0]),
+            "The prior notify should match the one for the overlapping ObjectID with the same version."
+        );
+
+        // Ensure the new object version got a new notify
+        assert!(
+            !Arc::ptr_eq(&prior_tasks2[1], &current_tasks2[1]),
+            "New version should have a separate notify."
+        );
+    }
+
+    #[test]
+    fn test_get_latest_handle_for_object() {
+        let dependency_controller = VersionedDependencyController::default();
+        let obj_id = ObjectID::random();
+
+        // Initially there should be no handle for the object
+        assert!(
+            dependency_controller
+                .get_latest_handle_for_object(&obj_id)
+                .is_none(),
+            "Should return None for an object with no entries"
+        );
+
+        // Add entries with different sequence numbers
+        let task_id1 = 1;
+        let task_id2 = 2;
+        let task_id3 = 3;
+        let seq_num1 = SequenceNumber::from(3);
+        let seq_num2 = SequenceNumber::from(5);
+        let seq_num3 = SequenceNumber::from(4);
+
+        // Create entries in non-sequential order to test sorting logic
+        dependency_controller.get_prior_dependency_and_update(
+            task_id1,
+            vec![(obj_id, seq_num1)],
+            false,
+            false,
+        );
+
+        let (_, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
+            task_id2,
+            vec![(obj_id, seq_num2)],
+            false,
+            false,
+        );
+
+        dependency_controller.get_prior_dependency_and_update(
+            task_id3,
+            vec![(obj_id, seq_num3)],
+            false,
+            false,
+        );
+
+        // Get the latest handle
+        let latest_handle = dependency_controller.get_latest_handle_for_object(&obj_id);
+
+        // The latest handle should correspond to seq_num2 (5), which is the highest
+        assert!(
+            latest_handle.is_some(),
+            "Should return a handle for an object with entries"
+        );
+
+        assert!(
+            Arc::ptr_eq(&latest_handle.unwrap(), &current_tasks1[0]),
+            "The latest handle should correspond to the highest sequence number (5)"
+        );
+
+        // Test with a different object ID that doesn't exist
+        let non_existent_obj_id = ObjectID::random();
+        assert!(
+            dependency_controller
+                .get_latest_handle_for_object(&non_existent_obj_id)
+                .is_none(),
+            "Should return None for a non-existent object ID"
+        );
+    }
+}
