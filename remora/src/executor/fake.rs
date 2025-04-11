@@ -500,9 +500,9 @@ impl Executor for FakeExecutor {
     }
 
     fn get_objects_for_dependency_tracking(
-        ctx: Arc<Self::ExecutionContext>,
-        store: Arc<Self::Store>,
-        transaction: TransactionWithTimestamp<Self::Transaction>,
+        _ctx: Arc<Self::ExecutionContext>,
+        _store: Arc<Self::Store>,
+        _transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> Vec<(ObjectID, SequenceNumber)> {
         todo!()
     }

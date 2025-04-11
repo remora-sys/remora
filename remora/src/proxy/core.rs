@@ -2,11 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::Deref,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
@@ -30,7 +26,6 @@ use crate::{
             InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
             RemoraTransaction, StateStore, Store,
         },
-        dependency_controller,
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -145,10 +140,6 @@ where
             PrimaryToProxyMessage::StatelessTxn(transaction) => {
                 self.process_stateless_transaction(transaction).await
             }
-
-            _ => {
-                tracing::warn!("Received unexpected message");
-            }
         }
     }
 
@@ -186,7 +177,7 @@ where
             .iter()
             .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
             .collect();
-        let (prior_handles, current_handles) = self
+        let (_, current_handles) = self
             .dependency_controller
             .get_prior_dependency_and_update(0, objs, true, false);
 
@@ -333,8 +324,7 @@ where
         }
 
         // Get dependencies and schedule the transaction
-        let (obj_ids, prior_handles, current_handles) =
-            self.get_dependencies(transaction.clone(), 0);
+        let (obj_ids, prior_handles, current_handles) = self.get_dependencies(transaction.clone());
         self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles)
             .await
             .expect("Failed to schedule transaction");
@@ -343,7 +333,6 @@ where
     pub fn get_dependencies(
         &mut self,
         transaction: RemoraTransaction<E>,
-        task_id: u64,
     ) -> (
         Vec<(ObjectID, SequenceNumber)>,
         Vec<Arc<Notify>>,
@@ -357,7 +346,7 @@ where
 
         let (prior_handles, current_handles) = self
             .dependency_controller
-            .get_prior_dependency_and_update(0, obj_ids, false, false);
+            .get_prior_dependency_and_update(0, obj_ids.clone(), false, false);
 
         (obj_ids, prior_handles, current_handles)
     }
@@ -419,7 +408,10 @@ where
     }
 
     /// Sptransaction_awn the proxy in a new task.
-    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>> {
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
+    where
+        <E as Executor>::Transaction: Send + Sync,
+    {
         tokio::spawn(async move { self.run().await })
     }
 }
@@ -427,7 +419,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use dashmap::DashMap;
     use tokio::sync::mpsc;

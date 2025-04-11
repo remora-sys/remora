@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
+use std::{io, marker::PhantomData, sync::Arc};
 use tokio::{
     sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
 
-use super::core::{ProxyCore, ProxyId};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
     executor::api::{Executor, ProxyToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
+    proxy::core::{ProxyCore, ProxyId},
 };
 use dashmap::DashMap;
 

@@ -1,11 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    ops::Deref,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use rustc_hash::FxHashMap;
 use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
@@ -25,6 +21,18 @@ use crate::{
     },
     metrics::Metrics,
 };
+
+/// Defines different load balancing policies for distributing transactions.
+#[derive(Debug, Clone)]
+pub enum LoadBalancingPolicy {
+    /// Simple round-robin distribution
+    RoundRobin {
+        /// Current index for round-robin distribution
+        current_index: usize,
+    },
+    /// Send to proxy that already has most of the required states
+    Zeus,
+}
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
@@ -46,6 +54,8 @@ pub struct LoadBalancer<E: Executor> {
     states_to_proxy: FxHashMap<ObjectID, ExecutorIndex>,
     /// The routing information of stateless.
     stateless_routing: FxHashMap<TransactionDigest, ExecutorIndex>,
+    /// The load balancing policy.
+    policy: LoadBalancingPolicy,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -71,6 +81,7 @@ impl<E: Executor> LoadBalancer<E> {
             states_to_proxy: FxHashMap::default(),
             stateless_routing: FxHashMap::default(),
             metrics,
+            policy: LoadBalancingPolicy::RoundRobin { current_index: 0 },
         }
     }
 
@@ -105,7 +116,7 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Get assigned proxies for shared objects in a transaction.
-    fn get_proxies_for_shared_objects(
+    /*fn get_proxies_for_shared_objects(
         &self,
         shared_object_ids: &[ObjectID],
     ) -> HashSet<ExecutorIndex> {
@@ -113,6 +124,78 @@ impl<E: Executor> LoadBalancer<E> {
             .iter()
             .map(|id| self.fast_fibonacci_hash(id))
             .collect()
+    }*/
+
+    /// Get assigned proxy for shared objects in a transaction.
+    /// This is the main entry point for load balancing policy selection.
+    fn get_proxy_for_shared_objects(
+        &mut self,
+        shared_object_ids: &[ObjectID],
+    ) -> Option<ExecutorIndex> {
+        match self.policy {
+            LoadBalancingPolicy::RoundRobin { mut current_index } => {
+                self.get_proxy_for_shared_objects_round_robin(&mut current_index)
+            }
+            LoadBalancingPolicy::Zeus => {
+                self.get_proxy_for_shared_objects_most_states(shared_object_ids)
+            }
+        }
+    }
+
+    /// Get assigned proxy for shared objects using round-robin.
+    fn get_proxy_for_shared_objects_round_robin(
+        &mut self,
+        current_index: &mut usize,
+    ) -> Option<ExecutorIndex> {
+        let proxy_count = self.proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        let proxy_index = *current_index % proxy_count;
+        *current_index = (*current_index + 1) % proxy_count;
+
+        Some(proxy_index)
+    }
+
+    /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
+    fn get_proxy_for_shared_objects_most_states(
+        &self,
+        shared_object_ids: &[ObjectID],
+    ) -> Option<ExecutorIndex> {
+        let proxy_count = self.proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        if shared_object_ids.is_empty() {
+            // If no shared objects, use first proxy
+            return Some(0);
+        }
+
+        // Count how many objects each proxy already has
+        let mut proxy_state_counts = vec![0; proxy_count];
+
+        for id in shared_object_ids {
+            if let Some(proxy_index) = self.states_to_proxy.get(id) {
+                if *proxy_index < proxy_count {
+                    proxy_state_counts[*proxy_index] += 1;
+                }
+            }
+        }
+
+        // Find the proxy with the most states
+        let mut max_count = 0;
+        let mut best_proxy = 0;
+
+        for (index, count) in proxy_state_counts.iter().enumerate() {
+            if *count > max_count {
+                max_count = *count;
+                best_proxy = index;
+            }
+        }
+
+        Some(best_proxy)
     }
 
     #[deprecated]
@@ -225,19 +308,15 @@ impl<E: Executor> LoadBalancer<E> {
         transaction: RemoraTransaction<E>,
         shared_object_ids: Vec<ObjectID>,
     ) {
-        let assigned_proxies = self.get_proxies_for_shared_objects(&shared_object_ids);
-
-        match assigned_proxies.len() {
-            1 => {
-                let proxy_index = *assigned_proxies.iter().next().unwrap();
-                self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
-                    .await;
-                self.send_transaction_to_proxy(proxy_index, transaction, true)
-                    .await;
-            }
+        if let Some(proxy_index) = self.get_proxy_for_shared_objects(&shared_object_ids) {
+            self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
+                .await;
+            self.send_transaction_to_proxy(proxy_index, transaction, true)
+                .await;
+        } else {
+            tracing::warn!("No proxies available for transaction with shared objects");
         }
     }
-
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
