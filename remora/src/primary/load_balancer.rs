@@ -483,6 +483,9 @@ mod tests {
         let (tx_to_proxy1, mut rx_from_lb1) = channel(100);
         let (tx_to_proxy2, mut rx_from_lb2) = channel(100);
 
+        // Spawn load balancer
+        let _lb_handle = lb.spawn();
+
         // Connect proxies to load balancer
         tx_proxy_connections.send(tx_to_proxy1).await.unwrap();
         tx_proxy_connections.send(tx_to_proxy2).await.unwrap();
@@ -490,9 +493,6 @@ mod tests {
         // Generate transactions
         let config = BenchmarkParameters::new_for_tests();
         let remora_txns = generate_test_transactions(&config, 5).await;
-
-        // Spawn load balancer
-        let _lb_handle = lb.spawn();
 
         // Send transactions to load balancer
         tx_committed_txns.send(remora_txns.clone()).await.unwrap();
@@ -609,7 +609,7 @@ mod tests {
             tx_committed_txns,
             rx_proxy_connections,
             rx_committed_txns,
-            rx_results,
+            _rx_results,
         ) = setup_test_environment().await;
 
         // Create load balancer

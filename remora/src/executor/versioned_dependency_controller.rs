@@ -229,12 +229,8 @@ mod tests {
             (obj_id2, SequenceNumber::from(3)),
         ];
 
-        let (prior_tasks1, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
-            task_id1,
-            obj_versions1.clone(),
-            false,
-            false,
-        );
+        let (_prior_tasks1, current_tasks1) = dependency_controller
+            .get_prior_dependency_and_update(task_id1, obj_versions1.clone(), false, false);
 
         let (prior_tasks2, current_tasks2) = dependency_controller.get_prior_dependency_and_update(
             task_id2,
