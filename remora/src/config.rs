@@ -317,6 +317,17 @@ impl BenchmarkParameters {
         }
     }
 
+    /// Create a new benchmark configuration for contention tests using SharedObjects workload.
+    pub fn new_for_contention_tests() -> Self {
+        BenchmarkParameters {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::SharedObjects {
+                txs_per_counter: default_cont_level_for_shared_obj(),
+            },
+        }
+    }
+
     /// Create a new benchmark configuration for fake txn tests.
     pub fn new_for_fake_tests() -> Self {
         BenchmarkParameters {

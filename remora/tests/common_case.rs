@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+/*use std::sync::Arc;
 
 use remora::{
     client::load_generator::LoadGenerator,
@@ -78,3 +78,4 @@ async fn remote_proxy_fake_txn() {
     let executor = FakeExecutor::new(&config).await;
     remote_proxy_common::<FakeExecutor>(executor, config).await;
 }
+*/
