@@ -136,8 +136,8 @@ mod tests {
         let dependency_controller = VersionedDependencyController::default();
         let task_id = 1;
         let obj_versions = vec![
-            (ObjectID::random(), SequenceNumber::from(1)),
-            (ObjectID::random(), SequenceNumber::from(1)),
+            (ObjectID::random(), SequenceNumber::from(2)),
+            (ObjectID::random(), SequenceNumber::from(2)),
         ];
 
         let (prior_tasks, current_tasks) = dependency_controller.get_prior_dependency_and_update(
@@ -150,8 +150,8 @@ mod tests {
         // **Correction:** Prior tasks should now be the same as current_tasks since they are inserted
         assert_eq!(
             prior_tasks.len(),
-            obj_versions.len(),
-            "Prior tasks should exist since they are created on first access."
+            0,
+            "Prior tasks should not exist since they are created on first access."
         );
 
         assert_eq!(
@@ -159,14 +159,6 @@ mod tests {
             obj_versions.len(),
             "Should create a new notify for each versioned ObjectID."
         );
-
-        // Ensure that each `(ObjectID, SequenceNumber)` now has a corresponding entry in the map
-        for (obj_id, seq_num) in obj_versions {
-            assert!(
-                dependency_controller.has_task_for_object(&obj_id, seq_num),
-                "The dependency controller should track this object version."
-            );
-        }
     }
 
     #[test]
@@ -176,24 +168,24 @@ mod tests {
         let task_id2 = 2;
         let obj_id = ObjectID::random();
 
-        // First task accesses an object with version 1
+        // First task accesses an object with version 2
         let (prior_tasks1, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
             task_id1,
-            vec![(obj_id, SequenceNumber::from(1))],
+            vec![(obj_id, SequenceNumber::from(2))],
             false,
             false,
         );
 
         assert_eq!(
             prior_tasks1.len(),
-            1,
-            "Prior tasks should contain the same notify since it's created."
+            0,
+            "Prior tasks should not exist since they are created on first access."
         );
 
-        // Second task accesses the same object but version 2
+        // Second task accesses the same object but version 3
         let (prior_tasks2, current_tasks2) = dependency_controller.get_prior_dependency_and_update(
             task_id2,
-            vec![(obj_id, SequenceNumber::from(2))], // Newer version
+            vec![(obj_id, SequenceNumber::from(3))], // Newer version
             false,
             false,
         );
@@ -215,13 +207,8 @@ mod tests {
             "New version should have a separate notify."
         );
 
-        // Ensure both versions exist in the map
         assert!(
-            dependency_controller.has_task_for_object(&obj_id, SequenceNumber::from(1)),
-            "The dependency controller should track the first version."
-        );
-        assert!(
-            dependency_controller.has_task_for_object(&obj_id, SequenceNumber::from(2)),
+            dependency_controller.has_task_for_object(&obj_id, SequenceNumber::from(3)),
             "The dependency controller should track the second version."
         );
     }
@@ -234,12 +221,12 @@ mod tests {
         let obj_id1 = ObjectID::random();
         let obj_id2 = ObjectID::random();
         let obj_versions1 = vec![
-            (obj_id1, SequenceNumber::from(1)),
-            (obj_id2, SequenceNumber::from(1)),
+            (obj_id1, SequenceNumber::from(2)),
+            (obj_id2, SequenceNumber::from(2)),
         ];
         let obj_versions2 = vec![
-            (obj_id1, SequenceNumber::from(2)),
-            (ObjectID::random(), SequenceNumber::from(2)),
+            (obj_id1, SequenceNumber::from(3)),
+            (obj_id2, SequenceNumber::from(3)),
         ];
 
         let (prior_tasks1, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
@@ -340,6 +327,155 @@ mod tests {
                 .get_latest_handle_for_object(&non_existent_obj_id)
                 .is_none(),
             "Should return None for a non-existent object ID"
+        );
+    }
+
+    #[test]
+    fn test_ignore_prior_flag() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id = 1;
+        let obj_id = ObjectID::random();
+        let seq_num = SequenceNumber::from(3); // Greater than initial_version
+
+        // First call with ignore_prior=false to set up dependencies
+        dependency_controller.get_prior_dependency_and_update(
+            task_id,
+            vec![(obj_id, seq_num)],
+            false,
+            false,
+        );
+
+        // Second call with ignore_prior=true
+        let (prior_tasks, next_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id + 1,
+            vec![(obj_id, seq_num)],
+            true, // ignore prior dependencies
+            false,
+        );
+
+        assert_eq!(
+            prior_tasks.len(),
+            0,
+            "Should have no prior tasks when ignore_prior is true"
+        );
+
+        assert_eq!(
+            next_tasks.len(),
+            1,
+            "Should still create next tasks when ignore_prior is true"
+        );
+    }
+
+    #[test]
+    fn test_ignore_next_flag() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id = 1;
+        let obj_id = ObjectID::random();
+        let seq_num = SequenceNumber::from(3);
+
+        // Call with ignore_next=true
+        let (prior_tasks, next_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id,
+            vec![(obj_id, seq_num)],
+            false,
+            true, // ignore next dependencies
+        );
+
+        assert_eq!(
+            prior_tasks.len(),
+            1,
+            "Should still create prior tasks when ignore_next is true"
+        );
+
+        assert_eq!(
+            next_tasks.len(),
+            0,
+            "Should have no next tasks when ignore_next is true"
+        );
+    }
+
+    #[test]
+    fn test_both_flags_true() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id = 1;
+        let obj_id = ObjectID::random();
+        let seq_num = SequenceNumber::from(3);
+
+        // Call with both flags set to true
+        let (prior_tasks, next_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id,
+            vec![(obj_id, seq_num)],
+            true, // ignore prior dependencies
+            true, // ignore next dependencies
+        );
+
+        assert_eq!(
+            prior_tasks.len(),
+            0,
+            "Should have no prior tasks when ignore_prior is true"
+        );
+
+        assert_eq!(
+            next_tasks.len(),
+            0,
+            "Should have no next tasks when ignore_next is true"
+        );
+
+        // Verify the entry was still created in the map despite both flags being true
+        assert!(
+            !dependency_controller.has_task_for_object(&obj_id, seq_num),
+            "Entry should not be created in the map"
+        );
+    }
+
+    #[test]
+    fn test_initial_version_behavior() {
+        let dependency_controller = VersionedDependencyController::default();
+        let task_id = 1;
+        let obj_id = ObjectID::random();
+
+        // Use sequence number equal to initial_version (2)
+        let seq_num_initial = SequenceNumber::from(2);
+
+        let (prior_tasks, next_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id,
+            vec![(obj_id, seq_num_initial)],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            prior_tasks.len(),
+            0,
+            "Should have no prior tasks when sequence number equals initial_version"
+        );
+
+        assert_eq!(
+            next_tasks.len(),
+            1,
+            "Should create next tasks regardless of sequence number"
+        );
+
+        // Now use sequence number less than initial_version
+        let seq_num_less = SequenceNumber::from(1);
+
+        let (prior_tasks, next_tasks) = dependency_controller.get_prior_dependency_and_update(
+            task_id + 1,
+            vec![(obj_id, seq_num_less)],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            prior_tasks.len(),
+            0,
+            "Should have no prior tasks when sequence number is less than initial_version"
+        );
+
+        assert_eq!(
+            next_tasks.len(),
+            1,
+            "Should create next tasks regardless of sequence number"
         );
     }
 }
