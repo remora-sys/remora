@@ -26,8 +26,9 @@ use sui_types::{
 };
 use tokio::{sync::Mutex, time::Instant};
 
-use super::api::{
-    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+use super::{
+    api::{ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore},
+    calibration::Calibration,
 };
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
@@ -67,9 +68,28 @@ impl StateStore<TransactionEffects> for InMemoryObjectStore {
     }
 }
 
+/// Wrapper context that contains both the benchmark context and verification context
+#[derive(Clone)]
+pub struct SuiExecutionContext {
+    benchmark_ctx: BenchmarkContext,
+    verification_spins: u64,
+}
+
+impl SuiExecutionContext {
+    /// Get a reference to the benchmark context
+    pub fn benchmark_ctx(&self) -> &BenchmarkContext {
+        &self.benchmark_ctx
+    }
+
+    /// Get the verification spins value
+    pub fn verification_spins(&self) -> u64 {
+        self.verification_spins
+    }
+}
+
 #[derive(Clone)]
 pub struct SuiExecutor {
-    ctx: Arc<BenchmarkContext>,
+    ctx: Arc<SuiExecutionContext>,
     /// Lock ensuring at most one proxy (or the primary) assigns the shared object transaction locks.
     /// This is likely not the best design, but the Sui epoch store is not very forgiving.
     shared_object_versions_assignment_lock: Arc<Mutex<()>>,
@@ -230,6 +250,7 @@ impl SuiExecutor {
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
         let mut ctx = BenchmarkContext::new(workload.clone(), component, false).await;
+        let verification_spins = Calibration::calibrate(config.verification_duration);
         let _ = workload.create_tx_generator(&mut ctx).await;
         let elapsed = start_time.elapsed();
         tracing::debug!(
@@ -238,14 +259,19 @@ impl SuiExecutor {
             elapsed.as_millis(),
         );
 
+        let context = SuiExecutionContext {
+            benchmark_ctx: ctx,
+            verification_spins,
+        };
+
         Self {
-            ctx: Arc::new(ctx),
+            ctx: Arc::new(context),
             shared_object_versions_assignment_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
-        self.ctx.validator().create_in_memory_store()
+        self.ctx.benchmark_ctx().validator().create_in_memory_store()
     }
 }
 
@@ -253,20 +279,20 @@ impl Executor for SuiExecutor {
     type Transaction = Transaction;
     type ExecutionResults = TransactionEffects;
     type Store = InMemoryObjectStore;
-    type ExecutionContext = BenchmarkContext;
+    type ExecutionContext = SuiExecutionContext;
 
-    fn context(&self) -> Arc<BenchmarkContext> {
+    fn context(&self) -> Arc<SuiExecutionContext> {
         self.ctx.clone()
     }
 
     async fn execute(
-        ctx: Arc<BenchmarkContext>,
+        ctx: Arc<SuiExecutionContext>,
         store: Arc<InMemoryObjectStore>,
         transaction: SuiTransaction,
     ) -> SuiExecutionResults {
         let tx_id = transaction.digest();
         let input_objects = transaction.transaction_data().input_objects().unwrap();
-        let validator = ctx.validator();
+        let validator = ctx.benchmark_ctx().validator();
         let epoch_store = validator.get_epoch_store();
         let protocol_config = epoch_store.protocol_config();
         let reference_gas_price = epoch_store.reference_gas_price();
@@ -337,12 +363,12 @@ impl Executor for SuiExecutor {
     }
 
     fn pre_execute_check(
-        ctx: Arc<BenchmarkContext>,
+        ctx: Arc<SuiExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
-        let validator = ctx.validator();
+        let validator = ctx.benchmark_ctx().validator();
         let epoch_store = validator.get_epoch_store();
 
         store
@@ -361,6 +387,7 @@ impl Executor for SuiExecutor {
     async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
         let _guard = self.shared_object_versions_assignment_lock.lock().await;
         self.context()
+            .benchmark_ctx()
             .validator()
             .assigned_shared_object_versions_on_transaction_not_idempotent(transactions)
             .await;
@@ -385,20 +412,23 @@ impl Executor for SuiExecutor {
     }
 
     async fn verify_transaction(
-        _ctx: Arc<Self::ExecutionContext>,
+        ctx: Arc<Self::ExecutionContext>,
         _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
-        todo!()
+        let spins = ctx.verification_spins();
+
+        Calibration::calibrated_work(spins);
+        true
     }
 
     fn get_objects_for_dependency_tracking(
-        ctx: Arc<BenchmarkContext>,
+        ctx: Arc<Self::ExecutionContext>,
         store: Arc<InMemoryObjectStore>,
         transaction: SuiTransaction,
     ) -> Vec<(ObjectID, SequenceNumber)> {
         // filter pkg id from the obj_id
         let input_objects = transaction.transaction_data().input_objects().unwrap();
-        let validator = ctx.validator();
+        let validator = ctx.benchmark_ctx().validator();
         let epoch_store = validator.get_epoch_store();
 
         store.get_object_id_and_versions(&**epoch_store, &transaction.key(), &input_objects)
@@ -459,6 +489,7 @@ mod tests {
         let (_, read_txs) = super::import_from_files(working_directory.into());
         executor
             .context()
+            .benchmark_ctx()
             .validator()
             .assigned_shared_object_versions_on_transaction(&read_txs) // Important!!
             .await;

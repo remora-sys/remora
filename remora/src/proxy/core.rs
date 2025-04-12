@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_processes_transaction() {
+    async fn test_proxy_processes_fake_transaction() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
 
@@ -681,8 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_stateless_transaction() {
-        let config = BenchmarkParameters::new_for_fake_tests();
-        let executor = FakeExecutor::new(&config).await;
+        let config = BenchmarkParameters::new_for_tests();
+        let executor = SuiExecutor::new(&config).await;
 
         // Setup proxy
         let (proxy, tx_to_proxy, _, _, _) = setup_proxy(executor.clone(), 0).await;
@@ -691,8 +691,8 @@ mod tests {
         let proxy_handle = proxy.spawn();
 
         // Generate a transaction
-        let transactions = FakeExecutor::generate_transactions(&config, None).await;
-        let transaction = RemoraTransaction::<FakeExecutor>::new_for_tests(transactions[0].clone());
+        let transactions = SuiExecutor::generate_transactions(&config, None).await;
+        let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy
         let message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());

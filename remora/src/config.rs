@@ -174,16 +174,12 @@ pub enum WorkloadType {
     FakedNoContention {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
     },
     FakedContention {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
         #[serde(default = "default_cont_level_for_shared_obj")]
         number_of_inputs: usize,
         #[serde(default = "default_contention_level")]
@@ -197,32 +193,22 @@ pub enum WorkloadType {
     FakeSolanaTransactions {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
     },
     FakeEthereumTransfers {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
     },
     FakeEthereumNftMint {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
     },
     FakeUniswapNormal {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
     },
     FakeUniswapPeak {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
-        #[serde(default = "default_fake_verification_duration")]
-        verification_duration: Duration,
     },
 }
 
@@ -253,9 +239,7 @@ pub fn default_fake_execution_duration() -> Duration {
     Duration::from_micros(500)
 }
 
-pub fn default_fake_verification_duration() -> Duration {
-    Duration::from_micros(2000)
-}
+
 
 impl Debug for WorkloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -305,6 +289,9 @@ pub struct BenchmarkParameters {
     /// The workload to generate.
     #[serde(default = "default_benchmark_config::default_workload")]
     pub workload: WorkloadType,
+    /// The verification duration.
+    #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
+    pub verification_duration: Duration,
 }
 
 impl BenchmarkParameters {
@@ -314,6 +301,7 @@ impl BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -325,6 +313,7 @@ impl BenchmarkParameters {
             workload: WorkloadType::SharedObjects {
                 txs_per_counter: default_cont_level_for_shared_obj(),
             },
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -335,9 +324,9 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(1),
             workload: WorkloadType::FakedNoContention {
                 execution_duration: default_fake_execution_duration(),
-                verification_duration: default_fake_verification_duration(),
                 number_of_inputs: 1,
             },
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -346,9 +335,9 @@ impl BenchmarkParameters {
         BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
             workload: WorkloadType::FakedContention {
                 execution_duration: default_fake_execution_duration(),
-                verification_duration: default_fake_verification_duration(),
                 number_of_inputs: 1,
                 contention: 100,
             },
@@ -372,6 +361,10 @@ mod default_benchmark_config {
     pub fn default_workload() -> WorkloadType {
         WorkloadType::Transfers
     }
+
+    pub fn default_fake_verification_duration() -> Duration {
+        Duration::from_micros(2000)
+    }
 }
 
 impl Default for BenchmarkParameters {
@@ -380,6 +373,7 @@ impl Default for BenchmarkParameters {
             load: default_benchmark_config::default_load(),
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
         }
     }
 }

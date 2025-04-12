@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, HashSet},
     future::Future,
     marker::PhantomData,
@@ -23,7 +22,6 @@ use sui_types::{
     object::{MoveObject, Object, Owner},
     transaction::InputObjectKind,
 };
-use tokio::time::Instant;
 
 use super::{
     super::config::{BenchmarkParameters, WorkloadType},
@@ -31,6 +29,7 @@ use super::{
         ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
         TransactionWithTimestamp,
     },
+    calibration::Calibration,
     sui::get_object_ids_for_dependency_tracking,
 };
 
@@ -288,53 +287,9 @@ pub struct FakeExecutionContext {
 impl FakeExecutionContext {
     pub fn new(execution_duration: Duration, verification_duration: Duration) -> Self {
         Self {
-            execution_spins: Self::calibrate(execution_duration),
-            verification_spins: Self::calibrate(verification_duration),
+            execution_spins: Calibration::calibrate(execution_duration),
+            verification_spins: Calibration::calibrate(verification_duration),
         }
-    }
-
-    /// Simulate CPU-bound work by running a computation for the duration of cpu_time
-    fn calibrated_work(iterations: u64) {
-        for _ in 0..iterations {
-            std::hint::spin_loop();
-        }
-    }
-
-    /// Calibrate the fake executor to run for the target_duration
-    fn calibrate(target_duration: Duration) -> u64 {
-        let mut iterations = 1_000_000;
-        let mut step_size = iterations;
-
-        loop {
-            let start = Instant::now();
-
-            Self::calibrated_work(iterations);
-
-            let elapsed = start.elapsed();
-
-            match elapsed.cmp(&target_duration) {
-                Ordering::Greater => {
-                    // Use a binary reduction approach to converge faster
-                    step_size = (step_size as f64 * 0.5) as u64;
-                    if step_size == 0 {
-                        break; // Stop when step size is too small to adjust further
-                    }
-                    iterations -= step_size;
-                }
-                Ordering::Less => {
-                    // Increase faster initially, then adjust slowly
-                    step_size = (step_size as f64 * 0.5) as u64;
-                    iterations += step_size;
-                }
-                Ordering::Equal => break,
-            }
-
-            // If the duration is very close to target, break early
-            if (elapsed.as_secs_f64() - target_duration.as_secs_f64()).abs() < 0.000_001 {
-                break;
-            }
-        }
-        iterations
     }
 }
 
@@ -345,27 +300,24 @@ pub struct FakeExecutor {
 
 impl FakeExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
-        let (execution_duration, verification_duration) = match config.workload {
+        let execution_duration = match config.workload {
             WorkloadType::FakedNoContention {
                 execution_duration,
-                verification_duration,
                 number_of_inputs: _,
-            } => (execution_duration, verification_duration),
+            } => execution_duration,
             WorkloadType::FakedContention {
                 execution_duration,
-                verification_duration,
                 number_of_inputs: _,
                 contention: _,
-            } => (execution_duration, verification_duration),
+            } => execution_duration,
             WorkloadType::FakeSolanaTransactions {
                 execution_duration,
-                verification_duration,
-            } => (execution_duration, verification_duration),
+            } => execution_duration,
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
         };
-        let ctx = FakeExecutionContext::new(execution_duration, verification_duration);
+        let ctx = FakeExecutionContext::new(execution_duration, config.verification_duration);
         Self {
             execution_context: Arc::new(ctx),
         }
@@ -394,7 +346,7 @@ impl Executor for FakeExecutor {
     type Transaction = FakeTransaction;
     type ExecutionResults = FakeTransactionEffects;
     type Store = FakeObjectStore<FakeTransactionEffects>;
-    type ExecutionContext = FakeExecutionContext;
+        type ExecutionContext = FakeExecutionContext;
 
     fn context(&self) -> Arc<FakeExecutionContext> {
         self.execution_context.clone()
@@ -407,9 +359,7 @@ impl Executor for FakeExecutor {
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
     {
         // Simulate execution
-        for _ in 0..ctx.execution_spins {
-            std::hint::spin_loop();
-        }
+        Calibration::calibrated_work(ctx.execution_spins);
 
         let mut modified_at_versions = Vec::new();
         let mut new_state = BTreeMap::new();
@@ -493,9 +443,7 @@ impl Executor for FakeExecutor {
         _transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         // Simulate verification
-        for _ in 0..ctx.verification_spins {
-            std::hint::spin_loop();
-        }
+        Calibration::calibrated_work(ctx.verification_spins);
         true
     }
 
@@ -576,7 +524,6 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
     match config.workload {
         WorkloadType::FakedNoContention {
             execution_duration: _,
-            verification_duration: _,
             number_of_inputs,
         } => {
             parallel_generate_transaction(
@@ -588,7 +535,6 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
         }
         WorkloadType::FakedContention {
             execution_duration: _,
-            verification_duration: _,
             number_of_inputs,
             contention,
         } => {
@@ -716,7 +662,7 @@ mod tests {
 
     use crate::{
         config::{
-            default_fake_execution_duration, default_fake_verification_duration,
+            default_fake_execution_duration,
             BenchmarkParameters, WorkloadType,
         },
         executor::{
@@ -727,6 +673,7 @@ mod tests {
                 generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
                 FakeTransaction,
             },
+            calibration::Calibration,
         },
     };
 
@@ -813,7 +760,6 @@ mod tests {
         let store = Arc::new(FakeObjectStore::new());
         let config = BenchmarkParameters {
             workload: WorkloadType::FakeSolanaTransactions {
-                verification_duration: default_fake_verification_duration(),
                 execution_duration: default_fake_execution_duration(),
             },
             ..BenchmarkParameters::new_for_fake_tests()
@@ -853,7 +799,6 @@ mod tests {
         let config = BenchmarkParameters {
             workload: WorkloadType::FakeEthereumTransfers {
                 execution_duration: default_fake_execution_duration(),
-                verification_duration: default_fake_verification_duration(),
             },
             ..BenchmarkParameters::new_for_fake_tests()
         };
