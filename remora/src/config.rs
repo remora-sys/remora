@@ -315,6 +315,16 @@ impl BenchmarkParameters {
         }
     }
 
+    /// Create a new benchmark configuration for contention tests using Ethereum workload.
+    pub fn new_for_ethereum_tests() -> Self {
+        BenchmarkParameters {
+            load: 10,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::EthereumTransfers,
+            verification_duration: default_benchmark_config::default_fake_verification_duration(),
+        }
+    }
+
     /// Create a new benchmark configuration for fake txn tests.
     pub fn new_for_fake_tests() -> Self {
         BenchmarkParameters {

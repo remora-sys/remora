@@ -688,7 +688,7 @@ mod tests {
         let (proxy, tx_to_proxy, _, _, _) = setup_proxy(executor.clone(), 0).await;
 
         // Spawn the proxy
-        let proxy_handle = proxy.spawn();
+        let _proxy_handle = proxy.spawn();
 
         // Generate a transaction
         let transactions = SuiExecutor::generate_transactions(&config, None).await;
@@ -722,8 +722,8 @@ mod tests {
         tx_inter_proxy_replies2.insert(0, tx_inter_proxy_requests1.clone());
 
         // Spawn the proxies
-        let proxy1_handle = proxy1.spawn();
-        let proxy2_handle = proxy2.spawn();
+        let _proxy1_handle = proxy1.spawn();
+        let _proxy2_handle = proxy2.spawn();
 
         // Generate a transaction
         let transactions = SuiExecutor::generate_transactions(&config, None).await;
@@ -772,6 +772,15 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_sui_transactions_contention() {
         let config = BenchmarkParameters::new_for_contention_tests();
+        let executor = SuiExecutor::new(&config).await;
+
+        let success = process_transaction(executor, &config).await;
+        assert!(success, "Sui transaction should be processed successfully");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ethereum_transactions() {
+        let config = BenchmarkParameters::new_for_ethereum_tests();
         let executor = SuiExecutor::new(&config).await;
 
         let success = process_transaction(executor, &config).await;
