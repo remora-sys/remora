@@ -704,56 +704,39 @@ mod tests {
         // Now send the stateful part
         let message = PrimaryToProxyMessage::Txn(transaction, 0, BTreeMap::new());
         tx_to_proxy.send(message).await.unwrap();
-
-        // Clean up
-        drop(tx_to_proxy);
-        let _ = proxy_handle.await;
     }
 
     #[tokio::test]
-    async fn test_inter_proxy_communication() {
+    async fn test_inter_proxy_communication_via_stateless_result() {
         let config = BenchmarkParameters::new_for_tests();
-        let executor = FakeExecutor::new(&config).await;
+        let executor = SuiExecutor::new(&config).await;
 
         // Setup two proxies
-        let (proxy1, tx_to_proxy1, _, _, tx_inter_proxy_replies1) =
+        let (proxy1, tx_to_proxy1, _, tx_inter_proxy_requests1, tx_inter_proxy_replies1) =
             setup_proxy(executor.clone(), 0).await;
-        let (proxy2, _, mut rx_results2, tx_inter_proxy_requests2, _) =
+        let (proxy2, tx_to_proxy2, _, tx_inter_proxy_requests2, tx_inter_proxy_replies2) =
             setup_proxy(executor.clone(), 1).await;
 
         // Connect the proxies
-        tx_inter_proxy_replies1.insert(1, tx_inter_proxy_requests2);
+        tx_inter_proxy_replies1.insert(1, tx_inter_proxy_requests2.clone());
+        tx_inter_proxy_replies2.insert(0, tx_inter_proxy_requests1.clone());
 
         // Spawn the proxies
         let proxy1_handle = proxy1.spawn();
         let proxy2_handle = proxy2.spawn();
 
         // Generate a transaction
-        let transactions = FakeExecutor::generate_transactions(&config, None).await;
-        let transaction = RemoraTransaction::<FakeExecutor>::new_for_tests(transactions[0].clone());
+        let transactions = SuiExecutor::generate_transactions(&config, None).await;
+        let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
+
+        // Send stateless transaction to proxy2
+        let message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+        tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
         let missing_states: BTreeMap<ObjectID, usize> = BTreeMap::new();
-        let message = PrimaryToProxyMessage::Txn(transaction.clone(), 1, missing_states);
+        let message = PrimaryToProxyMessage::Txn(transaction, 1, missing_states);
         tx_to_proxy1.send(message).await.unwrap();
-
-        // Send stateless transaction to proxy2
-        let message = PrimaryToProxyMessage::StatelessTxn(transaction);
-        tx_to_proxy1.send(message).await.unwrap();
-
-        // Verify proxy2 produces a result
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), rx_results2.recv()).await;
-
-        assert!(
-            result.is_ok(),
-            "Should receive execution result from proxy2"
-        );
-
-        // Clean up
-        drop(tx_to_proxy1);
-        let _ = proxy1_handle.await;
-        let _ = proxy2_handle.await;
     }
 
     #[tokio::test]

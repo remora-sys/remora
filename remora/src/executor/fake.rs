@@ -310,9 +310,7 @@ impl FakeExecutor {
                 number_of_inputs: _,
                 contention: _,
             } => execution_duration,
-            WorkloadType::FakeSolanaTransactions {
-                execution_duration,
-            } => execution_duration,
+            WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
@@ -346,7 +344,7 @@ impl Executor for FakeExecutor {
     type Transaction = FakeTransaction;
     type ExecutionResults = FakeTransactionEffects;
     type Store = FakeObjectStore<FakeTransactionEffects>;
-        type ExecutionContext = FakeExecutionContext;
+    type ExecutionContext = FakeExecutionContext;
 
     fn context(&self) -> Arc<FakeExecutionContext> {
         self.execution_context.clone()
@@ -661,19 +659,16 @@ mod tests {
     use tokio::time::Instant;
 
     use crate::{
-        config::{
-            default_fake_execution_duration,
-            BenchmarkParameters, WorkloadType,
-        },
+        config::{default_fake_execution_duration, BenchmarkParameters, WorkloadType},
         executor::{
             api::{Executor, TransactionWithTimestamp},
+            calibration::Calibration,
             fake::{
                 fake_owned_object, fake_shared_object, fake_shared_object_with_id,
                 generate_fake_load_objects_and_transactions,
                 generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
                 FakeTransaction,
             },
-            calibration::Calibration,
         },
     };
 

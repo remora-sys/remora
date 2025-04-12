@@ -271,7 +271,10 @@ impl SuiExecutor {
     }
 
     pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
-        self.ctx.benchmark_ctx().validator().create_in_memory_store()
+        self.ctx
+            .benchmark_ctx()
+            .validator()
+            .create_in_memory_store()
     }
 }
 
