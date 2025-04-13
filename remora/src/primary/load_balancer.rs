@@ -23,10 +23,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum LoadBalancingPolicy {
     /// Simple round-robin distribution
-    RoundRobin {
-        /// Current index for round-robin distribution
-        current_index: usize,
-    },
+    RoundRobin,
     /// Send to proxy that already has most of the required states
     Zeus,
 }
@@ -82,7 +79,7 @@ impl<E: Executor> LoadBalancer<E> {
             states_to_proxy: FxHashMap::default(),
             stateless_routing: FxHashMap::default(),
             metrics,
-            policy: LoadBalancingPolicy::RoundRobin { current_index: 0 },
+            policy: LoadBalancingPolicy::RoundRobin,
         }
     }
 
@@ -133,10 +130,8 @@ impl<E: Executor> LoadBalancer<E> {
         &mut self,
         shared_object_ids: &[ObjectID],
     ) -> Option<ExecutorIndex> {
-        match self.policy {
-            LoadBalancingPolicy::RoundRobin { mut current_index } => {
-                self.get_proxy_for_shared_objects_round_robin(&mut current_index)
-            }
+        match &mut self.policy {
+            LoadBalancingPolicy::RoundRobin => self.get_proxy_for_shared_objects_round_robin(),
             LoadBalancingPolicy::Zeus => {
                 self.get_proxy_for_shared_objects_most_states(shared_object_ids)
             }
@@ -144,17 +139,14 @@ impl<E: Executor> LoadBalancer<E> {
     }
 
     /// Get assigned proxy for shared objects using round-robin.
-    fn get_proxy_for_shared_objects_round_robin(
-        &mut self,
-        current_index: &mut usize,
-    ) -> Option<ExecutorIndex> {
+    fn get_proxy_for_shared_objects_round_robin(&mut self) -> Option<ExecutorIndex> {
         let proxy_count = self.proxy_connections.len();
         if proxy_count == 0 {
             return None;
         }
 
-        let proxy_index = *current_index % proxy_count;
-        *current_index = (*current_index + 1) % proxy_count;
+        let proxy_index = self.index % proxy_count;
+        self.index = (self.index + 1) % proxy_count;
 
         Some(proxy_index)
     }
@@ -250,11 +242,21 @@ impl<E: Executor> LoadBalancer<E> {
             transaction.clone(),
         );
 
+        tracing::debug!(
+            "sent to proxy {}: obj_id vec {:?}",
+            proxy_index,
+            object_ids.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+
         for (object_id, _) in object_ids {
-            // If this object is not in our states_to_proxy map, it's missing
-            let previous_owner = self.states_to_proxy.get(&object_id).unwrap();
-            if *previous_owner != proxy_index {
-                missing_states.insert(object_id, *previous_owner);
+            // Check if this object is already mapped to a proxy
+            if let Some(previous_owner) = self.states_to_proxy.get(&object_id) {
+                if *previous_owner != proxy_index {
+                    missing_states.insert(object_id, *previous_owner);
+                    self.states_to_proxy.insert(object_id, proxy_index);
+                }
+            } else {
+                // If not mapped yet, assign it to this proxy
                 self.states_to_proxy.insert(object_id, proxy_index);
             }
         }
@@ -626,8 +628,17 @@ mod tests {
         // Setup first proxy and its channels
         let (tx_to_proxy1, rx_from_lb1) = channel(100);
         let (tx_results1, _) = channel(100);
-        let (_tx_inter_proxy_requests1, rx_inter_proxy_requests1) = channel(100);
+        let (tx_inter_proxy_requests1, rx_inter_proxy_requests1) = channel(100);
         let tx_inter_proxy_replies1 = Arc::new(DashMap::new());
+
+        // Setup second proxy and its channels
+        let (tx_to_proxy2, rx_from_lb2) = channel(100);
+        let (tx_results2, _) = channel(100);
+        let (tx_inter_proxy_requests2, rx_inter_proxy_requests2) = channel(100);
+        let tx_inter_proxy_replies2 = Arc::new(DashMap::new());
+
+        tx_inter_proxy_replies1.insert(1, tx_inter_proxy_requests2);
+        tx_inter_proxy_replies2.insert(0, tx_inter_proxy_requests1);
 
         // Create and spawn first proxy core
         let proxy_store1 = Arc::new(executor.init_store());
@@ -642,12 +653,6 @@ mod tests {
             metrics.clone(),
         );
         let proxy_handle1 = proxy1.spawn();
-
-        // Setup second proxy and its channels
-        let (tx_to_proxy2, rx_from_lb2) = channel(100);
-        let (tx_results2, _) = channel(100);
-        let (_tx_inter_proxy_requests2, rx_inter_proxy_requests2) = channel(100);
-        let tx_inter_proxy_replies2 = Arc::new(DashMap::new());
 
         // Create and spawn second proxy core
         let proxy_store2 = Arc::new(executor.init_store());
@@ -671,7 +676,7 @@ mod tests {
         let _lb_handle = lb.spawn();
 
         // Generate transactions
-        let config = BenchmarkParameters::new_for_ethereum_tests();
+        let config = BenchmarkParameters::new_for_contention_tests();
         let remora_txns = generate_test_transactions(&config, 4).await;
 
         // Send transactions to load balancer

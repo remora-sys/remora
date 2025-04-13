@@ -504,6 +504,7 @@ where
                         }
                     )
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
+            let ready_to_execute = true;
 
             let execution_result = if ready_to_execute {
                 tracing::debug!(
