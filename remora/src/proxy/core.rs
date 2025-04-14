@@ -26,7 +26,7 @@ use crate::{
             InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
             RemoraTransaction, StateStore, Store,
         },
-        versioned_stateful_controller::VersionedDependencyController,
+        versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
 };
