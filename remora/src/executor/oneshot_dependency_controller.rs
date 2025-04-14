@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_set_and_get_dependency() {
-        let mut dependency_controller = OneshotDependencyController::new();
+        let dependency_controller = OneshotDependencyController::new();
         let txn_id = TransactionDigest::random();
 
         // Initially there should be no entry
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_has_entry_for_txn() {
-        let mut dependency_controller = OneshotDependencyController::new();
+        let dependency_controller = OneshotDependencyController::new();
         let txn_id = TransactionDigest::random();
 
         // Initially there should be no entry
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_get_dependencies_nonexistent() {
-        let mut dependency_controller = OneshotDependencyController::new();
+        let dependency_controller = OneshotDependencyController::new();
         let txn_id = TransactionDigest::random();
 
         // This should return None because the transaction doesn't exist
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_multiple_transactions() {
-        let mut dependency_controller = OneshotDependencyController::new();
+        let dependency_controller = OneshotDependencyController::new();
         let txn_id1 = TransactionDigest::random();
         let txn_id2 = TransactionDigest::random();
 

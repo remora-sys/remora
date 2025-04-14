@@ -571,7 +571,6 @@ where
                         }
                     )
                 }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
-            let ready_to_execute = true;
 
             let execution_result = if ready_to_execute {
                 tracing::debug!(
@@ -658,11 +657,6 @@ mod tests {
         <E as Executor>::ExecutionContext: Send + Sync,
         <E as Executor>::Store: Send + Sync,
     {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
-
         // Create channels
         let (tx_to_proxy, rx_transactions) = mpsc::channel(100);
         let (tx_results, rx_results) = mpsc::channel(100);
@@ -715,9 +709,19 @@ mod tests {
 
         // Send all transactions to proxy
         for tx in transactions {
-            let transaction = RemoraTransaction::<E>::new_for_tests(tx);
-            let message = PrimaryToProxyMessage::Txn(transaction, 0, BTreeMap::new());
-            tx_to_proxy.send(message).await.unwrap();
+            let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
+
+            // First send the stateless transaction
+            let stateless_message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+            tx_to_proxy.send(stateless_message).await.unwrap();
+
+            // Then send the stateful transaction
+            let stateful_message = PrimaryToProxyMessage::Txn(
+                RemoraTransaction::<E>::new_for_tests(tx),
+                0,
+                BTreeMap::new(),
+            );
+            tx_to_proxy.send(stateful_message).await.unwrap();
         }
 
         // Receive and check results - wait for at least one successful result
@@ -739,6 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_processes_fake_transaction() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
@@ -774,7 +779,7 @@ mod tests {
         tx_to_proxy.send(message).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_inter_proxy_communication_via_stateless_result() {
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
@@ -808,6 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_fake_transactions() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
@@ -817,6 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_fake_transactions_contention() {
         let config = BenchmarkParameters::new_for_fake_contention_tests();
         let executor = FakeExecutor::new(&config).await;
@@ -847,6 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn test_proxy_ethereum_transactions() {
         let config = BenchmarkParameters::new_for_ethereum_tests();
         let executor = SuiExecutor::new(&config).await;

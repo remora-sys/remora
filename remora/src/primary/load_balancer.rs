@@ -13,7 +13,7 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, MissingStates, NewStates,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, MissingStates,
         PrimaryToProxyMessage, RemoraTransaction, Store,
     },
     metrics::Metrics,
@@ -44,8 +44,6 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
     index: ExecutorIndex,
-    /// The receiver of new effects from local executor and needs to forward to proxies.
-    rx_states_sync: Receiver<ExecutionResults<E>>,
     /// The mapping of the states and the proxy index.
     states_to_proxy: FxHashMap<ObjectID, ExecutorIndex>,
     /// The routing information of stateless.
@@ -56,8 +54,6 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
 }
 
-const FIB_CONSTANT: u64 = 11400714819323198485; // Golden ratio * 2^64
-
 impl<E: Executor> LoadBalancer<E> {
     /// Create a new load balancer.
     pub fn new(
@@ -65,7 +61,6 @@ impl<E: Executor> LoadBalancer<E> {
         store: Store<E>,
         rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_states_sync: Receiver<ExecutionResults<E>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -75,7 +70,6 @@ impl<E: Executor> LoadBalancer<E> {
             proxy_connections: Vec::new(),
             rx_committed_txns,
             index: 0,
-            rx_states_sync,
             states_to_proxy: FxHashMap::default(),
             stateless_routing: FxHashMap::default(),
             metrics,
@@ -97,32 +91,6 @@ impl<E: Executor> LoadBalancer<E> {
             })
             .collect()
     }
-
-    /// Fibonacci Hashing for ObjectID → Proxy Index Mapping (Fast & Even Distribution)
-    fn fast_fibonacci_hash(&self, object_id: &ObjectID) -> ExecutorIndex {
-        let mut hash = 0u64;
-        for chunk in object_id.chunks(8) {
-            let mut chunk_array = [0u8; 8];
-            chunk_array[..chunk.len()].copy_from_slice(chunk);
-            let num = u64::from_ne_bytes(chunk_array);
-            hash ^= num; // XOR to spread entropy
-        }
-
-        // Apply Fibonacci hashing for fast and even distribution
-        let proxy_count = self.proxy_connections.len().max(1); // Avoid div by zero
-        ((hash.wrapping_mul(FIB_CONSTANT)) >> (64 - proxy_count.ilog2())) as usize % proxy_count
-    }
-
-    /// Get assigned proxies for shared objects in a transaction.
-    /*fn get_proxies_for_shared_objects(
-        &self,
-        shared_object_ids: &[ObjectID],
-    ) -> HashSet<ExecutorIndex> {
-        shared_object_ids
-            .iter()
-            .map(|id| self.fast_fibonacci_hash(id))
-            .collect()
-    }*/
 
     /// Get assigned proxy for shared objects in a transaction.
     /// This is the main entry point for load balancing policy selection.
@@ -189,24 +157,6 @@ impl<E: Executor> LoadBalancer<E> {
         }
 
         Some(best_proxy)
-    }
-
-    #[deprecated]
-    /// Prepare state updates based on sharding
-    fn prepare_state_updates(
-        &mut self,
-        execution_result: ExecutionResults<E>,
-    ) -> FxHashMap<ExecutorIndex, NewStates> {
-        // HashMap to hold the updates for each executor
-        let mut updates_by_executor: FxHashMap<ExecutorIndex, NewStates> = FxHashMap::default();
-
-        for (object_id, object) in execution_result.new_state.unwrap() {
-            let executor_id = self.fast_fibonacci_hash(&object_id);
-            let entry = updates_by_executor.entry(executor_id).or_default();
-            entry.insert(object_id, object);
-        }
-
-        updates_by_executor
     }
 
     /// Determines the correct forwarding target for a transaction.
@@ -466,13 +416,11 @@ mod tests {
         ) = setup_test_environment(&config).await;
 
         // Create load balancer
-        let (_tx_states_sync, rx_states_sync) = channel(100);
         let lb = LoadBalancer::new(
             executor.clone(),
             store.clone(),
             rx_proxy_connections,
             rx_committed_txns,
-            rx_states_sync,
             metrics,
         );
 
@@ -546,13 +494,11 @@ mod tests {
         ) = setup_test_environment(&config).await;
 
         // Create load balancer
-        let (_tx_states_sync, rx_states_sync) = channel(100);
         let lb = LoadBalancer::new(
             executor.clone(),
             store.clone(),
             rx_proxy_connections,
             rx_committed_txns,
-            rx_states_sync,
             metrics.clone(),
         );
 
@@ -610,13 +556,11 @@ mod tests {
         ) = setup_test_environment(&config).await;
 
         // Create load balancer
-        let (_tx_states_sync, rx_states_sync) = channel(100);
         let lb = LoadBalancer::new(
             executor.clone(),
             store.clone(),
             rx_proxy_connections,
             rx_committed_txns,
-            rx_states_sync,
             metrics.clone(),
         );
 

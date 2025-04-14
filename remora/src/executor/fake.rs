@@ -311,6 +311,10 @@ impl FakeExecutor {
                 contention: _,
             } => execution_duration,
             WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
+            WorkloadType::FakeEthereumTransfers { execution_duration } => execution_duration,
+            WorkloadType::FakeEthereumNftMint { execution_duration } => execution_duration,
+            WorkloadType::FakeUniswapNormal { execution_duration } => execution_duration,
+            WorkloadType::FakeUniswapPeak { execution_duration } => execution_duration,
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
@@ -662,7 +666,6 @@ mod tests {
         config::{default_fake_execution_duration, BenchmarkParameters, WorkloadType},
         executor::{
             api::{Executor, TransactionWithTimestamp},
-            calibration::Calibration,
             fake::{
                 fake_owned_object, fake_shared_object, fake_shared_object_with_id,
                 generate_fake_load_objects_and_transactions,

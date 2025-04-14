@@ -13,7 +13,7 @@ use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{ExecutionResults, Executor, Timestamp},
+    executor::api::{ExecutionResults, Executor},
     metrics::Metrics,
     networking::server::NetworkServer,
 };
@@ -27,8 +27,6 @@ pub struct PrimaryNode<E: Executor> {
     pub consensus_handle: JoinHandle<()>,
     /// The handles for the network servers.
     pub network_handles: Vec<JoinHandle<io::Result<()>>>,
-    /// The receiver for the final execution results.
-    pub rx_output: Receiver<(Timestamp, ExecutionResults<E>)>,
     /// The receiver for client connections. These channels can be used to reply to the clients.
     pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
@@ -47,12 +45,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_proxy_results, rx_proxy_results) =
+        let (tx_proxy_results, _rx_proxy_results) =
             mpsc::channel::<ExecutionResults<E>>(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_output, rx_output) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        // let (tx_executor_local, rx_executor_local) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_states_sync, rx_states_sync) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
@@ -65,7 +60,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             store.clone(),
             rx_proxy_connections,
             rx_committed_txns,
-            rx_states_sync,
             metrics.clone(),
         )
         .spawn();
@@ -115,22 +109,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         .spawn();
         network_handles.push(proxy_network_handle);
 
-        // // Boot the primary executor. This component receives ordered transactions from consensus.
-        // // It then combines the pre-execution results from the proxies and re-executes the transactions
-        // // only if necessary.
-        // let store = Arc::new(executor.init_store());
-        // let primary_handle = PrimaryCore::new(
-        //     executor,
-        //     store,
-        //     rx_proxy_results,
-        //     tx_output,
-        //     tx_executor_local,
-        //     rx_executor_local,
-        //     tx_states_sync,
-        // )
-        // .spawn();
-        // primary_handles.push(primary_handle);
-
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.
         let transactions_network_handle = NetworkServer::new(
@@ -146,7 +124,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             primary_handles,
             consensus_handle,
             network_handles,
-            rx_output,
             rx_client_connections,
             metrics,
         }
@@ -161,20 +138,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         // TODO: In a real system, these connections would be used to reply to the clients, acknowledging
         // the receipt of the transaction and its final execution status.
         let mut client_connections = Vec::new();
-        let mut counter = 0;
 
         loop {
             tokio::select! {
-                Some((timestamp, result)) = self.rx_output.recv() => {
-                    tracing::debug!("Received output: {:?}", result);
-                    assert!(result.success());
-                    // TODO: Record transactions success and failure.
-                    self.metrics.update_metrics(timestamp);
-                    counter += 1;
-                    if counter % 100 == 0 {
-                        tracing::debug!("Successfully processed {counter} transactions");
-                    }
-                }
                 Some(connection) = self.rx_client_connections.recv() => {
                     tracing::info!("Received a new client connection");
                     client_connections.push(connection);
@@ -207,7 +173,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut primary = PrimaryNode::start(executor, &config, validator_metrics).await;
+        let _primary = PrimaryNode::start(executor, &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -215,14 +181,7 @@ mod tests {
             LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
 
         let transactions = load_generator.initialize().await;
-        let total_transactions = transactions.len();
         load_generator.run(transactions).await;
-
-        // Wait for all transactions to be processed.
-        for _ in 0..total_transactions {
-            let (_ts, result) = primary.rx_output.recv().await.unwrap();
-            assert!(result.success());
-        }
     }
 
     #[tokio::test]
@@ -241,7 +200,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let mut validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
+        let _validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -249,13 +208,6 @@ mod tests {
             LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
 
         let transactions = load_generator.initialize().await;
-        let total_transactions = transactions.len();
         load_generator.run(transactions).await;
-
-        // Wait for all transactions to be processed.
-        for _ in 0..total_transactions {
-            let (_ts, result) = validator.rx_output.recv().await.unwrap();
-            assert!(result.success());
-        }
     }
 }
