@@ -287,6 +287,7 @@ impl<E: Executor> LoadBalancer<E> {
 
                 Some(transactions) = self.rx_committed_txns.recv() => {
 
+                    // TODO: shall we avoid assign for non-shared-object txns
                     // Assign shared objects version.
                     self.executor
                         .assign_shared_object_versions(
