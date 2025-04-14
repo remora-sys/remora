@@ -400,7 +400,6 @@ mod tests {
     use crate::executor::sui::SuiExecutor;
     use crate::proxy::core::ProxyCore;
     use dashmap::DashMap;
-    use std::collections::HashMap;
     use tokio::sync::mpsc::{channel, Sender};
 
     // Helper function to set up common test environment
@@ -421,7 +420,7 @@ mod tests {
         // Create channels for load balancer
         let (tx_proxy_connections, rx_proxy_connections) = channel(100);
         let (tx_committed_txns, rx_committed_txns) = channel(100);
-        let (tx_results, rx_results) = channel(100);
+        let (_tx_results, rx_results) = channel(100);
 
         // Create metrics and store
         let metrics = Arc::new(Metrics::new_for_tests());
@@ -579,10 +578,11 @@ mod tests {
             tx_inter_proxy_replies,
             metrics.clone(),
         );
-        let proxy_handle = proxy.spawn();
+        let _proxy_handle = proxy.spawn();
+
         // Spawn load balancer
         let _lb_handle = lb.spawn();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
         // Connect proxy to load balancer
         tx_proxy_connections.send(tx_to_proxy).await.unwrap();
 
@@ -647,7 +647,7 @@ mod tests {
             tx_inter_proxy_replies1,
             metrics.clone(),
         );
-        let proxy_handle1 = proxy1.spawn();
+        let _proxy_handle1 = proxy1.spawn();
 
         // Create and spawn second proxy core
         let proxy_store2 = Arc::new(executor.init_store());
@@ -661,7 +661,7 @@ mod tests {
             tx_inter_proxy_replies2,
             metrics.clone(),
         );
-        let proxy_handle2 = proxy2.spawn();
+        let _proxy_handle2 = proxy2.spawn();
 
         // Connect proxies to load balancer
         tx_proxy_connections.send(tx_to_proxy1).await.unwrap();
@@ -683,12 +683,12 @@ mod tests {
         let mut finished_count = 0;
 
         // Check results from first proxy
-        while let Ok(result) = rx_results1.try_recv() {
+        while let Ok(_) = rx_results1.try_recv() {
             finished_count += 1;
         }
 
         // Check results from second proxy
-        while let Ok(result) = rx_results2.try_recv() {
+        while let Ok(_) = rx_results2.try_recv() {
             finished_count += 1;
         }
 

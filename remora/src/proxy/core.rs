@@ -26,6 +26,7 @@ use crate::{
             InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
             RemoraTransaction, StateStore, Store,
         },
+        oneshot_dependency_controller::OneshotDependencyController,
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -51,8 +52,8 @@ pub struct ProxyCore<E: Executor> {
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     /// The dependency controller for multi-core tx execution.
     stateful_controller: Arc<VersionedDependencyController>,
-    /// The buffer of stateless transactions.
-    stateless_txn_results: DashMap<TransactionDigest, bool>,
+    /// The dependency controller for stateless transactions.
+    stateless_controller: Arc<OneshotDependencyController>,
     /// The buffer of pending stateful transactions which are waiting for the stateless results.
     pending_stateful_txns: DashMap<TransactionDigest, (RemoraTransaction<E>, MissingStates)>,
     /// The  metrics for the proxy
@@ -87,7 +88,7 @@ where
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
             stateful_controller: Arc::new(VersionedDependencyController::new()),
-            stateless_txn_results: DashMap::new(),
+            stateless_controller: Arc::new(OneshotDependencyController::new()),
             pending_stateful_txns: DashMap::new(),
             metrics,
         }
@@ -123,34 +124,6 @@ where
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
         match message {
-            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
-                tracing::debug!(
-                    "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
-                    self.id,
-                    transaction.digest(),
-                    stateless_res_proxy_id
-                );
-
-                if stateless_res_proxy_id == self.id {
-                    return self
-                        .schedule_stateful_transaction(transaction, missing_states)
-                        .await;
-                }
-
-                // Send stateless request to the appropriate proxy
-                let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
-                let tx = self
-                    .tx_inter_proxy_replies
-                    .get(&stateless_res_proxy_id)
-                    .unwrap();
-                if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
-                    tracing::error!("Failed to send stateless request: {}", e);
-                }
-
-                self.pending_stateful_txns
-                    .insert(*transaction.digest(), (transaction, missing_states));
-            }
-
             PrimaryToProxyMessage::StatelessTxn(transaction) => {
                 tracing::debug!(
                     "Proxy {} received stateless transaction {:?}",
@@ -159,7 +132,74 @@ where
                 );
                 self.process_stateless_transaction(transaction).await
             }
+
+            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
+                tracing::debug!(
+                    "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
+                    self.id,
+                    transaction.digest(),
+                    stateless_res_proxy_id
+                );
+                self.process_stateful_transaction(
+                    transaction,
+                    stateless_res_proxy_id,
+                    missing_states,
+                )
+                .await;
+            }
         }
+    }
+
+    async fn process_stateful_transaction(
+        &mut self,
+        transaction: RemoraTransaction<E>,
+        stateless_res_proxy_id: ProxyId,
+        missing_states: MissingStates,
+    ) {
+        if stateless_res_proxy_id == self.id {
+            let rx = self
+                .stateless_controller
+                .get_dependencies(transaction.digest())
+                .unwrap();
+            // Check the stateless verification result before scheduling
+            match rx.await {
+                Ok(true) => {
+                    self.schedule_stateful_transaction(transaction, missing_states)
+                        .await;
+                    return;
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        "Proxy {} skipping transaction {:?} due to failed stateless verification",
+                        self.id,
+                        transaction.digest()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Proxy {} failed to get stateless result for {:?}: {:?}",
+                        self.id,
+                        transaction.digest(),
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Send stateless request to the appropriate proxy
+        let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
+        let tx = self
+            .tx_inter_proxy_replies
+            .get(&stateless_res_proxy_id)
+            .unwrap();
+        if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
+            tracing::error!("Failed to send stateless request: {}", e);
+        }
+
+        self.pending_stateful_txns
+            .insert(*transaction.digest(), (transaction, missing_states));
     }
 
     async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
@@ -169,8 +209,11 @@ where
             transaction.digest()
         );
 
+        let tx = self
+            .stateless_controller
+            .set_dependency(*transaction.digest());
+
         let context = self.executor.context().clone();
-        let stateless_txn_results = self.stateless_txn_results.clone();
         let id = self.id;
         tokio::spawn(async move {
             let res = E::verify_transaction(context, &transaction).await;
@@ -180,7 +223,7 @@ where
                 transaction.digest(),
                 res
             );
-            stateless_txn_results.insert(*transaction.digest(), res);
+            tx.send(res).expect("Failed to send result");
         });
     }
 
@@ -204,7 +247,7 @@ where
                         proxy_id,
                         txn_digest
                     );
-                    self.handle_stateless_request(proxy_id, txn_digest).await;
+                    self.handle_stateless_request(proxy_id, &txn_digest).await;
                 }
             },
             ProxyToProxyMessage::Reply(reply) => match reply {
@@ -342,7 +385,11 @@ where
         });
     }
 
-    async fn handle_stateless_request(&mut self, proxy_id: ProxyId, txn_digest: TransactionDigest) {
+    async fn handle_stateless_request(
+        &mut self,
+        proxy_id: ProxyId,
+        txn_digest: &TransactionDigest,
+    ) {
         tracing::debug!(
             "Proxy {} handling stateless request from proxy {} for transaction {:?}",
             self.id,
@@ -350,12 +397,13 @@ where
             txn_digest
         );
 
-        let verification_result = self
-            .stateless_txn_results
-            .remove(&txn_digest)
-            .unwrap_or((txn_digest, false));
+        let rx = self
+            .stateless_controller
+            .get_dependencies(&txn_digest)
+            .unwrap();
+        let verification_result = rx.await.unwrap();
 
-        let reply = InterProxyReply::Stateless(verification_result.0, verification_result.1);
+        let reply = InterProxyReply::Stateless(*txn_digest, verification_result);
         Self::send_msg_to_proxy(
             self.tx_inter_proxy_replies.clone(),
             proxy_id,
