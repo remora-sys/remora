@@ -404,7 +404,9 @@ mod tests {
     use tokio::sync::mpsc::{channel, Sender};
 
     // Helper function to set up common test environment
-    async fn setup_test_environment() -> (
+    async fn setup_test_environment(
+        config: &BenchmarkParameters,
+    ) -> (
         SuiExecutor,
         Arc<Metrics>,
         Arc<<SuiExecutor as Executor>::Store>,
@@ -414,13 +416,6 @@ mod tests {
         Receiver<Vec<RemoraTransaction<SuiExecutor>>>,
         Receiver<ExecutionResults<SuiExecutor>>,
     ) {
-        // Setup test environment
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
-
-        let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
 
         // Create channels for load balancer
@@ -459,6 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_balancer_rr_forwarding() {
+        let config = BenchmarkParameters::new_for_tests();
         let (
             executor,
             metrics,
@@ -468,7 +464,7 @@ mod tests {
             rx_proxy_connections,
             rx_committed_txns,
             _rx_results,
-        ) = setup_test_environment().await;
+        ) = setup_test_environment(&config).await;
 
         // Create load balancer
         let (_tx_states_sync, rx_states_sync) = channel(100);
@@ -493,7 +489,6 @@ mod tests {
         tx_proxy_connections.send(tx_to_proxy2).await.unwrap();
 
         // Generate transactions
-        let config = BenchmarkParameters::new_for_tests();
         let remora_txns = generate_test_transactions(&config, 5).await;
 
         // Send transactions to load balancer
@@ -535,9 +530,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tracing_test::traced_test]
     async fn test_load_balancer_with_one_proxy() {
         // Setup test environment
+        let config = BenchmarkParameters::new_for_tests();
         let (
             executor,
             metrics,
@@ -547,7 +544,7 @@ mod tests {
             rx_proxy_connections,
             rx_committed_txns,
             _rx_results,
-        ) = setup_test_environment().await;
+        ) = setup_test_environment(&config).await;
 
         // Create load balancer
         let (_tx_states_sync, rx_states_sync) = channel(100);
@@ -567,6 +564,10 @@ mod tests {
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         // Create and spawn proxy core
+        // Generate transactions
+        let remora_txns = generate_test_transactions(&config, 3).await;
+
+        let executor = SuiExecutor::new(&config).await;
         let proxy_store = Arc::new(executor.init_store());
         let proxy = ProxyCore::new(
             0,
@@ -579,30 +580,24 @@ mod tests {
             metrics.clone(),
         );
         let proxy_handle = proxy.spawn();
-
-        // Connect proxy to load balancer
-        tx_proxy_connections.send(tx_to_proxy).await.unwrap();
-
         // Spawn load balancer
         let _lb_handle = lb.spawn();
-
-        // Generate transactions
-        let config = BenchmarkParameters::new_for_tests();
-        let remora_txns = generate_test_transactions(&config, 3).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Connect proxy to load balancer
+        tx_proxy_connections.send(tx_to_proxy).await.unwrap();
 
         // Send transactions to load balancer
         tx_committed_txns.send(remora_txns.clone()).await.unwrap();
 
         // Add sleep to ensure all operations complete
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Drop proxy handle
-        drop(proxy_handle);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tracing_test::traced_test]
     async fn test_load_balancer_with_two_proxies() {
         // Setup test environment
+        let config = BenchmarkParameters::new_for_contention_tests();
         let (
             executor,
             metrics,
@@ -612,7 +607,7 @@ mod tests {
             rx_proxy_connections,
             rx_committed_txns,
             _rx_results,
-        ) = setup_test_environment().await;
+        ) = setup_test_environment(&config).await;
 
         // Create load balancer
         let (_tx_states_sync, rx_states_sync) = channel(100);
@@ -627,13 +622,13 @@ mod tests {
 
         // Setup first proxy and its channels
         let (tx_to_proxy1, rx_from_lb1) = channel(100);
-        let (tx_results1, _) = channel(100);
+        let (tx_results1, mut rx_results1) = channel(100);
         let (tx_inter_proxy_requests1, rx_inter_proxy_requests1) = channel(100);
         let tx_inter_proxy_replies1 = Arc::new(DashMap::new());
 
         // Setup second proxy and its channels
         let (tx_to_proxy2, rx_from_lb2) = channel(100);
-        let (tx_results2, _) = channel(100);
+        let (tx_results2, mut rx_results2) = channel(100);
         let (tx_inter_proxy_requests2, rx_inter_proxy_requests2) = channel(100);
         let tx_inter_proxy_replies2 = Arc::new(DashMap::new());
 
@@ -647,7 +642,7 @@ mod tests {
             executor.clone(),
             proxy_store1,
             rx_from_lb1,
-            tx_results1,
+            tx_results1.clone(),
             rx_inter_proxy_requests1,
             tx_inter_proxy_replies1,
             metrics.clone(),
@@ -661,7 +656,7 @@ mod tests {
             executor.clone(),
             proxy_store2,
             rx_from_lb2,
-            tx_results2,
+            tx_results2.clone(),
             rx_inter_proxy_requests2,
             tx_inter_proxy_replies2,
             metrics.clone(),
@@ -676,17 +671,32 @@ mod tests {
         let _lb_handle = lb.spawn();
 
         // Generate transactions
-        let config = BenchmarkParameters::new_for_contention_tests();
         let remora_txns = generate_test_transactions(&config, 4).await;
 
         // Send transactions to load balancer
         tx_committed_txns.send(remora_txns.clone()).await.unwrap();
 
         // Add sleep to ensure all operations complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        // Drop proxy handles
-        drop(proxy_handle1);
-        drop(proxy_handle2);
+        // Poll the results channels to verify transaction completion
+        let mut finished_count = 0;
+
+        // Check results from first proxy
+        while let Ok(result) = rx_results1.try_recv() {
+            finished_count += 1;
+        }
+
+        // Check results from second proxy
+        while let Ok(result) = rx_results2.try_recv() {
+            finished_count += 1;
+        }
+
+        // Verify that all 4 transactions were processed
+        assert_eq!(
+            finished_count, 4,
+            "Expected 4 completed transactions, got {}",
+            finished_count
+        );
     }
 }

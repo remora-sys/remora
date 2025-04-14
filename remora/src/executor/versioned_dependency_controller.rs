@@ -114,7 +114,14 @@ impl VersionedDependencyController {
 
         // Remove the entry with the latest sequence number if found
         if let Some(seq) = latest_seq {
+            tracing::debug!(
+                "Found latest handle for object {} with sequence number {}",
+                obj_id,
+                seq
+            );
             self.obj_task_map.remove(&(*obj_id, seq));
+        } else {
+            tracing::debug!("No handle found for object {}", obj_id);
         }
 
         latest_handle

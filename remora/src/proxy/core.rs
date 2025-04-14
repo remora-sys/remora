@@ -26,7 +26,7 @@ use crate::{
             InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
             RemoraTransaction, StateStore, Store,
         },
-        versioned_dependency_controller::VersionedDependencyController,
+        versioned_stateful_controller::VersionedDependencyController,
     },
     metrics::Metrics,
 };
@@ -50,7 +50,7 @@ pub struct ProxyCore<E: Executor> {
     /// The sender for inter-proxy replies.
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     /// The dependency controller for multi-core tx execution.
-    dependency_controller: Arc<VersionedDependencyController>,
+    stateful_controller: Arc<VersionedDependencyController>,
     /// The buffer of stateless transactions.
     stateless_txn_results: DashMap<TransactionDigest, bool>,
     /// The buffer of pending stateful transactions which are waiting for the stateless results.
@@ -86,7 +86,7 @@ where
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
-            dependency_controller: Arc::new(VersionedDependencyController::new()),
+            stateful_controller: Arc::new(VersionedDependencyController::new()),
             stateless_txn_results: DashMap::new(),
             pending_stateful_txns: DashMap::new(),
             metrics,
@@ -168,15 +168,20 @@ where
             self.id,
             transaction.digest()
         );
-        let res = E::verify_transaction(self.executor.context().clone(), &transaction).await;
-        tracing::debug!(
-            "Proxy {} completed stateless verification for {:?}, result: {}",
-            self.id,
-            transaction.digest(),
-            res
-        );
-        self.stateless_txn_results
-            .insert(*transaction.digest(), res);
+
+        let context = self.executor.context().clone();
+        let stateless_txn_results = self.stateless_txn_results.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            let res = E::verify_transaction(context, &transaction).await;
+            tracing::debug!(
+                "Proxy {} completed stateless verification for {:?}, result: {}",
+                id,
+                transaction.digest(),
+                res
+            );
+            stateless_txn_results.insert(*transaction.digest(), res);
+        });
     }
 
     async fn handle_proxy_message(&mut self, message: ProxyToProxyMessage) {
@@ -237,7 +242,7 @@ where
             .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
             .collect();
         let (_, current_handles) = self
-            .dependency_controller
+            .stateful_controller
             .get_prior_dependency_and_update(0, objs, true, false);
 
         let store = self.store.clone();
@@ -296,7 +301,7 @@ where
         let mut prior_handles = Vec::new();
         for obj_id in requested_states.iter() {
             let latest_handle = self
-                .dependency_controller
+                .stateful_controller
                 .get_latest_handle_for_object(obj_id);
 
             if latest_handle.is_none() {
@@ -311,6 +316,7 @@ where
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
+            tracing::debug!("Ready to get objects for stateful request");
             let mut objects = BTreeMap::new();
             for state in requested_states {
                 let object = match store.read_object(&state) {
@@ -363,6 +369,19 @@ where
         proxy_id: ProxyId,
         message: ProxyToProxyMessage,
     ) {
+        let message_type = match &message {
+            ProxyToProxyMessage::Request(req) => match req {
+                InterProxyRequest::Stateful(_, _) => "Stateful request",
+                InterProxyRequest::Stateless(_, _) => "Stateless request",
+            },
+            ProxyToProxyMessage::Reply(reply) => match reply {
+                InterProxyReply::Stateful(_) => "Stateful reply",
+                InterProxyReply::Stateless(_, _) => "Stateless reply",
+            },
+        };
+
+        tracing::debug!("Sending {} to proxy {}", message_type, proxy_id);
+
         if let Some(tx) = tx_inter_proxy_replies.get(&proxy_id) {
             if tx.send(message).await.is_err() {
                 tracing::warn!(
@@ -460,7 +479,7 @@ where
         }
 
         let (prior_handles, current_handles) = self
-            .dependency_controller
+            .stateful_controller
             .get_prior_dependency_and_update(0, obj_ids.clone(), false, false);
 
         (obj_ids, prior_handles, current_handles)
@@ -484,12 +503,12 @@ where
         let tx_results = self.tx_results.clone();
         let ctx = self.executor.context().clone();
         let metrics = self.metrics.clone();
-        let dependency_controller = self.dependency_controller.clone();
+        let stateful_controller = self.stateful_controller.clone();
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
-            dependency_controller.remove_dependency(obj_ids.clone());
+            stateful_controller.remove_dependency(obj_ids.clone());
 
             // check the version ID for shared objects
             // skip if versions don't match
