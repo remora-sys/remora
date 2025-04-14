@@ -67,108 +67,43 @@ where
         mut reader: OwnedReadHalf,
         tx_incoming: Sender<I>,
     ) -> io::Result<()> {
-        use futures::{stream, StreamExt};
+        let mut buffer = vec![0u8; Self::MAX_MESSAGE_SIZE as usize].into_boxed_slice();
 
-        let buffer_size = Self::MAX_MESSAGE_SIZE;
+        loop {
+            // Deserialize the message.
+            let size = reader.read_u32().await?;
+            let message = &mut buffer[..size as usize];
+            let bytes_read = reader.read_exact(message).await?;
+            debug_assert_eq!(bytes_read, message.len());
 
-        // Create an stream using unfold.
-        let message_stream = stream::unfold(&mut reader, move |reader| async move {
-            match reader.read_u32().await {
-                Ok(size) => {
-                    let size = size as usize;
-
-                    // Make sure that the size is not larger than the buffer size to prevent overflows.
-                    if size > buffer_size {
-                        tracing::error!(
-                            "Message size exceeds maximum allowed: {} > {}",
-                            size,
-                            buffer_size
-                        );
-                        return None;
+            // Send the message to the application layer.
+            match bincode::deserialize(message) {
+                Ok(data) => {
+                    if tx_incoming.send(data).await.is_err() {
+                        tracing::warn!("Cannot send message to application layer, stopping worker");
+                        break Ok(());
                     }
-
-                    let mut message = vec![0u8; size];
-                    match reader.read_exact(&mut message).await {
-                        Ok(_) => Some((message, reader)),
-                        Err(e) => {
-                            tracing::error!("Error reading message content: {:?}", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    tracing::warn!("Connection closed by peer (EOF)");
-                    None
                 }
                 Err(e) => {
-                    tracing::error!("Error reading message size: {:?}", e);
-                    None
+                    tracing::error!("Cannot deserialize message (killing connection): {e:?}");
+                    break Ok(());
                 }
             }
-        });
-
-        message_stream
-            .for_each_concurrent(Some(Self::MAX_BATCH_SIZE), |message| {
-                let tx_incoming = tx_incoming.clone();
-                async move {
-                    match bincode::deserialize::<I>(&message) {
-                        Ok(data) => {
-                            if tx_incoming.send(data).await.is_err() {
-                                tracing::warn!(
-                                    "Cannot send message to application layer, stopping worker"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Cannot deserialize message (killing connection): {:?}",
-                                e
-                            );
-                        }
-                    }
-                }
-            })
-            .await;
-
-        Ok(())
+        }
     }
 
-    /// Handle writing from the stream.
+    /// Handle writing to the stream.
     async fn handle_write_stream(
         mut writer: OwnedWriteHalf,
         mut rx_outgoing: Receiver<O>,
     ) -> io::Result<()> {
-        let mut buffer: Vec<O> = Vec::with_capacity(Self::MAX_BATCH_SIZE);
-        let mut serialized_buffer: Vec<u8> = Vec::new();
-
-        loop {
-            let num_received = rx_outgoing
-                .recv_many(&mut buffer, Self::MAX_BATCH_SIZE)
-                .await;
-
-            if num_received == 0 {
-                tracing::warn!(
-                    "Outgoing channel closed, stopping write stream but keeping connection alive"
-                );
-                break;
-            }
-
-            // Batching writes
-            for transaction in &buffer {
-                let serialized = bincode::serialize(transaction).expect("Infallible serialization");
-
-                let size = serialized.len() as u32;
-                serialized_buffer.extend_from_slice(&size.to_be_bytes());
-
-                serialized_buffer.extend_from_slice(&serialized);
-            }
-
-            writer.write_all(&serialized_buffer).await?;
-
-            serialized_buffer.clear();
-            buffer.clear();
+        while let Some(transaction) = rx_outgoing.recv().await {
+            // Serialize and send the message.
+            let serialized = bincode::serialize(&transaction).expect("Infallible serialization");
+            writer.write_u32(serialized.len() as u32).await?;
+            writer.write_all(&serialized).await?;
         }
-
+        tracing::warn!("Cannot receive transaction from application layer, stopping worker");
         Ok(())
     }
 

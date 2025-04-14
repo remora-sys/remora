@@ -224,8 +224,20 @@ impl<E: Executor> LoadBalancer<E> {
         let message = if is_stateful {
             let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
             let missing_states = self.get_missing_states_for_transaction(&transaction, proxy_index);
+            tracing::debug!(
+                "Sending stateful transaction to proxy {}: digest={:?}, stateless_proxy_id={}, missing_states_count={}",
+                proxy_index,
+                transaction.digest(),
+                stateless_proxy_id,
+                missing_states.len()
+            );
             PrimaryToProxyMessage::Txn(transaction, stateless_proxy_id, missing_states)
         } else {
+            tracing::debug!(
+                "Sending stateless transaction to proxy {}: digest={:?}",
+                proxy_index,
+                transaction.digest()
+            );
             self.stateless_routing
                 .insert(*transaction.digest(), proxy_index);
             PrimaryToProxyMessage::StatelessTxn(transaction)

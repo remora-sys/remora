@@ -161,6 +161,7 @@ where
                 .stateless_controller
                 .get_dependencies(transaction.digest())
                 .unwrap();
+
             // Check the stateless verification result before scheduling
             match rx.await {
                 Ok(true) => {
