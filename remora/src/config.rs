@@ -59,15 +59,6 @@ pub fn default_metrics_address() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18502)
 }
 
-/// Configuration to collocate pre-executors.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CollocatedPreExecutors {
-    /// The number of pre-executors running on the same machine as the primary.
-    pub primary: usize,
-    /// The number of pre-executors running on each proxy machine.
-    pub proxy: usize,
-}
-
 /// The parameters for the validator.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ValidatorParameters {
@@ -116,6 +107,8 @@ pub struct ProxyInfo {
     pub proxy_id: ProxyId,
     /// The listening address for the proxy's P2P network.
     pub listen_address: SocketAddr,
+    /// The address for metrics
+    pub metrics_address: SocketAddr,
 }
 
 /// The configuration for the validator, containing network addresses.
@@ -144,10 +137,12 @@ impl ValidatorConfig {
                 proxy_id: 0,
                 // Derive a unique port number from the base address.
                 listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
+                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
             },
             ProxyInfo {
                 proxy_id: 1,
                 listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
+                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
             },
         ];
 

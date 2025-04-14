@@ -4,14 +4,14 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{io, marker::PhantomData, sync::Arc};
 use tokio::{
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{Executor, ProxyToProxyMessage},
+    executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
     proxy::core::{ProxyCore, ProxyId},
@@ -22,10 +22,12 @@ pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
     core_handles: Vec<JoinHandle<NodeResult<()>>>,
+    /// The receiver for the proxy results.
+    rx_proxy_results: Receiver<ExecutionResults<E>>,
     /// The handle for the network client.
     _network_handles: Vec<JoinHandle<io::Result<()>>>,
-    /// The  metrics for the proxy
-    _metrics: Arc<Metrics>,
+    /// The metrics for the proxy
+    metrics: Arc<Metrics>,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
@@ -65,15 +67,17 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             // Skip creating a connection to self
             if proxy_info.proxy_id != id {
                 let (tx_replies, rx_replies) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-                tx_inter_proxy_replies.insert(proxy_info.proxy_id.clone(), tx_replies);
+                tx_inter_proxy_replies.insert(proxy_info.proxy_id.clone(), tx_replies.clone());
 
-                // ignore the outgoing direction
+                // Keep both ends of the channel to avoid dropping
                 let (tx_placeholder, _) =
                     mpsc::channel::<ProxyToProxyMessage>(DEFAULT_CHANNEL_SIZE);
+
                 // Create network client to connect to other proxy
                 let client_handle =
                     NetworkClient::new(proxy_info.listen_address, tx_placeholder, rx_replies)
                         .spawn();
+
                 network_handles.push(client_handle);
             }
         }
@@ -92,44 +96,61 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         .spawn();
         core_handles.push(core_handle);
 
-        // communication for distributed transactions from the load balancer in the primary
-        let network_handle = NetworkClient::new(
-            config.proxy_server_address,
-            tx_transactions,
-            rx_proxy_results,
-        )
-        .spawn();
-        network_handles.push(network_handle);
-
-        // ignore the outgoing direction
-        let (tx_placeholder, _) =
+        // Create a proper channel for new connections from other proxies
+        let (tx_connections, _) =
             mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
         // Create a server that listens for connections from other proxies
         let inter_proxy_server_handle = NetworkServer::new(
             our_proxy_info.listen_address,
-            tx_placeholder,
+            tx_connections,
             tx_inter_proxy_requests.clone(),
         )
         .spawn();
         network_handles.push(inter_proxy_server_handle);
 
+        let (_, rx_placeholder) = mpsc::channel::<
+            PrimaryToProxyMessage<<E as Executor>::Transaction>,
+        >(DEFAULT_CHANNEL_SIZE);
+        let network_handle =
+            NetworkClient::new(config.proxy_server_address, tx_transactions, rx_placeholder)
+                .spawn();
+        network_handles.push(network_handle);
+
         Self {
             phantom_data: PhantomData,
             core_handles,
+            rx_proxy_results,
             _network_handles: network_handles,
-            _metrics: metrics,
+            metrics,
         }
     }
 
-    /// Collect the results from the validator.
-    pub fn await_completion(self) {
-        for handle in self.core_handles {
-            // tokio::task::JoinHandle requires awaiting in an async context
-            match tokio::runtime::Handle::current().block_on(handle) {
-                Ok(Ok(_)) => println!("Thread completed successfully!"),
-                Ok(Err(e)) => println!("Thread failed with error: {:?}", e),
-                Err(e) => println!("Thread panicked: {:?}", e),
-            }
+    /// Collect the results from the validator and wait for core handles to complete.
+    pub async fn await_completion(&mut self) {
+        // Take ownership of the core_handles to avoid ownership issues
+        let core_handles = std::mem::take(&mut self.core_handles);
+
+        // Spawn a task to wait for all core handles to complete
+        let mut core_completion = tokio::spawn(async move {
+            futures::future::join_all(core_handles).await;
+            tracing::info!("All core tasks have completed");
+        });
+
+        // Process results until core tasks complete
+        while let Some(result) = tokio::select! {
+            result = self.rx_proxy_results.recv() => result,
+            _ = &mut core_completion => None,
+        } {
+            // tracing::debug!("Received output: {:?}", result);
+            assert!(result.success());
+            let submit_timestamp = result.transaction_timestamp();
+            // TODO: Record transactions success and failure.
+            self.metrics.update_metrics(submit_timestamp);
+        }
+
+        // Ensure core_completion task is done
+        if let Err(e) = core_completion.await {
+            tracing::error!("Error in core completion task: {:?}", e);
         }
     }
 }

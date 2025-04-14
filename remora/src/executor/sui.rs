@@ -362,6 +362,7 @@ impl Executor for SuiExecutor {
         );
         store.commit_objects(inner_temp_store);
 
+        // TODO: should avoid duplicated txn in returns
         SuiExecutionResults::new(transaction, Some(effects), Some(written))
     }
 

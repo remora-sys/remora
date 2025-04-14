@@ -1,5 +1,14 @@
 proxy_server_address: "127.0.0.1:8080"
 client_server_address: "127.0.0.1:8081"
+# Proxy configurations
+proxies:
+  - proxy_id: 0
+    listen_address: 127.0.0.1:19000
+    metrics_address: 127.0.0.1:19090
+  - proxy_id: 1
+    listen_address: 127.0.0.1:19001
+    metrics_address: 127.0.0.1:19091
+
 metrics_address: "127.0.0.1:9090"
 validator_parameters:
   collocated_pre_executors:
