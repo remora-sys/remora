@@ -97,10 +97,16 @@ where
     /// Run the proxy.
     async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Proxy {} started", self.id);
+        let mut task_id = 0;
         loop {
             tokio::select! {
                 // handle transactions from the primary
                 Some(message) = self.rx_transactions.recv() => {
+                    if task_id == 0 {
+                        self.metrics.register_start_time();
+                    }
+                    task_id += 1;
+
                     self.handle_primary_message(message).await;
                 }
 
@@ -474,13 +480,6 @@ where
         self.executor
             .assign_shared_object_versions(&[transaction.deref().clone()])
             .await;
-
-        // let new_task_id = if task_id == 0 {
-        //     self.metrics.register_start_time();
-        //     1
-        // } else {
-        //     task_id + 1
-        // };
 
         self.metrics.increase_proxy_load(self.id);
 

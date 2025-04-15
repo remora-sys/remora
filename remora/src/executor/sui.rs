@@ -293,6 +293,8 @@ impl Executor for SuiExecutor {
         store: Arc<InMemoryObjectStore>,
         transaction: SuiTransaction,
     ) -> SuiExecutionResults {
+        let start_time = Instant::now();
+
         let tx_id = transaction.digest();
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.benchmark_ctx().validator();
@@ -362,6 +364,12 @@ impl Executor for SuiExecutor {
         );
         store.commit_objects(inner_temp_store);
 
+        let elapsed = start_time.elapsed();
+        tracing::debug!(
+            "[{tx_id}] Transaction execution took {} us",
+            elapsed.as_micros()
+        );
+
         // TODO: should avoid duplicated txn in returns
         SuiExecutionResults::new(transaction, Some(effects), Some(written))
     }
@@ -419,9 +427,17 @@ impl Executor for SuiExecutor {
         ctx: Arc<Self::ExecutionContext>,
         _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
+        let start_time = Instant::now();
+        let tx_id = _transaction.digest();
         let spins = ctx.verification_spins();
 
         Calibration::calibrated_work(spins);
+
+        let elapsed = start_time.elapsed();
+        tracing::debug!(
+            "[{tx_id}] Transaction verification took {} us",
+            elapsed.as_micros()
+        );
         true
     }
 
