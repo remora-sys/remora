@@ -131,7 +131,7 @@ async fn start_node<E>(
                     .proxies
                     .get(proxy_id)
                     .unwrap()
-                    .listen_address
+                    .listen_proxy_address
             );
             // Periodically print metrics.
             let workload = "default".to_string();

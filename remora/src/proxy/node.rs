@@ -75,7 +75,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
 
                 // Create network client to connect to other proxy
                 let client_handle =
-                    NetworkClient::new(proxy_info.listen_address, tx_placeholder, rx_replies)
+                    NetworkClient::new(proxy_info.listen_proxy_address, tx_placeholder, rx_replies)
                         .spawn();
 
                 network_handles.push(client_handle);
@@ -101,20 +101,31 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
         // Create a server that listens for connections from other proxies
         let inter_proxy_server_handle = NetworkServer::new(
-            our_proxy_info.listen_address,
+            our_proxy_info.listen_proxy_address,
             tx_connections,
             tx_inter_proxy_requests.clone(),
         )
         .spawn();
         network_handles.push(inter_proxy_server_handle);
 
-        let (_, rx_placeholder) = mpsc::channel::<
-            PrimaryToProxyMessage<<E as Executor>::Transaction>,
+        let (tx_primary_connection, _) = mpsc::channel::<
+            Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         >(DEFAULT_CHANNEL_SIZE);
-        let network_handle =
-            NetworkClient::new(config.proxy_server_address, tx_transactions, rx_placeholder)
-                .spawn();
-        network_handles.push(network_handle);
+
+        let primary_connection_handle = NetworkServer::new(
+            our_proxy_info.listen_primary_address,
+            tx_primary_connection,
+            tx_transactions,
+        )
+        .spawn();
+        network_handles.push(primary_connection_handle);
+        // let (_, rx_placeholder) = mpsc::channel::<
+        //     PrimaryToProxyMessage<<E as Executor>::Transaction>,
+        // >(DEFAULT_CHANNEL_SIZE);
+        // let network_handle =
+        //     NetworkClient::new(config.proxy_server_address, tx_transactions, rx_placeholder)
+        //         .spawn();
+        // network_handles.push(network_handle);
 
         Self {
             phantom_data: PhantomData,

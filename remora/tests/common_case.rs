@@ -1,8 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use remora::{
     client::load_generator::LoadGenerator,
     config::{BenchmarkParameters, ValidatorConfig, ValidatorParameters},
@@ -12,6 +10,8 @@ use remora::{
     proxy::node::ProxyNode,
 };
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 
 async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
     executor: E,
@@ -46,9 +46,20 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
     .await;
     tokio::task::yield_now().await;
 
-    // Start a remote proxy.
-    let proxy_id = 0;
-    let _proxy = ProxyNode::start(proxy_id, executor, &validator_config, validator_metrics).await;
+    // Start two remote proxies.
+    let proxy_id_1 = 0;
+    let _proxy1 = ProxyNode::start(
+        proxy_id_1,
+        executor.clone(),
+        &validator_config,
+        validator_metrics.clone(),
+    )
+    .await;
+    tokio::task::yield_now().await;
+
+    let proxy_id_2 = 1;
+    let _proxy2 =
+        ProxyNode::start(proxy_id_2, executor, &validator_config, validator_metrics).await;
     tokio::task::yield_now().await;
 
     // Generate transactions.
@@ -59,9 +70,10 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn remote_proxy_sui() {
-    let config = BenchmarkParameters::new_for_tests();
+    let config = BenchmarkParameters::new_for_ethereum_tests();
     let executor = SuiExecutor::new(&config).await;
-    remote_proxy_common::<SuiExecutor>(executor, config).await;
+    remote_proxy_common::<SuiExecutor>(executor, config.clone()).await;
+    tokio::time::sleep(Duration::from_secs(config.duration.as_secs())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

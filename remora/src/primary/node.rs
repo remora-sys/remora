@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use rustc_hash::FxHashMap;
 use std::{io, marker::PhantomData, sync::Arc};
 
 use serde::de::DeserializeOwned;
@@ -13,9 +14,9 @@ use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{ExecutionResults, Executor},
+    executor::api::{Executor, PrimaryToProxyMessage},
     metrics::Metrics,
-    networking::server::NetworkServer,
+    networking::{client::NetworkClient, server::NetworkServer},
 };
 
 /// The single machine validator is a simple validator that runs all components.
@@ -44,21 +45,37 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_proxy_connections, rx_proxy_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (tx_proxy_results, _rx_proxy_results) =
-            mpsc::channel::<ExecutionResults<E>>(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+
+        // For storing proxy connections
+        let mut proxy_connections = FxHashMap::default();
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
         let store = Arc::new(executor.init_store());
 
+        // Connect to each proxy server
+        for (idx, proxy_info) in config.proxies.iter().enumerate() {
+            let (tx_proxy, rx_proxy) =
+                mpsc::channel::<PrimaryToProxyMessage<E::Transaction>>(DEFAULT_CHANNEL_SIZE);
+
+            let network_client_handle = NetworkClient::new(
+                proxy_info.listen_primary_address,
+                tx_proxy.clone(),
+                rx_proxy,
+            )
+            .spawn();
+
+            network_handles.push(network_client_handle);
+            proxy_connections.insert(proxy_info.proxy_id.clone(), tx_proxy);
+        }
+
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<E>::new(
             executor.clone(),
             store.clone(),
-            rx_proxy_connections,
+            proxy_connections, // Pass the hashmap of proxy connections instead of a channel
             rx_committed_txns,
             metrics.clone(),
         )
@@ -74,40 +91,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_committed_txns,
         )
         .spawn();
-
-        // let mode = match config.parallel_proxy {
-        //     false => ProxyMode::SingleThreaded,
-        //     true => ProxyMode::MultiThreaded,
-        // };
-
-        // // Boot the local proxies. Additional proxies can still remotely connect. Proxies
-        // // receive transactions in parallel with the consensus for pre-execution.
-        // for i in 0..config.validator_parameters.collocated_pre_executors.primary {
-        //     let proxy_id = format!("primary-{i}");
-        //     let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        //     let store = Arc::new(executor.init_store());
-        //     ProxyCore::new(
-        //         proxy_id,
-        //         executor.clone(),
-        //         mode,
-        //         store,
-        //         rx,
-        //         tx_proxy_results.clone(),
-        //         metrics.clone(),
-        //     )
-        //     .spawn_with_threads();
-        //     tx_proxy_connections.send(tx).await.expect("Channel open");
-        // }
-
-        // Boot another server handling connections from (additional) remote proxies. These remote
-        // proxies perform the same functions as the local proxies.
-        let proxy_network_handle = NetworkServer::new(
-            config.proxy_server_address,
-            tx_proxy_connections,
-            tx_proxy_results,
-        )
-        .spawn();
-        network_handles.push(proxy_network_handle);
 
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.

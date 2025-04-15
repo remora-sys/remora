@@ -106,7 +106,9 @@ pub struct ProxyInfo {
     /// Unique identifier for the proxy.
     pub proxy_id: ProxyId,
     /// The listening address for the proxy's P2P network.
-    pub listen_address: SocketAddr,
+    pub listen_proxy_address: SocketAddr,
+    /// The listening address for the primary connection.
+    pub listen_primary_address: SocketAddr,
     /// The address for metrics
     pub metrics_address: SocketAddr,
 }
@@ -136,13 +138,15 @@ impl ValidatorConfig {
             ProxyInfo {
                 proxy_id: 0,
                 // Derive a unique port number from the base address.
-                listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
-                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
+                listen_proxy_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
+                listen_primary_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
+                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 3),
             },
             ProxyInfo {
                 proxy_id: 1,
-                listen_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
-                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
+                listen_proxy_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 4),
+                listen_primary_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 5),
+                metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 6),
             },
         ];
 

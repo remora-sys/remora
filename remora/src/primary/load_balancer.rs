@@ -17,6 +17,7 @@ use crate::{
         PrimaryToProxyMessage, RemoraTransaction, Store,
     },
     metrics::Metrics,
+    proxy::core::ProxyId,
 };
 
 /// Defines different load balancing policies for distributing transactions.
@@ -34,12 +35,9 @@ pub struct LoadBalancer<E: Executor> {
     executor: E,
     /// The store is only used to assigned shared object versions.
     store: Store<E>,
-    /// Receive handles to forward transactions to proxies. When a new client connects,
-    /// this channel receives a sender from the network layer which is used to forward
-    /// transactions to the proxies.
-    rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-    /// Holds senders to forward transactions to proxies.
-    proxy_connections: Vec<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+    /// The proxy connections.
+    proxy_connections:
+        FxHashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
@@ -59,15 +57,17 @@ impl<E: Executor> LoadBalancer<E> {
     pub fn new(
         executor: E,
         store: Store<E>,
-        rx_proxy_connections: Receiver<Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        proxy_connections: FxHashMap<
+            ProxyId,
+            Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
+        >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             executor,
             store,
-            rx_proxy_connections,
-            proxy_connections: Vec::new(),
+            proxy_connections,
             rx_committed_txns,
             index: 0,
             states_to_proxy: FxHashMap::default(),
@@ -179,30 +179,30 @@ impl<E: Executor> LoadBalancer<E> {
 
     /// Helper method to determine missing states for a transaction
     /// and update the states ownership map
-    fn get_missing_states_for_transaction(
+    async fn get_missing_states_for_transaction(
         &mut self,
         transaction: &RemoraTransaction<E>,
         proxy_index: ExecutorIndex,
     ) -> MissingStates {
         let mut missing_states = BTreeMap::new();
 
-        let object_ids = E::get_objects_for_dependency_tracking(
-            self.executor.context().clone(),
-            self.store.clone(),
-            transaction.clone(),
-        );
+        // Add tracing for required versions using the executor API
+        let required_versions = self
+            .executor
+            .get_required_shared_object_versions(&transaction.digest())
+            .await;
 
         tracing::debug!(
-            "sent to proxy {}: obj_id vec {:?}",
-            proxy_index,
-            object_ids.iter().map(|(id, _)| id).collect::<Vec<_>>()
+            "Transaction {:?} required versions: {:?}",
+            transaction.digest(),
+            required_versions
         );
 
-        for (object_id, _) in object_ids {
+        for (object_id, seq_num) in required_versions.unwrap() {
             // Check if this object is already mapped to a proxy
             if let Some(previous_owner) = self.states_to_proxy.get(&object_id) {
                 if *previous_owner != proxy_index {
-                    missing_states.insert(object_id, *previous_owner);
+                    missing_states.insert((object_id, seq_num), *previous_owner);
                     self.states_to_proxy.insert(object_id, proxy_index);
                 }
             } else {
@@ -223,7 +223,9 @@ impl<E: Executor> LoadBalancer<E> {
     ) -> bool {
         let message = if is_stateful {
             let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
-            let missing_states = self.get_missing_states_for_transaction(&transaction, proxy_index);
+            let missing_states = self
+                .get_missing_states_for_transaction(&transaction, proxy_index)
+                .await;
             tracing::debug!(
                 "Sending stateful transaction to proxy {}: digest={:?}, stateless_proxy_id={}, missing_states_count={}",
                 proxy_index,
@@ -243,7 +245,10 @@ impl<E: Executor> LoadBalancer<E> {
             PrimaryToProxyMessage::StatelessTxn(transaction)
         };
 
-        if self.proxy_connections[proxy_index]
+        if self
+            .proxy_connections
+            .get(&proxy_index)
+            .unwrap()
             .send(message)
             .await
             .is_ok()
@@ -255,7 +260,7 @@ impl<E: Executor> LoadBalancer<E> {
                 "Failed to send transaction to proxy {}, removing connection",
                 proxy_index
             );
-            self.proxy_connections.swap_remove(proxy_index);
+            self.proxy_connections.remove(&proxy_index);
             false
         }
     }
@@ -292,11 +297,6 @@ impl<E: Executor> LoadBalancer<E> {
         let mut txn_cnt = 0;
         loop {
             tokio::select! {
-                Some(connection) = self.rx_proxy_connections.recv() => {
-                    self.proxy_connections.push(connection);
-                    tracing::info!("Added a new proxy connection");
-                }
-
                 Some(transactions) = self.rx_committed_txns.recv() => {
 
                     // TODO: shall we avoid assign for non-shared-object txns
@@ -371,31 +371,26 @@ mod tests {
     ) -> (
         SuiExecutor,
         Arc<Metrics>,
-        Arc<<SuiExecutor as Executor>::Store>,
-        Sender<Sender<PrimaryToProxyMessage<<SuiExecutor as Executor>::Transaction>>>,
+        Store<SuiExecutor>,
         Sender<Vec<RemoraTransaction<SuiExecutor>>>,
-        Receiver<Sender<PrimaryToProxyMessage<<SuiExecutor as Executor>::Transaction>>>,
         Receiver<Vec<RemoraTransaction<SuiExecutor>>>,
         Receiver<ExecutionResults<SuiExecutor>>,
     ) {
         let executor = SuiExecutor::new(&config).await;
 
         // Create channels for load balancer
-        let (tx_proxy_connections, rx_proxy_connections) = channel(100);
         let (tx_committed_txns, rx_committed_txns) = channel(100);
         let (_tx_results, rx_results) = channel(100);
 
         // Create metrics and store
         let metrics = Arc::new(Metrics::new_for_tests());
-        let store = Arc::new(executor.init_store());
+        let store = executor.init_store();
 
         (
             executor,
             metrics,
-            store,
-            tx_proxy_connections,
+            Arc::new(store),
             tx_committed_txns,
-            rx_proxy_connections,
             rx_committed_txns,
             rx_results,
         )
@@ -417,36 +412,29 @@ mod tests {
     #[tokio::test]
     async fn test_load_balancer_rr_forwarding() {
         let config = BenchmarkParameters::new_for_tests();
-        let (
-            executor,
-            metrics,
-            store,
-            tx_proxy_connections,
-            tx_committed_txns,
-            rx_proxy_connections,
-            rx_committed_txns,
-            _rx_results,
-        ) = setup_test_environment(&config).await;
-
-        // Create load balancer
-        let lb = LoadBalancer::new(
-            executor.clone(),
-            store.clone(),
-            rx_proxy_connections,
-            rx_committed_txns,
-            metrics,
-        );
+        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
 
         // Setup proxy channels
         let (tx_to_proxy1, mut rx_from_lb1) = channel(100);
         let (tx_to_proxy2, mut rx_from_lb2) = channel(100);
 
+        // Create proxy connections map
+        let mut proxy_connections = FxHashMap::default();
+        proxy_connections.insert(0, tx_to_proxy1);
+        proxy_connections.insert(1, tx_to_proxy2);
+
+        // Create load balancer
+        let lb = LoadBalancer::new(
+            executor.clone(),
+            store.clone(),
+            proxy_connections,
+            rx_committed_txns,
+            metrics,
+        );
+
         // Spawn load balancer
         let _lb_handle = lb.spawn();
-
-        // Connect proxies to load balancer
-        tx_proxy_connections.send(tx_to_proxy1).await.unwrap();
-        tx_proxy_connections.send(tx_to_proxy2).await.unwrap();
 
         // Generate transactions
         let remora_txns = generate_test_transactions(&config, 5).await;
@@ -495,25 +483,8 @@ mod tests {
     async fn test_load_balancer_with_one_proxy() {
         // Setup test environment
         let config = BenchmarkParameters::new_for_tests();
-        let (
-            executor,
-            metrics,
-            store,
-            tx_proxy_connections,
-            tx_committed_txns,
-            rx_proxy_connections,
-            rx_committed_txns,
-            _rx_results,
-        ) = setup_test_environment(&config).await;
-
-        // Create load balancer
-        let lb = LoadBalancer::new(
-            executor.clone(),
-            store.clone(),
-            rx_proxy_connections,
-            rx_committed_txns,
-            metrics.clone(),
-        );
+        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
 
         // Setup proxy and its channels
         let (tx_to_proxy, rx_from_lb) = channel(100);
@@ -521,7 +492,19 @@ mod tests {
         let (_tx_inter_proxy_requests, rx_inter_proxy_requests) = channel(100);
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
-        // Create and spawn proxy core
+        // Create proxy connections map
+        let mut proxy_connections = FxHashMap::default();
+        proxy_connections.insert(0, tx_to_proxy);
+
+        // Create load balancer
+        let lb = LoadBalancer::new(
+            executor.clone(),
+            store.clone(),
+            proxy_connections,
+            rx_committed_txns,
+            metrics.clone(),
+        );
+
         // Generate transactions
         let remora_txns = generate_test_transactions(&config, 3).await;
 
@@ -542,9 +525,6 @@ mod tests {
         // Spawn load balancer
         let _lb_handle = lb.spawn();
 
-        // Connect proxy to load balancer
-        tx_proxy_connections.send(tx_to_proxy).await.unwrap();
-
         // Send transactions to load balancer
         tx_committed_txns.send(remora_txns.clone()).await.unwrap();
 
@@ -557,25 +537,8 @@ mod tests {
     async fn test_load_balancer_with_two_proxies() {
         // Setup test environment
         let config = BenchmarkParameters::new_for_contention_tests();
-        let (
-            executor,
-            metrics,
-            store,
-            tx_proxy_connections,
-            tx_committed_txns,
-            rx_proxy_connections,
-            rx_committed_txns,
-            _rx_results,
-        ) = setup_test_environment(&config).await;
-
-        // Create load balancer
-        let lb = LoadBalancer::new(
-            executor.clone(),
-            store.clone(),
-            rx_proxy_connections,
-            rx_committed_txns,
-            metrics.clone(),
-        );
+        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
 
         // Setup first proxy and its channels
         let (tx_to_proxy1, rx_from_lb1) = channel(100);
@@ -591,6 +554,20 @@ mod tests {
 
         tx_inter_proxy_replies1.insert(1, tx_inter_proxy_requests2);
         tx_inter_proxy_replies2.insert(0, tx_inter_proxy_requests1);
+
+        // Create proxy connections map
+        let mut proxy_connections = FxHashMap::default();
+        proxy_connections.insert(0, tx_to_proxy1);
+        proxy_connections.insert(1, tx_to_proxy2);
+
+        // Create load balancer
+        let lb = LoadBalancer::new(
+            executor.clone(),
+            store.clone(),
+            proxy_connections,
+            rx_committed_txns,
+            metrics.clone(),
+        );
 
         // Create and spawn first proxy core
         let proxy_store1 = Arc::new(executor.init_store());
@@ -619,10 +596,6 @@ mod tests {
             metrics.clone(),
         );
         let _proxy_handle2 = proxy2.spawn();
-
-        // Connect proxies to load balancer
-        tx_proxy_connections.send(tx_to_proxy1).await.unwrap();
-        tx_proxy_connections.send(tx_to_proxy2).await.unwrap();
 
         // Spawn load balancer
         let _lb_handle = lb.spawn();

@@ -470,49 +470,44 @@ where
             missing_states.len()
         );
 
-        // Add tracing for required versions using the executor API
-        let required_versions = self
-            .executor
-            .get_required_shared_object_versions(&transaction.digest())
-            .await;
-
-        tracing::debug!(
-            "Transaction {:?} required versions: {:?}",
-            transaction.digest(),
-            required_versions
-        );
-
-        // Send requests for missing states to other proxies
-        if required_versions.is_some() {
-            let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
-            let mut proxy_requests: BTreeMap<ProxyId, Vec<(ObjectID, SequenceNumber)>> =
-                BTreeMap::new();
-
-            for (obj_id, seq_num) in required_versions.unwrap() {
-                if let Some(&proxy_id) = missing_states.get(&obj_id) {
-                    proxy_requests
-                        .entry(proxy_id)
-                        .or_default()
-                        .push((obj_id, seq_num));
-                }
-            }
-
-            for (proxy_id, states) in proxy_requests {
-                let request = InterProxyRequest::Stateful(self.id, states);
-                Self::send_msg_to_proxy(
-                    tx_inter_proxy_replies.clone(),
-                    proxy_id,
-                    ProxyToProxyMessage::Request(request),
-                )
-                .await;
-            }
-        }
-
         // TODO: check if assigning before all the states are received making sense
         // Assign shared objects version.
         self.executor
             .assign_shared_object_versions(&[transaction.deref().clone()])
             .await;
+
+        // Send requests for missing states to other proxies
+        // if required_versions.is_some() {
+        //     let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
+        //     let mut proxy_requests: BTreeMap<ProxyId, Vec<(ObjectID, SequenceNumber)>> =
+        //         BTreeMap::new();
+
+        //     for (obj_id, seq_num) in required_versions.unwrap() {
+        //         if let Some(&proxy_id) = missing_states.get(&obj_id) {
+        //             proxy_requests
+        //                 .entry(proxy_id)
+        //                 .or_default()
+        //                 .push((obj_id, seq_num));
+        //         }
+        //     }
+
+        for (states, proxy_id) in missing_states {
+            tracing::debug!(
+                "Proxy {} requesting {} missing states from proxy {}: {:?}",
+                self.id,
+                1,
+                proxy_id,
+                states
+            );
+            let request = InterProxyRequest::Stateful(self.id, vec![states]);
+            Self::send_msg_to_proxy(
+                self.tx_inter_proxy_replies.clone(),
+                proxy_id,
+                ProxyToProxyMessage::Request(request),
+            )
+            .await;
+        }
+        // }
 
         self.metrics.increase_proxy_load(self.id);
 
@@ -657,7 +652,7 @@ where
 mod tests {
     use dashmap::DashMap;
     use std::{collections::BTreeMap, sync::Arc};
-    use sui_types::base_types::ObjectID;
+    use sui_types::base_types::{ObjectID, SequenceNumber};
     use tokio::sync::mpsc;
 
     use crate::{
@@ -840,7 +835,7 @@ mod tests {
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
-        let missing_states: BTreeMap<ObjectID, usize> = BTreeMap::new();
+        let missing_states: BTreeMap<(ObjectID, SequenceNumber), usize> = BTreeMap::new();
         let message = PrimaryToProxyMessage::Txn(transaction, 1, missing_states);
         tx_to_proxy1.send(message).await.unwrap();
     }

@@ -218,7 +218,7 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
-pub type MissingStates = BTreeMap<ObjectID, ProxyId>;
+pub type MissingStates = BTreeMap<(ObjectID, SequenceNumber), ProxyId>;
 
 pub type ExecutorIndex = usize;
 
