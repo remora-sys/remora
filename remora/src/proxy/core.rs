@@ -338,7 +338,7 @@ where
     async fn handle_stateful_request(
         &mut self,
         proxy_id: ProxyId,
-        requested_states: Vec<ObjectID>,
+        requested_states: Vec<(ObjectID, SequenceNumber)>,
     ) {
         tracing::debug!(
             "Proxy {} handling stateful request from proxy {} for states: {:?}",
@@ -348,17 +348,12 @@ where
         );
 
         // Need to ensure that the latest transaction accessing the object is already committed
-        let mut prior_handles = Vec::new();
-        for obj_id in requested_states.iter() {
-            let latest_handle = self
-                .stateful_controller
-                .get_latest_handle_for_object(obj_id);
-
-            if latest_handle.is_none() {
-                tracing::warn!("No latest handle found for object {}", obj_id);
-            }
-            prior_handles.push(latest_handle.unwrap());
-        }
+        let (prior_handles, _) = self.stateful_controller.get_prior_dependency_and_update(
+            0,
+            requested_states.clone(),
+            false,
+            true,
+        );
 
         let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
         let store = self.store.clone();
@@ -369,16 +364,27 @@ where
             tracing::debug!("Ready to get objects for stateful request");
             let mut objects = BTreeMap::new();
             for state in requested_states {
-                let object = match store.read_object(&state) {
+                let object = match store.read_object(&state.0) {
                     Ok(obj) => obj,
                     Err(e) => {
                         tracing::warn!("Failed to read object: {:?}", e);
                         None
                     }
                 };
-                // TODO: check version
+
+                // Check that the object version matches the requested version
                 if let Some(obj) = object {
-                    objects.insert(state, obj);
+                    let obj_version = obj.version();
+                    if obj_version == state.1 {
+                        objects.insert(state.0, obj);
+                    } else {
+                        tracing::warn!(
+                            "Version mismatch for object {:?}: requested version {}, found version {}",
+                            state.0,
+                            state.1,
+                            obj_version
+                        );
+                    }
                 }
             }
 
@@ -469,6 +475,7 @@ where
             .executor
             .get_required_shared_object_versions(&transaction.digest())
             .await;
+
         tracing::debug!(
             "Transaction {:?} required versions: {:?}",
             transaction.digest(),
@@ -476,14 +483,29 @@ where
         );
 
         // Send requests for missing states to other proxies
-        for state in missing_states {
-            let request = InterProxyRequest::Stateful(self.id, vec![state.0]);
-            Self::send_msg_to_proxy(
-                self.tx_inter_proxy_replies.clone(),
-                state.1,
-                ProxyToProxyMessage::Request(request),
-            )
-            .await;
+        if required_versions.is_some() {
+            let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
+            let mut proxy_requests: BTreeMap<ProxyId, Vec<(ObjectID, SequenceNumber)>> =
+                BTreeMap::new();
+
+            for (obj_id, seq_num) in required_versions.unwrap() {
+                if let Some(&proxy_id) = missing_states.get(&obj_id) {
+                    proxy_requests
+                        .entry(proxy_id)
+                        .or_default()
+                        .push((obj_id, seq_num));
+                }
+            }
+
+            for (proxy_id, states) in proxy_requests {
+                let request = InterProxyRequest::Stateful(self.id, states);
+                Self::send_msg_to_proxy(
+                    tx_inter_proxy_replies.clone(),
+                    proxy_id,
+                    ProxyToProxyMessage::Request(request),
+                )
+                .await;
+            }
         }
 
         // TODO: check if assigning before all the states are received making sense

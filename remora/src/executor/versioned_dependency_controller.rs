@@ -92,6 +92,7 @@ impl VersionedDependencyController {
         (current_handles, next_handles)
     }
 
+    #[deprecated]
     /// Returns the task handle associated with the highest sequence number for a given object ID.
     /// Returns None if no entries exist for the object ID.
     pub fn get_latest_handle_for_object(&self, obj_id: &ObjectID) -> Option<Arc<Notify>> {

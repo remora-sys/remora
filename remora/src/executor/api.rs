@@ -235,7 +235,7 @@ where
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum InterProxyRequest {
-    Stateful(ProxyId, Vec<ObjectID>),
+    Stateful(ProxyId, Vec<(ObjectID, SequenceNumber)>),
     Stateless(ProxyId, TransactionDigest),
 }
 
