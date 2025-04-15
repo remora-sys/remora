@@ -175,6 +175,12 @@ pub trait Executor: Clone {
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send;
 
+    /// Get the required shared object versions for the transactions.
+    fn get_required_shared_object_versions(
+        &self,
+        transaction: &TransactionDigest,
+    ) -> impl Future<Output = Option<Vec<(ObjectID, SequenceNumber)>>> + Send;
+
     fn generate_transactions(
         config: &BenchmarkParameters,
         working_directory: Option<PathBuf>,

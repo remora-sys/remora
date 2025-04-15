@@ -405,6 +405,17 @@ impl Executor for SuiExecutor {
             .await;
     }
 
+    async fn get_required_shared_object_versions(
+        &self,
+        transaction: &TransactionDigest,
+    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
+        self.context()
+            .benchmark_ctx()
+            .validator()
+            .get_required_shared_object_versions(transaction)
+            .await
+    }
+
     fn generate_transactions(
         config: &BenchmarkParameters,
         working_directory: Option<PathBuf>,

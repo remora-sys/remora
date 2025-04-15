@@ -419,6 +419,13 @@ impl Executor for FakeExecutor {
         //todo!()
     }
 
+    async fn get_required_shared_object_versions(
+        &self,
+        transaction: &TransactionDigest,
+    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
+        todo!()
+    }
+
     fn generate_transactions(
         config: &BenchmarkParameters,
         _working_directory: Option<std::path::PathBuf>,

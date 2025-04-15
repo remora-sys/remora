@@ -464,6 +464,17 @@ where
             missing_states.len()
         );
 
+        // Add tracing for required versions using the executor API
+        let required_versions = self
+            .executor
+            .get_required_shared_object_versions(&transaction.digest())
+            .await;
+        tracing::debug!(
+            "Transaction {:?} required versions: {:?}",
+            transaction.digest(),
+            required_versions
+        );
+
         // Send requests for missing states to other proxies
         for state in missing_states {
             let request = InterProxyRequest::Stateful(self.id, vec![state.0]);
