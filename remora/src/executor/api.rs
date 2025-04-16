@@ -218,7 +218,8 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
-pub type MissingStates = BTreeMap<(ObjectID, SequenceNumber), ProxyId>;
+// if the proxy id is none, the state is not required
+pub type RequiredStates = BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>>;
 
 pub type ExecutorIndex = usize;
 
@@ -228,7 +229,7 @@ where
     T: ExecutableTransaction + Clone,
 {
     /// Stateful transaction that requires object access and execution
-    Txn(TransactionWithTimestamp<T>, ProxyId, MissingStates),
+    Txn(TransactionWithTimestamp<T>, ProxyId, RequiredStates),
     /// Stateless transaction that only requires signature verification
     StatelessTxn(TransactionWithTimestamp<T>),
 }

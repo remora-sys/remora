@@ -23,8 +23,8 @@ use crate::{
     executor::{
         api::{
             ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, InterProxyReply,
-            InterProxyRequest, MissingStates, PrimaryToProxyMessage, ProxyToProxyMessage,
-            RemoraTransaction, StateStore, Store,
+            InterProxyRequest, PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction,
+            RequiredStates, StateStore, Store,
         },
         oneshot_dependency_controller::OneshotDependencyController,
         versioned_dependency_controller::VersionedDependencyController,
@@ -55,7 +55,7 @@ pub struct ProxyCore<E: Executor> {
     /// The dependency controller for stateless transactions.
     stateless_controller: Arc<OneshotDependencyController>,
     /// The buffer of pending stateful transactions which are waiting for the stateless results.
-    pending_stateful_txns: DashMap<TransactionDigest, (RemoraTransaction<E>, MissingStates)>,
+    pending_stateful_txns: DashMap<TransactionDigest, (RemoraTransaction<E>, RequiredStates)>,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -67,6 +67,7 @@ where
     RemoraTransaction<E>: Send + Sync,
     ExecutionResults<E>: Send + Sync,
     <E as Executor>::ExecutionContext: Send + Sync,
+    <E as Executor>::Transaction: Send,
 {
     /// Create a new proxy.
     pub fn new(
@@ -160,7 +161,7 @@ where
         &mut self,
         transaction: RemoraTransaction<E>,
         stateless_res_proxy_id: ProxyId,
-        missing_states: MissingStates,
+        required_states: RequiredStates,
     ) {
         if stateless_res_proxy_id == self.id {
             let rx = self
@@ -171,7 +172,7 @@ where
             // Check the stateless verification result before scheduling
             match rx.await {
                 Ok(true) => {
-                    self.schedule_stateful_transaction(transaction, missing_states)
+                    self.schedule_stateful_transaction(transaction, required_states)
                         .await;
                     return;
                 }
@@ -206,7 +207,7 @@ where
         }
 
         self.pending_stateful_txns
-            .insert(*transaction.digest(), (transaction, missing_states));
+            .insert(*transaction.digest(), (transaction, required_states));
     }
 
     async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
@@ -460,54 +461,39 @@ where
     async fn schedule_stateful_transaction(
         &mut self,
         transaction: RemoraTransaction<E>,
-        missing_states: MissingStates,
-        // task_id: u64,
+        required_states: RequiredStates,
     ) {
         tracing::debug!(
-            "Proxy {} scheduling stateful transaction {:?} with {} missing states",
+            "Proxy {} scheduling stateful transaction {:?} with {} required states",
             self.id,
             transaction.digest(),
-            missing_states.len()
+            required_states.len()
         );
 
-        // TODO: check if assigning before all the states are received making sense
-        // Assign shared objects version.
-        self.executor
-            .assign_shared_object_versions(&[transaction.deref().clone()])
-            .await;
+        // // TODO: check if assigning before all the states are received making sense
+        // // Assign shared objects version.
+        // self.executor
+        //     .assign_shared_object_versions(&[transaction.deref().clone()])
+        //     .await;
 
-        // Send requests for missing states to other proxies
-        // if required_versions.is_some() {
-        //     let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
-        //     let mut proxy_requests: BTreeMap<ProxyId, Vec<(ObjectID, SequenceNumber)>> =
-        //         BTreeMap::new();
-
-        //     for (obj_id, seq_num) in required_versions.unwrap() {
-        //         if let Some(&proxy_id) = missing_states.get(&obj_id) {
-        //             proxy_requests
-        //                 .entry(proxy_id)
-        //                 .or_default()
-        //                 .push((obj_id, seq_num));
-        //         }
-        //     }
-
-        for (states, proxy_id) in missing_states {
-            tracing::debug!(
-                "Proxy {} requesting {} missing states from proxy {}: {:?}",
-                self.id,
-                1,
-                proxy_id,
-                states
-            );
-            let request = InterProxyRequest::Stateful(self.id, vec![states]);
-            Self::send_msg_to_proxy(
-                self.tx_inter_proxy_replies.clone(),
-                proxy_id,
-                ProxyToProxyMessage::Request(request),
-            )
-            .await;
+        for (states, proxy_id) in &required_states {
+            if let Some(proxy_id) = proxy_id {
+                tracing::debug!(
+                    "Proxy {} requesting {} missing states from proxy {}: {:?}",
+                    self.id,
+                    1,
+                    proxy_id,
+                    states
+                );
+                let request = InterProxyRequest::Stateful(self.id, vec![*states]);
+                Self::send_msg_to_proxy(
+                    self.tx_inter_proxy_replies.clone(),
+                    *proxy_id,
+                    ProxyToProxyMessage::Request(request),
+                )
+                .await;
+            }
         }
-        // }
 
         self.metrics.increase_proxy_load(self.id);
 
@@ -522,12 +508,12 @@ where
         }
 
         // Get dependencies and schedule the transaction
-        let (obj_ids, prior_handles, current_handles) = self.get_dependencies(transaction.clone());
+        let (obj_ids, prior_handles, current_handles) = self.get_dependencies(required_states);
         tracing::debug!(
-            "Proxy {} got dependencies for transaction {:?}: {} objects",
+            "Proxy {} got dependencies for transaction {:?}: objects {:?}",
             self.id,
             transaction.digest(),
-            obj_ids.len()
+            obj_ids
         );
 
         self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles)
@@ -537,17 +523,16 @@ where
 
     pub fn get_dependencies(
         &mut self,
-        transaction: RemoraTransaction<E>,
+        required_states: RequiredStates,
     ) -> (
         Vec<(ObjectID, SequenceNumber)>,
         Vec<Arc<Notify>>,
         Vec<Arc<Notify>>,
     ) {
-        let obj_ids = E::get_objects_for_dependency_tracking(
-            self.executor.context().clone(),
-            self.store.clone(),
-            transaction,
-        );
+        let obj_ids: Vec<(ObjectID, SequenceNumber)> = required_states
+            .iter()
+            .map(|(state, _)| (state.0, state.1))
+            .collect();
 
         // If there are no object dependencies, return empty vectors for handles
         if obj_ids.is_empty() {
@@ -580,11 +565,23 @@ where
         let ctx = self.executor.context().clone();
         let metrics = self.metrics.clone();
         let stateful_controller = self.stateful_controller.clone();
+        let executor = self.executor.clone();
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
             stateful_controller.remove_dependency(obj_ids.clone());
+
+            tracing::debug!(
+                "Proxy {} assigning shared objects version {:?} for transaction {:?}",
+                id,
+                obj_ids,
+                transaction.digest()
+            );
+            // // Assign shared objects version.
+            executor
+                .assign_shared_object_versions(&[transaction.deref().clone()])
+                .await;
 
             // check the version ID for shared objects
             // skip if versions don't match
@@ -835,8 +832,8 @@ mod tests {
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
-        let missing_states: BTreeMap<(ObjectID, SequenceNumber), usize> = BTreeMap::new();
-        let message = PrimaryToProxyMessage::Txn(transaction, 1, missing_states);
+        let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> = BTreeMap::new();
+        let message = PrimaryToProxyMessage::Txn(transaction, 1, required_states);
         tx_to_proxy1.send(message).await.unwrap();
     }
 
@@ -874,6 +871,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_sui_transactions_contention() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+
         let config = BenchmarkParameters::new_for_contention_tests();
         let executor = SuiExecutor::new(&config).await;
 

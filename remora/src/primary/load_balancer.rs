@@ -13,8 +13,8 @@ use tokio::{
 use crate::{
     error::{NodeError, NodeResult},
     executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, MissingStates,
-        PrimaryToProxyMessage, RemoraTransaction, Store,
+        ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, PrimaryToProxyMessage,
+        RemoraTransaction, RequiredStates, Store,
     },
     metrics::Metrics,
     proxy::core::ProxyId,
@@ -183,8 +183,8 @@ impl<E: Executor> LoadBalancer<E> {
         &mut self,
         transaction: &RemoraTransaction<E>,
         proxy_index: ExecutorIndex,
-    ) -> MissingStates {
-        let mut missing_states = BTreeMap::new();
+    ) -> RequiredStates {
+        let mut required_states = BTreeMap::new();
 
         // Add tracing for required versions using the executor API
         let required_versions = self
@@ -198,20 +198,24 @@ impl<E: Executor> LoadBalancer<E> {
             required_versions
         );
 
-        for (object_id, seq_num) in required_versions.unwrap() {
-            // Check if this object is already mapped to a proxy
-            if let Some(previous_owner) = self.states_to_proxy.get(&object_id) {
-                if *previous_owner != proxy_index {
-                    missing_states.insert((object_id, seq_num), *previous_owner);
-                    self.states_to_proxy.insert(object_id, proxy_index);
-                }
-            } else {
-                // If not mapped yet, assign it to this proxy
+        if let Some(required_versions) = required_versions {
+            for (object_id, seq_num) in required_versions {
+                let previous_owner = self.states_to_proxy.get(&object_id);
+
+                // Insert into required_states map - with previous owner if object needs migration,
+                // with None if it's already at the correct proxy or hasn't been assigned yet
+                let previous_owner_value = previous_owner
+                    .filter(|&owner| *owner != proxy_index)
+                    .copied();
+
+                required_states.insert((object_id, seq_num), previous_owner_value);
+
+                // Always update the mapping to point to this proxy
                 self.states_to_proxy.insert(object_id, proxy_index);
             }
         }
 
-        missing_states
+        required_states
     }
 
     /// Sends a transaction to a specific proxy and handles connection failures.
