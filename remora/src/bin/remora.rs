@@ -44,12 +44,25 @@ enum Role {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let validator_config =
+    let mut validator_config =
         ValidatorConfig::load(args.validator_config).context("Failed to load validator config")?;
     let benchmark_config = match args.benchmark_config {
         Some(path) => BenchmarkParameters::load(path).context("Failed to load benchmark config")?,
         None => BenchmarkParameters::default(),
     };
+
+    // Start the metrics server.
+    if let Some(binding_address) = args.binding_address {
+        validator_config.metrics_address.set_ip(binding_address);
+    }
+    let registry = mysten_metrics::start_prometheus_server(validator_config.metrics_address);
+    let metrics = Arc::new(Metrics::new(&registry.default_registry()));
+    tracing::info!("Exposing metrics on {}", validator_config.metrics_address);
+
+    // Periodically print metrics.
+    let workload = "default".to_string();
+    let print_period = Duration::from_secs(5);
+    periodically_print_metrics(validator_config.metrics_address, workload, print_period);
 
     tracing_subscriber::fmt::try_init().map_err(|e| anyhow!("{e}"))?;
 
@@ -57,10 +70,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading executor");
     if benchmark_config.workload.is_fake() {
         let executor = FakeExecutor::new(&benchmark_config).await;
-        start_node(args.role, executor, validator_config, args.binding_address).await;
+        start_node(args.role, executor, validator_config, metrics).await;
     } else {
         let executor = SuiExecutor::new(&benchmark_config).await;
-        start_node(args.role, executor, validator_config, args.binding_address).await;
+        start_node(args.role, executor, validator_config, metrics).await;
     }
 
     Ok(())
@@ -69,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
 async fn start_node<E>(
     role: Role,
     executor: E,
-    mut validator_config: ValidatorConfig,
-    binding_address: Option<IpAddr>,
+    validator_config: ValidatorConfig,
+    metrics: Arc<Metrics>,
 ) where
     E: Executor + Send + Sync + 'static,
     <E as Executor>::Store: Send + Sync,
@@ -89,42 +102,12 @@ async fn start_node<E>(
                 "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
-            if let Some(binding_address) = binding_address {
-                validator_config
-                    .proxy_server_address
-                    .set_ip(binding_address);
-                validator_config
-                    .client_server_address
-                    .set_ip(binding_address);
-            }
-            // Start the metrics server.
-            if let Some(binding_address) = binding_address {
-                validator_config.metrics_address.set_ip(binding_address);
-            }
-            let registry =
-                mysten_metrics::start_prometheus_server(validator_config.metrics_address);
-            let metrics = Arc::new(Metrics::new(&registry.default_registry()));
-            tracing::info!("Exposing metrics on {}", validator_config.metrics_address);
-
-            // Periodically print metrics.
-            let workload = "default".to_string();
-            let print_period = Duration::from_secs(5);
-            periodically_print_metrics(validator_config.metrics_address, workload, print_period);
-
             PrimaryNode::start(executor, &validator_config, metrics)
                 .await
                 .collect_results()
                 .await;
         }
         Role::Proxy { proxy_id } => {
-            let metrics_address = validator_config
-                .proxies
-                .get(proxy_id)
-                .unwrap()
-                .metrics_address;
-            let registry = mysten_metrics::start_prometheus_server(metrics_address);
-            let metrics = Arc::new(Metrics::new(&registry.default_registry()));
-
             tracing::info!(
                 "Starting proxy targeting {}",
                 validator_config
@@ -133,10 +116,6 @@ async fn start_node<E>(
                     .unwrap()
                     .listen_proxy_address
             );
-            // Periodically print metrics.
-            let workload = "default".to_string();
-            let print_period = Duration::from_secs(5);
-            periodically_print_metrics(metrics_address, workload, print_period);
 
             // Check if the proxy_id exists in the configuration
             if let Some(_proxy_config) = validator_config.proxies.get(proxy_id) {

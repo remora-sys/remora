@@ -483,7 +483,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[tracing_test::traced_test]
     async fn test_load_balancer_with_one_proxy() {
         // Setup test environment
         let config = BenchmarkParameters::new_for_tests();
@@ -537,7 +536,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[tracing_test::traced_test]
     async fn test_load_balancer_with_two_proxies() {
         // Setup test environment
         let config = BenchmarkParameters::new_for_contention_tests();

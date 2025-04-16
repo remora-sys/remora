@@ -884,7 +884,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn test_proxy_ethereum_transactions() {
         let config = BenchmarkParameters::new_for_ethereum_tests();
         let executor = SuiExecutor::new(&config).await;

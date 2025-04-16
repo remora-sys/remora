@@ -146,7 +146,6 @@ mod tests {
     };
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn execute_transactions() {
         let config = ValidatorConfig::new_for_tests();
         let benchmark_config = BenchmarkParameters::new_for_tests();
@@ -168,7 +167,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn no_proxies() {
         let validator_parameters = ValidatorParameters::new_for_tests();
         let config = ValidatorConfig {
