@@ -103,7 +103,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         // Prepare listen addresses on localhost for proxy and primary
         let proxy_port = our_proxy_info.listen_proxy_address.port();
         let primary_port = our_proxy_info.listen_primary_address.port();
-        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
         let listen_proxy_address = std::net::SocketAddr::new(localhost, proxy_port);
         let listen_primary_address = std::net::SocketAddr::new(localhost, primary_port);

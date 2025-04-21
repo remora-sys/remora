@@ -94,8 +94,11 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Boot the client transactions server. This component receives client transactions from the
         // the network and forwards them to the load balancer.
+        let client_port = config.client_server_address.port();
+        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let client_server_address = std::net::SocketAddr::new(localhost, client_port);
         let transactions_network_handle = NetworkServer::new(
-            config.client_server_address,
+            client_server_address,
             tx_client_connections,
             tx_client_transactions,
         )
