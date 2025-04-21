@@ -99,9 +99,18 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         // Create a proper channel for new connections from other proxies
         let (tx_connections, _) =
             mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
+
+        // Prepare listen addresses on localhost for proxy and primary
+        let proxy_port = our_proxy_info.listen_proxy_address.port();
+        let primary_port = our_proxy_info.listen_primary_address.port();
+        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let listen_proxy_address = std::net::SocketAddr::new(localhost, proxy_port);
+        let listen_primary_address = std::net::SocketAddr::new(localhost, primary_port);
+
         // Create a server that listens for connections from other proxies
         let inter_proxy_server_handle = NetworkServer::new(
-            our_proxy_info.listen_proxy_address,
+            listen_proxy_address,
             tx_connections,
             tx_inter_proxy_requests.clone(),
         )
@@ -112,8 +121,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         >(DEFAULT_CHANNEL_SIZE);
 
+        // Create a server that listens for connections from the primary
         let primary_connection_handle = NetworkServer::new(
-            our_proxy_info.listen_primary_address,
+            listen_primary_address,
             tx_primary_connection,
             tx_transactions,
         )
