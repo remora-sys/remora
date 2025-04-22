@@ -405,6 +405,44 @@ impl Executor for SuiExecutor {
             .await;
     }
 
+    async fn assign_shared_object_versions_with_required_versions(
+        &self,
+        transactions: &[Self::Transaction],
+        required_versions: &[(ObjectID, SequenceNumber)],
+    ) {
+        let _guard = self.shared_object_versions_assignment_lock.lock().await;
+
+        // Collect all shared object IDs from the transactions' input objects
+        let shared_object_ids: std::collections::HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.input_objects().into_iter().filter_map(|kind| {
+                    if let InputObjectKind::SharedMoveObject { id, .. } = kind {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // Filter required_versions to only include shared object IDs
+        let filtered_required_versions: Vec<_> = required_versions
+            .iter()
+            .cloned()
+            .filter(|(id, _)| shared_object_ids.contains(id))
+            .collect();
+
+        self.context()
+            .benchmark_ctx()
+            .validator()
+            .assigned_shared_object_versions_on_transaction_not_idempotent_with_required_versions(
+                transactions,
+                &filtered_required_versions,
+            )
+            .await;
+    }
+
     async fn get_required_shared_object_versions(
         &self,
         transaction: &TransactionDigest,

@@ -437,11 +437,20 @@ where
             required_states.len()
         );
 
-        // // TODO: check if assigning before all the states are received making sense
-        // // Assign shared objects version.
-        // self.executor
-        //     .assign_shared_object_versions(&[transaction.deref().clone()])
-        //     .await;
+        // TODO: check if assigning before all the states are received making sense
+        // Assign shared objects version.
+        if !required_states.is_empty() {
+            let required_versions: Vec<(ObjectID, SequenceNumber)> = required_states
+                .iter()
+                .map(|(state, _)| (state.0, state.1))
+                .collect();
+            self.executor
+                .assign_shared_object_versions_with_required_versions(
+                    &[transaction.deref().clone()],
+                    &required_versions,
+                )
+                .await;
+        }
 
         for (states, proxy_id) in &required_states {
             if let Some(proxy_id) = proxy_id {
@@ -464,6 +473,7 @@ where
 
         self.metrics.increase_proxy_load(self.id);
 
+        // FIXME?
         // Check and prepare objects
         if !E::pre_execute_check_objects(self.store.clone(), &transaction) {
             tracing::debug!(
@@ -545,16 +555,16 @@ where
             }
             stateful_controller.remove_dependency(obj_ids.clone());
 
-            tracing::debug!(
-                "Proxy {} assigning shared objects version {:?} for transaction {:?}",
-                id,
-                obj_ids,
-                transaction.digest()
-            );
-            // Assign shared objects version.
-            executor
-                .assign_shared_object_versions(&[transaction.deref().clone()])
-                .await;
+            // tracing::debug!(
+            //     "Proxy {} assigning shared objects version {:?} for transaction {:?}",
+            //     id,
+            //     obj_ids,
+            //     transaction.digest()
+            // );
+            // // Assign shared objects version.
+            // executor
+            //     .assign_shared_object_versions(&[transaction.deref().clone()])
+            //     .await;
 
             // check the version ID for shared objects
             // skip if versions don't match
@@ -629,8 +639,8 @@ mod tests {
         config::BenchmarkParameters,
         executor::{
             api::{
-                ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage,
-                RemoraTransaction,
+                ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
+                ProxyToProxyMessage, RemoraTransaction,
             },
             fake::FakeExecutor,
             sui::SuiExecutor,
@@ -713,11 +723,31 @@ mod tests {
             let stateless_message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
             tx_to_proxy.send(stateless_message).await.unwrap();
 
-            // Then send the stateful transaction
+            // Assign shared object versions before getting required versions
+            executor.assign_shared_object_versions(&[tx.clone()]).await;
+
+            // Get required versions for the transaction
+            let required_versions = executor
+                .get_required_shared_object_versions(&tx.digest())
+                .await;
+
+            // Build required_states as a BTreeMap<(ObjectID, SequenceNumber), Option<usize>>
+            // If required_versions is empty, this will be an empty BTreeMap
+            let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> =
+                if let Some(required_versions) = required_versions {
+                    required_versions
+                        .into_iter()
+                        .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
+
+            // Then send the stateful transaction with required_states (empty or not)
             let stateful_message = PrimaryToProxyMessage::Txn(
                 RemoraTransaction::<E>::new_for_tests(tx),
                 0,
-                BTreeMap::new(),
+                required_states,
             );
             tx_to_proxy.send(stateful_message).await.unwrap();
         }

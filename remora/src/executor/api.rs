@@ -175,6 +175,13 @@ pub trait Executor: Clone {
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send;
 
+    /// Assign a shared object version.
+    fn assign_shared_object_versions_with_required_versions(
+        &self,
+        _transactions: &[Self::Transaction],
+        _required_versions: &[(ObjectID, SequenceNumber)],
+    ) -> impl Future<Output = ()> + std::marker::Send;
+
     /// Get the required shared object versions for the transactions.
     fn get_required_shared_object_versions(
         &self,

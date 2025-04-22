@@ -419,6 +419,15 @@ impl Executor for FakeExecutor {
         //todo!()
     }
 
+    /// Assign a shared object version.
+    async fn assign_shared_object_versions_with_required_versions(
+        &self,
+        _transactions: &[Self::Transaction],
+        _required_versions: &[(ObjectID, SequenceNumber)],
+    ) {
+        //todo!()
+    }
+
     async fn get_required_shared_object_versions(
         &self,
         transaction: &TransactionDigest,
