@@ -288,25 +288,11 @@ where
             result
         );
 
-        // // Process the transaction if verification passed, otherwise just remove it
-        // if let Some((_, (transaction, missing_states))) = self.pending_stateful_txns.remove(&digest)
-        // {
-        //     if result {
-        //         tracing::debug!(
-        //             "Proxy {} scheduling stateful transaction {:?} after stateless verification",
-        //             self.id,
-        //             digest
-        //         );
-        //         self.schedule_stateful_transaction(transaction, missing_states)
-        //             .await;
-        //     } else {
-        //         tracing::debug!(
-        //             "Proxy {} discarding transaction {:?} due to failed stateless verification",
-        //             self.id,
-        //             digest
-        //         );
-        //     }
-        // }
+        let tx = self.stateless_controller.take_signal(&digest);
+        if let Some(tx) = tx {
+            tx.send(result).expect("Failed to send result");
+        }
+        self.stateless_controller.remove_dependency(&digest);
     }
 
     async fn handle_stateful_request(
