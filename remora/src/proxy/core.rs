@@ -630,7 +630,7 @@ where
             }
 
             metrics.decrease_proxy_load(&id);
-            metrics.update_metrics(transaction.timestamp());
+            //metrics.update_metrics(transaction.timestamp());
             Ok::<_, NodeError>(())
         });
         Ok(())
