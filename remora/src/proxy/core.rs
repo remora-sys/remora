@@ -3,7 +3,6 @@
 
 use dashmap::DashMap;
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
-
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
@@ -13,7 +12,7 @@ use sui_types::{
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
-        Notify,
+        oneshot, Notify,
     },
     task::JoinHandle,
 };
@@ -54,8 +53,6 @@ pub struct ProxyCore<E: Executor> {
     stateful_controller: Arc<VersionedDependencyController>,
     /// The dependency controller for stateless transactions.
     stateless_controller: Arc<OneshotDependencyController>,
-    /// The buffer of pending stateful transactions which are waiting for the stateless results.
-    pending_stateful_txns: DashMap<TransactionDigest, (RemoraTransaction<E>, RequiredStates)>,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -90,7 +87,6 @@ where
             tx_inter_proxy_replies,
             stateful_controller: Arc::new(VersionedDependencyController::new()),
             stateless_controller: Arc::new(OneshotDependencyController::new()),
-            pending_stateful_txns: DashMap::new(),
             metrics,
         }
     }
@@ -163,51 +159,28 @@ where
         stateless_res_proxy_id: ProxyId,
         required_states: RequiredStates,
     ) {
-        if stateless_res_proxy_id == self.id {
-            let rx = self
-                .stateless_controller
-                .get_dependencies(transaction.digest())
+        // If the stateless result is from the same proxy, look up the handle
+        let rx = if stateless_res_proxy_id == self.id {
+            self.stateless_controller
+                .get_dependency(transaction.digest())
+                .unwrap()
+        } else {
+            // Otherwise, set a remote dependency
+            // Send stateless request to the appropriate proxy
+            let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
+            let tx = self
+                .tx_inter_proxy_replies
+                .get(&stateless_res_proxy_id)
                 .unwrap();
-
-            // Check the stateless verification result before scheduling
-            match rx.await {
-                Ok(true) => {
-                    self.schedule_stateful_transaction(transaction, required_states)
-                        .await;
-                    return;
-                }
-                Ok(false) => {
-                    tracing::debug!(
-                        "Proxy {} skipping transaction {:?} due to failed stateless verification",
-                        self.id,
-                        transaction.digest()
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Proxy {} failed to get stateless result for {:?}: {:?}",
-                        self.id,
-                        transaction.digest(),
-                        e
-                    );
-                    return;
-                }
+            if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
+                tracing::error!("Failed to send stateless request: {}", e);
             }
-        }
+            self.stateless_controller
+                .set_remote_dependency(*transaction.digest())
+        };
 
-        // Send stateless request to the appropriate proxy
-        let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
-        let tx = self
-            .tx_inter_proxy_replies
-            .get(&stateless_res_proxy_id)
-            .unwrap();
-        if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
-            tracing::error!("Failed to send stateless request: {}", e);
-        }
-
-        self.pending_stateful_txns
-            .insert(*transaction.digest(), (transaction, required_states));
+        self.schedule_stateful_transaction(transaction, required_states, rx)
+            .await;
     }
 
     async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
@@ -219,7 +192,7 @@ where
 
         let tx = self
             .stateless_controller
-            .set_dependency(*transaction.digest());
+            .set_local_dependency(*transaction.digest());
 
         let context = self.executor.context().clone();
         let id = self.id;
@@ -315,25 +288,25 @@ where
             result
         );
 
-        // Process the transaction if verification passed, otherwise just remove it
-        if let Some((_, (transaction, missing_states))) = self.pending_stateful_txns.remove(&digest)
-        {
-            if result {
-                tracing::debug!(
-                    "Proxy {} scheduling stateful transaction {:?} after stateless verification",
-                    self.id,
-                    digest
-                );
-                self.schedule_stateful_transaction(transaction, missing_states)
-                    .await;
-            } else {
-                tracing::debug!(
-                    "Proxy {} discarding transaction {:?} due to failed stateless verification",
-                    self.id,
-                    digest
-                );
-            }
-        }
+        // // Process the transaction if verification passed, otherwise just remove it
+        // if let Some((_, (transaction, missing_states))) = self.pending_stateful_txns.remove(&digest)
+        // {
+        //     if result {
+        //         tracing::debug!(
+        //             "Proxy {} scheduling stateful transaction {:?} after stateless verification",
+        //             self.id,
+        //             digest
+        //         );
+        //         self.schedule_stateful_transaction(transaction, missing_states)
+        //             .await;
+        //     } else {
+        //         tracing::debug!(
+        //             "Proxy {} discarding transaction {:?} due to failed stateless verification",
+        //             self.id,
+        //             digest
+        //         );
+        //     }
+        // }
     }
 
     async fn handle_stateful_request(
@@ -413,17 +386,24 @@ where
 
         let rx = self
             .stateless_controller
-            .get_dependencies(&txn_digest)
+            .get_dependency(&txn_digest)
             .unwrap();
-        let verification_result = rx.await.unwrap();
 
-        let reply = InterProxyReply::Stateless(*txn_digest, verification_result);
-        Self::send_msg_to_proxy(
-            self.tx_inter_proxy_replies.clone(),
-            proxy_id,
-            ProxyToProxyMessage::Reply(reply),
-        )
-        .await;
+        let stateless_controller = self.stateless_controller.clone();
+        let txn_digest = *txn_digest;
+        let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
+        tokio::spawn(async move {
+            let verification_result = rx.await.unwrap();
+            stateless_controller.remove_dependency(&txn_digest);
+
+            let reply = InterProxyReply::Stateless(txn_digest, verification_result);
+            Self::send_msg_to_proxy(
+                tx_inter_proxy_replies.clone(),
+                proxy_id,
+                ProxyToProxyMessage::Reply(reply),
+            )
+            .await;
+        });
     }
 
     async fn send_msg_to_proxy(
@@ -462,6 +442,7 @@ where
         &mut self,
         transaction: RemoraTransaction<E>,
         required_states: RequiredStates,
+        rx: oneshot::Receiver<bool>,
     ) {
         tracing::debug!(
             "Proxy {} scheduling stateful transaction {:?} with {} required states",
@@ -516,7 +497,7 @@ where
             obj_ids
         );
 
-        self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles)
+        self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles, rx)
             .await
             .expect("Failed to schedule transaction");
     }
@@ -552,6 +533,7 @@ where
         obj_ids: Vec<(ObjectID, SequenceNumber)>,
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
+        stateless_handle: oneshot::Receiver<bool>,
     ) -> NodeResult<()> {
         tracing::debug!(
             "Proxy {} spawning stateful transaction {:?}",
@@ -565,8 +547,13 @@ where
         let ctx = self.executor.context().clone();
         let metrics = self.metrics.clone();
         let stateful_controller = self.stateful_controller.clone();
+        let stateless_controller = self.stateless_controller.clone();
         let executor = self.executor.clone();
         tokio::spawn(async move {
+            // Wait for the stateless dependency to be resolved
+            stateless_handle.await.unwrap();
+            stateless_controller.remove_dependency(&transaction.digest());
+
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
@@ -578,7 +565,7 @@ where
                 obj_ids,
                 transaction.digest()
             );
-            // // Assign shared objects version.
+            // Assign shared objects version.
             executor
                 .assign_shared_object_versions(&[transaction.deref().clone()])
                 .await;
