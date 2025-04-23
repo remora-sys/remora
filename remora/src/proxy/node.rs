@@ -26,6 +26,8 @@ pub struct ProxyNode<E: Executor> {
     rx_proxy_results: Receiver<ExecutionResults<E>>,
     /// The handle for the network client.
     _network_handles: Vec<JoinHandle<io::Result<()>>>,
+    /// The handles for the connection listeners.
+    _connection_listener_handles: Vec<JoinHandle<()>>,
     /// The metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -62,6 +64,51 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             .find(|p| p.proxy_id == id)
             .expect("Could not find our proxy in the config");
 
+        // Create a proper channel for new connections from other proxies
+        let (tx_connections, mut rx_connections) =
+            mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
+
+        // Prepare listen addresses on localhost for proxy and primary
+        let proxy_port = our_proxy_info.listen_proxy_address.port();
+        let primary_port = our_proxy_info.listen_primary_address.port();
+        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+        let listen_proxy_address = std::net::SocketAddr::new(localhost, proxy_port);
+        let listen_primary_address = std::net::SocketAddr::new(localhost, primary_port);
+
+        // Create a server that listens for connections from other proxies
+        let inter_proxy_server_handle = NetworkServer::new(
+            listen_proxy_address,
+            tx_connections.clone(),
+            tx_inter_proxy_requests.clone(),
+        )
+        .spawn();
+        network_handles.push(inter_proxy_server_handle);
+
+        // Spawn a task to handle incoming proxy connections
+        let connection_handle = tokio::spawn(async move {
+            while let Some(_new_connection) = rx_connections.recv().await {
+                tracing::info!("Received new proxy connection");
+                // Store the connection for future use
+                // You might want to store this in a shared state or handle it according to your needs
+            }
+        });
+        let mut connection_listener_handles = Vec::new();
+        connection_listener_handles.push(connection_handle);
+
+        let (tx_primary_connection, _) = mpsc::channel::<
+            Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
+        >(DEFAULT_CHANNEL_SIZE);
+
+        // Create a server that listens for connections from the primary
+        let primary_connection_handle = NetworkServer::new(
+            listen_primary_address,
+            tx_primary_connection,
+            tx_transactions,
+        )
+        .spawn();
+        network_handles.push(primary_connection_handle);
+
         // Create connections to other proxies
         for proxy_info in &config.proxies {
             // Skip creating a connection to self
@@ -96,51 +143,11 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         .spawn();
         core_handles.push(core_handle);
 
-        // Create a proper channel for new connections from other proxies
-        let (tx_connections, _) =
-            mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
-
-        // Prepare listen addresses on localhost for proxy and primary
-        let proxy_port = our_proxy_info.listen_proxy_address.port();
-        let primary_port = our_proxy_info.listen_primary_address.port();
-        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-
-        let listen_proxy_address = std::net::SocketAddr::new(localhost, proxy_port);
-        let listen_primary_address = std::net::SocketAddr::new(localhost, primary_port);
-
-        // Create a server that listens for connections from other proxies
-        let inter_proxy_server_handle = NetworkServer::new(
-            listen_proxy_address,
-            tx_connections,
-            tx_inter_proxy_requests.clone(),
-        )
-        .spawn();
-        network_handles.push(inter_proxy_server_handle);
-
-        let (tx_primary_connection, _) = mpsc::channel::<
-            Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
-        >(DEFAULT_CHANNEL_SIZE);
-
-        // Create a server that listens for connections from the primary
-        let primary_connection_handle = NetworkServer::new(
-            listen_primary_address,
-            tx_primary_connection,
-            tx_transactions,
-        )
-        .spawn();
-        network_handles.push(primary_connection_handle);
-        // let (_, rx_placeholder) = mpsc::channel::<
-        //     PrimaryToProxyMessage<<E as Executor>::Transaction>,
-        // >(DEFAULT_CHANNEL_SIZE);
-        // let network_handle =
-        //     NetworkClient::new(config.proxy_server_address, tx_transactions, rx_placeholder)
-        //         .spawn();
-        // network_handles.push(network_handle);
-
         Self {
             phantom_data: PhantomData,
             core_handles,
             rx_proxy_results,
+            _connection_listener_handles: connection_listener_handles,
             _network_handles: network_handles,
             metrics,
         }
