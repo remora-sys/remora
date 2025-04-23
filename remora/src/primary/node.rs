@@ -77,7 +77,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             store.clone(),
             proxy_connections,
             rx_committed_txns,
-            config.load_balancing_policy.clone(),
+            config.validator_parameters.load_balancing_policy.clone(),
             metrics.clone(),
         )
         .spawn();

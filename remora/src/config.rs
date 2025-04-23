@@ -81,6 +81,9 @@ pub struct ValidatorParameters {
     /// The consensus parameters.
     #[serde(default = "default_validator_config::default_consensus_parameters")]
     pub consensus_parameters: MockConsensusParameters,
+    /// The load balancing policy.
+    #[serde(default = "default_validator_config::default_load_balancing_policy")]
+    pub load_balancing_policy: LoadBalancingPolicy,
 }
 
 impl ValidatorParameters {
@@ -112,6 +115,7 @@ impl Default for ValidatorParameters {
         ValidatorParameters {
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
+            load_balancing_policy: default_validator_config::default_load_balancing_policy(),
         }
     }
 }
@@ -145,8 +149,6 @@ pub struct ValidatorConfig {
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
     pub validator_parameters: ValidatorParameters,
-    /// The load balancing policy.
-    pub load_balancing_policy: LoadBalancingPolicy,
 }
 
 impl ValidatorConfig {
@@ -176,7 +178,6 @@ impl ValidatorConfig {
             proxies,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
-            load_balancing_policy: default_validator_config::default_load_balancing_policy(),
         }
     }
 }
