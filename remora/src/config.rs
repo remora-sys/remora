@@ -17,6 +17,19 @@ use crate::{
     proxy::core::ProxyId,
 };
 
+/// Defines different load balancing policies for distributing transactions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum LoadBalancingPolicy {
+    /// Simple round-robin distribution
+    RoundRobin,
+    /// Send to proxy that already has most of the required states
+    Zeus,
+    /// Dedicated: one proxy for stateless, another for stateful
+    Dedicated,
+    /// Combined: one proxy for both stateless and stateful
+    Combined,
+}
+
 /// Default channel size for communication between components.
 pub const DEFAULT_CHANNEL_SIZE: usize = 100_000;
 
@@ -78,6 +91,7 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
+    use crate::config::LoadBalancingPolicy;
     use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
     pub fn default_consensus_delay_model() -> FixedDelay {
@@ -86,6 +100,10 @@ mod default_validator_config {
 
     pub fn default_consensus_parameters() -> MockConsensusParameters {
         MockConsensusParameters::default()
+    }
+
+    pub fn default_load_balancing_policy() -> LoadBalancingPolicy {
+        LoadBalancingPolicy::RoundRobin
     }
 }
 
@@ -127,6 +145,8 @@ pub struct ValidatorConfig {
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
     pub validator_parameters: ValidatorParameters,
+    /// The load balancing policy.
+    pub load_balancing_policy: LoadBalancingPolicy,
 }
 
 impl ValidatorConfig {
@@ -156,6 +176,7 @@ impl ValidatorConfig {
             proxies,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
+            load_balancing_policy: default_validator_config::default_load_balancing_policy(),
         }
     }
 }

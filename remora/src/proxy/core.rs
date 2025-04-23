@@ -150,6 +150,26 @@ where
                 )
                 .await;
             }
+            PrimaryToProxyMessage::CombinedTxn(
+                transaction,
+                stateless_res_proxy_id,
+                missing_states,
+            ) => {
+                tracing::debug!(
+                    "Proxy {} received combined transaction {:?}, stateless proxy: {}",
+                    self.id,
+                    transaction.digest(),
+                    stateless_res_proxy_id
+                );
+                self.process_stateless_transaction(transaction.clone())
+                    .await;
+                self.process_stateful_transaction(
+                    transaction,
+                    stateless_res_proxy_id,
+                    missing_states,
+                )
+                .await;
+            }
         }
     }
 

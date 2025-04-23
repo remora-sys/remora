@@ -239,6 +239,8 @@ where
     Txn(TransactionWithTimestamp<T>, ProxyId, RequiredStates),
     /// Stateless transaction that only requires signature verification
     StatelessTxn(TransactionWithTimestamp<T>),
+    /// Combined stateless+stateful
+    CombinedTxn(TransactionWithTimestamp<T>, ProxyId, RequiredStates),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

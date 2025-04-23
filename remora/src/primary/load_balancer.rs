@@ -11,6 +11,7 @@ use tokio::{
 };
 
 use crate::{
+    config::LoadBalancingPolicy,
     error::{NodeError, NodeResult},
     executor::api::{
         ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, PrimaryToProxyMessage,
@@ -19,15 +20,6 @@ use crate::{
     metrics::Metrics,
     proxy::core::ProxyId,
 };
-
-/// Defines different load balancing policies for distributing transactions.
-#[derive(Debug, Clone)]
-pub enum LoadBalancingPolicy {
-    /// Simple round-robin distribution
-    RoundRobin,
-    /// Send to proxy that already has most of the required states
-    Zeus,
-}
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
@@ -62,6 +54,7 @@ impl<E: Executor> LoadBalancer<E> {
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        policy: LoadBalancingPolicy,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -73,7 +66,7 @@ impl<E: Executor> LoadBalancer<E> {
             states_to_proxy: FxHashMap::default(),
             stateless_routing: FxHashMap::default(),
             metrics,
-            policy: LoadBalancingPolicy::RoundRobin,
+            policy,
         }
     }
 
@@ -102,6 +95,14 @@ impl<E: Executor> LoadBalancer<E> {
             LoadBalancingPolicy::RoundRobin => self.get_proxy_for_shared_objects_round_robin(),
             LoadBalancingPolicy::Zeus => {
                 self.get_proxy_for_shared_objects_most_states(shared_object_ids)
+            }
+            LoadBalancingPolicy::Dedicated => {
+                // Dedicated: proxy 0 for stateless, proxy 1 for stateful
+                let proxy_index = if shared_object_ids.is_empty() { 0 } else { 1 };
+                Some(proxy_index)
+            }
+            LoadBalancingPolicy::Combined => {
+                unimplemented!()
             }
         }
     }
@@ -224,8 +225,20 @@ impl<E: Executor> LoadBalancer<E> {
         proxy_index: usize,
         transaction: RemoraTransaction<E>,
         is_stateful: bool,
+        is_combined: bool,
     ) -> bool {
-        let message = if is_stateful {
+        let message = if is_combined {
+            let missing_states = self
+                .get_missing_states_for_transaction(&transaction, proxy_index)
+                .await;
+            tracing::debug!(
+                "Sending combined transaction to proxy {}: digest={:?}, missing_states_count={}",
+                proxy_index,
+                transaction.digest(),
+                missing_states.len()
+            );
+            PrimaryToProxyMessage::CombinedTxn(transaction, proxy_index, missing_states)
+        } else if is_stateful {
             let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
             let missing_states = self
                 .get_missing_states_for_transaction(&transaction, proxy_index)
@@ -269,15 +282,35 @@ impl<E: Executor> LoadBalancer<E> {
         }
     }
 
-    /// Forwards transactions with owned-object only using round-robin.
+    /// Forwards transactions with owned-object only using the selected policy.
     async fn forward_owned_object_only_txn(&mut self, transaction: RemoraTransaction<E>) {
-        let proxy_index = self.index % self.proxy_connections.len();
-        self.index += 1;
+        match &self.policy {
+            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
+                let proxy_index = self.index % self.proxy_connections.len();
+                self.index += 1;
 
-        self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
-            .await;
-        self.send_transaction_to_proxy(proxy_index, transaction, true)
-            .await;
+                self.send_transaction_to_proxy(proxy_index, transaction.clone(), false, false)
+                    .await;
+                self.send_transaction_to_proxy(proxy_index, transaction, true, false)
+                    .await;
+            }
+            LoadBalancingPolicy::Dedicated => {
+                let stateless_proxy = 0;
+                let stateful_proxy = 1 % self.proxy_connections.len();
+
+                self.send_transaction_to_proxy(stateless_proxy, transaction.clone(), false, false)
+                    .await;
+                self.send_transaction_to_proxy(stateful_proxy, transaction, true, false)
+                    .await;
+            }
+            LoadBalancingPolicy::Combined => {
+                let proxy_index = self.index % self.proxy_connections.len();
+                self.index += 1;
+
+                self.send_transaction_to_proxy(proxy_index, transaction, false, true)
+                    .await;
+            }
+        }
     }
 
     /// Forwards transactions with shared objects to the appropriate proxy.
@@ -287,9 +320,9 @@ impl<E: Executor> LoadBalancer<E> {
         shared_object_ids: Vec<ObjectID>,
     ) {
         if let Some(proxy_index) = self.get_proxy_for_shared_objects(&shared_object_ids) {
-            self.send_transaction_to_proxy(proxy_index, transaction.clone(), false)
+            self.send_transaction_to_proxy(proxy_index, transaction.clone(), false, false)
                 .await;
-            self.send_transaction_to_proxy(proxy_index, transaction, true)
+            self.send_transaction_to_proxy(proxy_index, transaction, true, false)
                 .await;
         } else {
             tracing::warn!("No proxies available for transaction with shared objects");
@@ -363,7 +396,7 @@ impl<E: Executor> LoadBalancer<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BenchmarkParameters;
+    use crate::config::{BenchmarkParameters, LoadBalancingPolicy};
     use crate::executor::sui::SuiExecutor;
     use crate::proxy::core::ProxyCore;
     use dashmap::DashMap;
@@ -434,6 +467,7 @@ mod tests {
             store.clone(),
             proxy_connections,
             rx_committed_txns,
+            LoadBalancingPolicy::RoundRobin,
             metrics,
         );
 
@@ -457,12 +491,14 @@ mod tests {
                     match msg {
                         PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
+                        PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
                 }
                 Some(msg) = rx_from_lb2.recv() => {
                     match msg {
                         PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
+                        PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
@@ -484,7 +520,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_load_balancer_with_one_proxy() {
-        // Setup test environment
         let config = BenchmarkParameters::new_for_tests();
         let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
@@ -505,6 +540,7 @@ mod tests {
             store.clone(),
             proxy_connections,
             rx_committed_txns,
+            LoadBalancingPolicy::RoundRobin,
             metrics.clone(),
         );
 
@@ -537,7 +573,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_load_balancer_with_two_proxies() {
-        // Setup test environment
         let config = BenchmarkParameters::new_for_contention_tests();
         let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
@@ -568,6 +603,7 @@ mod tests {
             store.clone(),
             proxy_connections,
             rx_committed_txns,
+            LoadBalancingPolicy::RoundRobin,
             metrics.clone(),
         );
 
@@ -629,6 +665,73 @@ mod tests {
             finished_count, 4,
             "Expected 4 completed transactions, got {}",
             finished_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_balancer_dedicated_forwarding() {
+        let config = BenchmarkParameters::new_for_tests();
+        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
+
+        // Setup proxy channels
+        let (tx_to_proxy0, mut rx_from_lb0) = channel(100);
+        let (tx_to_proxy1, mut rx_from_lb1) = channel(100);
+
+        // Create proxy connections map
+        let mut proxy_connections = FxHashMap::default();
+        proxy_connections.insert(0, tx_to_proxy0);
+        proxy_connections.insert(1, tx_to_proxy1);
+
+        // Create load balancer with Dedicated policy
+        let lb = LoadBalancer::new(
+            executor.clone(),
+            store.clone(),
+            proxy_connections,
+            rx_committed_txns,
+            LoadBalancingPolicy::Dedicated,
+            metrics,
+        );
+
+        // Spawn load balancer
+        let _lb_handle = lb.spawn();
+
+        // Generate transactions
+        let remora_txns = generate_test_transactions(&config, 5).await;
+
+        // Send transactions to load balancer
+        tx_committed_txns.send(remora_txns.clone()).await.unwrap();
+
+        // Counters for each proxy
+        let mut stateless_on_0 = 0;
+        let mut stateful_on_1 = 0;
+
+        // Check messages received by proxies
+        for _ in 0..5 {
+            if let Some(msg) = rx_from_lb0.recv().await {
+                match msg {
+                    PrimaryToProxyMessage::StatelessTxn(_) => stateless_on_0 += 1,
+                    _ => panic!("Proxy 0 should only receive stateless transactions"),
+                }
+            }
+        }
+        for _ in 0..5 {
+            if let Some(msg) = rx_from_lb1.recv().await {
+                match msg {
+                    PrimaryToProxyMessage::Txn(_, _, _) => stateful_on_1 += 1,
+                    _ => panic!("Proxy 1 should only receive stateful transactions"),
+                }
+            }
+        }
+
+        // We should have received both stateless and stateful versions of each transaction
+        assert_eq!(
+            stateless_on_0, 5,
+            "Proxy 0 should have received 5 stateless transactions"
+        );
+        assert_eq!(
+            stateful_on_1, 5,
+            "Proxy 1 should have received 5 stateful transactions"
         );
     }
 }

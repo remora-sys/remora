@@ -56,7 +56,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let store = Arc::new(executor.init_store());
 
         // Connect to each proxy server
-        for (idx, proxy_info) in config.proxies.iter().enumerate() {
+        for (_idx, proxy_info) in config.proxies.iter().enumerate() {
             let (tx_proxy, rx_proxy) =
                 mpsc::channel::<PrimaryToProxyMessage<E::Transaction>>(DEFAULT_CHANNEL_SIZE);
 
@@ -75,8 +75,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let load_balancer_handle = LoadBalancer::<E>::new(
             executor.clone(),
             store.clone(),
-            proxy_connections, // Pass the hashmap of proxy connections instead of a channel
+            proxy_connections,
             rx_committed_txns,
+            config.load_balancing_policy.clone(),
             metrics.clone(),
         )
         .spawn();
