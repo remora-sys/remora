@@ -44,7 +44,10 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor> LoadBalancer<E> {
+impl<E: Executor> LoadBalancer<E>
+where
+    <E as Executor>::Transaction: Send + 'static,
+{
     /// Create a new load balancer.
     pub fn new(
         executor: E,
@@ -226,7 +229,9 @@ impl<E: Executor> LoadBalancer<E> {
         transaction: RemoraTransaction<E>,
         is_stateful: bool,
         is_combined: bool,
-    ) -> bool {
+    ) where
+        <E as Executor>::Transaction: Send,
+    {
         let message = if is_combined {
             let missing_states = self
                 .get_missing_states_for_transaction(&transaction, proxy_index)
@@ -262,24 +267,17 @@ impl<E: Executor> LoadBalancer<E> {
             PrimaryToProxyMessage::StatelessTxn(transaction)
         };
 
-        if self
-            .proxy_connections
-            .get(&proxy_index)
-            .unwrap()
-            .send(message)
-            .await
-            .is_ok()
-        {
-            tracing::debug!("Sent transaction to proxy {}", proxy_index);
-            true
-        } else {
-            tracing::warn!(
-                "Failed to send transaction to proxy {}, removing connection",
-                proxy_index
-            );
-            self.proxy_connections.remove(&proxy_index);
-            false
-        }
+        let proxy_connection = self.proxy_connections.get(&proxy_index).unwrap().clone();
+        tokio::spawn(async move {
+            if proxy_connection.send(message).await.is_ok() {
+                tracing::debug!("Sent transaction to proxy {}", proxy_index);
+            } else {
+                tracing::warn!(
+                    "Failed to send transaction to proxy {}, removing connection",
+                    proxy_index
+                );
+            }
+        });
     }
 
     /// Forwards transactions with owned-object only using the selected policy.

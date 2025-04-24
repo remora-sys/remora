@@ -50,24 +50,66 @@ impl OneshotDependencyController {
         rx
     }
 
-    /// Set the local dependency for a given `TransactionDigest`.
-    /// This stores only the receiver in the map and returns the sender.
+    /// Sets a local dependency for a transaction.
+    ///
+    /// This method creates or updates an entry for the given transaction ID in the dependency map.
+    /// It stores only the receiver part of the oneshot channel in the map and returns the sender.
+    ///
+    /// If an entry already exists but has no sender, a new channel is created.
+    /// If an entry exists with a sender, that sender is taken and returned.
+    ///
+    /// # Arguments
+    /// * `txn_id` - The transaction digest to set the dependency for
+    ///
+    /// # Returns
+    /// A oneshot sender that can be used to signal completion of the transaction
     pub fn set_local_dependency(&self, txn_id: TransactionDigest) -> oneshot::Sender<bool> {
-        let (tx, rx) = oneshot::channel::<bool>();
-        self.obj_task_map.insert(txn_id, Some((Some(rx), None)));
-        tx
+        use dashmap::mapref::entry::Entry;
+
+        match self.obj_task_map.entry(txn_id) {
+            Entry::Occupied(mut occ) => {
+                if let Some((_, tx_opt)) = occ.get_mut() {
+                    if let Some(tx) = tx_opt.take() {
+                        return tx;
+                    }
+                }
+                // If no sender exists, create a new one
+                let (tx, rx) = oneshot::channel::<bool>();
+                *occ.get_mut() = Some((Some(rx), None));
+                tx
+            }
+            Entry::Vacant(vac) => {
+                // Create new entry if it doesn't exist
+                let (tx, rx) = oneshot::channel::<bool>();
+                vac.insert(Some((Some(rx), None)));
+                tx
+            }
+        }
     }
 
-    /// Get the dependency for a given `TransactionDigest`.
-    /// Returns None if the transaction doesn't exist.
-    /// This removes the receiver from the entry, but leaves the entry if the sender exists.
-    /// If both receiver and sender are gone, removes the entry entirely.
+    /// Retrieves the dependency receiver for a transaction.
+    ///
+    /// This method looks up the entry for the given transaction ID and returns the receiver
+    /// part of the oneshot channel if it exists. The receiver is removed from the entry,
+    /// but the entry remains if a sender still exists.
+    ///
+    /// If no entry exists, a new channel is created, the sender is stored, and the receiver
+    /// is returned.
+    ///
+    /// If both receiver and sender are gone after taking the receiver, the entry is removed
+    /// entirely from the map.
+    ///
+    /// # Arguments
+    /// * `txn_id` - The transaction digest to get the dependency for
+    ///
+    /// # Returns
+    /// An optional oneshot receiver that can be awaited to determine transaction completion
     pub fn get_dependency(&self, txn_id: &TransactionDigest) -> Option<oneshot::Receiver<bool>> {
         use dashmap::mapref::entry::Entry;
 
         match self.obj_task_map.entry(txn_id.clone()) {
             Entry::Occupied(mut occ) => {
-                if let Some((rx, tx_opt)) = occ.get_mut().take() {
+                if let Some((rx_opt, tx_opt)) = occ.get_mut().take() {
                     // If sender still exists, leave entry with sender only
                     if tx_opt.is_some() {
                         *occ.get_mut() = Some((None, tx_opt));
@@ -75,24 +117,24 @@ impl OneshotDependencyController {
                         // If sender is also None, remove entry
                         occ.remove();
                     }
-                    rx
+                    rx_opt
                 } else {
                     // Entry exists but is None
                     None
                 }
             }
-            Entry::Vacant(_) => None,
+            Entry::Vacant(vac) => {
+                // Create new entry if it doesn't exist
+                let (tx, rx) = oneshot::channel::<bool>();
+                vac.insert(Some((None, Some(tx))));
+                Some(rx)
+            }
         }
     }
 
-    /// Remove and get the dependency for a given `TransactionDigest`.
-    /// Returns None if the transaction doesn't exist.
-    /// This removes the entire entry from the map and returns the receiver if present.
-    pub fn remove_dependency(&self, txn_id: &TransactionDigest) -> Option<oneshot::Receiver<bool>> {
-        self.obj_task_map
-            .remove(txn_id)
-            .and_then(|(_, entry)| entry)
-            .and_then(|(rx, _)| rx)
+    /// Remove the dependency for a given `TransactionDigest` without returning the receiver.
+    pub fn remove_dependency(&self, txn_id: &TransactionDigest) {
+        self.obj_task_map.remove(txn_id);
     }
 
     /// Get the signal sender for a given `TransactionDigest` if it exists.
@@ -173,12 +215,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_dependencies_nonexistent() {
+    fn test_get_dependencies_existent() {
         let dependency_controller = OneshotDependencyController::new();
         let txn_id = TransactionDigest::random();
 
         // This should return None because the transaction doesn't exist
-        assert!(dependency_controller.get_dependency(&txn_id).is_none());
+        assert!(dependency_controller.get_dependency(&txn_id).is_some());
     }
 
     #[test]
@@ -223,5 +265,45 @@ mod tests {
         let result2 =
             runtime.block_on(async { handle2.await.expect("Failed to receive completion signal") });
         assert!(!result2, "Expected failure completion for transaction 2");
+    }
+
+    #[test]
+    fn test_remove_dependency() {
+        let dependency_controller = OneshotDependencyController::new();
+        let txn_id = TransactionDigest::random();
+
+        // Set a dependency
+        dependency_controller.set_remote_dependency(txn_id);
+
+        // Ensure the entry exists
+        assert!(dependency_controller.has_entry_for_txn(&txn_id));
+
+        // Remove the dependency
+        dependency_controller.remove_dependency(&txn_id);
+
+        // Ensure the entry no longer exists
+        assert!(!dependency_controller.has_entry_for_txn(&txn_id));
+    }
+
+    #[test]
+    fn test_take_signal() {
+        let dependency_controller = OneshotDependencyController::new();
+        let txn_id = TransactionDigest::random();
+
+        // Set a remote dependency
+        let _ = dependency_controller.set_remote_dependency(txn_id);
+
+        // Ensure the entry exists
+        assert!(dependency_controller.has_entry_for_txn(&txn_id));
+
+        // Take the signal (sender)
+        let taken_sender = dependency_controller.take_signal(&txn_id);
+
+        // Ensure the sender is the same
+        assert!(taken_sender.is_some());
+
+        // Try to take the signal again, should be None
+        let taken_sender_again = dependency_controller.take_signal(&txn_id);
+        assert!(taken_sender_again.is_none());
     }
 }
