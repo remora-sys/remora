@@ -4,7 +4,11 @@
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use rustc_hash::FxHashMap;
-use sui_types::{base_types::ObjectID, digests::TransactionDigest, transaction::InputObjectKind};
+use sui_types::{
+    base_types::{ObjectID, SequenceNumber},
+    digests::TransactionDigest,
+    transaction::InputObjectKind,
+};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -92,16 +96,16 @@ where
     /// This is the main entry point for load balancing policy selection.
     fn get_proxy_for_shared_objects(
         &mut self,
-        shared_object_ids: &[ObjectID],
+        required_versions: &[(ObjectID, SequenceNumber)],
     ) -> Option<ExecutorIndex> {
         match &mut self.policy {
             LoadBalancingPolicy::RoundRobin => self.get_proxy_for_shared_objects_round_robin(),
             LoadBalancingPolicy::Zeus => {
-                self.get_proxy_for_shared_objects_most_states(shared_object_ids)
+                self.get_proxy_for_shared_objects_most_states(required_versions)
             }
             LoadBalancingPolicy::Dedicated => {
                 // Dedicated: proxy 0 for stateless, proxy 1 for stateful
-                let proxy_index = if shared_object_ids.is_empty() { 0 } else { 1 };
+                let proxy_index = if required_versions.is_empty() { 0 } else { 1 };
                 Some(proxy_index)
             }
             LoadBalancingPolicy::Combined => {
@@ -126,14 +130,14 @@ where
     /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
     fn get_proxy_for_shared_objects_most_states(
         &self,
-        shared_object_ids: &[ObjectID],
+        required_versions: &[(ObjectID, SequenceNumber)],
     ) -> Option<ExecutorIndex> {
         let proxy_count = self.proxy_connections.len();
         if proxy_count == 0 {
             return None;
         }
 
-        if shared_object_ids.is_empty() {
+        if required_versions.is_empty() {
             // If no shared objects, use first proxy
             return Some(0);
         }
@@ -141,7 +145,7 @@ where
         // Count how many objects each proxy already has
         let mut proxy_state_counts = vec![0; proxy_count];
 
-        for id in shared_object_ids {
+        for (id, _) in required_versions {
             if let Some(proxy_index) = self.states_to_proxy.get(id) {
                 if *proxy_index < proxy_count {
                     proxy_state_counts[*proxy_index] += 1;
@@ -163,38 +167,15 @@ where
         Some(best_proxy)
     }
 
-    /// Determines the correct forwarding target for a transaction.
-    async fn forward_txn_to_proxy(&mut self, transaction: RemoraTransaction<E>) {
-        // If no proxies exist, send to the local executor.
-        if self.proxy_connections.is_empty() {
-            tracing::error!("No proxies available");
-            return;
-        }
-
-        let shared_object_ids = self.get_shared_object_ids(transaction.deref());
-
-        if shared_object_ids.is_empty() {
-            self.forward_owned_object_only_txn(transaction).await;
-        } else {
-            self.forward_shared_object_txn(transaction, shared_object_ids)
-                .await;
-        }
-    }
-
     /// Helper method to determine missing states for a transaction
     /// and update the states ownership map
     async fn get_missing_states_for_transaction(
         &mut self,
         transaction: &RemoraTransaction<E>,
+        required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
         proxy_index: ExecutorIndex,
     ) -> RequiredStates {
         let mut required_states = BTreeMap::new();
-
-        // Add tracing for required versions using the executor API
-        let required_versions = self
-            .executor
-            .get_required_shared_object_versions(&transaction.digest())
-            .await;
 
         tracing::debug!(
             "Transaction {:?} required versions: {:?}",
@@ -227,6 +208,7 @@ where
         &mut self,
         proxy_index: usize,
         transaction: RemoraTransaction<E>,
+        required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
         is_stateful: bool,
         is_combined: bool,
     ) where
@@ -234,7 +216,7 @@ where
     {
         let message = if is_combined {
             let missing_states = self
-                .get_missing_states_for_transaction(&transaction, proxy_index)
+                .get_missing_states_for_transaction(&transaction, required_versions, proxy_index)
                 .await;
             tracing::debug!(
                 "Sending combined transaction to proxy {}: digest={:?}, missing_states_count={}",
@@ -246,7 +228,7 @@ where
         } else if is_stateful {
             let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
             let missing_states = self
-                .get_missing_states_for_transaction(&transaction, proxy_index)
+                .get_missing_states_for_transaction(&transaction, required_versions, proxy_index)
                 .await;
             tracing::debug!(
                 "Sending stateful transaction to proxy {}: digest={:?}, stateless_proxy_id={}, missing_states_count={}",
@@ -287,25 +269,37 @@ where
                 let proxy_index = self.index % self.proxy_connections.len();
                 self.index += 1;
 
-                self.send_transaction_to_proxy(proxy_index, transaction.clone(), false, false)
-                    .await;
-                self.send_transaction_to_proxy(proxy_index, transaction, true, false)
+                self.send_transaction_to_proxy(
+                    proxy_index,
+                    transaction.clone(),
+                    None,
+                    false,
+                    false,
+                )
+                .await;
+                self.send_transaction_to_proxy(proxy_index, transaction, None, true, false)
                     .await;
             }
             LoadBalancingPolicy::Dedicated => {
                 let stateless_proxy = 0;
                 let stateful_proxy = 1 % self.proxy_connections.len();
 
-                self.send_transaction_to_proxy(stateless_proxy, transaction.clone(), false, false)
-                    .await;
-                self.send_transaction_to_proxy(stateful_proxy, transaction, true, false)
+                self.send_transaction_to_proxy(
+                    stateless_proxy,
+                    transaction.clone(),
+                    None,
+                    false,
+                    false,
+                )
+                .await;
+                self.send_transaction_to_proxy(stateful_proxy, transaction, None, true, false)
                     .await;
             }
             LoadBalancingPolicy::Combined => {
                 let proxy_index = self.index % self.proxy_connections.len();
                 self.index += 1;
 
-                self.send_transaction_to_proxy(proxy_index, transaction, false, true)
+                self.send_transaction_to_proxy(proxy_index, transaction, None, false, true)
                     .await;
             }
         }
@@ -315,13 +309,25 @@ where
     async fn forward_shared_object_txn(
         &mut self,
         transaction: RemoraTransaction<E>,
-        shared_object_ids: Vec<ObjectID>,
+        required_versions: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        if let Some(proxy_index) = self.get_proxy_for_shared_objects(&shared_object_ids) {
-            self.send_transaction_to_proxy(proxy_index, transaction.clone(), false, false)
-                .await;
-            self.send_transaction_to_proxy(proxy_index, transaction, true, false)
-                .await;
+        if let Some(proxy_index) = self.get_proxy_for_shared_objects(&required_versions) {
+            self.send_transaction_to_proxy(
+                proxy_index,
+                transaction.clone(),
+                Some(required_versions.clone()),
+                false,
+                false,
+            )
+            .await;
+            self.send_transaction_to_proxy(
+                proxy_index,
+                transaction,
+                Some(required_versions.clone()),
+                true,
+                false,
+            )
+            .await;
         } else {
             tracing::warn!("No proxies available for transaction with shared objects");
         }
@@ -333,45 +339,24 @@ where
         loop {
             tokio::select! {
                 Some(transactions) = self.rx_committed_txns.recv() => {
-
-                    // TODO: shall we avoid assign for non-shared-object txns
-                    // Assign shared objects version.
-                    self.executor
-                        .assign_shared_object_versions(
-                            &transactions.iter().map(|tx| tx.deref().clone()).collect::<Vec<_>>()
-                        )
-                        .await;
-
                     txn_cnt += 1;
                     if txn_cnt == 1 {
                         self.metrics.register_start_time();
                     }
 
                     for transaction in transactions {
-                        self.forward_txn_to_proxy(transaction).await;
-                    }
-                }
-
-                /*Some(result) = self.rx_states_sync.recv() => {
-                    // send states updates to the proxy
-                    if self.proxy_connections.is_empty() {
-                        tracing::debug!("Skip states updating given no available other executors");
-                        continue;
-                    }
-
-                    let states_updates = self.prepare_state_updates(result);
-                    for (proxy_index, update) in states_updates {
-                        match self.proxy_connections[proxy_index].send(PrimaryToProxyMessage::States(update)).await {
-                            Ok(()) => {
-                                tracing::debug!("Sent updates to proxy {}", proxy_index);
-                            }
-                            Err(_) => {
-                                tracing::warn!("Failed to send states to proxy {}", proxy_index);
-                                self.proxy_connections.swap_remove(proxy_index);
-                            }
+                        let shared_object_ids = self.get_shared_object_ids(transaction.deref());
+                        if shared_object_ids.is_empty() {
+                            self.forward_owned_object_only_txn(transaction).await;
+                        } else {
+                            let required_versions = self.executor
+                                .assign_shared_object_versions_and_return_required_versions(&transaction)
+                                .await
+                                .unwrap();
+                            self.forward_shared_object_txn(transaction, required_versions).await;
                         }
                     }
-                }*/
+                }
 
                 else => Err(NodeError::ShuttingDown)?,
             }

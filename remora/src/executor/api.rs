@@ -170,10 +170,17 @@ pub trait Executor: Clone {
     ) -> bool;
 
     /// Assign a shared object version.
+    #[deprecated(note = "Use assign_shared_object_versions_and_return_required_versions instead")]
     fn assign_shared_object_versions(
         &self,
         _transactions: &[Self::Transaction],
     ) -> impl Future<Output = ()> + std::marker::Send;
+
+    /// Assign versions for single transaction and return the required versions.
+    fn assign_shared_object_versions_and_return_required_versions(
+        &self,
+        transaction: &Self::Transaction,
+    ) -> impl Future<Output = Option<Vec<(ObjectID, SequenceNumber)>>> + Send;
 
     /// Assign a shared object version.
     fn assign_shared_object_versions_with_required_versions(
@@ -183,6 +190,7 @@ pub trait Executor: Clone {
     ) -> impl Future<Output = ()> + std::marker::Send;
 
     /// Get the required shared object versions for the transactions.
+    #[deprecated(note = "Use assign_shared_object_versions_and_return_required_versions instead")]
     fn get_required_shared_object_versions(
         &self,
         transaction: &TransactionDigest,

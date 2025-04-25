@@ -428,6 +428,13 @@ impl Executor for FakeExecutor {
         //todo!()
     }
 
+    async fn assign_shared_object_versions_and_return_required_versions(
+        &self,
+        _transaction: &Self::Transaction,
+    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
+        todo!()
+    }
+
     async fn get_required_shared_object_versions(
         &self,
         transaction: &TransactionDigest,

@@ -405,6 +405,18 @@ impl Executor for SuiExecutor {
             .await;
     }
 
+    async fn assign_shared_object_versions_and_return_required_versions(
+        &self,
+        transaction: &Self::Transaction,
+    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
+        let _guard = self.shared_object_versions_assignment_lock.lock().await;
+        self.context()
+            .benchmark_ctx()
+            .validator()
+            .assign_shared_object_versions_and_return_required_versions(transaction)
+            .await
+    }
+
     async fn assign_shared_object_versions_with_required_versions(
         &self,
         transactions: &[Self::Transaction],
