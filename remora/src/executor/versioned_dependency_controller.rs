@@ -92,42 +92,6 @@ impl VersionedDependencyController {
         (current_handles, next_handles)
     }
 
-    #[deprecated]
-    /// Returns the task handle associated with the highest sequence number for a given object ID.
-    /// Returns None if no entries exist for the object ID.
-    pub fn get_latest_handle_for_object(&self, obj_id: &ObjectID) -> Option<Arc<Notify>> {
-        let mut latest_seq = None;
-        let mut latest_handle = None;
-
-        // Iterate through all entries to find the highest sequence number for this object ID
-        for entry in self.obj_task_map.iter() {
-            let ((entry_obj_id, seq_num), task_entry) = entry.pair();
-
-            if entry_obj_id == obj_id {
-                if latest_seq.is_none() || seq_num > &latest_seq.unwrap() {
-                    latest_seq = Some(*seq_num);
-                    if let Some((_, notify)) = task_entry.as_ref() {
-                        latest_handle = Some(notify.clone());
-                    }
-                }
-            }
-        }
-
-        // Remove the entry with the latest sequence number if found
-        if let Some(seq) = latest_seq {
-            tracing::debug!(
-                "Found latest handle for object {} with sequence number {}",
-                obj_id,
-                seq
-            );
-            self.obj_task_map.remove(&(*obj_id, seq));
-        } else {
-            tracing::debug!("No handle found for object {}", obj_id);
-        }
-
-        latest_handle
-    }
-
     /// Removes dependencies for the given object versions.
     pub fn remove_dependency(&self, obj_versions: Vec<(ObjectID, SequenceNumber)>) {
         for (obj_id, seq_num) in obj_versions {
@@ -264,73 +228,6 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&prior_tasks2[1], &current_tasks2[1]),
             "New version should have a separate notify."
-        );
-    }
-
-    #[test]
-    fn test_get_latest_handle_for_object() {
-        let dependency_controller = VersionedDependencyController::default();
-        let obj_id = ObjectID::random();
-
-        // Initially there should be no handle for the object
-        assert!(
-            dependency_controller
-                .get_latest_handle_for_object(&obj_id)
-                .is_none(),
-            "Should return None for an object with no entries"
-        );
-
-        // Add entries with different sequence numbers
-        let task_id1 = 1;
-        let task_id2 = 2;
-        let task_id3 = 3;
-        let seq_num1 = SequenceNumber::from(3);
-        let seq_num2 = SequenceNumber::from(5);
-        let seq_num3 = SequenceNumber::from(4);
-
-        // Create entries in non-sequential order to test sorting logic
-        dependency_controller.get_prior_dependency_and_update(
-            task_id1,
-            vec![(obj_id, seq_num1)],
-            false,
-            false,
-        );
-
-        let (_, current_tasks1) = dependency_controller.get_prior_dependency_and_update(
-            task_id2,
-            vec![(obj_id, seq_num2)],
-            false,
-            false,
-        );
-
-        dependency_controller.get_prior_dependency_and_update(
-            task_id3,
-            vec![(obj_id, seq_num3)],
-            false,
-            false,
-        );
-
-        // Get the latest handle
-        let latest_handle = dependency_controller.get_latest_handle_for_object(&obj_id);
-
-        // The latest handle should correspond to seq_num2 (5), which is the highest
-        assert!(
-            latest_handle.is_some(),
-            "Should return a handle for an object with entries"
-        );
-
-        assert!(
-            Arc::ptr_eq(&latest_handle.unwrap(), &current_tasks1[0]),
-            "The latest handle should correspond to the highest sequence number (5)"
-        );
-
-        // Test with a different object ID that doesn't exist
-        let non_existent_obj_id = ObjectID::random();
-        assert!(
-            dependency_controller
-                .get_latest_handle_for_object(&non_existent_obj_id)
-                .is_none(),
-            "Should return None for a non-existent object ID"
         );
     }
 
