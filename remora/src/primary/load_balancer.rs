@@ -40,8 +40,6 @@ pub struct LoadBalancer<E: Executor> {
     index: ExecutorIndex,
     /// The mapping of the states and the proxy index.
     states_to_proxy: FxHashMap<ObjectID, ExecutorIndex>,
-    /// The routing information of stateless.
-    stateless_routing: FxHashMap<TransactionDigest, ExecutorIndex>,
     /// The load balancing policy.
     policy: LoadBalancingPolicy,
     /// The metrics for the validator.
@@ -71,7 +69,6 @@ where
             rx_committed_txns,
             index: 0,
             states_to_proxy: FxHashMap::default(),
-            stateless_routing: FxHashMap::default(),
             metrics,
             policy,
         }
@@ -97,7 +94,7 @@ where
     fn get_proxy_for_shared_objects(
         &mut self,
         required_versions: &[(ObjectID, SequenceNumber)],
-    ) -> Option<ExecutorIndex> {
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match &mut self.policy {
             LoadBalancingPolicy::RoundRobin => self.get_proxy_for_shared_objects_round_robin(),
             LoadBalancingPolicy::Zeus => {
@@ -105,8 +102,7 @@ where
             }
             LoadBalancingPolicy::Dedicated => {
                 // Dedicated: proxy 0 for stateless, proxy 1 for stateful
-                let proxy_index = if required_versions.is_empty() { 0 } else { 1 };
-                Some(proxy_index)
+                Some((0, 1))
             }
             LoadBalancingPolicy::Combined => {
                 unimplemented!()
@@ -115,7 +111,9 @@ where
     }
 
     /// Get assigned proxy for shared objects using round-robin.
-    fn get_proxy_for_shared_objects_round_robin(&mut self) -> Option<ExecutorIndex> {
+    fn get_proxy_for_shared_objects_round_robin(
+        &mut self,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count = self.proxy_connections.len();
         if proxy_count == 0 {
             return None;
@@ -124,14 +122,14 @@ where
         let proxy_index = self.index % proxy_count;
         self.index = (self.index + 1) % proxy_count;
 
-        Some(proxy_index)
+        Some((proxy_index, proxy_index))
     }
 
     /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
     fn get_proxy_for_shared_objects_most_states(
         &self,
         required_versions: &[(ObjectID, SequenceNumber)],
-    ) -> Option<ExecutorIndex> {
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count = self.proxy_connections.len();
         if proxy_count == 0 {
             return None;
@@ -139,7 +137,7 @@ where
 
         if required_versions.is_empty() {
             // If no shared objects, use first proxy
-            return Some(0);
+            return Some((0, 0));
         }
 
         // Count how many objects each proxy already has
@@ -164,7 +162,7 @@ where
             }
         }
 
-        Some(best_proxy)
+        Some((best_proxy, best_proxy))
     }
 
     /// Helper method to determine missing states for a transaction
@@ -207,6 +205,7 @@ where
     async fn send_transaction_to_proxy(
         &mut self,
         proxy_index: usize,
+        stateless_proxy_id: ExecutorIndex,
         transaction: RemoraTransaction<E>,
         required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
         is_stateful: bool,
@@ -226,7 +225,6 @@ where
             );
             PrimaryToProxyMessage::CombinedTxn(transaction, proxy_index, missing_states)
         } else if is_stateful {
-            let stateless_proxy_id = self.stateless_routing.remove(transaction.digest()).unwrap();
             let missing_states = self
                 .get_missing_states_for_transaction(&transaction, required_versions, proxy_index)
                 .await;
@@ -244,19 +242,23 @@ where
                 proxy_index,
                 transaction.digest()
             );
-            self.stateless_routing
-                .insert(*transaction.digest(), proxy_index);
             PrimaryToProxyMessage::StatelessTxn(transaction)
         };
 
-        let proxy_connection = self.proxy_connections.get(&proxy_index).unwrap().clone();
+        let dest_proxy = if is_stateful {
+            proxy_index
+        } else {
+            stateless_proxy_id
+        };
+
+        let proxy_connection = self.proxy_connections.get(&dest_proxy).unwrap().clone();
         tokio::spawn(async move {
             if proxy_connection.send(message).await.is_ok() {
-                tracing::debug!("Sent transaction to proxy {}", proxy_index);
+                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
             } else {
                 tracing::warn!(
                     "Failed to send transaction to proxy {}, removing connection",
-                    proxy_index
+                    dest_proxy
                 );
             }
         });
@@ -271,20 +273,29 @@ where
 
                 self.send_transaction_to_proxy(
                     proxy_index,
+                    proxy_index,
                     transaction.clone(),
                     None,
                     false,
                     false,
                 )
                 .await;
-                self.send_transaction_to_proxy(proxy_index, transaction, None, true, false)
-                    .await;
+                self.send_transaction_to_proxy(
+                    proxy_index,
+                    proxy_index,
+                    transaction,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
             }
             LoadBalancingPolicy::Dedicated => {
                 let stateless_proxy = 0;
                 let stateful_proxy = 1 % self.proxy_connections.len();
 
                 self.send_transaction_to_proxy(
+                    stateful_proxy,
                     stateless_proxy,
                     transaction.clone(),
                     None,
@@ -292,15 +303,29 @@ where
                     false,
                 )
                 .await;
-                self.send_transaction_to_proxy(stateful_proxy, transaction, None, true, false)
-                    .await;
+                self.send_transaction_to_proxy(
+                    stateful_proxy,
+                    stateless_proxy,
+                    transaction,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
             }
             LoadBalancingPolicy::Combined => {
                 let proxy_index = self.index % self.proxy_connections.len();
                 self.index += 1;
 
-                self.send_transaction_to_proxy(proxy_index, transaction, None, false, true)
-                    .await;
+                self.send_transaction_to_proxy(
+                    proxy_index,
+                    proxy_index,
+                    transaction,
+                    None,
+                    false,
+                    true,
+                )
+                .await;
             }
         }
     }
@@ -311,9 +336,12 @@ where
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        if let Some(proxy_index) = self.get_proxy_for_shared_objects(&required_versions) {
+        if let Some((proxy_index, stateless_proxy_id)) =
+            self.get_proxy_for_shared_objects(&required_versions)
+        {
             self.send_transaction_to_proxy(
                 proxy_index,
+                stateless_proxy_id,
                 transaction.clone(),
                 Some(required_versions.clone()),
                 false,
@@ -322,6 +350,7 @@ where
             .await;
             self.send_transaction_to_proxy(
                 proxy_index,
+                stateless_proxy_id,
                 transaction,
                 Some(required_versions.clone()),
                 true,
