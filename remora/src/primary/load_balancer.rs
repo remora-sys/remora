@@ -219,6 +219,24 @@ where
         }
     }
 
+    /// Simplified method to send a message to a proxy
+    async fn send_to_proxy_channel(
+        dest_proxy: ExecutorIndex,
+        proxy_connection: Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
+        message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
+    ) {
+        tokio::spawn(async move {
+            if proxy_connection.send(message).await.is_ok() {
+                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
+            } else {
+                tracing::warn!(
+                    "Failed to send transaction to proxy {}, removing connection",
+                    dest_proxy
+                );
+            }
+        });
+    }
+
     /// Forwards transactions with owned-object only using the selected policy.
     async fn forward_owned_object_only_txn(&mut self, transaction: RemoraTransaction<E>) {
         match &self.policy {
@@ -359,96 +377,67 @@ where
             return;
         }
 
-        // Clone proxy_connections to avoid borrowing self in the async block
-        let proxy_connections = self.proxy_connections.clone();
-
-        // Create a vector of proxy assignments
         let start = self.index;
-        let policy = self.policy.clone();
+        let policy = &self.policy;
 
-        // Pre-determine stateless assignments based on policy
-        let assignments: Vec<_> = match &policy {
-            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
-                // For these policies: both stateless and stateful to same proxy
-                transactions
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(i, tx)| {
-                        let idx = (start + i) % proxy_count;
-                        let tx_clone = tx.clone();
-                        // Both parts go to the same proxy
-                        vec![
-                            (tx_clone, idx, true, idx, false),
-                            (tx, idx, false, idx, false),
-                        ]
-                    })
-                    .collect()
-            }
-            LoadBalancingPolicy::Combined => {
-                transactions
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(i, tx)| {
-                        let idx = (start + i) % proxy_count;
-                        let tx_clone = tx.clone();
-                        // Both parts go to the same proxy
-                        vec![(tx_clone, idx, true, idx, true)]
-                    })
-                    .collect()
-            }
-            LoadBalancingPolicy::Dedicated => {
-                // For Dedicated: stateless to proxy 0, stateful to proxy 1
-                let stateful_proxy = 1 % proxy_count; // Handle case with only one proxy
-                transactions
-                    .into_iter()
-                    .flat_map(|tx| {
-                        let tx_clone = tx.clone();
-                        // Special assignment for Dedicated policy
-                        vec![
-                            (tx_clone, 0, true, 0, false),
-                            (tx, stateful_proxy, false, 0, false),
-                        ]
-                    })
-                    .collect()
-            }
-        };
+        // bump your index in one go
+        self.index = (start + transactions.len()) % proxy_count;
 
-        // advance your index by the number of transactions (not assignments, since we doubled them)
-        self.index = (start + assignments.len() / 2) % proxy_count;
+        stream::iter(transactions.into_iter().enumerate())
+            .for_each_concurrent(None, |(i, tx)| {
+                let proxy_connection = self.proxy_connections.clone();
+                async move {
+                    let idx = (start + i) % proxy_count;
 
-        // Create a stream from the assignments and process them in parallel
-        stream::iter(assignments)
-            .for_each_concurrent(
-                None,
-                |(transaction, proxy_idx, is_stateless, stateless_idx, is_combined)| {
-                    let proxy_connections = proxy_connections.clone();
-                    async move {
-                        if let Some(proxy_conn) = proxy_connections.get(&proxy_idx) {
-                            let proxy_conn = proxy_conn.clone();
-                            let message = if is_combined {
-                                // Combined transaction
-                                PrimaryToProxyMessage::CombinedTxn(
-                                    transaction,
-                                    proxy_idx,
-                                    BTreeMap::new(),
+                    if let Some(proxy_connection) = proxy_connection.get(&idx) {
+                        let proxy_connection = proxy_connection.clone();
+                        match policy {
+                            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
+                                // send both parts to the same proxy
+                                Self::send_to_proxy_channel(
+                                    idx,
+                                    proxy_connection.clone(),
+                                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
                                 )
-                            } else if is_stateless {
-                                // Stateless transaction
-                                PrimaryToProxyMessage::StatelessTxn(transaction)
-                            } else {
-                                // Stateful transaction (with reference to stateless proxy)
-                                PrimaryToProxyMessage::Txn(
-                                    transaction,
-                                    stateless_idx,
-                                    BTreeMap::new(),
+                                .await;
+                                Self::send_to_proxy_channel(
+                                    idx,
+                                    proxy_connection.clone(),
+                                    PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new()),
                                 )
-                            };
-
-                            let _ = proxy_conn.send(message).await;
+                                .await;
+                            }
+                            LoadBalancingPolicy::Combined => {
+                                Self::send_to_proxy_channel(
+                                    idx,
+                                    proxy_connection.clone(),
+                                    PrimaryToProxyMessage::CombinedTxn(
+                                        tx.clone(),
+                                        idx,
+                                        BTreeMap::new(),
+                                    ),
+                                )
+                                .await;
+                            }
+                            LoadBalancingPolicy::Dedicated => {
+                                // stateless → proxy 0, stateful → proxy 1
+                                Self::send_to_proxy_channel(
+                                    0,
+                                    proxy_connection.clone(),
+                                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
+                                )
+                                .await;
+                                Self::send_to_proxy_channel(
+                                    1 % proxy_count,
+                                    proxy_connection.clone(),
+                                    PrimaryToProxyMessage::Txn(tx.clone(), 0, BTreeMap::new()),
+                                )
+                                .await;
+                            }
                         }
                     }
-                },
-            )
+                }
+            })
             .await;
     }
 
