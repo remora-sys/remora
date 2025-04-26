@@ -564,7 +564,6 @@ where
         let metrics = self.metrics.clone();
         let stateful_controller = self.stateful_controller.clone();
         let stateless_controller = self.stateless_controller.clone();
-        let executor = self.executor.clone();
         tokio::spawn(async move {
             // Wait for the stateless dependency to be resolved
             stateless_handle.await.unwrap();
@@ -574,17 +573,6 @@ where
                 prior_notify.notified().await;
             }
             stateful_controller.remove_dependency(obj_ids.clone());
-
-            // tracing::debug!(
-            //     "Proxy {} assigning shared objects version {:?} for transaction {:?}",
-            //     id,
-            //     obj_ids,
-            //     transaction.digest()
-            // );
-            // // Assign shared objects version.
-            // executor
-            //     .assign_shared_object_versions(&[transaction.deref().clone()])
-            //     .await;
 
             // check the version ID for shared objects
             // skip if versions don't match
