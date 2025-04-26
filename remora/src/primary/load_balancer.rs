@@ -1,9 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
-
+use futures::{stream, StreamExt};
 use rustc_hash::FxHashMap;
+use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     transaction::InputObjectKind,
@@ -306,23 +306,110 @@ where
                         self.metrics.register_start_time();
                     }
 
+                    // Separate transactions into owned-only and shared-object transactions
+                    let mut owned_txns = Vec::new();
+                    let mut shared_txns = Vec::new();
+                    
                     for transaction in transactions {
                         let shared_object_ids = self.get_shared_object_ids(transaction.deref());
                         if shared_object_ids.is_empty() {
-                            self.forward_owned_object_only_txn(transaction).await;
+                            owned_txns.push(transaction);
                         } else {
-                            let required_versions = self.executor
-                                .assign_shared_object_versions_and_return_required_versions(&transaction)
-                                .await
-                                .unwrap();
-                            self.forward_shared_object_txn(transaction, required_versions).await;
+                            shared_txns.push(transaction);
                         }
+                    }
+
+                    // Process owned-only transactions in parallel for supported policies
+                    if !owned_txns.is_empty() {
+                        match self.policy {
+                            LoadBalancingPolicy::RoundRobin | 
+                            LoadBalancingPolicy::Zeus | 
+                            LoadBalancingPolicy::Dedicated => {
+                                self.forward_owned_txns_in_parallel(owned_txns).await;
+                            },
+                            _ => {
+                                // Process sequentially for other policies
+                                for transaction in owned_txns {
+                                    self.forward_owned_object_only_txn(transaction).await;
+                                }
+                            }
+                        }
+                    }
+
+                    // Process shared-object transactions sequentially
+                    for transaction in shared_txns {
+                        let required_versions = self.executor
+                            .assign_shared_object_versions_and_return_required_versions(&transaction)
+                            .await
+                            .unwrap();
+                        self.forward_shared_object_txn(transaction, required_versions).await;
                     }
                 }
 
                 else => Err(NodeError::ShuttingDown)?,
             }
         }
+    }
+
+    /// Forward owned-object transactions in parallel with true concurrency
+    async fn forward_owned_txns_in_parallel(&mut self, transactions: Vec<RemoraTransaction<E>>) {
+        let proxy_count = self.proxy_connections.len();
+        if proxy_count == 0 {
+            tracing::warn!("No proxies available for transactions");
+            return;
+        }
+
+        // Clone proxy_connections to avoid borrowing self in the async block
+        let proxy_connections = self.proxy_connections.clone();
+
+        // Create a vector of proxy assignments
+        let start = self.index;
+        let policy = self.policy.clone();
+        let assignments: Vec<_> = match &policy {
+            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus | LoadBalancingPolicy::Combined => transactions
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, tx)| {
+                    let idx = (start + i) % proxy_count;
+                    let tx_clone = tx.clone();
+                    // Create two entries: one for stateless and one for stateful, both to same proxy
+                    vec![(tx_clone, idx, true), (tx, idx, false)]
+                })
+                .collect(),
+            LoadBalancingPolicy::Dedicated => transactions
+                .into_iter()
+                .flat_map(|tx| {
+                    let tx_clone = tx.clone();
+                    // For Dedicated: stateless to proxy 0, stateful to proxy 1
+                    vec![(tx_clone, 0, true), (tx, 1 % proxy_count, false)]
+                })
+                .collect(),
+        };
+
+        // advance your index by the number of transactions (not assignments, since we doubled them)
+        self.index = (start + assignments.len() / 2) % proxy_count;
+
+        // Create a stream from the assignments and process them in parallel
+        stream::iter(assignments)
+            .for_each_concurrent(None, |(transaction, proxy_idx, is_stateless)| {
+                let proxy_connections = proxy_connections.clone();
+                let policy = policy.clone();
+                async move {
+                    if let Some(proxy_conn) = proxy_connections.get(&proxy_idx) {
+                        let proxy_conn = proxy_conn.clone();
+                        let message = if is_stateless {
+                            // Stateless transaction
+                            PrimaryToProxyMessage::StatelessTxn(transaction)
+                        } else {
+                            // Stateful transaction - the first parameter is needed for Dedicated policy
+                            let stateless_idx = if matches!(policy, LoadBalancingPolicy::Dedicated) { 0 } else { proxy_idx };
+                            PrimaryToProxyMessage::Txn(transaction, stateless_idx, BTreeMap::new())
+                        };
+                        let _ = proxy_conn.send(message).await;
+                    }
+                }
+            })
+            .await;
     }
 
     /// Spawn the load balancer in a new task.
