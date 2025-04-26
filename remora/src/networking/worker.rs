@@ -49,9 +49,16 @@ where
         let (reader, writer) = self.stream.into_split();
         let read_stream_handle = Self::handle_read_stream(reader, self.tx_incoming).boxed();
         let write_stream_handle = Self::handle_write_stream(writer, self.rx_outgoing).boxed();
-        tokio::select! {
-            _ = read_stream_handle => (),
-            _ = write_stream_handle => (),
+
+        // Use join! instead of select! to keep the read stream going even if write stream stops
+        let (read_result, write_result) = tokio::join!(read_stream_handle, write_stream_handle,);
+
+        if let Err(e) = read_result {
+            tracing::error!("Error in read stream: {:?}", e);
+        }
+
+        if let Err(e) = write_result {
+            tracing::error!("Error in write stream: {:?}", e);
         }
     }
 
