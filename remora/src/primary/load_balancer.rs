@@ -452,6 +452,71 @@ where
     {
         tokio::spawn(async move { self.run().await })
     }
+
+    /// Benchmarks the throughput and latency of parallel transaction forwarding
+    #[cfg(feature = "benchmark")]
+    pub async fn benchmark_parallel_forwarding(&mut self, transaction_count: usize) -> (f64, f64) {
+        use futures::future;
+        use std::time::{Duration, Instant};
+
+        // Create dummy transactions for benchmarking
+        let transactions = self.create_benchmark_transactions(transaction_count).await;
+
+        // Measure throughput
+        let start_time = Instant::now();
+        self.forward_owned_txns_in_parallel(transactions.clone())
+            .await;
+        let elapsed = start_time.elapsed();
+
+        // Calculate throughput (transactions per second)
+        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
+
+        // Measure latency with smaller batches
+        let latency_batch_size = std::cmp::min(10, transaction_count);
+        let mut latencies = Vec::with_capacity(10);
+
+        for _ in 0..10 {
+            let batch = self.create_benchmark_transactions(latency_batch_size).await;
+            let start = Instant::now();
+            self.forward_owned_txns_in_parallel(batch).await;
+            latencies.push(start.elapsed());
+        }
+
+        // Calculate average latency in milliseconds
+        let avg_latency = latencies
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .sum::<f64>()
+            / latencies.len() as f64;
+
+        // Log results
+        tracing::info!(
+            "Parallel forwarding benchmark: Throughput = {:.2} txns/sec, Latency = {:.2} ms",
+            throughput,
+            avg_latency
+        );
+
+        (throughput, avg_latency)
+    }
+
+    /// Create benchmark transactions for testing
+    #[cfg(feature = "benchmark")]
+    async fn create_benchmark_transactions(&self, count: usize) -> Vec<RemoraTransaction<E>> {
+        use crate::config::{BenchmarkParameters, WorkloadType};
+        use std::time::Duration;
+        let config = BenchmarkParameters {
+            load: count as u64,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::Transfers,
+            verification_duration: Duration::from_secs(0),
+        };
+        let transactions = E::generate_transactions(&config, None).await;
+        transactions
+            .into_iter()
+            .take(count)
+            .map(|tx| RemoraTransaction::<E>::new_for_tests(tx))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +527,117 @@ mod tests {
     use crate::proxy::core::ProxyCore;
     use dashmap::DashMap;
     use tokio::sync::mpsc::{channel, Sender};
+
+    /// The command to run the benchmark is:
+    /// cargo test run_bench_suite --features benchmark --release -- --nocapture
+    #[tokio::test]
+    #[cfg(feature = "benchmark")]
+    async fn run_bench_suite() {
+        // Setup a simplified test environment
+        let config = BenchmarkParameters::new_for_tests();
+        let (executor, metrics, _tx_committed_txns, rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
+
+        // Create a high-capacity channel for benchmarking
+        let (tx_benchmark, _rx_benchmark) = channel(10000);
+
+        // Create multiple proxy connections for testing parallel performance
+        let mut proxy_connections = FxHashMap::default();
+        for i in 0..4 {
+            proxy_connections.insert(i, tx_benchmark.clone());
+        }
+
+        // Create load balancer with RoundRobin policy
+        let mut lb = LoadBalancer::new(
+            executor,
+            proxy_connections,
+            rx_committed_txns,
+            LoadBalancingPolicy::RoundRobin,
+            metrics,
+        );
+
+        let transaction_counts = [100, 1000, 10000];
+        let policies = [
+            LoadBalancingPolicy::RoundRobin,
+            LoadBalancingPolicy::Zeus,
+            LoadBalancingPolicy::Dedicated,
+            LoadBalancingPolicy::Combined,
+        ];
+
+        // Store results for comparison
+        let mut results = Vec::new();
+
+        for &count in &transaction_counts {
+            for policy in &policies {
+                // Save original policy
+                let original_policy = lb.policy.clone();
+
+                // Set policy for this benchmark
+                lb.policy = policy.clone();
+
+                // Run benchmark and store results
+                let (throughput, latency) = lb.benchmark_parallel_forwarding(count).await;
+                results.push((count, policy.clone(), throughput, latency));
+
+                // Restore original policy
+                lb.policy = original_policy;
+
+                // Let system cool down a bit between tests
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Print comparison table
+        println!("======= Benchmark Results =======");
+        println!("Count | Policy | Throughput (txns/s) | Latency (ms)");
+        println!("------------------------------------------");
+
+        for (count, policy, throughput, latency) in results {
+            println!(
+                "{} | {:?} | {:.2} | {:.2}",
+                count, policy, throughput, latency
+            );
+        }
+
+        println!("=================================");
+    }
+
+    // Add this at the beginning of the test module
+    #[tokio::test]
+    #[cfg(feature = "benchmark")]
+    async fn test_parallel_forwarding_benchmark() {
+        let config = BenchmarkParameters::new_for_tests();
+        let (executor, metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
+
+        // Create proxy connections map with a high capacity channel
+        let (tx_benchmark, _rx_benchmark) = channel(10000);
+        let mut proxy_connections = FxHashMap::default();
+        proxy_connections.insert(0, tx_benchmark.clone());
+        proxy_connections.insert(1, tx_benchmark);
+
+        // Create load balancer with RoundRobin policy
+        let mut lb = LoadBalancer::new(
+            executor,
+            proxy_connections,
+            _rx_committed_txns,
+            LoadBalancingPolicy::RoundRobin,
+            metrics,
+        );
+
+        // Run a mini benchmark
+        let transaction_count = 100; // Small count for tests
+        let (throughput, latency) = lb.benchmark_parallel_forwarding(transaction_count).await;
+
+        // Just assert they're positive values (actual values will vary by environment)
+        assert!(throughput > 0.0, "Throughput should be positive");
+        assert!(latency > 0.0, "Latency should be positive");
+
+        println!(
+            "Benchmark results: Throughput = {:.2} txns/sec, Latency = {:.2} ms",
+            throughput, latency
+        );
+    }
 
     // Helper function to set up common test environment
     async fn setup_test_environment(
