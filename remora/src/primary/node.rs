@@ -53,8 +53,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
 
-        let store = Arc::new(executor.init_store());
-
         // Connect to each proxy server
         for (_idx, proxy_info) in config.proxies.iter().enumerate() {
             let (tx_proxy, rx_proxy) =
@@ -74,7 +72,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<E>::new(
             executor.clone(),
-            store.clone(),
             proxy_connections,
             rx_committed_txns,
             config.validator_parameters.load_balancing_policy.clone(),

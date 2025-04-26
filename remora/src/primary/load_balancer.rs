@@ -6,7 +6,6 @@ use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 use rustc_hash::FxHashMap;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
-    digests::TransactionDigest,
     transaction::InputObjectKind,
 };
 use tokio::{
@@ -29,8 +28,6 @@ use crate::{
 pub struct LoadBalancer<E: Executor> {
     /// The executor is only used to assigned shared object versions.
     executor: E,
-    /// The store is only used to assigned shared object versions.
-    store: Store<E>,
     /// The proxy connections.
     proxy_connections:
         FxHashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
@@ -46,14 +43,13 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor> LoadBalancer<E>
+impl<E: Executor + Send + Sync> LoadBalancer<E>
 where
     <E as Executor>::Transaction: Send + 'static,
 {
     /// Create a new load balancer.
     pub fn new(
         executor: E,
-        store: Store<E>,
         proxy_connections: FxHashMap<
             ProxyId,
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
@@ -64,7 +60,6 @@ where
     ) -> Self {
         Self {
             executor,
-            store,
             proxy_connections,
             rx_committed_txns,
             index: 0,
@@ -201,67 +196,27 @@ where
         required_states
     }
 
-    /// Sends a transaction to a specific proxy and handles connection failures.
-    async fn send_transaction_to_proxy(
-        &mut self,
-        proxy_index: usize,
-        stateless_proxy_id: ExecutorIndex,
-        transaction: RemoraTransaction<E>,
-        required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
-        is_stateful: bool,
-        is_combined: bool,
-    ) where
-        <E as Executor>::Transaction: Send,
-    {
-        let message = if is_combined {
-            let missing_states = self
-                .get_missing_states_for_transaction(&transaction, required_versions, proxy_index)
-                .await;
-            tracing::debug!(
-                "Sending combined transaction to proxy {}: digest={:?}, missing_states_count={}",
-                proxy_index,
-                transaction.digest(),
-                missing_states.len()
-            );
-            PrimaryToProxyMessage::CombinedTxn(transaction, proxy_index, missing_states)
-        } else if is_stateful {
-            let missing_states = self
-                .get_missing_states_for_transaction(&transaction, required_versions, proxy_index)
-                .await;
-            tracing::debug!(
-                "Sending stateful transaction to proxy {}: digest={:?}, stateless_proxy_id={}, missing_states_count={}",
-                proxy_index,
-                transaction.digest(),
-                stateless_proxy_id,
-                missing_states.len()
-            );
-            PrimaryToProxyMessage::Txn(transaction, stateless_proxy_id, missing_states)
+    /// Simplified method to send a message to a proxy
+    async fn send_to_proxy(
+        &self,
+        dest_proxy: ExecutorIndex,
+        message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
+    ) {
+        if let Some(proxy_connection) = self.proxy_connections.get(&dest_proxy) {
+            let proxy_connection = proxy_connection.clone();
+            tokio::spawn(async move {
+                if proxy_connection.send(message).await.is_ok() {
+                    tracing::debug!("Sent transaction to proxy {}", dest_proxy);
+                } else {
+                    tracing::warn!(
+                        "Failed to send transaction to proxy {}, removing connection",
+                        dest_proxy
+                    );
+                }
+            });
         } else {
-            tracing::debug!(
-                "Sending stateless transaction to proxy {}: digest={:?}",
-                proxy_index,
-                transaction.digest()
-            );
-            PrimaryToProxyMessage::StatelessTxn(transaction)
-        };
-
-        let dest_proxy = if is_stateful {
-            proxy_index
-        } else {
-            stateless_proxy_id
-        };
-
-        let proxy_connection = self.proxy_connections.get(&dest_proxy).unwrap().clone();
-        tokio::spawn(async move {
-            if proxy_connection.send(message).await.is_ok() {
-                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
-            } else {
-                tracing::warn!(
-                    "Failed to send transaction to proxy {}, removing connection",
-                    dest_proxy
-                );
-            }
-        });
+            tracing::warn!("Proxy connection {} not found", dest_proxy);
+        }
     }
 
     /// Forwards transactions with owned-object only using the selected policy.
@@ -271,61 +226,38 @@ where
                 let proxy_index = self.index % self.proxy_connections.len();
                 self.index += 1;
 
-                self.send_transaction_to_proxy(
-                    proxy_index,
-                    proxy_index,
-                    transaction.clone(),
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-                self.send_transaction_to_proxy(
-                    proxy_index,
-                    proxy_index,
-                    transaction,
-                    None,
-                    true,
-                    false,
-                )
-                .await;
+                // Stateless transaction
+                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+                self.send_to_proxy(proxy_index, stateless_msg).await;
+
+                // Stateful transaction - for owned objects, an empty map is sufficient
+                let stateful_msg =
+                    PrimaryToProxyMessage::Txn(transaction, proxy_index, BTreeMap::new());
+                self.send_to_proxy(proxy_index, stateful_msg).await;
             }
+
             LoadBalancingPolicy::Dedicated => {
                 let stateless_proxy = 0;
                 let stateful_proxy = 1 % self.proxy_connections.len();
 
-                self.send_transaction_to_proxy(
-                    stateful_proxy,
-                    stateless_proxy,
-                    transaction.clone(),
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-                self.send_transaction_to_proxy(
-                    stateful_proxy,
-                    stateless_proxy,
-                    transaction,
-                    None,
-                    true,
-                    false,
-                )
-                .await;
+                // Stateless transaction to proxy 0
+                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+                self.send_to_proxy(stateless_proxy, stateless_msg).await;
+
+                // Stateful transaction to proxy 1 - for owned objects, an empty map is sufficient
+                let stateful_msg =
+                    PrimaryToProxyMessage::Txn(transaction, stateless_proxy, BTreeMap::new());
+                self.send_to_proxy(stateful_proxy, stateful_msg).await;
             }
+
             LoadBalancingPolicy::Combined => {
                 let proxy_index = self.index % self.proxy_connections.len();
                 self.index += 1;
 
-                self.send_transaction_to_proxy(
-                    proxy_index,
-                    proxy_index,
-                    transaction,
-                    None,
-                    false,
-                    true,
-                )
-                .await;
+                // Combined transaction - for owned objects, an empty map is sufficient
+                let combined_msg =
+                    PrimaryToProxyMessage::CombinedTxn(transaction, proxy_index, BTreeMap::new());
+                self.send_to_proxy(proxy_index, combined_msg).await;
             }
         }
     }
@@ -339,28 +271,29 @@ where
         if let Some((proxy_index, stateless_proxy_id)) =
             self.get_proxy_for_shared_objects(&required_versions)
         {
-            self.send_transaction_to_proxy(
-                proxy_index,
-                stateless_proxy_id,
-                transaction.clone(),
-                Some(required_versions.clone()),
-                false,
-                false,
-            )
-            .await;
-            self.send_transaction_to_proxy(
-                proxy_index,
-                stateless_proxy_id,
+            // Stateless transaction doesn't need missing states
+            let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+            self.send_to_proxy(stateless_proxy_id, stateless_msg).await;
+
+            // Stateful transaction needs missing states
+            let stateful_missing_states = self
+                .get_missing_states_for_transaction(
+                    &transaction,
+                    Some(required_versions),
+                    proxy_index,
+                )
+                .await;
+            let stateful_msg = PrimaryToProxyMessage::Txn(
                 transaction,
-                Some(required_versions.clone()),
-                true,
-                false,
-            )
-            .await;
+                stateless_proxy_id,
+                stateful_missing_states,
+            );
+            self.send_to_proxy(proxy_index, stateful_msg).await;
         } else {
             tracing::warn!("No proxies available for transaction with shared objects");
         }
     }
+
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
@@ -420,7 +353,6 @@ mod tests {
     ) -> (
         SuiExecutor,
         Arc<Metrics>,
-        Store<SuiExecutor>,
         Sender<Vec<RemoraTransaction<SuiExecutor>>>,
         Receiver<Vec<RemoraTransaction<SuiExecutor>>>,
         Receiver<ExecutionResults<SuiExecutor>>,
@@ -433,12 +365,10 @@ mod tests {
 
         // Create metrics and store
         let metrics = Arc::new(Metrics::new_for_tests());
-        let store = executor.init_store();
 
         (
             executor,
             metrics,
-            Arc::new(store),
             tx_committed_txns,
             rx_committed_txns,
             rx_results,
@@ -461,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_balancer_rr_forwarding() {
         let config = BenchmarkParameters::new_for_tests();
-        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+        let (executor, metrics, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup proxy channels
@@ -476,7 +406,6 @@ mod tests {
         // Create load balancer
         let lb = LoadBalancer::new(
             executor.clone(),
-            store.clone(),
             proxy_connections,
             rx_committed_txns,
             LoadBalancingPolicy::RoundRobin,
@@ -533,7 +462,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_load_balancer_with_one_proxy() {
         let config = BenchmarkParameters::new_for_tests();
-        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+        let (executor, metrics, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup proxy and its channels
@@ -549,7 +478,6 @@ mod tests {
         // Create load balancer
         let lb = LoadBalancer::new(
             executor.clone(),
-            store.clone(),
             proxy_connections,
             rx_committed_txns,
             LoadBalancingPolicy::RoundRobin,
@@ -586,7 +514,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_load_balancer_with_two_proxies() {
         let config = BenchmarkParameters::new_for_contention_tests();
-        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+        let (executor, metrics, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup first proxy and its channels
@@ -612,7 +540,6 @@ mod tests {
         // Create load balancer
         let lb = LoadBalancer::new(
             executor.clone(),
-            store.clone(),
             proxy_connections,
             rx_committed_txns,
             LoadBalancingPolicy::RoundRobin,
@@ -683,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_balancer_dedicated_forwarding() {
         let config = BenchmarkParameters::new_for_tests();
-        let (executor, metrics, store, tx_committed_txns, rx_committed_txns, _rx_results) =
+        let (executor, metrics, tx_committed_txns, rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup proxy channels
@@ -698,7 +625,6 @@ mod tests {
         // Create load balancer with Dedicated policy
         let lb = LoadBalancer::new(
             executor.clone(),
-            store.clone(),
             proxy_connections,
             rx_committed_txns,
             LoadBalancingPolicy::Dedicated,
