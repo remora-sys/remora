@@ -378,67 +378,72 @@ where
         }
 
         let start = self.index;
-        let policy = &self.policy;
-
+        let policy = self.policy.clone();
         // bump your index in one go
         self.index = (start + transactions.len()) % proxy_count;
 
-        stream::iter(transactions.into_iter().enumerate())
-            .for_each_concurrent(None, |(i, tx)| {
-                let proxy_connection = self.proxy_connections.clone();
-                async move {
-                    let idx = (start + i) % proxy_count;
+        // prepare a set of futures
+        let mut tasks = stream::FuturesUnordered::new();
 
-                    if let Some(proxy_connection) = proxy_connection.get(&idx) {
-                        let proxy_connection = proxy_connection.clone();
-                        match policy {
-                            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
-                                // send both parts to the same proxy
-                                Self::send_to_proxy_channel(
-                                    idx,
-                                    proxy_connection.clone(),
-                                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
-                                )
-                                .await;
-                                Self::send_to_proxy_channel(
-                                    idx,
-                                    proxy_connection.clone(),
-                                    PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new()),
-                                )
-                                .await;
+        for (i, tx) in transactions.into_iter().enumerate() {
+            let policy = policy.clone();
+            let idx = (start + i) % proxy_count;
+            let proxy_connections = self.proxy_connections.clone();
+            let fut = async move {
+                match policy {
+                    LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
+                        if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
+                            let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
+                            let msg2 = PrimaryToProxyMessage::Txn(tx, idx, BTreeMap::new());
+
+                            if proxy_conn.send(msg1).await.is_err() {
+                                tracing::warn!("Failed to send stateless txn to proxy {}", idx);
                             }
-                            LoadBalancingPolicy::Combined => {
-                                Self::send_to_proxy_channel(
-                                    idx,
-                                    proxy_connection.clone(),
-                                    PrimaryToProxyMessage::CombinedTxn(
-                                        tx.clone(),
-                                        idx,
-                                        BTreeMap::new(),
-                                    ),
-                                )
-                                .await;
-                            }
-                            LoadBalancingPolicy::Dedicated => {
-                                // stateless → proxy 0, stateful → proxy 1
-                                Self::send_to_proxy_channel(
-                                    0,
-                                    proxy_connection.clone(),
-                                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
-                                )
-                                .await;
-                                Self::send_to_proxy_channel(
-                                    1 % proxy_count,
-                                    proxy_connection.clone(),
-                                    PrimaryToProxyMessage::Txn(tx.clone(), 0, BTreeMap::new()),
-                                )
-                                .await;
+                            if proxy_conn.send(msg2).await.is_err() {
+                                tracing::warn!("Failed to send stateful txn to proxy {}", idx);
                             }
                         }
                     }
+                    LoadBalancingPolicy::Combined => {
+                        if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
+                            let combined = PrimaryToProxyMessage::CombinedTxn(
+                                tx,
+                                idx,
+                                BTreeMap::new(),
+                            );
+                            if proxy_conn.send(combined).await.is_err() {
+                                tracing::warn!("Failed to send combined txn to proxy {}", idx);
+                            }
+                        }
+                    }
+                    LoadBalancingPolicy::Dedicated => {
+                        // stateless → proxy 0, stateful → proxy 1
+                        let stateless_proxy = proxy_connections.get(&0).cloned().unwrap();
+                        let stateful_proxy = proxy_connections.get(&1).cloned().unwrap();
+                        if stateless_proxy
+                            .send(PrimaryToProxyMessage::StatelessTxn(tx.clone()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("Failed to send stateless txn to proxy 0");
+                        }
+                        if stateful_proxy
+                            .send(PrimaryToProxyMessage::Txn(tx, 0, BTreeMap::new()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("Failed to send stateful txn to proxy 1");
+                        }
+                    }
                 }
-            })
-            .await;
+            };
+
+            // push it into our unordered set
+            tasks.push(fut);
+        }
+
+        // drive all of them to completion, in parallel
+        while let Some(_) = tasks.next().await {}
     }
 
     /// Spawn the load balancer in a new task.
@@ -514,7 +519,7 @@ mod tests {
         );
 
         // Run a mini benchmark
-        let transaction_count = 10000; // Small count for tests
+        let transaction_count = 1000000; // Small count for tests
         let transactions = lb.create_benchmark_transactions(transaction_count).await;
         let handle = tokio::spawn(async move {
             lb.benchmark_parallel_forwarding(transactions).await;
