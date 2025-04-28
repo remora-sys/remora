@@ -244,11 +244,11 @@ where
     T: ExecutableTransaction + Clone,
 {
     /// Stateful transaction that requires object access and execution
-    Txn(TransactionWithTimestamp<T>, ProxyId, RequiredStates),
+    Txn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
     /// Stateless transaction that only requires signature verification
-    StatelessTxn(TransactionWithTimestamp<T>),
+    StatelessTxn(Arc<TransactionWithTimestamp<T>>),
     /// Combined stateless+stateful
-    CombinedTxn(TransactionWithTimestamp<T>, ProxyId, RequiredStates),
+    CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

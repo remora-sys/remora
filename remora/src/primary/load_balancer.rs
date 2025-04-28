@@ -45,7 +45,7 @@ pub struct LoadBalancer<E: Executor> {
 
 impl<E: Executor + Send + Sync> LoadBalancer<E>
 where
-    <E as Executor>::Transaction: Send + 'static,
+    <E as Executor>::Transaction: Send + Sync + 'static,
 {
     /// Create a new load balancer.
     pub fn new(
@@ -245,12 +245,16 @@ where
                 self.index += 1;
 
                 // Stateless transaction
-                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+                let stateless_msg =
+                    PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
                 self.send_to_proxy(proxy_index, stateless_msg).await;
 
                 // Stateful transaction - for owned objects, an empty map is sufficient
-                let stateful_msg =
-                    PrimaryToProxyMessage::Txn(transaction, proxy_index, BTreeMap::new());
+                let stateful_msg = PrimaryToProxyMessage::Txn(
+                    Arc::new(transaction.clone()),
+                    proxy_index,
+                    BTreeMap::new(),
+                );
                 self.send_to_proxy(proxy_index, stateful_msg).await;
             }
 
@@ -259,12 +263,16 @@ where
                 let stateful_proxy = 1 % self.proxy_connections.len();
 
                 // Stateless transaction to proxy 0
-                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+                let stateless_msg =
+                    PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
                 self.send_to_proxy(stateless_proxy, stateless_msg).await;
 
                 // Stateful transaction to proxy 1 - for owned objects, an empty map is sufficient
-                let stateful_msg =
-                    PrimaryToProxyMessage::Txn(transaction, stateless_proxy, BTreeMap::new());
+                let stateful_msg = PrimaryToProxyMessage::Txn(
+                    Arc::new(transaction.clone()),
+                    stateless_proxy,
+                    BTreeMap::new(),
+                );
                 self.send_to_proxy(stateful_proxy, stateful_msg).await;
             }
 
@@ -273,8 +281,11 @@ where
                 self.index += 1;
 
                 // Combined transaction - for owned objects, an empty map is sufficient
-                let combined_msg =
-                    PrimaryToProxyMessage::CombinedTxn(transaction, proxy_index, BTreeMap::new());
+                let combined_msg = PrimaryToProxyMessage::CombinedTxn(
+                    Arc::new(transaction.clone()),
+                    proxy_index,
+                    BTreeMap::new(),
+                );
                 self.send_to_proxy(proxy_index, combined_msg).await;
             }
         }
@@ -290,7 +301,7 @@ where
             self.get_proxy_for_shared_objects(&required_versions)
         {
             // Stateless transaction doesn't need missing states
-            let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+            let stateless_msg = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
             self.send_to_proxy(stateless_proxy_id, stateless_msg).await;
 
             // Stateful transaction needs missing states
@@ -302,7 +313,7 @@ where
                 )
                 .await;
             let stateful_msg = PrimaryToProxyMessage::Txn(
-                transaction,
+                Arc::new(transaction.clone()),
                 stateless_proxy_id,
                 stateful_missing_states,
             );
@@ -388,13 +399,14 @@ where
         for (i, tx) in transactions.into_iter().enumerate() {
             let policy = policy.clone();
             let idx = (start + i) % proxy_count;
+            let tx = Arc::new(tx);
             let proxy_connections = self.proxy_connections.clone();
             let fut = async move {
                 match policy {
                     LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
                         if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
                             let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
-                            let msg2 = PrimaryToProxyMessage::Txn(tx, idx, BTreeMap::new());
+                            let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
 
                             if proxy_conn.send(msg1).await.is_err() {
                                 tracing::warn!("Failed to send stateless txn to proxy {}", idx);
@@ -407,7 +419,7 @@ where
                     LoadBalancingPolicy::Combined => {
                         if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
                             let combined = PrimaryToProxyMessage::CombinedTxn(
-                                tx,
+                                tx.clone(),
                                 idx,
                                 BTreeMap::new(),
                             );
@@ -428,7 +440,7 @@ where
                             tracing::warn!("Failed to send stateless txn to proxy 0");
                         }
                         if stateful_proxy
-                            .send(PrimaryToProxyMessage::Txn(tx, 0, BTreeMap::new()))
+                            .send(PrimaryToProxyMessage::Txn(tx.clone(), 0, BTreeMap::new()))
                             .await
                             .is_err()
                         {

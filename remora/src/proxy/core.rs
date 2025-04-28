@@ -133,7 +133,8 @@ where
                     self.id,
                     transaction.digest()
                 );
-                self.process_stateless_transaction(transaction).await
+                self.process_stateless_transaction(transaction.deref().clone())
+                    .await
             }
 
             PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
@@ -161,7 +162,7 @@ where
                     transaction.digest(),
                     stateless_res_proxy_id
                 );
-                self.process_stateless_transaction(transaction.clone())
+                self.process_stateless_transaction(transaction.deref().clone())
                     .await;
                 self.process_stateful_transaction(
                     transaction,
@@ -175,7 +176,7 @@ where
 
     async fn process_stateful_transaction(
         &mut self,
-        transaction: RemoraTransaction<E>,
+        transaction: Arc<RemoraTransaction<E>>,
         stateless_res_proxy_id: ProxyId,
         required_states: RequiredStates,
     ) {
@@ -446,7 +447,7 @@ where
     /// including sending requests for missing states to other proxies.
     async fn schedule_stateful_transaction(
         &mut self,
-        transaction: RemoraTransaction<E>,
+        transaction: Arc<RemoraTransaction<E>>,
         required_states: RequiredStates,
         rx: oneshot::Receiver<bool>,
     ) {
@@ -466,7 +467,7 @@ where
                 .collect();
             self.executor
                 .assign_shared_object_versions_with_required_versions(
-                    &[transaction.deref().clone()],
+                    &[transaction.deref().deref().clone()],
                     &required_versions,
                 )
                 .await;
@@ -545,7 +546,7 @@ where
 
     pub async fn spawn_stateful_txn(
         &mut self,
-        transaction: RemoraTransaction<E>,
+        transaction: Arc<RemoraTransaction<E>>,
         obj_ids: Vec<(ObjectID, SequenceNumber)>,
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
@@ -594,14 +595,14 @@ where
                     id,
                     transaction.digest()
                 );
-                E::execute(ctx, store, transaction.clone()).await
+                E::execute(ctx, store, transaction.deref().clone()).await
             } else {
                 tracing::warn!(
                     "Proxy {} skipped execution for transaction {:?}",
                     id,
                     transaction.digest()
                 );
-                ExecutionResults::<E>::new(transaction.clone(), None, None)
+                ExecutionResults::<E>::new(transaction.deref().clone(), None, None)
             };
 
             tracing::debug!(
@@ -728,7 +729,8 @@ mod tests {
             let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
 
             // First send the stateless transaction
-            let stateless_message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+            let stateless_message =
+                PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
             tx_to_proxy.send(stateless_message).await.unwrap();
 
             // Assign shared object versions before getting required versions
@@ -753,7 +755,7 @@ mod tests {
 
             // Then send the stateful transaction with required_states (empty or not)
             let stateful_message = PrimaryToProxyMessage::Txn(
-                RemoraTransaction::<E>::new_for_tests(tx),
+                Arc::new(RemoraTransaction::<E>::new_for_tests(tx)),
                 0,
                 required_states,
             );
@@ -804,14 +806,14 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy
-        let message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
         tx_to_proxy.send(message).await.unwrap();
 
         // Allow time for processing
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Now send the stateful part
-        let message = PrimaryToProxyMessage::Txn(transaction, 0, BTreeMap::new());
+        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 0, BTreeMap::new());
         tx_to_proxy.send(message).await.unwrap();
     }
 
@@ -839,12 +841,12 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy2
-        let message = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
         let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> = BTreeMap::new();
-        let message = PrimaryToProxyMessage::Txn(transaction, 1, required_states);
+        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 1, required_states);
         tx_to_proxy1.send(message).await.unwrap();
     }
 
