@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    config::LoadBalancingPolicy,
+    config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::api::{
         ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, PrimaryToProxyMessage,
@@ -43,7 +43,7 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
 }
 
-impl<E: Executor + Send + Sync> LoadBalancer<E>
+impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
 where
     <E as Executor>::Transaction: Send + Sync + 'static,
 {
@@ -254,6 +254,25 @@ where
     /// Run the load balancer.
     pub async fn run(&mut self) -> NodeResult<()> {
         tracing::info!("Load balancer started");
+
+        // Create a channel for owned transactions
+        let (owned_txn_sender, owned_txn_receiver) =
+            tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
+
+        // Initialize the OwnedTxnProcessor
+        let mut owned_txn_processor = OwnedTxnProcessor::<E> {
+            proxy_connections: self.proxy_connections.clone(),
+            policy: self.policy.clone(),
+            index: 0,
+        };
+
+        // Spawn a task to process owned transactions
+        tokio::spawn(async move {
+            owned_txn_processor
+                .process_owned_txns(owned_txn_receiver)
+                .await;
+        });
+
         let mut txn_cnt = 0;
         loop {
             tokio::select! {
@@ -276,9 +295,11 @@ where
                         }
                     }
 
-                    // Process owned-only transactions in parallel for supported policies
+                    // Send owned-only transactions to the dedicated task
                     if !owned_txns.is_empty() {
-                        self.forward_owned_txns_in_parallel(owned_txns).await;
+                        if let Err(e) = owned_txn_sender.send(owned_txns).await {
+                            tracing::error!("Failed to send owned transactions: {:?}", e);
+                        }
                     }
 
                     // Process shared-object transactions sequentially
@@ -293,6 +314,45 @@ where
 
                 else => Err(NodeError::ShuttingDown)?,
             }
+        }
+    }
+
+    /// Spawn the load balancer in a new task.
+    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
+    where
+        E: Send + 'static,
+        Store<E>: Send + Sync,
+        RemoraTransaction<E>: Send + Sync,
+        ExecutionResults<E>: Send,
+        <E as Executor>::Transaction: Send + Sync,
+    {
+        tokio::spawn(async move { self.run().await })
+    }
+}
+
+// Define a new struct for processing owned transactions
+struct OwnedTxnProcessor<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    proxy_connections:
+        FxHashMap<usize, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+    policy: LoadBalancingPolicy,
+    index: usize,
+}
+
+impl<E> OwnedTxnProcessor<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    async fn process_owned_txns(
+        &mut self,
+        mut owned_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
+    ) {
+        while let Some(owned_txns) = owned_txn_receiver.recv().await {
+            self.forward_owned_txns_in_parallel(owned_txns).await;
         }
     }
 
@@ -374,18 +434,6 @@ where
         while let Some(_) = tasks.next().await {}
     }
 
-    /// Spawn the load balancer in a new task.
-    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
-    where
-        E: Send + 'static,
-        Store<E>: Send + Sync,
-        RemoraTransaction<E>: Send + Sync,
-        ExecutionResults<E>: Send,
-        <E as Executor>::Transaction: Send + Sync,
-    {
-        tokio::spawn(async move { self.run().await })
-    }
-
     /// Benchmarks the throughput and latency of parallel transaction forwarding
     #[cfg(feature = "benchmark")]
     pub async fn benchmark_parallel_forwarding(&mut self, transactions: Vec<RemoraTransaction<E>>) {
@@ -437,20 +485,21 @@ mod tests {
         proxy_connections.insert(0, tx_benchmark.clone());
         proxy_connections.insert(1, tx_benchmark);
 
-        // Create load balancer with RoundRobin policy
-        let mut lb = LoadBalancer::new(
-            executor,
-            proxy_connections,
-            _rx_committed_txns,
-            LoadBalancingPolicy::RoundRobin,
-            metrics,
-        );
+        let mut owned_txn_processor = OwnedTxnProcessor::<SuiExecutor> {
+            proxy_connections: proxy_connections.clone(),
+            policy: LoadBalancingPolicy::RoundRobin,
+            index: 0,
+        };
 
         // Run a mini benchmark
         let transaction_count = 1000000; // Small count for tests
-        let transactions = lb.create_benchmark_transactions(transaction_count).await;
+        let transactions = owned_txn_processor
+            .create_benchmark_transactions(transaction_count)
+            .await;
         let handle = tokio::spawn(async move {
-            lb.benchmark_parallel_forwarding(transactions).await;
+            owned_txn_processor
+                .forward_owned_txns_in_parallel(transactions)
+                .await;
         });
 
         let instant = Instant::now();

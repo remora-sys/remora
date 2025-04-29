@@ -34,7 +34,7 @@ pub struct LoadGenerator<Executor> {
     arrival: Distribution,
 }
 
-const NUM_CLIENTS: usize = 8;
+const NUM_CLIENTS: usize = 16;
 
 impl<E: Executor> LoadGenerator<E> {
     /// Create a new load generator.
