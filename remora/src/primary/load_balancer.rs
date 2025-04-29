@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use rustc_hash::FxHashMap;
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
@@ -30,7 +31,7 @@ pub struct LoadBalancer<E: Executor> {
     executor: E,
     /// The proxy connections.
     proxy_connections:
-        FxHashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// Keeps track of every attempt to forward a transaction to a proxy.
@@ -50,9 +51,8 @@ where
     /// Create a new load balancer.
     pub fn new(
         executor: E,
-        proxy_connections: FxHashMap<
-            ProxyId,
-            Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
+        proxy_connections: Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         policy: LoadBalancingPolicy,
@@ -337,7 +337,7 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     proxy_connections:
-        FxHashMap<usize, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     policy: LoadBalancingPolicy,
     index: usize,
 }
@@ -380,7 +380,7 @@ where
             let fut = async move {
                 match policy {
                     LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
-                        if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
+                        if let Some(proxy_conn) = proxy_connections.get(&idx) {
                             let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
                             let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
 
@@ -393,7 +393,7 @@ where
                         }
                     }
                     LoadBalancingPolicy::Combined => {
-                        if let Some(proxy_conn) = proxy_connections.get(&idx).cloned() {
+                        if let Some(proxy_conn) = proxy_connections.get(&idx) {
                             let combined = PrimaryToProxyMessage::CombinedTxn(
                                 tx.clone(),
                                 idx,
@@ -406,8 +406,8 @@ where
                     }
                     LoadBalancingPolicy::Dedicated => {
                         // stateless → proxy 0, stateful → proxy 1
-                        let stateless_proxy = proxy_connections.get(&0).cloned().unwrap();
-                        let stateful_proxy = proxy_connections.get(&1).cloned().unwrap();
+                        let stateless_proxy = proxy_connections.get(&0).unwrap();
+                        let stateful_proxy = proxy_connections.get(&1).unwrap();
                         if stateless_proxy
                             .send(PrimaryToProxyMessage::StatelessTxn(tx.clone()))
                             .await
@@ -476,12 +476,10 @@ mod tests {
     async fn test_parallel_forwarding_benchmark() {
         use std::time::Instant;
         let config = BenchmarkParameters::new_for_tests();
-        let (executor, metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
-            setup_test_environment(&config).await;
 
         // Create proxy connections map with a high capacity channel
         let (tx_benchmark, mut rx_benchmark) = channel(20000);
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_benchmark.clone());
         proxy_connections.insert(1, tx_benchmark);
 
@@ -568,7 +566,7 @@ mod tests {
         let (tx_to_proxy2, mut rx_from_lb2) = channel(100);
 
         // Create proxy connections map
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_to_proxy1);
         proxy_connections.insert(1, tx_to_proxy2);
 
@@ -641,7 +639,7 @@ mod tests {
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         // Create proxy connections map
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_to_proxy);
 
         // Create load balancer
@@ -702,7 +700,7 @@ mod tests {
         tx_inter_proxy_replies2.insert(0, tx_inter_proxy_requests1);
 
         // Create proxy connections map
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_to_proxy1);
         proxy_connections.insert(1, tx_to_proxy2);
 
@@ -787,7 +785,7 @@ mod tests {
         let (tx_to_proxy1, mut rx_from_lb1) = channel(100);
 
         // Create proxy connections map
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_to_proxy0);
         proxy_connections.insert(1, tx_to_proxy1);
 

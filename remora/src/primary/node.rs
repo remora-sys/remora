@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use rustc_hash::FxHashMap;
+use dashmap::DashMap;
 use std::{io, marker::PhantomData, sync::Arc};
 
 use serde::de::DeserializeOwned;
@@ -48,7 +48,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         // For storing proxy connections
-        let mut proxy_connections = FxHashMap::default();
+        let proxy_connections = Arc::new(DashMap::new());
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
