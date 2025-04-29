@@ -219,78 +219,6 @@ where
         }
     }
 
-    /// Simplified method to send a message to a proxy
-    async fn send_to_proxy_channel(
-        dest_proxy: ExecutorIndex,
-        proxy_connection: Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
-        message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
-    ) {
-        tokio::spawn(async move {
-            if proxy_connection.send(message).await.is_ok() {
-                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
-            } else {
-                tracing::warn!(
-                    "Failed to send transaction to proxy {}, removing connection",
-                    dest_proxy
-                );
-            }
-        });
-    }
-
-    /// Forwards transactions with owned-object only using the selected policy.
-    async fn forward_owned_object_only_txn(&mut self, transaction: RemoraTransaction<E>) {
-        match &self.policy {
-            LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
-                let proxy_index = self.index % self.proxy_connections.len();
-                self.index += 1;
-
-                // Stateless transaction
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
-                self.send_to_proxy(proxy_index, stateless_msg).await;
-
-                // Stateful transaction - for owned objects, an empty map is sufficient
-                let stateful_msg = PrimaryToProxyMessage::Txn(
-                    Arc::new(transaction.clone()),
-                    proxy_index,
-                    BTreeMap::new(),
-                );
-                self.send_to_proxy(proxy_index, stateful_msg).await;
-            }
-
-            LoadBalancingPolicy::Dedicated => {
-                let stateless_proxy = 0;
-                let stateful_proxy = 1 % self.proxy_connections.len();
-
-                // Stateless transaction to proxy 0
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
-                self.send_to_proxy(stateless_proxy, stateless_msg).await;
-
-                // Stateful transaction to proxy 1 - for owned objects, an empty map is sufficient
-                let stateful_msg = PrimaryToProxyMessage::Txn(
-                    Arc::new(transaction.clone()),
-                    stateless_proxy,
-                    BTreeMap::new(),
-                );
-                self.send_to_proxy(stateful_proxy, stateful_msg).await;
-            }
-
-            LoadBalancingPolicy::Combined => {
-                let proxy_index = self.index % self.proxy_connections.len();
-                self.index += 1;
-
-                // Combined transaction - for owned objects, an empty map is sufficient
-                let combined_msg = PrimaryToProxyMessage::CombinedTxn(
-                    Arc::new(transaction.clone()),
-                    proxy_index,
-                    BTreeMap::new(),
-                );
-                self.send_to_proxy(proxy_index, combined_msg).await;
-            }
-        }
-    }
-
     /// Forwards transactions with shared objects to the appropriate proxy.
     async fn forward_shared_object_txn(
         &mut self,
@@ -350,19 +278,7 @@ where
 
                     // Process owned-only transactions in parallel for supported policies
                     if !owned_txns.is_empty() {
-                        match self.policy {
-                            LoadBalancingPolicy::RoundRobin |
-                            LoadBalancingPolicy::Zeus |
-                            LoadBalancingPolicy::Dedicated => {
-                                self.forward_owned_txns_in_parallel(owned_txns).await;
-                            },
-                            _ => {
-                                // Process sequentially for other policies
-                                for transaction in owned_txns {
-                                    self.forward_owned_object_only_txn(transaction).await;
-                                }
-                            }
-                        }
+                        self.forward_owned_txns_in_parallel(owned_txns).await;
                     }
 
                     // Process shared-object transactions sequentially
