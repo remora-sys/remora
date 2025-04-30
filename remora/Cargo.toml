@@ -57,6 +57,7 @@ move-bytecode-utils.workspace = true
 sui-archival.workspace = true
 rustc-hash = "2.0.0"
 num_cpus.workspace = true
+bitcode = { version = "0.6.6", features = ["serde"] }
 
 [dev-dependencies]
 tracing-test = "0.2.5"

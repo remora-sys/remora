@@ -111,7 +111,7 @@ where
             .for_each_concurrent(Some(Self::MAX_BATCH_SIZE), |message| {
                 let tx_incoming = tx_incoming.clone();
                 async move {
-                    match bincode::deserialize::<I>(&message) {
+                    match bitcode::deserialize::<I>(&message) {
                         Ok(data) => {
                             if tx_incoming.send(data).await.is_err() {
                                 tracing::warn!(
@@ -155,7 +155,7 @@ where
 
             // Batching writes
             for transaction in &buffer {
-                let serialized = bincode::serialize(transaction).expect("Infallible serialization");
+                let serialized = bitcode::serialize(transaction).expect("Infallible serialization");
 
                 let size = serialized.len() as u32;
                 serialized_buffer.extend_from_slice(&size.to_be_bytes());
