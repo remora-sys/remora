@@ -15,7 +15,7 @@ mod tests {
             sui::SuiExecutor,
         },
         metrics::Metrics,
-        primary::owned_processors::OwnedTxnProcessor,
+        primary::owned_obj_txn_forwarder::OwnedObjTxnForwarder,
     };
 
     // Helper function to set up common test environment
@@ -128,7 +128,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
     #[cfg(feature = "benchmark")]
     async fn test_version_assignment_throughput() {
-        use crate::primary::shared_processor::VersionAssignmentTask;
+        use crate::primary::shared_obj_txn_forwarder::VersionAssignmentTask;
         use std::time::Instant;
         // Generate test transactions
         let transaction_count = 100000; // Use a smaller count for this test
@@ -183,7 +183,7 @@ mod tests {
     #[cfg(feature = "benchmark")]
     async fn test_shared_processor_throughput() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_processor::SharedTxnProcessor;
+        use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
         use std::time::Instant;
         use sui_types::base_types::{ObjectID, SequenceNumber};
 
@@ -273,7 +273,7 @@ mod tests {
         proxy_connections.insert(1, tx_to_proxy2);
 
         // Create owned processor
-        let mut owned_processor = OwnedTxnProcessor::<SuiExecutor> {
+        let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
             proxy_connections,
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -341,7 +341,7 @@ mod tests {
         proxy_connections.insert(1, tx_to_proxy1);
 
         // Create owned processor with Dedicated policy
-        let mut owned_processor = OwnedTxnProcessor::<SuiExecutor> {
+        let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
             proxy_connections,
             policy: LoadBalancingPolicy::Dedicated,
             index: 0,
@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn test_shared_processor_forwarding() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_processor::SharedTxnProcessor;
+        use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
         use sui_types::base_types::{ObjectID, SequenceNumber};
 
         let config = BenchmarkParameters::new_for_contention_tests();
@@ -412,7 +412,7 @@ mod tests {
         let dependency_controller = Arc::new(VersionedDependencyController::default());
 
         // Create shared processor
-        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -475,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedicated_policy_shared_processor() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_processor::SharedTxnProcessor;
+        use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
         use sui_types::base_types::{ObjectID, SequenceNumber};
 
         let config = BenchmarkParameters::new_for_contention_tests();
@@ -496,7 +496,7 @@ mod tests {
         let dependency_controller = Arc::new(VersionedDependencyController::default());
 
         // Create shared processor with Dedicated policy
-        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::Dedicated,
             index: 0,
@@ -559,7 +559,7 @@ mod tests {
     #[cfg(feature = "benchmark")]
     async fn test_combined_version_assignment_and_processing_throughput() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_processor::{SharedTxnProcessor, VersionAssignmentTask};
+        use crate::primary::shared_obj_txn_forwarder::{SharedTxnProcessor, VersionAssignmentTask};
         use std::time::Instant;
         use sui_types::base_types::{ObjectID, SequenceNumber};
 

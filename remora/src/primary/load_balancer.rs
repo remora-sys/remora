@@ -17,8 +17,8 @@ use crate::{
     },
     metrics::Metrics,
     primary::{
-        owned_processors::OwnedTxnProcessor,
-        shared_processor::{SharedTxnProcessor, VersionAssignmentTask},
+        owned_obj_txn_forwarder::OwnedObjTxnForwarder,
+        shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
 };
@@ -76,7 +76,7 @@ where
             tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         // Initialize the OwnedTxnProcessor
-        let mut owned_txn_processor = OwnedTxnProcessor::<E> {
+        let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
             index: 0,
@@ -88,7 +88,7 @@ where
         };
 
         // Initialize the SharedTxnProcessor
-        let mut shared_txn_processor = SharedTxnProcessor::<E> {
+        let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
             index: 0,

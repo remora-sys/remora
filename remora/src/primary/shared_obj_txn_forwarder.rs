@@ -102,7 +102,7 @@ where
 
 /// Processor for transactions that involve shared objects.
 /// Used only for load balancing policy selection.
-pub(crate) struct SharedTxnProcessor<E>
+pub(crate) struct SharedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
@@ -115,7 +115,7 @@ where
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
 }
 
-impl<E> SharedTxnProcessor<E>
+impl<E> SharedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
@@ -136,9 +136,15 @@ where
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        let (prior_handles, current_handles) = self
-            .dependency_controller
-            .get_prior_dependency_and_update(0, required_versions.clone(), false, false);
+        let (prior_handles, current_handles) = match required_versions.is_empty() {
+            true => (Vec::new(), Vec::new()),
+            false => self.dependency_controller.get_prior_dependency_and_update(
+                0,
+                required_versions.clone(),
+                false,
+                false,
+            ),
+        };
 
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();

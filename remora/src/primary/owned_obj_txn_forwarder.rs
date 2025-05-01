@@ -14,7 +14,7 @@ use crate::{
 
 /// Processor for transactions that only involve owned objects.
 /// Used only for load balancing policy selection.
-pub(crate) struct OwnedTxnProcessor<E>
+pub(crate) struct OwnedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
@@ -25,7 +25,7 @@ where
     pub(crate) index: usize,
 }
 
-impl<E> OwnedTxnProcessor<E>
+impl<E> OwnedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
