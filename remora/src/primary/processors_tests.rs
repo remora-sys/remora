@@ -147,6 +147,7 @@ mod tests {
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             executor: executor.clone(),
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            _phantom: std::marker::PhantomData,
         };
 
         // Create and spawn the version assignment task
@@ -587,6 +588,7 @@ mod tests {
         let mut version_assignment_task = VersionAssignmentTask {
             executor: executor_arc.clone(),
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            _phantom: std::marker::PhantomData,
         };
 
         // Create shared processor

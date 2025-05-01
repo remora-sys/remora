@@ -11,9 +11,8 @@ use crate::{
 };
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use sui_types::base_types::{ObjectID, SequenceNumber};
-use sui_types::transaction::InputObjectKind;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -21,9 +20,10 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
-    pub(crate) executor: Arc<E>,
     // Mapping of object ID to its current version for shared objects
     pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    // PhantomData to indicate we're using the generic parameter
+    pub(crate) _phantom: PhantomData<E>,
 }
 
 impl<E> VersionAssignmentTask<E>
@@ -60,23 +60,24 @@ where
         transaction: &RemoraTransaction<E>,
     ) -> Vec<(ObjectID, SequenceNumber)> {
         // Get all shared object IDs from the transaction
-        let shared_object_ids = self.get_shared_object_ids(transaction);
+        let shared_object_ids = transaction.shared_object_ids();
 
         if shared_object_ids.is_empty() {
             return Vec::new();
         }
 
         // Find the maximum version for all objects in the transaction
-        let mut max_version = SequenceNumber::from(2); // Start with version 2 as specified
-        let mut result = Vec::new();
+        let mut max_version = SequenceNumber::from(2);
+        let initial_version = SequenceNumber::from(2);
+        let mut result = Vec::with_capacity(shared_object_ids.len());
 
         // First collect current versions for result and find max
-        for obj_id in &shared_object_ids {
+        for obj_id in shared_object_ids {
             let current_version = self
                 .shared_object_versions
                 .get(obj_id)
                 .copied()
-                .unwrap_or_else(|| SequenceNumber::from(2));
+                .unwrap_or(initial_version);
 
             // Add current version to result
             result.push((*obj_id, current_version));
@@ -92,25 +93,10 @@ where
 
         // Update all objects to the new version
         for obj_id in shared_object_ids {
-            self.shared_object_versions.insert(obj_id, new_version);
+            self.shared_object_versions.insert(*obj_id, new_version);
         }
 
         result
-    }
-
-    /// Helper to get all shared object IDs from a transaction
-    fn get_shared_object_ids(&self, transaction: &RemoraTransaction<E>) -> Vec<ObjectID> {
-        transaction
-            .input_objects()
-            .iter()
-            .filter_map(|input_object| {
-                if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 }
 

@@ -32,6 +32,9 @@ pub trait ExecutableTransaction {
             .map(|kind| kind.object_id())
             .collect()
     }
+
+    /// The object IDs for the shared objects.
+    fn shared_object_ids(&self) -> Vec<ObjectID>;
 }
 
 pub type Timestamp = f64;
@@ -43,14 +46,17 @@ pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     transaction: T,
     /// The timestamp when the transaction was created.
     timestamp: Timestamp,
+    /// The shared object IDs in the transaction.
+    shared_object_ids: Vec<ObjectID>,
 }
 
 impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
     /// Create a new transaction with a timestamp.
-    pub fn new(transaction: T, timestamp: Timestamp) -> Self {
+    pub fn new(transaction: T, timestamp: Timestamp, shared_object_ids: Vec<ObjectID>) -> Self {
         Self {
             transaction,
             timestamp,
+            shared_object_ids,
         }
     }
 
@@ -64,7 +70,13 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
         Self {
             transaction,
             timestamp: 0.0,
+            shared_object_ids: vec![],
         }
+    }
+
+    /// Get the shared object IDs in the transaction.
+    pub fn shared_object_ids(&self) -> &Vec<ObjectID> {
+        &self.shared_object_ids
     }
 }
 

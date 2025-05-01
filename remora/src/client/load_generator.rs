@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     client::request_arrival_distribution::Distribution,
     config::BenchmarkParameters,
-    executor::api::{Executor, RemoraTransaction, TransactionWithTimestamp},
+    executor::api::{ExecutableTransaction, Executor, RemoraTransaction, TransactionWithTimestamp},
     metrics::Metrics,
     networking::client::NetworkClient,
 };
@@ -77,7 +77,8 @@ impl<E: Executor> LoadGenerator<E> {
 
             // Get the current timestamp for metrics
             let timestamp = Metrics::now().as_secs_f64();
-            let full_tx = TransactionWithTimestamp::new(tx, timestamp);
+            let full_tx =
+                TransactionWithTimestamp::new(tx.clone(), timestamp, tx.shared_object_ids());
 
             // Send the transaction
             if sender.send(full_tx).await.is_err() {

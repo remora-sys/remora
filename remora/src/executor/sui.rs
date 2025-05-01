@@ -49,6 +49,18 @@ impl ExecutableTransaction for Transaction {
             .input_objects()
             .expect("Transaction syntax already checked")
     }
+
+    fn shared_object_ids(&self) -> Vec<ObjectID> {
+        self.transaction_data()
+            .input_objects()
+            .expect("Transaction syntax already checked")
+            .iter()
+            .filter_map(|kind| match kind {
+                InputObjectKind::SharedMoveObject { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl StateStore<TransactionEffects> for InMemoryObjectStore {

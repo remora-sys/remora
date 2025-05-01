@@ -110,6 +110,16 @@ impl ExecutableTransaction for FakeTransaction {
     fn input_objects(&self) -> Vec<InputObjectKind> {
         self.inputs.clone()
     }
+
+    fn shared_object_ids(&self) -> Vec<ObjectID> {
+        self.inputs
+            .iter()
+            .filter_map(|kind| match kind {
+                InputObjectKind::SharedMoveObject { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -437,7 +447,7 @@ impl Executor for FakeExecutor {
 
     async fn get_required_shared_object_versions(
         &self,
-        transaction: &TransactionDigest,
+        _transaction: &TransactionDigest,
     ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
         todo!()
     }
@@ -688,7 +698,7 @@ mod tests {
     use crate::{
         config::{default_fake_execution_duration, BenchmarkParameters, WorkloadType},
         executor::{
-            api::{Executor, TransactionWithTimestamp},
+            api::{ExecutableTransaction, Executor, TransactionWithTimestamp},
             fake::{
                 fake_owned_object, fake_shared_object, fake_shared_object_with_id,
                 generate_fake_load_objects_and_transactions,
@@ -713,8 +723,8 @@ mod tests {
                 id
             })
             .collect();
-        let transaction = FakeTransaction::from_store(&store, inputs);
-        let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+        let transaction = FakeTransaction::from_store(&store, inputs.clone());
+        let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0, inputs);
 
         let start = Instant::now();
         let result = FakeExecutor::execute(ctx, store, transaction_with_timestamp).await;
@@ -739,8 +749,8 @@ mod tests {
                 id
             })
             .collect();
-        let transaction = FakeTransaction::from_store(&store, inputs);
-        let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+        let transaction = FakeTransaction::from_store(&store, inputs.clone());
+        let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0, inputs);
 
         let start = Instant::now();
         let result = FakeExecutor::execute(ctx, store, transaction_with_timestamp).await;
@@ -764,7 +774,11 @@ mod tests {
         for _ in 0..10 {
             let contention = 100;
             let transaction = generate_fake_shared_object_transaction(1, contention);
-            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+            let transaction_with_timestamp = TransactionWithTimestamp::new(
+                transaction.clone(),
+                0.0,
+                transaction.shared_object_ids(),
+            );
 
             let start = Instant::now();
             let result =
@@ -802,7 +816,11 @@ mod tests {
         }
 
         for transaction in transactions {
-            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+            let transaction_with_timestamp = TransactionWithTimestamp::new(
+                transaction.clone(),
+                0.0,
+                transaction.shared_object_ids(),
+            );
 
             let start = Instant::now();
             let result =
@@ -849,7 +867,11 @@ mod tests {
         }
 
         for transaction in transactions {
-            let transaction_with_timestamp = TransactionWithTimestamp::new(transaction, 0.0);
+            let transaction_with_timestamp = TransactionWithTimestamp::new(
+                transaction.clone(),
+                0.0,
+                transaction.shared_object_ids(),
+            );
 
             let start = Instant::now();
             let result =

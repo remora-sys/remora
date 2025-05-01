@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{ops::Deref, sync::Arc};
-use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
+use std::{marker::PhantomData, sync::Arc};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -13,10 +12,7 @@ use crate::{
     config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{
-            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
-            RemoraTransaction, Store,
-        },
+        api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -29,8 +25,8 @@ use crate::{
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
-    /// The executor is only used to assigned shared object versions.
-    executor: E,
+    /// The executor trait
+    _phantom: PhantomData<E>,
     /// The proxy connections.
     proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
@@ -48,7 +44,6 @@ where
 {
     /// Create a new load balancer.
     pub fn new(
-        executor: E,
         proxy_connections: Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
@@ -57,27 +52,12 @@ where
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            executor,
+            _phantom: PhantomData,
             proxy_connections,
             rx_committed_txns,
             metrics,
             policy,
         }
-    }
-
-    /// Helper to get all shared object IDs from a transaction.
-    fn get_shared_object_ids(&self, transaction: &E::Transaction) -> Vec<ObjectID> {
-        transaction
-            .input_objects()
-            .iter()
-            .filter_map(|input_object| {
-                if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Initialize transaction processors and return the senders
@@ -103,8 +83,8 @@ where
         };
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
-            executor: Arc::new(self.executor.clone()),
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            _phantom: PhantomData,
         };
 
         // Initialize the SharedTxnProcessor
@@ -161,7 +141,7 @@ where
                     let mut shared_txns = Vec::new();
 
                     for transaction in transactions {
-                        let shared_object_ids = self.get_shared_object_ids(transaction.deref());
+                        let shared_object_ids = transaction.shared_object_ids();
                         if shared_object_ids.is_empty() {
                             owned_txns.push(transaction);
                         } else {
