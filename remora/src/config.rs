@@ -211,6 +211,12 @@ pub enum WorkloadType {
     EthereumNftMint,
     UniswapNormal,
     UniswapPeak,
+    Zipfian {
+        #[serde(default = "default_zipfian_alpha")]
+        alpha: f64,
+        #[serde(default = "default_number_of_inputs")]
+        number_of_inputs: usize,
+    },
     FakeSolanaTransactions {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
@@ -260,6 +266,14 @@ pub fn default_fake_execution_duration() -> Duration {
     Duration::from_micros(500)
 }
 
+pub fn default_zipfian_alpha() -> f64 {
+    0.5
+}
+
+pub fn default_number_of_inputs() -> usize {
+    2
+}
+
 impl Debug for WorkloadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -272,6 +286,7 @@ impl Debug for WorkloadType {
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
             WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
             WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
+            WorkloadType::Zipfian { .. } => write!(f, "Zipfian"),
             WorkloadType::FakeSolanaTransactions { .. } => write!(f, "Fake Solana transactions"),
             WorkloadType::FakeEthereumTransfers { .. } => write!(f, "Fake Ethereum transfers"),
             WorkloadType::FakeEthereumNftMint { .. } => write!(f, "Fake Ethereum NFT mint"),

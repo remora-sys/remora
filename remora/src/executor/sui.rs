@@ -118,6 +118,13 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         WorkloadType::EthereumNftMint => Ok(WorkloadKind::EthereumNftMint),
         WorkloadType::UniswapNormal => Ok(WorkloadKind::UniswapNormal),
         WorkloadType::UniswapPeak => Ok(WorkloadKind::UniswapPeak),
+        WorkloadType::Zipfian {
+            alpha,
+            number_of_inputs,
+        } => Ok(WorkloadKind::ZipfianWorkload {
+            theta: alpha,
+            number_of_inputs,
+        }),
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 
