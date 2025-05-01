@@ -11,7 +11,7 @@ mod tests {
     use crate::{
         config::{BenchmarkParameters, LoadBalancingPolicy},
         executor::{
-            api::{ExecutionResults, PrimaryToProxyMessage, RemoraTransaction, Executor},
+            api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction},
             sui::SuiExecutor,
         },
         metrics::Metrics,

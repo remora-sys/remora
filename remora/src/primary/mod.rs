@@ -6,8 +6,8 @@ mod load_balancer;
 pub mod mock_consensus;
 pub mod node;
 mod owned_processors;
-mod shared_processor;
 #[cfg(test)]
 mod processors_tests;
+mod shared_processor;
 
 pub use load_balancer::LoadBalancer;

@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use rustc_hash::FxHashMap;
 use std::{ops::Deref, sync::Arc};
-use sui_types::{
-    base_types::ObjectID,
-    transaction::InputObjectKind,
-};
+use sui_types::{base_types::ObjectID, transaction::InputObjectKind};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -16,12 +12,18 @@ use tokio::{
 use crate::{
     config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
-    executor::api::{
-        ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
-        RemoraTransaction, Store,
+    executor::{
+        api::{
+            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
+            RemoraTransaction, Store,
+        },
+        versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
-    primary::{owned_processors::OwnedTxnProcessor, shared_processor::SharedTxnProcessor},
+    primary::{
+        owned_processors::OwnedTxnProcessor,
+        shared_processor::{SharedTxnProcessor, VersionAssignmentTask},
+    },
     proxy::core::ProxyId,
 };
 
@@ -90,6 +92,8 @@ where
             tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (shared_txn_sender, shared_txn_receiver) =
             tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (version_assignment_sender, version_assignment_receiver) =
+            tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedTxnProcessor::<E> {
@@ -98,13 +102,17 @@ where
             index: 0,
         };
 
+        let mut version_assignment_processor = VersionAssignmentTask::<E> {
+            executor: Arc::new(self.executor.clone()),
+        };
+
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedTxnProcessor::<E> {
-            executor: Arc::new(self.executor.clone()),
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
             index: 0,
-            states_to_proxy: FxHashMap::default(),
+            states_to_proxy: Arc::new(DashMap::new()),
+            dependency_controller: Arc::new(VersionedDependencyController::new()),
         };
 
         // Spawn a task to process owned transactions
@@ -114,10 +122,16 @@ where
                 .await;
         });
 
+        tokio::spawn(async move {
+            version_assignment_processor
+                .process_version_assignments(shared_txn_receiver, version_assignment_sender)
+                .await;
+        });
+
         // Spawn a task to process shared transactions
         tokio::spawn(async move {
             shared_txn_processor
-                .process_shared_txns(shared_txn_receiver)
+                .process_shared_txns(version_assignment_receiver)
                 .await;
         });
 
