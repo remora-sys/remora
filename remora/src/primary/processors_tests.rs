@@ -63,6 +63,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
     #[cfg(feature = "benchmark")]
     async fn test_parallel_forwarding_benchmark() {
+        use std::time::Instant;
         let config = BenchmarkParameters::new_for_tests();
 
         // Create proxy connections map with a high capacity channel
@@ -99,6 +100,159 @@ mod tests {
         let elapsed = instant.elapsed();
         let throughput = transaction_count as f64 / elapsed.as_secs_f64();
         println!("Throughput = {:.2} tps", throughput);
+        handle.await.unwrap();
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub async fn create_benchmark_shared_object_transactions<E: Executor>(
+        count: usize,
+    ) -> (BenchmarkParameters, Vec<RemoraTransaction<E>>) {
+        use crate::config::{BenchmarkParameters, WorkloadType};
+        use std::time::Duration;
+        let config = BenchmarkParameters {
+            load: count as u64,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::SharedObjects { txs_per_counter: 3 },
+            verification_duration: Duration::from_secs(0),
+        };
+        let transactions = E::generate_transactions(&config, None).await;
+        let remora_txns: Vec<RemoraTransaction<E>> = transactions
+            .into_iter()
+            .take(count)
+            .map(|tx| RemoraTransaction::<E>::new_for_tests(tx))
+            .collect();
+
+        (config, remora_txns)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+    #[cfg(feature = "benchmark")]
+    async fn test_version_assignment_throughput() {
+        use crate::primary::shared_processor::VersionAssignmentTask;
+        use std::time::Instant;
+        // Generate test transactions
+        let transaction_count = 100000; // Use a smaller count for this test
+        let (config, transactions) =
+            create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
+
+        // Configure benchmark params
+        let executor = SuiExecutor::new(&config).await;
+        let executor = Arc::new(executor);
+
+        // Create channels for the version assignment task
+        let (tx_shared_txns, rx_shared_txns) = channel(20000);
+        let (tx_assigned, mut rx_assigned) = channel(20000);
+
+        // Create the version assignment task
+        let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
+            executor: executor.clone(),
+            shared_object_versions: rustc_hash::FxHashMap::default(),
+        };
+
+        // Create and spawn the version assignment task
+        let handle = tokio::spawn(async move {
+            version_assignment_task
+                .process_version_assignments(rx_shared_txns, tx_assigned)
+                .await;
+        });
+
+        // Send transactions to the version assignment task
+        tx_shared_txns.send(transactions).await.unwrap();
+
+        // Measure throughput of receiving version-assigned transactions
+        let instant = Instant::now();
+        let mut cnt = 0;
+        while let Some(_) = rx_assigned.recv().await {
+            cnt += 1;
+            if cnt == transaction_count - 1 {
+                break;
+            }
+        }
+        let elapsed = instant.elapsed();
+        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
+        println!("Version Assignment Throughput = {:.2} txns/s", throughput);
+
+        // Drop channels to terminate the task
+        drop(tx_shared_txns);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+    #[tracing_test::traced_test]
+    #[cfg(feature = "benchmark")]
+    async fn test_shared_processor_throughput() {
+        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
+        use crate::primary::shared_processor::SharedTxnProcessor;
+        use std::time::Instant;
+        use sui_types::base_types::{ObjectID, SequenceNumber};
+
+        // Generate transactions with required versions
+        let transaction_count = 100000; // Use a smaller count for this test
+        let (config, transactions) =
+            create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
+
+        // Create proxy connections with a high capacity channel
+        let (tx_benchmark, mut rx_benchmark) = channel(20000);
+        let proxy_connections = Arc::new(DashMap::new());
+        proxy_connections.insert(0, tx_benchmark.clone());
+        proxy_connections.insert(1, tx_benchmark);
+
+        // Create states_to_proxy map and dependency controller
+        let states_to_proxy = Arc::new(DashMap::new());
+        let dependency_controller = Arc::new(VersionedDependencyController::default());
+
+        // Create shared processor
+        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+            proxy_connections: proxy_connections.clone(),
+            policy: LoadBalancingPolicy::RoundRobin,
+            index: 0,
+            states_to_proxy: states_to_proxy.clone(),
+            dependency_controller: dependency_controller.clone(),
+        };
+
+        // Shared object ID and version for transactions
+        let obj_id = ObjectID::random();
+        let version = SequenceNumber::new();
+        let required_versions = vec![(obj_id, version)];
+
+        // Create channels for the process_shared_txns method
+        let (tx_shared, rx_shared) = channel::<(
+            RemoraTransaction<SuiExecutor>,
+            Vec<(ObjectID, SequenceNumber)>,
+        )>(20000);
+
+        // Prepare transactions with required versions
+        for txn in transactions {
+            tx_shared
+                .send((txn, required_versions.clone()))
+                .await
+                .unwrap();
+        }
+
+        // Start measuring throughput
+        let instant = Instant::now();
+
+        // Process transactions using process_shared_txns
+        let handle = tokio::spawn(async move {
+            shared_processor.process_shared_txns(rx_shared).await;
+        });
+
+        // Count received messages
+        let mut cnt = 0;
+        // Each transaction generates 2 messages: stateless and stateful
+        while let Some(_) = rx_benchmark.recv().await {
+            cnt += 1;
+            if cnt == transaction_count * 2 - 2 {
+                break;
+            }
+        }
+
+        let elapsed = instant.elapsed();
+        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
+        println!("Shared Processor Throughput = {:.2} txns/s", throughput);
+
+        // Drop the channel to terminate the task
+        drop(tx_shared);
         handle.await.unwrap();
     }
 
@@ -231,5 +385,262 @@ mod tests {
             stateful_on_1, 5,
             "Proxy 1 should have received 5 stateful transactions"
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_processor_forwarding() {
+        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
+        use crate::primary::shared_processor::SharedTxnProcessor;
+        use sui_types::base_types::{ObjectID, SequenceNumber};
+
+        let config = BenchmarkParameters::new_for_contention_tests();
+        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
+
+        // Setup proxy channels
+        let (tx_to_proxy1, mut rx_from_processor1) = channel(100);
+        let (tx_to_proxy2, mut rx_from_processor2) = channel(100);
+
+        // Create proxy connections map
+        let proxy_connections = Arc::new(DashMap::new());
+        proxy_connections.insert(0, tx_to_proxy1);
+        proxy_connections.insert(1, tx_to_proxy2);
+
+        // Create states_to_proxy map and dependency controller
+        let states_to_proxy = Arc::new(DashMap::new());
+        let dependency_controller = Arc::new(VersionedDependencyController::default());
+
+        // Create shared processor
+        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+            proxy_connections: proxy_connections.clone(),
+            policy: LoadBalancingPolicy::RoundRobin,
+            index: 0,
+            states_to_proxy: states_to_proxy.clone(),
+            dependency_controller: dependency_controller.clone(),
+        };
+
+        // Generate transactions
+        let remora_txns = generate_test_transactions(&config, 5).await;
+        let required_versions = vec![(ObjectID::random(), SequenceNumber::new())];
+
+        // Manually forward transactions with required versions
+        for txn in remora_txns {
+            shared_processor
+                .forward_shared_object_txn(txn, required_versions.clone())
+                .await;
+        }
+
+        // Wait a bit for async processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify transactions were forwarded to proxies
+        let mut received_stateless = 0;
+        let mut received_stateful = 0;
+
+        // Check messages received by proxies
+        for _ in 0..10 {
+            tokio::select! {
+                Some(msg) = rx_from_processor1.recv() => {
+                    match msg {
+                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
+                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
+                        _ => unreachable!(),
+                    }
+                }
+                Some(msg) = rx_from_processor2.recv() => {
+                    match msg {
+                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
+                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
+                        _ => unreachable!(),
+                    }
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => {
+                    break;
+                }
+            }
+        }
+
+        // We should have received both stateless and stateful versions of each transaction
+        assert_eq!(
+            received_stateless, 5,
+            "Should have received 5 stateless transactions"
+        );
+        assert_eq!(
+            received_stateful, 5,
+            "Should have received 5 stateful transactions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedicated_policy_shared_processor() {
+        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
+        use crate::primary::shared_processor::SharedTxnProcessor;
+        use sui_types::base_types::{ObjectID, SequenceNumber};
+
+        let config = BenchmarkParameters::new_for_contention_tests();
+        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
+            setup_test_environment(&config).await;
+
+        // Setup proxy channels
+        let (tx_to_proxy0, mut rx_from_processor0) = channel(100);
+        let (tx_to_proxy1, mut rx_from_processor1) = channel(100);
+
+        // Create proxy connections map
+        let proxy_connections = Arc::new(DashMap::new());
+        proxy_connections.insert(0, tx_to_proxy0);
+        proxy_connections.insert(1, tx_to_proxy1);
+
+        // Create states_to_proxy map and dependency controller
+        let states_to_proxy = Arc::new(DashMap::new());
+        let dependency_controller = Arc::new(VersionedDependencyController::default());
+
+        // Create shared processor with Dedicated policy
+        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+            proxy_connections: proxy_connections.clone(),
+            policy: LoadBalancingPolicy::Dedicated,
+            index: 0,
+            states_to_proxy: states_to_proxy.clone(),
+            dependency_controller: dependency_controller.clone(),
+        };
+
+        // Generate transactions
+        let remora_txns = generate_test_transactions(&config, 5).await;
+        let required_versions = vec![(ObjectID::random(), SequenceNumber::new())];
+
+        // Manually forward transactions with required versions
+        for txn in remora_txns {
+            shared_processor
+                .forward_shared_object_txn(txn, required_versions.clone())
+                .await;
+        }
+
+        // Wait a bit for async processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // With Dedicated policy:
+        // - Stateless transactions should go to proxy 0
+        // - Stateful transactions should go to proxy 1
+        let mut stateless_on_0 = 0;
+        let mut stateful_on_1 = 0;
+
+        // Check messages received by proxy 0 (should be stateless)
+        for _ in 0..5 {
+            if let Some(msg) = rx_from_processor0.recv().await {
+                match msg {
+                    PrimaryToProxyMessage::StatelessTxn(_) => stateless_on_0 += 1,
+                    _ => panic!("Proxy 0 should only receive stateless transactions"),
+                }
+            }
+        }
+
+        // Check messages received by proxy 1 (should be stateful)
+        for _ in 0..5 {
+            if let Some(msg) = rx_from_processor1.recv().await {
+                match msg {
+                    PrimaryToProxyMessage::Txn(_, _, _) => stateful_on_1 += 1,
+                    _ => panic!("Proxy 1 should only receive stateful transactions"),
+                }
+            }
+        }
+
+        // We should have received both stateless on proxy 0 and stateful on proxy 1
+        assert_eq!(
+            stateless_on_0, 5,
+            "Proxy 0 should have received 5 stateless transactions"
+        );
+        assert_eq!(
+            stateful_on_1, 5,
+            "Proxy 1 should have received 5 stateful transactions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+    #[cfg(feature = "benchmark")]
+    async fn test_combined_version_assignment_and_processing_throughput() {
+        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
+        use crate::primary::shared_processor::{SharedTxnProcessor, VersionAssignmentTask};
+        use std::time::Instant;
+        use sui_types::base_types::{ObjectID, SequenceNumber};
+
+        // Configure benchmark params
+        let config = BenchmarkParameters::new_for_tests();
+
+        // Setup executor
+        let executor = SuiExecutor::new(&config).await;
+        let executor_arc = Arc::new(executor);
+
+        // Create proxy connections with a high capacity channel
+        let (tx_benchmark, mut rx_benchmark) = channel(20000);
+        let proxy_connections = Arc::new(DashMap::new());
+        proxy_connections.insert(0, tx_benchmark.clone());
+        proxy_connections.insert(1, tx_benchmark);
+
+        // Create states_to_proxy map and dependency controller
+        let states_to_proxy = Arc::new(DashMap::new());
+        let dependency_controller = Arc::new(VersionedDependencyController::default());
+
+        // Create channels between version assignment and shared processor
+        let (tx_shared_txns, rx_shared_txns) = channel(20000);
+        let (tx_assigned, rx_assigned) = channel(20000);
+
+        // Create the version assignment task
+        let mut version_assignment_task = VersionAssignmentTask {
+            executor: executor_arc.clone(),
+            shared_object_versions: rustc_hash::FxHashMap::default(),
+        };
+
+        // Create shared processor
+        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+            proxy_connections: proxy_connections.clone(),
+            policy: LoadBalancingPolicy::RoundRobin,
+            index: 0,
+            states_to_proxy: states_to_proxy.clone(),
+            dependency_controller: dependency_controller.clone(),
+        };
+
+        // Generate transactions
+        let transaction_count = 10; // Use a smaller count for this test
+        let transactions = SuiExecutor::generate_transactions(&config, None).await;
+        let remora_txns: Vec<RemoraTransaction<SuiExecutor>> = transactions
+            .into_iter()
+            .take(transaction_count)
+            .map(|tx| RemoraTransaction::<SuiExecutor>::new_for_tests(tx))
+            .collect();
+
+        // Spawn tasks for version assignment and shared processing
+        let version_task = tokio::spawn(async move {
+            version_assignment_task
+                .process_version_assignments(rx_shared_txns, tx_assigned)
+                .await;
+        });
+
+        let processor_task = tokio::spawn(async move {
+            shared_processor.process_shared_txns(rx_assigned).await;
+        });
+
+        // Start measuring throughput
+        let instant = Instant::now();
+
+        // Send transactions to the version assignment task
+        tx_shared_txns.send(remora_txns).await.unwrap();
+
+        // Count received messages at the end of the pipeline
+        let mut cnt = 0;
+        // Each transaction generates 2 messages: stateless and stateful
+        while let Some(_) = rx_benchmark.recv().await {
+            cnt += 1;
+            if cnt == transaction_count * 2 {
+                break;
+            }
+        }
+
+        let elapsed = instant.elapsed();
+        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
+        println!("Combined Throughput = {:.2} txns/s", throughput);
+
+        // Drop the channel to terminate the tasks
+        drop(tx_shared_txns);
+        version_task.await.unwrap();
+        processor_task.await.unwrap();
     }
 }

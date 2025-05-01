@@ -104,6 +104,7 @@ where
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             executor: Arc::new(self.executor.clone()),
+            shared_object_versions: rustc_hash::FxHashMap::default(),
         };
 
         // Initialize the SharedTxnProcessor

@@ -10,24 +10,11 @@ use crate::{
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use std::{collections::BTreeMap, sync::Arc};
 use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::transaction::InputObjectKind;
 use tokio::sync::mpsc::{Receiver, Sender};
-
-/// Processor for transactions that involve shared objects.
-/// Used only for load balancing policy selection.
-pub(crate) struct SharedTxnProcessor<E>
-where
-    E: Executor + Clone + Send + Sync + 'static,
-    E::Transaction: Send + Sync + 'static,
-{
-    pub(crate) proxy_connections:
-        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) policy: LoadBalancingPolicy,
-    pub(crate) index: usize,
-    pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-    pub(crate) dependency_controller: Arc<VersionedDependencyController>,
-}
 
 pub(crate) struct VersionAssignmentTask<E>
 where
@@ -35,6 +22,8 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     pub(crate) executor: Arc<E>,
+    // Mapping of object ID to its current version for shared objects
+    pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
 }
 
 impl<E> VersionAssignmentTask<E>
@@ -49,16 +38,95 @@ where
     ) {
         while let Some(shared_txns) = shared_txn_receiver.recv().await {
             for transaction in shared_txns {
-                let required_versions = self
-                    .executor
-                    .assign_shared_object_versions_and_return_required_versions(&transaction)
-                    .await
-                    .unwrap();
+                let required_versions = self.assign_shared_object_versions(&transaction);
+                tracing::debug!(
+                    "Version assignment task received transaction {:?}",
+                    transaction.digest()
+                );
 
                 sender.send((transaction, required_versions)).await.unwrap();
             }
         }
     }
+
+    /// Assign versions to shared objects in a transaction
+    ///
+    /// 1. Get the shared object IDs from the transaction
+    /// 2. Find the maximum version among all objects
+    /// 3. Assign the next version (max + 1) to all objects
+    /// 4. Return the list of (ObjectID, SequenceNumber) pairs
+    fn assign_shared_object_versions(
+        &mut self,
+        transaction: &RemoraTransaction<E>,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        // Get all shared object IDs from the transaction
+        let shared_object_ids = self.get_shared_object_ids(transaction);
+
+        if shared_object_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Find the maximum version for all objects in the transaction
+        let mut max_version = SequenceNumber::from(2); // Start with version 2 as specified
+        let mut result = Vec::new();
+
+        // First collect current versions for result and find max
+        for obj_id in &shared_object_ids {
+            let current_version = self
+                .shared_object_versions
+                .get(obj_id)
+                .copied()
+                .unwrap_or_else(|| SequenceNumber::from(2));
+
+            // Add current version to result
+            result.push((*obj_id, current_version));
+
+            // Update max version if needed
+            if current_version > max_version {
+                max_version = current_version;
+            }
+        }
+
+        // Calculate the new version (max + 1)
+        let new_version = max_version.next();
+
+        // Update all objects to the new version
+        for obj_id in shared_object_ids {
+            self.shared_object_versions.insert(obj_id, new_version);
+        }
+
+        result
+    }
+
+    /// Helper to get all shared object IDs from a transaction
+    fn get_shared_object_ids(&self, transaction: &RemoraTransaction<E>) -> Vec<ObjectID> {
+        transaction
+            .input_objects()
+            .iter()
+            .filter_map(|input_object| {
+                if let InputObjectKind::SharedMoveObject { id, .. } = input_object {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Processor for transactions that involve shared objects.
+/// Used only for load balancing policy selection.
+pub(crate) struct SharedTxnProcessor<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub(crate) proxy_connections:
+        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
+    pub(crate) policy: LoadBalancingPolicy,
+    pub(crate) index: usize,
+    pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+    pub(crate) dependency_controller: Arc<VersionedDependencyController>,
 }
 
 impl<E> SharedTxnProcessor<E>
@@ -166,7 +234,7 @@ where
             ),
             LoadBalancingPolicy::Dedicated => {
                 // Dedicated: proxy 0 for stateless, proxy 1 for stateful
-                Some((0, 1))
+                Some((1, 0))
             }
             LoadBalancingPolicy::Combined => {
                 unimplemented!()
