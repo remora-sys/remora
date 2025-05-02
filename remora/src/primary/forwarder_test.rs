@@ -415,7 +415,7 @@ mod tests {
         let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::RoundRobin,
-            index: 0,
+            txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
         };
@@ -434,41 +434,52 @@ mod tests {
         // Wait a bit for async processing
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Verify transactions were forwarded to proxies
-        let mut received_stateless = 0;
-        let mut received_stateful = 0;
+        // For RoundRobin policy, each proxy should receive equal number of transactions
+        let mut proxy1_stateless = 0;
+        let mut proxy1_stateful = 0;
+        let mut proxy2_stateless = 0;
+        let mut proxy2_stateful = 0;
 
-        // Check messages received by proxies
-        for _ in 0..10 {
-            tokio::select! {
-                Some(msg) = rx_from_processor1.recv() => {
-                    match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
-                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
-                        _ => unreachable!(),
-                    }
-                }
-                Some(msg) = rx_from_processor2.recv() => {
-                    match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
-                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
-                        _ => unreachable!(),
-                    }
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => {
-                    break;
-                }
+        // Check messages received by proxy 1
+        while let Ok(msg) = rx_from_processor1.try_recv() {
+            match msg {
+                PrimaryToProxyMessage::StatelessTxn(_) => proxy1_stateless += 1,
+                PrimaryToProxyMessage::Txn(_, _, _) => proxy1_stateful += 1,
+                _ => unreachable!(),
             }
         }
 
-        // We should have received both stateless and stateful versions of each transaction
+        // Check messages received by proxy 2
+        while let Ok(msg) = rx_from_processor2.try_recv() {
+            match msg {
+                PrimaryToProxyMessage::StatelessTxn(_) => proxy2_stateless += 1,
+                PrimaryToProxyMessage::Txn(_, _, _) => proxy2_stateful += 1,
+                _ => unreachable!(),
+            }
+        }
+
+        // With RoundRobin, each proxy should receive approximately equal number of transactions
         assert_eq!(
-            received_stateless, 5,
-            "Should have received 5 stateless transactions"
+            proxy1_stateless + proxy2_stateless,
+            5,
+            "Should have received 5 stateless transactions in total"
         );
         assert_eq!(
-            received_stateful, 5,
-            "Should have received 5 stateful transactions"
+            proxy1_stateful + proxy2_stateful,
+            5,
+            "Should have received 5 stateful transactions in total"
+        );
+
+        // Each proxy should have received either 2 or 3 transactions of each type
+        assert!(
+            (proxy1_stateless == 2 || proxy1_stateless == 3)
+                && (proxy2_stateless == 2 || proxy2_stateless == 3),
+            "Each proxy should receive either 2 or 3 stateless transactions"
+        );
+        assert!(
+            (proxy1_stateful == 2 || proxy1_stateful == 3)
+                && (proxy2_stateful == 2 || proxy2_stateful == 3),
+            "Each proxy should receive either 2 or 3 stateful transactions"
         );
     }
 
@@ -499,7 +510,7 @@ mod tests {
         let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::Dedicated,
-            index: 0,
+            txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
         };

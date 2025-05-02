@@ -856,7 +856,7 @@ mod tests {
         let mut objects = HashSet::new();
         let mut transactions = Vec::new();
         for load in loads {
-            let (os, txs) = generate_fake_load_objects_and_transactions(&mut rng, 3, load);
+            let (os, txs) = generate_fake_load_objects_and_transactions(&mut rng, 10, load);
             objects.extend(os);
             transactions.extend(txs);
         }

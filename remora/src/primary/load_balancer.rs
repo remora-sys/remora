@@ -91,7 +91,7 @@ where
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
-            index: 0,
+            txn_cnt: 0,
             states_to_proxy: Arc::new(DashMap::new()),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
         };

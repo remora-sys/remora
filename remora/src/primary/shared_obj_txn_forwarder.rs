@@ -110,7 +110,7 @@ where
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) policy: LoadBalancingPolicy,
-    pub(crate) index: usize,
+    pub(crate) txn_cnt: usize,
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
 }
@@ -151,7 +151,8 @@ where
         let states_to_proxy = self.states_to_proxy.clone();
         let policy = self.policy.clone();
         let proxy_connections = self.proxy_connections.clone();
-        let mut index = self.index;
+        let txn_cnt = self.txn_cnt;
+        self.txn_cnt = self.txn_cnt + 1;
 
         tokio::spawn(async move {
             // Wait for prior dependencies to complete
@@ -166,7 +167,7 @@ where
                 &policy,
                 &proxy_connections,
                 &states_to_proxy,
-                &mut index,
+                txn_cnt,
                 &required_versions,
             ) {
                 // Stateless transaction doesn't need missing states
@@ -199,9 +200,6 @@ where
                 notify.notify_one();
             }
         });
-
-        // Update the index in the original struct
-        self.index = index;
     }
 
     /// Get assigned proxy for shared objects in a transaction.
@@ -212,12 +210,12 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        index: &mut usize,
+        txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => {
-                Self::get_proxy_for_shared_objects_round_robin(proxy_connections, index)
+                Self::get_proxy_for_shared_objects_round_robin(proxy_connections, txn_cnt)
             }
             LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
                 proxy_connections,
@@ -239,15 +237,14 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        index: &mut usize,
+        txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count = proxy_connections.len();
         if proxy_count == 0 {
             return None;
         }
 
-        let proxy_index = *index % proxy_count;
-        *index = (*index + 1) % proxy_count;
+        let proxy_index = txn_cnt % proxy_count;
 
         Some((proxy_index, proxy_index))
     }
