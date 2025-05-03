@@ -308,11 +308,19 @@ where
         );
 
         if let Some(required_versions) = required_versions {
+            let mut max_version = SequenceNumber::from(2);
+            for (_, seq_num) in &required_versions {
+                if *seq_num > max_version {
+                    max_version = *seq_num;
+                }
+            }
+
+            // Calculate the new version (max + 1) for mapping updates
+            let next_version = max_version.next();
+
             for (object_id, seq_num) in required_versions {
                 let previous_owner = states_to_proxy.get(&(object_id, seq_num));
 
-                // Insert into required_states map - with previous owner if object needs migration,
-                // with None if it's already at the correct proxy or hasn't been assigned yet
                 let previous_owner_value = if let Some(owner) = previous_owner {
                     if *owner != proxy_index {
                         Some(*owner)
@@ -325,10 +333,16 @@ where
 
                 required_states.insert((object_id, seq_num), previous_owner_value);
 
-                // Always update the mapping to point to this proxy
-                states_to_proxy.insert((object_id, seq_num), proxy_index);
+                // Update the mapping with next version to point to this proxy
+                states_to_proxy.insert((object_id, next_version), proxy_index);
             }
         }
+
+        tracing::debug!(
+            "Transaction {:?} missing states: {:?}",
+            transaction.digest(),
+            required_states
+        );
 
         required_states
     }

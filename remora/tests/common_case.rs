@@ -46,6 +46,8 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
     .await;
     tokio::task::yield_now().await;
 
+    // Note: the following proxy hasn't called the await_completion() method,
+    // so there might be some issues with early termination of the proxy.
     // Start two remote proxies.
     let proxy_id_1 = 0;
     let _proxy1 = ProxyNode::start(
@@ -70,10 +72,10 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn remote_proxy_sui() {
-    let config = BenchmarkParameters::new_for_tests();
+    let config = BenchmarkParameters::new_for_contention_tests();
     let executor = SuiExecutor::new(&config).await;
     remote_proxy_common::<SuiExecutor>(executor, config.clone()).await;
-    tokio::time::sleep(Duration::from_secs(config.duration.as_secs())).await;
+    tokio::time::sleep(Duration::from_secs(config.duration.as_secs() * 4)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

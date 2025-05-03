@@ -51,13 +51,16 @@ impl VersionedDependencyController {
         seq_num: SequenceNumber,
         task_id: TaskID,
     ) -> Arc<Notify> {
-        self.obj_task_map
-            .entry((obj_id, seq_num))
-            .or_insert_with(|| Some((task_id, Arc::new(Notify::new()))))
-            .as_ref()
-            .unwrap()
-            .1
-            .clone()
+        use dashmap::mapref::entry::Entry;
+
+        match self.obj_task_map.entry((obj_id, seq_num)) {
+            Entry::Occupied(entry) => entry.get().as_ref().unwrap().1.clone(),
+            Entry::Vacant(entry) => {
+                let notify = Arc::new(Notify::new());
+                entry.insert(Some((task_id, notify.clone())));
+                notify
+            }
+        }
     }
 
     /// Get handles for both current version and the next version
@@ -204,12 +207,8 @@ mod tests {
         let (_prior_tasks1, current_tasks1) = dependency_controller
             .get_prior_dependency_and_update(task_id1, obj_versions1.clone(), false, false);
 
-        let (prior_tasks2, current_tasks2) = dependency_controller.get_prior_dependency_and_update(
-            task_id2,
-            obj_versions2.clone(),
-            false,
-            false,
-        );
+        let (prior_tasks2, _current_tasks2) = dependency_controller
+            .get_prior_dependency_and_update(task_id2, obj_versions2.clone(), false, false);
 
         // Only the first object should have a prior dependency
         assert_eq!(
@@ -226,8 +225,8 @@ mod tests {
 
         // Ensure the new object version got a new notify
         assert!(
-            !Arc::ptr_eq(&prior_tasks2[1], &current_tasks2[1]),
-            "New version should have a separate notify."
+            Arc::ptr_eq(&prior_tasks2[1], &current_tasks1[1]),
+            "The prior notify should match the one for the overlapping ObjectID with the same version."
         );
     }
 

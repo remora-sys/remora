@@ -338,10 +338,12 @@ where
 
         let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
         let store = self.store.clone();
+        let stateful_controller = self.stateful_controller.clone();
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
+            stateful_controller.remove_dependency(requested_states.clone());
             tracing::debug!("Ready to get objects for stateful request");
             let mut objects = BTreeMap::new();
             for state in requested_states {
@@ -569,11 +571,19 @@ where
             // Wait for the stateless dependency to be resolved
             stateless_handle.await.unwrap();
             stateless_controller.remove_dependency(&transaction.digest());
+            tracing::debug!(
+                "stateless dependency satisfied for transaction {:?}",
+                transaction.digest()
+            );
 
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
             }
             stateful_controller.remove_dependency(obj_ids.clone());
+            tracing::debug!(
+                "stateful dependency satisfied for transaction {:?}",
+                transaction.digest()
+            );
 
             // check the version ID for shared objects
             // skip if versions don't match
@@ -612,14 +622,14 @@ where
                 execution_result.success()
             );
 
+            for notify in current_handles {
+                notify.notify_one();
+            }
+
             tx_results
                 .send(execution_result)
                 .await
                 .map_err(|_| NodeError::ShuttingDown)?;
-
-            for notify in current_handles {
-                notify.notify_one();
-            }
 
             metrics.decrease_proxy_load(&id);
             //metrics.update_metrics(transaction.timestamp());
