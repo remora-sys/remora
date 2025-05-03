@@ -93,8 +93,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
                 // You might want to store this in a shared state or handle it according to your needs
             }
         });
-        let mut connection_listener_handles = Vec::new();
-        connection_listener_handles.push(connection_handle);
+        let connection_listener_handles = vec![connection_handle];
 
         let (tx_primary_connection, _) = mpsc::channel::<
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
@@ -114,7 +113,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             // Skip creating a connection to self
             if proxy_info.proxy_id != id {
                 let (tx_replies, rx_replies) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-                tx_inter_proxy_replies.insert(proxy_info.proxy_id.clone(), tx_replies.clone());
+                tx_inter_proxy_replies.insert(proxy_info.proxy_id, tx_replies.clone());
 
                 // Keep both ends of the channel to avoid dropping
                 let (tx_placeholder, _) =

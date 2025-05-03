@@ -107,7 +107,7 @@ impl OneshotDependencyController {
     pub fn get_dependency(&self, txn_id: &TransactionDigest) -> Option<oneshot::Receiver<bool>> {
         use dashmap::mapref::entry::Entry;
 
-        match self.obj_task_map.entry(txn_id.clone()) {
+        match self.obj_task_map.entry(*txn_id) {
             Entry::Occupied(mut occ) => {
                 if let Some((rx_opt, tx_opt)) = occ.get_mut().take() {
                     // If sender still exists, leave entry with sender only
@@ -143,7 +143,7 @@ impl OneshotDependencyController {
     pub fn take_signal(&self, txn_id: &TransactionDigest) -> Option<oneshot::Sender<bool>> {
         use dashmap::mapref::entry::Entry;
 
-        match self.obj_task_map.entry(txn_id.clone()) {
+        match self.obj_task_map.entry(*txn_id) {
             Entry::Occupied(mut occ) => {
                 if let Some((rx_opt, tx_opt)) = occ.get_mut().take() {
                     // If receiver still exists, leave entry with receiver only

@@ -117,7 +117,7 @@ where
         }
 
         // drive all of them to completion, in parallel
-        while let Some(_) = tasks.next().await {}
+        while (tasks.next().await).is_some() {}
     }
 
     #[cfg(feature = "benchmark")]

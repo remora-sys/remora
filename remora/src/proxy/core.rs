@@ -395,7 +395,7 @@ where
 
         let rx = self
             .stateless_controller
-            .get_dependency(&txn_digest)
+            .get_dependency(txn_digest)
             .unwrap();
 
         let stateless_controller = self.stateless_controller.clone();
@@ -464,8 +464,8 @@ where
         // Assign shared objects version.
         if !required_states.is_empty() {
             let required_versions: Vec<(ObjectID, SequenceNumber)> = required_states
-                .iter()
-                .map(|(state, _)| (state.0, state.1))
+                .keys()
+                .map(|state| (state.0, state.1))
                 .collect();
             self.executor
                 .assign_shared_object_versions_with_required_versions(
@@ -530,8 +530,8 @@ where
         Vec<Arc<Notify>>,
     ) {
         let obj_ids: Vec<(ObjectID, SequenceNumber)> = required_states
-            .iter()
-            .map(|(state, _)| (state.0, state.1))
+            .keys()
+            .map(|state| (state.0, state.1))
             .collect();
 
         // If there are no object dependencies, return empty vectors for handles
@@ -561,7 +561,7 @@ where
         );
 
         let store = self.store.clone();
-        let id = self.id.clone();
+        let id = self.id;
         let tx_results = self.tx_results.clone();
         let ctx = self.executor.context().clone();
         let metrics = self.metrics.clone();
@@ -570,7 +570,7 @@ where
         tokio::spawn(async move {
             // Wait for the stateless dependency to be resolved
             stateless_handle.await.unwrap();
-            stateless_controller.remove_dependency(&transaction.digest());
+            stateless_controller.remove_dependency(transaction.digest());
             tracing::debug!(
                 "stateless dependency satisfied for transaction {:?}",
                 transaction.digest()

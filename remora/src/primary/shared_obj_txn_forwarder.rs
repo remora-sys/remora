@@ -152,7 +152,7 @@ where
         let policy = self.policy.clone();
         let proxy_connections = self.proxy_connections.clone();
         let txn_cnt = self.txn_cnt;
-        self.txn_cnt = self.txn_cnt + 1;
+        self.txn_cnt += 1;
 
         tokio::spawn(async move {
             // Wait for prior dependencies to complete

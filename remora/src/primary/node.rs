@@ -54,7 +54,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let mut network_handles = Vec::new();
 
         // Connect to each proxy server
-        for (_idx, proxy_info) in config.proxies.iter().enumerate() {
+        for proxy_info in config.proxies.iter() {
             let (tx_proxy, rx_proxy) =
                 mpsc::channel::<PrimaryToProxyMessage<E::Transaction>>(DEFAULT_CHANNEL_SIZE);
 
@@ -66,7 +66,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             .spawn();
 
             network_handles.push(network_client_handle);
-            proxy_connections.insert(proxy_info.proxy_id.clone(), tx_proxy);
+            proxy_connections.insert(proxy_info.proxy_id, tx_proxy);
         }
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
