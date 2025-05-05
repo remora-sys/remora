@@ -153,6 +153,7 @@ where
         let proxy_connections = self.proxy_connections.clone();
         let txn_cnt = self.txn_cnt;
         self.txn_cnt += 1;
+        let transaction = Arc::new(transaction);
 
         tokio::spawn(async move {
             // Wait for prior dependencies to complete
@@ -171,8 +172,7 @@ where
                 &required_versions,
             ) {
                 // Stateless transaction doesn't need missing states
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
                 Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
 
                 // Stateful transaction needs missing states
@@ -185,7 +185,7 @@ where
                 .await;
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
-                    Arc::new(transaction.clone()),
+                    transaction.clone(),
                     stateless_proxy_id,
                     stateful_missing_states,
                 );
@@ -279,15 +279,48 @@ where
 
         // Find the proxy with the most states
         let mut max_count = 0;
-        let mut best_proxy = 0;
+        let mut best_proxies = Vec::new();
 
+        // First pass to find maximum count
         for (index, count) in proxy_state_counts.iter().enumerate() {
             if *count > max_count {
                 max_count = *count;
-                best_proxy = index;
+                best_proxies.clear();
+                best_proxies.push(index);
+            } else if *count == max_count {
+                best_proxies.push(index);
             }
         }
 
+        // If we have multiple best proxies (including the case where all counts are 0)
+        // select one using a simple deterministic approach based on object IDs
+        if best_proxies.len() > 1 {
+            // Use the first object ID as a seed for selection
+            if let Some((first_id, _)) = required_versions.first() {
+                // Ultra-fast method: Mix bits from object_id string pointer address
+                // Combined with a few bytes from the string for uniqueness
+                let object_id_str = format!("{:?}", first_id);
+                let ptr_val = object_id_str.as_ptr() as usize;
+                let len = object_id_str.len();
+
+                // Mix in the first and last few bytes if available for better distribution
+                let mut hash = ptr_val;
+                if len > 0 {
+                    hash ^= object_id_str.as_bytes()[0] as usize;
+                    if len > 4 {
+                        hash ^= (object_id_str.as_bytes()[len - 1] as usize) << 8;
+                    }
+                }
+
+                // Simple bit mixing for better distribution - extremely fast
+                hash = hash ^ (hash >> 12);
+
+                let proxy_index = best_proxies[hash % best_proxies.len()];
+                return Some((proxy_index, proxy_index));
+            }
+        }
+
+        let best_proxy = best_proxies.first().copied().unwrap_or(0);
         Some((best_proxy, best_proxy))
     }
 

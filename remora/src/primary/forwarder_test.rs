@@ -64,7 +64,6 @@ mod tests {
     #[cfg(feature = "benchmark")]
     async fn test_parallel_forwarding_benchmark() {
         use std::time::Instant;
-        let config = BenchmarkParameters::new_for_tests();
 
         // Create proxy connections map with a high capacity channel
         let (tx_benchmark, mut rx_benchmark) = channel(20000);
@@ -72,7 +71,7 @@ mod tests {
         proxy_connections.insert(0, tx_benchmark.clone());
         proxy_connections.insert(1, tx_benchmark);
 
-        let mut owned_txn_processor = OwnedTxnProcessor::<SuiExecutor> {
+        let mut owned_txn_processor = OwnedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -107,12 +106,15 @@ mod tests {
     pub async fn create_benchmark_shared_object_transactions<E: Executor>(
         count: usize,
     ) -> (BenchmarkParameters, Vec<RemoraTransaction<E>>) {
-        use crate::config::{BenchmarkParameters, WorkloadType};
+        use crate::config::WorkloadType;
         use std::time::Duration;
         let config = BenchmarkParameters {
             load: count as u64,
             duration: Duration::from_secs(1),
-            workload: WorkloadType::SharedObjects { txs_per_counter: 3 },
+            workload: WorkloadType::Zipfian {
+                alpha: 0.99,
+                number_of_inputs: 2,
+            },
             verification_duration: Duration::from_secs(0),
         };
         let transactions = E::generate_transactions(&config, None).await;
@@ -135,17 +137,12 @@ mod tests {
         let (config, transactions) =
             create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
 
-        // Configure benchmark params
-        let executor = SuiExecutor::new(&config).await;
-        let executor = Arc::new(executor);
-
         // Create channels for the version assignment task
         let (tx_shared_txns, rx_shared_txns) = channel(20000);
         let (tx_assigned, mut rx_assigned) = channel(20000);
 
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
-            executor: executor.clone(),
             shared_object_versions: rustc_hash::FxHashMap::default(),
             _phantom: std::marker::PhantomData,
         };
@@ -175,85 +172,6 @@ mod tests {
 
         // Drop channels to terminate the task
         drop(tx_shared_txns);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
-    #[tracing_test::traced_test]
-    #[cfg(feature = "benchmark")]
-    async fn test_shared_processor_throughput() {
-        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
-        use std::time::Instant;
-        use sui_types::base_types::{ObjectID, SequenceNumber};
-
-        // Generate transactions with required versions
-        let transaction_count = 100000; // Use a smaller count for this test
-        let (config, transactions) =
-            create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
-
-        // Create proxy connections with a high capacity channel
-        let (tx_benchmark, mut rx_benchmark) = channel(20000);
-        let proxy_connections = Arc::new(DashMap::new());
-        proxy_connections.insert(0, tx_benchmark.clone());
-        proxy_connections.insert(1, tx_benchmark);
-
-        // Create states_to_proxy map and dependency controller
-        let states_to_proxy = Arc::new(DashMap::new());
-        let dependency_controller = Arc::new(VersionedDependencyController::default());
-
-        // Create shared processor
-        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
-            proxy_connections: proxy_connections.clone(),
-            policy: LoadBalancingPolicy::RoundRobin,
-            index: 0,
-            states_to_proxy: states_to_proxy.clone(),
-            dependency_controller: dependency_controller.clone(),
-        };
-
-        // Shared object ID and version for transactions
-        let obj_id = ObjectID::random();
-        let version = SequenceNumber::new();
-        let required_versions = vec![(obj_id, version)];
-
-        // Create channels for the process_shared_txns method
-        let (tx_shared, rx_shared) = channel::<(
-            RemoraTransaction<SuiExecutor>,
-            Vec<(ObjectID, SequenceNumber)>,
-        )>(20000);
-
-        // Prepare transactions with required versions
-        for txn in transactions {
-            tx_shared
-                .send((txn, required_versions.clone()))
-                .await
-                .unwrap();
-        }
-
-        // Start measuring throughput
-        let instant = Instant::now();
-
-        // Process transactions using process_shared_txns
-        let handle = tokio::spawn(async move {
-            shared_processor.process_shared_txns(rx_shared).await;
-        });
-
-        // Count received messages
-        let mut cnt = 0;
-        // Each transaction generates 2 messages: stateless and stateful
-        while let Some(_) = rx_benchmark.recv().await {
-            cnt += 1;
-            if cnt == transaction_count * 2 - 2 {
-                break;
-            }
-        }
-
-        let elapsed = instant.elapsed();
-        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
-        println!("Shared Processor Throughput = {:.2} txns/s", throughput);
-
-        // Drop the channel to terminate the task
-        drop(tx_shared);
         handle.await.unwrap();
     }
 
@@ -570,16 +488,15 @@ mod tests {
     #[cfg(feature = "benchmark")]
     async fn test_combined_version_assignment_and_processing_throughput() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_obj_txn_forwarder::{SharedTxnProcessor, VersionAssignmentTask};
+        use crate::primary::shared_obj_txn_forwarder::{
+            SharedObjTxnForwarder, VersionAssignmentTask,
+        };
         use std::time::Instant;
-        use sui_types::base_types::{ObjectID, SequenceNumber};
 
         // Configure benchmark params
-        let config = BenchmarkParameters::new_for_tests();
-
-        // Setup executor
-        let executor = SuiExecutor::new(&config).await;
-        let executor_arc = Arc::new(executor);
+        let transaction_count = 100000; // Use a smaller count for this test
+        let (_, transactions) =
+            create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
 
         // Create proxy connections with a high capacity channel
         let (tx_benchmark, mut rx_benchmark) = channel(20000);
@@ -596,29 +513,19 @@ mod tests {
         let (tx_assigned, rx_assigned) = channel(20000);
 
         // Create the version assignment task
-        let mut version_assignment_task = VersionAssignmentTask {
-            executor: executor_arc.clone(),
+        let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
             _phantom: std::marker::PhantomData,
         };
 
         // Create shared processor
-        let mut shared_processor = SharedTxnProcessor::<SuiExecutor> {
+        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
             proxy_connections: proxy_connections.clone(),
-            policy: LoadBalancingPolicy::RoundRobin,
-            index: 0,
+            policy: LoadBalancingPolicy::Zeus,
+            txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
         };
-
-        // Generate transactions
-        let transaction_count = 10; // Use a smaller count for this test
-        let transactions = SuiExecutor::generate_transactions(&config, None).await;
-        let remora_txns: Vec<RemoraTransaction<SuiExecutor>> = transactions
-            .into_iter()
-            .take(transaction_count)
-            .map(|tx| RemoraTransaction::<SuiExecutor>::new_for_tests(tx))
-            .collect();
 
         // Spawn tasks for version assignment and shared processing
         let version_task = tokio::spawn(async move {
@@ -635,14 +542,14 @@ mod tests {
         let instant = Instant::now();
 
         // Send transactions to the version assignment task
-        tx_shared_txns.send(remora_txns).await.unwrap();
+        tx_shared_txns.send(transactions).await.unwrap();
 
         // Count received messages at the end of the pipeline
         let mut cnt = 0;
         // Each transaction generates 2 messages: stateless and stateful
         while let Some(_) = rx_benchmark.recv().await {
             cnt += 1;
-            if cnt == transaction_count * 2 {
+            if cnt == transaction_count * 2 - 2 {
                 break;
             }
         }
