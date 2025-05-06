@@ -78,7 +78,7 @@ mod tests {
         };
 
         // Run a mini benchmark
-        let transaction_count = 1000000; // Small count for tests
+        let transaction_count = 100000; // Small count for tests
         let transactions = owned_txn_processor
             .create_benchmark_transactions(transaction_count)
             .await;
@@ -336,6 +336,7 @@ mod tests {
             txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
+            proxy_loads: Arc::new(DashMap::new()),
         };
 
         // Generate transactions
@@ -431,6 +432,7 @@ mod tests {
             txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
+            proxy_loads: Arc::new(DashMap::new()),
         };
 
         // Generate transactions
@@ -487,6 +489,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
     #[cfg(feature = "benchmark")]
     async fn test_combined_version_assignment_and_processing_throughput() {
+        use crate::config::DEFAULT_CHANNEL_SIZE;
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
         use crate::primary::shared_obj_txn_forwarder::{
             SharedObjTxnForwarder, VersionAssignmentTask,
@@ -497,9 +500,10 @@ mod tests {
         let transaction_count = 100000; // Use a smaller count for this test
         let (_, transactions) =
             create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
+        println!("finished creating transactions");
 
         // Create proxy connections with a high capacity channel
-        let (tx_benchmark, mut rx_benchmark) = channel(20000);
+        let (tx_benchmark, mut rx_benchmark) = channel(DEFAULT_CHANNEL_SIZE);
         let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_benchmark.clone());
         proxy_connections.insert(1, tx_benchmark);
@@ -509,8 +513,8 @@ mod tests {
         let dependency_controller = Arc::new(VersionedDependencyController::default());
 
         // Create channels between version assignment and shared processor
-        let (tx_shared_txns, rx_shared_txns) = channel(20000);
-        let (tx_assigned, rx_assigned) = channel(20000);
+        let (tx_shared_txns, rx_shared_txns) = channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_assigned, rx_assigned) = channel(DEFAULT_CHANNEL_SIZE);
 
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
@@ -525,6 +529,7 @@ mod tests {
             txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
+            proxy_loads: Arc::new(DashMap::new()),
         };
 
         // Spawn tasks for version assignment and shared processing

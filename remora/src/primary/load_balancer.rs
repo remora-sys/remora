@@ -94,6 +94,7 @@ where
             txn_cnt: 0,
             states_to_proxy: Arc::new(DashMap::new()),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
+            proxy_loads: Arc::new(DashMap::new()),
         };
 
         // Spawn a task to process owned transactions

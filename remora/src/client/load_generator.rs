@@ -63,6 +63,7 @@ impl<E: Executor> LoadGenerator<E> {
         transactions: Vec<E::Transaction>,
         sender: Sender<RemoraTransaction<E>>,
         arrival: Distribution,
+        verification_duration: Duration,
     ) where
         <E as Executor>::Transaction: std::marker::Send + 'static,
     {
@@ -77,8 +78,12 @@ impl<E: Executor> LoadGenerator<E> {
 
             // Get the current timestamp for metrics
             let timestamp = Metrics::now().as_secs_f64();
-            let full_tx =
-                TransactionWithTimestamp::new(tx.clone(), timestamp, tx.shared_object_ids());
+            let full_tx = TransactionWithTimestamp::new(
+                tx.clone(),
+                timestamp,
+                tx.shared_object_ids(),
+                verification_duration,
+            );
 
             // Send the transaction
             if sender.send(full_tx).await.is_err() {
@@ -157,9 +162,10 @@ impl<E: Executor> LoadGenerator<E> {
         let mut handles = vec![];
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
             let arrival = self.arrival;
+            let verification_duration = self.config.verification_duration;
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_secs(1)).await;
-                Self::submit_transactions(tx_chunk, tx, arrival).await;
+                Self::submit_transactions(tx_chunk, tx, arrival, verification_duration).await;
             });
             handles.push(handle);
         }

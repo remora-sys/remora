@@ -28,6 +28,8 @@ pub enum LoadBalancingPolicy {
     Dedicated,
     /// Combined: one proxy for both stateless and stateful
     Combined,
+    /// Two-tier: separate policies for stateless and stateful
+    TwoTier,
 }
 
 /// Default channel size for communication between components.

@@ -3,6 +3,7 @@
 
 use std::{
     collections::BTreeMap, fmt::Debug, future::Future, ops::Deref, path::PathBuf, sync::Arc,
+    time::Duration,
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -48,15 +49,23 @@ pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     timestamp: Timestamp,
     /// The shared object IDs in the transaction.
     shared_object_ids: Vec<ObjectID>,
+    /// The verification duration for the transaction.
+    verification_duration: Duration,
 }
 
 impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
     /// Create a new transaction with a timestamp.
-    pub fn new(transaction: T, timestamp: Timestamp, shared_object_ids: Vec<ObjectID>) -> Self {
+    pub fn new(
+        transaction: T,
+        timestamp: Timestamp,
+        shared_object_ids: Vec<ObjectID>,
+        verification_duration: Duration,
+    ) -> Self {
         Self {
             transaction,
             timestamp,
             shared_object_ids,
+            verification_duration,
         }
     }
 
@@ -71,12 +80,18 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
             transaction,
             timestamp: 0.0,
             shared_object_ids: vec![],
+            verification_duration: Duration::from_micros(200),
         }
     }
 
     /// Get the shared object IDs in the transaction.
     pub fn shared_object_ids(&self) -> &Vec<ObjectID> {
         &self.shared_object_ids
+    }
+
+    /// Get the verification duration for the transaction.
+    pub fn verification_duration(&self) -> Duration {
+        self.verification_duration
     }
 }
 
