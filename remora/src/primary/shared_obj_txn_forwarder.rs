@@ -137,16 +137,6 @@ where
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        let (prior_handles, current_handles) = match required_versions.is_empty() {
-            true => (Vec::new(), Vec::new()),
-            false => self.dependency_controller.get_prior_dependency_and_update(
-                0,
-                required_versions.clone(),
-                false,
-                false,
-            ),
-        };
-
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();
         let states_to_proxy = self.states_to_proxy.clone();
@@ -159,6 +149,15 @@ where
         let transaction = Arc::new(transaction);
 
         tokio::spawn(async move {
+            let (prior_handles, current_handles) = match required_versions.is_empty() {
+                true => (Vec::new(), Vec::new()),
+                false => dependency_controller.get_prior_dependency_and_update(
+                    0,
+                    required_versions.clone(),
+                    false,
+                    false,
+                ),
+            };
             // Wait for prior dependencies to complete
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
