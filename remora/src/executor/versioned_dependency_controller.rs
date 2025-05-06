@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{
+    mapref::entry::Entry,
+    DashMap,
+};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::Notify;
 
@@ -45,14 +48,13 @@ impl VersionedDependencyController {
     }
 
     /// A helper function to check the existing entry in the map, else create one and fill there
+    #[inline]
     fn entry_helper(
         &self,
         obj_id: ObjectID,
         seq_num: SequenceNumber,
         task_id: TaskID,
     ) -> Arc<Notify> {
-        use dashmap::mapref::entry::Entry;
-
         match self.obj_task_map.entry((obj_id, seq_num)) {
             Entry::Occupied(entry) => entry.get().as_ref().unwrap().1.clone(),
             Entry::Vacant(entry) => {
@@ -61,6 +63,17 @@ impl VersionedDependencyController {
                 notify
             }
         }
+    }
+
+    /// Compute the next version number from a list of object versions
+    #[inline]
+    fn calculate_next_version(obj_versions: &[(ObjectID, SequenceNumber)]) -> SequenceNumber {
+        obj_versions
+            .iter()
+            .map(|(_, seq_num)| *seq_num)
+            .max()
+            .expect("No max key found, obj_versions is empty")
+            .next()
     }
 
     /// Get handles for both current version and the next version
@@ -76,12 +89,7 @@ impl VersionedDependencyController {
         let mut current_handles = Vec::new();
         let mut next_handles = Vec::new();
 
-        let next_v = obj_versions
-            .iter()
-            .map(|(_, seq_num)| *seq_num)
-            .max()
-            .expect("No max key found, obj_versions is empty")
-            .next();
+        let next_v = Self::calculate_next_version(&obj_versions);
 
         for (obj_id, seq_num) in obj_versions.iter() {
             if *seq_num > self.initial_version && !ignore_prior {
@@ -96,6 +104,7 @@ impl VersionedDependencyController {
     }
 
     /// Removes dependencies for the given object versions.
+    #[inline]
     pub fn remove_dependency(&self, obj_versions: Vec<(ObjectID, SequenceNumber)>) {
         for (obj_id, seq_num) in obj_versions {
             self.obj_task_map.remove(&((*obj_id).into(), seq_num));
