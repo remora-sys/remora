@@ -441,20 +441,10 @@ impl Executor for SuiExecutor {
         transactions: &[Self::Transaction],
         required_versions: &[(ObjectID, SequenceNumber)],
     ) {
-        let _guard = self.shared_object_versions_assignment_lock.lock().await;
-
-        // Collect all shared object IDs from the transactions' input objects
+        // Collect all shared object IDs from the transactions
         let shared_object_ids: std::collections::HashSet<_> = transactions
             .iter()
-            .flat_map(|tx| {
-                tx.input_objects().into_iter().filter_map(|kind| {
-                    if let InputObjectKind::SharedMoveObject { id, .. } = kind {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
-            })
+            .flat_map(|tx| tx.shared_object_ids())
             .collect();
 
         // Filter required_versions to only include shared object IDs
