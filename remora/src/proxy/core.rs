@@ -460,21 +460,6 @@ where
             required_states.len()
         );
 
-        // TODO: check if assigning before all the states are received making sense
-        // Assign shared objects version.
-        if !required_states.is_empty() {
-            let required_versions: Vec<(ObjectID, SequenceNumber)> = required_states
-                .keys()
-                .map(|state| (state.0, state.1))
-                .collect();
-            self.executor
-                .assign_shared_object_versions_with_required_versions(
-                    &[transaction.deref().deref().clone()],
-                    &required_versions,
-                )
-                .await;
-        }
-
         for (states, proxy_id) in &required_states {
             if let Some(proxy_id) = proxy_id {
                 tracing::debug!(
@@ -496,19 +481,9 @@ where
 
         self.metrics.increase_proxy_load(self.id);
 
-        // FIXME?
-        // Check and prepare objects
-        if !E::pre_execute_check_objects(self.store.clone(), &transaction) {
-            tracing::debug!(
-                "Proxy {} optimistically pre-generating objects for transaction {:?}",
-                self.id,
-                transaction.digest()
-            );
-            E::optimistically_pre_generate_objects(self.store.clone(), &transaction);
-        }
-
         // Get dependencies and schedule the transaction
-        let (obj_ids, prior_handles, current_handles) = self.get_dependencies(required_states);
+        let (obj_ids, prior_handles, current_handles) =
+            self.get_dependencies(required_states.clone());
         tracing::debug!(
             "Proxy {} got dependencies for transaction {:?}: objects {:?}",
             self.id,
@@ -516,9 +491,16 @@ where
             obj_ids
         );
 
-        self.spawn_stateful_txn(transaction, obj_ids, prior_handles, current_handles, rx)
-            .await
-            .expect("Failed to schedule transaction");
+        self.spawn_stateful_txn(
+            transaction,
+            obj_ids,
+            prior_handles,
+            current_handles,
+            rx,
+            required_states,
+        )
+        .await
+        .expect("Failed to schedule transaction");
     }
 
     pub fn get_dependencies(
@@ -553,6 +535,7 @@ where
         prior_handles: Vec<Arc<Notify>>,
         current_handles: Vec<Arc<Notify>>,
         stateless_handle: oneshot::Receiver<bool>,
+        required_states: RequiredStates,
     ) -> NodeResult<()> {
         tracing::debug!(
             "Proxy {} spawning stateful transaction {:?}",
@@ -567,7 +550,22 @@ where
         let metrics = self.metrics.clone();
         let stateful_controller = self.stateful_controller.clone();
         let stateless_controller = self.stateless_controller.clone();
+        let executor = self.executor.clone();
         tokio::spawn(async move {
+            // Assign shared objects version.
+            if !required_states.is_empty() {
+                let required_versions: Vec<(ObjectID, SequenceNumber)> = required_states
+                    .keys()
+                    .map(|state| (state.0, state.1))
+                    .collect();
+                executor
+                    .assign_shared_object_versions_with_required_versions(
+                        &[transaction.deref().deref().clone()],
+                        &required_versions,
+                    )
+                    .await;
+            }
+
             // Wait for the stateless dependency to be resolved
             stateless_handle.await.unwrap();
             stateless_controller.remove_dependency(transaction.digest());

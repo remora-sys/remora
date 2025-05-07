@@ -3,10 +3,7 @@
 
 use std::sync::Arc;
 
-use dashmap::{
-    mapref::entry::Entry,
-    DashMap,
-};
+use dashmap::{mapref::entry::Entry, DashMap};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::Notify;
 
