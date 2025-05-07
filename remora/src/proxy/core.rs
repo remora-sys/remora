@@ -462,6 +462,7 @@ where
 
         for (states, proxy_id) in &required_states {
             if let Some(proxy_id) = proxy_id {
+                assert_eq!(*proxy_id, self.id);
                 tracing::debug!(
                     "Proxy {} requesting {} missing states from proxy {}: {:?}",
                     self.id,
@@ -481,31 +482,14 @@ where
 
         self.metrics.increase_proxy_load(self.id);
 
-        // Get dependencies and schedule the transaction
-        let (obj_ids, prior_handles, current_handles) =
-            self.get_dependencies(required_states.clone());
-        tracing::debug!(
-            "Proxy {} got dependencies for transaction {:?}: objects {:?}",
-            self.id,
-            transaction.digest(),
-            obj_ids
-        );
-
-        self.spawn_stateful_txn(
-            transaction,
-            obj_ids,
-            prior_handles,
-            current_handles,
-            rx,
-            required_states,
-        )
-        .await
-        .expect("Failed to schedule transaction");
+        self.spawn_stateful_txn(transaction, rx, required_states)
+            .await
+            .expect("Failed to schedule transaction");
     }
 
     pub fn get_dependencies(
-        &mut self,
         required_states: RequiredStates,
+        stateful_controller: Arc<VersionedDependencyController>,
     ) -> (
         Vec<(ObjectID, SequenceNumber)>,
         Vec<Arc<Notify>>,
@@ -521,9 +505,8 @@ where
             return (obj_ids, Vec::new(), Vec::new());
         }
 
-        let (prior_handles, current_handles) = self
-            .stateful_controller
-            .get_prior_dependency_and_update(0, obj_ids.clone(), false, false);
+        let (prior_handles, current_handles) =
+            stateful_controller.get_prior_dependency_and_update(0, obj_ids.clone(), false, false);
 
         (obj_ids, prior_handles, current_handles)
     }
@@ -531,9 +514,6 @@ where
     pub async fn spawn_stateful_txn(
         &mut self,
         transaction: Arc<RemoraTransaction<E>>,
-        obj_ids: Vec<(ObjectID, SequenceNumber)>,
-        prior_handles: Vec<Arc<Notify>>,
-        current_handles: Vec<Arc<Notify>>,
         stateless_handle: oneshot::Receiver<bool>,
         required_states: RequiredStates,
     ) -> NodeResult<()> {
@@ -565,7 +545,15 @@ where
                     )
                     .await;
             }
-
+            // Get dependencies and schedule the transaction
+            let (obj_ids, prior_handles, current_handles) =
+                Self::get_dependencies(required_states.clone(), stateful_controller.clone());
+            tracing::debug!(
+                "Proxy {} got dependencies for transaction {:?}: objects {:?}",
+                id,
+                transaction.digest(),
+                obj_ids.clone()
+            );
             // Wait for the stateless dependency to be resolved
             stateless_handle.await.unwrap();
             stateless_controller.remove_dependency(transaction.digest());
