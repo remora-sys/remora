@@ -112,7 +112,7 @@ mod tests {
             load: count as u64,
             duration: Duration::from_secs(1),
             workload: WorkloadType::Zipfian {
-                alpha: 0.99,
+                alpha: 0.00,
                 number_of_inputs: 2,
             },
             verification_duration: Duration::from_secs(0),
@@ -567,5 +567,97 @@ mod tests {
         drop(tx_shared_txns);
         version_task.await.unwrap();
         processor_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+    #[cfg(feature = "benchmark")]
+    async fn test_proxy_throughput() {
+        use crate::proxy::core::ProxyCore;
+        use std::time::Instant;
+        use crate::executor::api::RequiredStates;
+        use sui_types::base_types::SequenceNumber;
+        use crate::executor::api::ExecutableTransaction;
+        use prometheus::Registry;
+
+        // Generate test transactions with shared objects
+        let transaction_count = 10000; // Use a smaller count for this test
+        let (config, transactions) =
+            create_benchmark_shared_object_transactions::<SuiExecutor>(transaction_count).await;
+        println!("finished creating transactions");
+
+        // Create channels for proxy communication
+        let (tx_primary_to_proxy, rx_primary_to_proxy) = channel(20000);
+        let (tx_proxy_to_primary, mut rx_proxy_to_primary) = channel(20000);
+        let (tx_inter_proxy_requests, rx_inter_proxy_requests) = channel(100);
+        let tx_inter_proxy_replies = Arc::new(DashMap::new());
+
+        let executor = SuiExecutor::new(&config).await;
+        let store = executor.init_store();
+        let registry = Registry::new();
+        let metrics = Arc::new(Metrics::new(&registry));
+
+        let proxy_core = ProxyCore::<SuiExecutor>::new(
+            0,
+            executor,
+            store.into(),
+            rx_primary_to_proxy,
+            tx_proxy_to_primary,
+            rx_inter_proxy_requests,
+            tx_inter_proxy_replies.clone(),
+            metrics,
+        );
+
+        // Spawn the proxy core task
+        let proxy_handle = proxy_core.spawn();
+
+        // Start measuring throughput
+        let instant = Instant::now();
+
+        // This simulates when the zipfian is 0
+        assert_eq!(config.workload.alpha, 0.00);
+
+        // Prepare messages to send to the proxy
+        let messages = transactions.into_iter().map(|transaction| {
+            // Create dummy required states for stateful transactions
+            let mut required_states = RequiredStates::new();
+            for obj_id in transaction.input_objects() {
+                required_states.insert((obj_id.object_id(), SequenceNumber::from(2)), Some(0));
+            }
+            let tx = Arc::new(transaction);
+            (
+                PrimaryToProxyMessage::StatelessTxn(tx.clone()),
+                PrimaryToProxyMessage::Txn(tx, 0, required_states)
+            )
+        }).collect::<Vec<_>>();
+
+        // Launch a tokio task to send the messages
+        let tx_primary_to_proxy_clone = tx_primary_to_proxy.clone();
+        tokio::spawn(async move {
+            for (msg_0, msg_1) in messages {
+                if tx_primary_to_proxy_clone.send(msg_0).await.is_err() {
+                    break;
+                }
+                if tx_primary_to_proxy_clone.send(msg_1).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Count received messages from the proxy
+        let mut cnt = 0;
+        while let Some(_) = rx_proxy_to_primary.recv().await {
+            cnt += 1;
+            if cnt == transaction_count - 1 {
+                break;
+            }
+        }
+
+        let elapsed = instant.elapsed();
+        let throughput = transaction_count as f64 / elapsed.as_secs_f64();
+        println!("Proxy Stateful Throughput = {:.2} txns/s", throughput);
+
+        // Clean up
+        drop(tx_primary_to_proxy);
+        // let _ = proxy_handle.await;
     }
 }
