@@ -128,7 +128,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             }
         }
 
-        let store = Arc::new(executor.init_store());
+        let store = executor.init_store();
         let core_handle = ProxyCore::new(
             id,
             executor.clone(),

@@ -239,6 +239,14 @@ pub enum WorkloadType {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
     },
+    FakeZipfian {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+        #[serde(default = "default_zipfian_alpha")]
+        alpha: f64,
+        #[serde(default = "default_number_of_inputs")]
+        number_of_inputs: usize,
+    },
 }
 
 impl WorkloadType {
@@ -250,7 +258,8 @@ impl WorkloadType {
             | WorkloadType::FakeEthereumTransfers { .. }
             | WorkloadType::FakeEthereumNftMint { .. }
             | WorkloadType::FakeUniswapNormal { .. }
-            | WorkloadType::FakeUniswapPeak { .. } => true,
+            | WorkloadType::FakeUniswapPeak { .. }
+            | WorkloadType::FakeZipfian { .. } => true,
             _ => false,
         }
     }
@@ -294,6 +303,7 @@ impl Debug for WorkloadType {
             WorkloadType::FakeEthereumNftMint { .. } => write!(f, "Fake Ethereum NFT mint"),
             WorkloadType::FakeUniswapNormal { .. } => write!(f, "Fake Uniswap normal"),
             WorkloadType::FakeUniswapPeak { .. } => write!(f, "Fake Uniswap peak"),
+            WorkloadType::FakeZipfian { .. } => write!(f, "Fake Zipfian"),
         }
     }
 }

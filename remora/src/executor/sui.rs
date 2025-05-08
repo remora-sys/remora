@@ -289,11 +289,11 @@ impl SuiExecutor {
         }
     }
 
-    pub fn create_in_memory_store(&self) -> InMemoryObjectStore {
-        self.ctx
+    pub fn create_in_memory_store(&self) -> Arc<InMemoryObjectStore> {
+        Arc::new(self.ctx
             .benchmark_ctx()
             .validator()
-            .create_in_memory_store()
+            .create_in_memory_store())
     }
 }
 
@@ -482,7 +482,7 @@ impl Executor for SuiExecutor {
         generate_sui_transactions(config, working_directory)
     }
 
-    fn init_store(&self) -> Self::Store {
+    fn init_store(&self) -> Arc<Self::Store> {
         self.create_in_memory_store()
     }
 
@@ -528,7 +528,7 @@ impl Executor for SuiExecutor {
 #[cfg(test)]
 mod tests {
 
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{path::PathBuf, time::Duration};
 
     use tokio::time::Instant;
 
@@ -544,7 +544,7 @@ mod tests {
     async fn test_sui_executor() {
         let config = BenchmarkParameters::new_for_tests();
         let executor = SuiExecutor::new(&config).await;
-        let store = Arc::new(executor.create_in_memory_store());
+        let store = executor.create_in_memory_store();
         let ctx = executor.context();
 
         let transactions = generate_sui_transactions(&config, None).await;
@@ -573,7 +573,7 @@ mod tests {
 
         // execute on another executor
         let executor = SuiExecutor::new(&config).await;
-        let store = Arc::new(executor.create_in_memory_store());
+        let store = executor.create_in_memory_store();
 
         // import txs to assign shared-object versions
         let (_, read_txs) = super::import_from_files(working_directory.into());

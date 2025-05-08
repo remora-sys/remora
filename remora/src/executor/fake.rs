@@ -306,6 +306,7 @@ impl FakeExecutionContext {
 #[derive(Clone)]
 pub struct FakeExecutor {
     execution_context: Arc<FakeExecutionContext>,
+    store: Arc<FakeObjectStore<FakeTransactionEffects>>,
 }
 
 impl FakeExecutor {
@@ -330,8 +331,14 @@ impl FakeExecutor {
             }
         };
         let ctx = FakeExecutionContext::new(execution_duration, config.verification_duration);
+        let store = Arc::new(FakeObjectStore::new());
+        let (objects, _) = generate_fake_transactions(config).await;
+        for object in objects {
+            store.write_object(object);
+        }
         Self {
             execution_context: Arc::new(ctx),
+            store,
         }
     }
 
@@ -452,15 +459,16 @@ impl Executor for FakeExecutor {
         todo!()
     }
 
-    fn generate_transactions(
+    async fn generate_transactions(
         config: &BenchmarkParameters,
         _working_directory: Option<std::path::PathBuf>,
-    ) -> impl Future<Output = Vec<Self::Transaction>> + Send {
-        generate_fake_transactions(config)
+    ) -> Vec<Self::Transaction> {
+        let (_, transactions) = generate_fake_transactions(config).await;
+        transactions
     }
 
-    fn init_store(&self) -> Self::Store {
-        FakeObjectStore::new()
+    fn init_store(&self) -> Arc<Self::Store> {
+        self.store.clone()
     }
 
     fn optimistically_pre_generate_objects(
@@ -553,7 +561,9 @@ where
         .collect()
 }
 
-pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<FakeTransaction> {
+pub async fn generate_fake_transactions(
+    config: &BenchmarkParameters,
+) -> (HashSet<Object>, Vec<FakeTransaction>) {
     let pre_generation = config.load * config.duration.as_secs();
 
     match config.workload {
@@ -561,67 +571,76 @@ pub async fn generate_fake_transactions(config: &BenchmarkParameters) -> Vec<Fak
             execution_duration: _,
             number_of_inputs,
         } => {
-            parallel_generate_transaction(
+            let transactions = parallel_generate_transaction(
                 pre_generation,
                 number_of_inputs,
                 generate_fake_owned_object_transaction,
             )
-            .await
+            .await;
+            (HashSet::new(), transactions)
         }
         WorkloadType::FakedContention {
             execution_duration: _,
             number_of_inputs,
             contention,
         } => {
-            parallel_generate_transaction(pre_generation, number_of_inputs, move |x| {
+            let transactions = parallel_generate_transaction(pre_generation, number_of_inputs, move |x| {
                 generate_fake_shared_object_transaction(x, contention)
             })
-            .await
+            .await;
+            (HashSet::new(), transactions)
         }
         WorkloadType::FakeSolanaTransactions { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            let (_, transactions) = generate_fake_load_objects_and_transactions(
+            generate_fake_load_objects_and_transactions(
                 &mut rng,
                 pre_generation as usize,
                 solana_load,
-            );
-            transactions
+            )
         }
         WorkloadType::FakeEthereumTransfers { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            let (_, transactions) = generate_fake_load_objects_and_transactions(
+            generate_fake_load_objects_and_transactions(
                 &mut rng,
                 pre_generation as usize,
                 eth_transfers,
-            );
-            transactions
+            )
         }
         WorkloadType::FakeEthereumNftMint { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            let (_, transactions) = generate_fake_load_objects_and_transactions(
+            generate_fake_load_objects_and_transactions(
                 &mut rng,
                 pre_generation as usize,
                 eth_mint,
-            );
-            transactions
+            )
         }
         WorkloadType::FakeUniswapNormal { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            let (_, transactions) = generate_fake_load_objects_and_transactions(
+            generate_fake_load_objects_and_transactions(
                 &mut rng,
                 pre_generation as usize,
                 uniswap_normal,
-            );
-            transactions
+            )
         }
         WorkloadType::FakeUniswapPeak { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            let (_, transactions) = generate_fake_load_objects_and_transactions(
+            generate_fake_load_objects_and_transactions(
                 &mut rng,
                 pre_generation as usize,
                 uniswap_peak,
-            );
-            transactions
+            )
+        }
+        WorkloadType::FakeZipfian {
+            execution_duration: _,
+            alpha,
+            number_of_inputs,
+        } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                |rng| zipfian(rng, alpha, number_of_inputs),
+            )
         }
 
         _ => {
@@ -685,6 +704,10 @@ pub fn uniswap_normal(rng: &mut StdRng) -> Vec<usize> {
 pub fn uniswap_peak(rng: &mut StdRng) -> Vec<usize> {
     let coin_pair = sui_single_node_benchmark::load_statistics::ethereum_uniswap_peak(rng);
     vec![coin_pair]
+}
+
+pub fn zipfian(rng: &mut StdRng, alpha: f64, number_of_inputs: usize) -> Vec<usize> {
+    sui_single_node_benchmark::load_statistics::zipfian_workload(rng, alpha, number_of_inputs)
 }
 
 #[cfg(test)]

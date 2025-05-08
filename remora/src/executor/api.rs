@@ -228,7 +228,7 @@ pub trait Executor: Clone {
         working_directory: Option<PathBuf>,
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send;
 
-    fn init_store(&self) -> Self::Store;
+    fn init_store(&self) -> Arc<Self::Store>;
 
     fn optimistically_pre_generate_objects(
         store: Arc<Self::Store>,

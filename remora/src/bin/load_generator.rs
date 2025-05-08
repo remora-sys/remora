@@ -10,7 +10,10 @@ use remora::{
     client::load_generator::{default_metrics_address, LoadGenerator},
     config::{BenchmarkParameters, ImportExport, ValidatorConfig},
     executor::sui::SuiExecutor,
+    executor::fake::FakeExecutor,
+    executor::api::Executor,
 };
+
 use sui_types::transaction::TransactionDataAPI;
 
 #[derive(Parser, Debug)]
@@ -46,23 +49,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Create genesis and generate transactions.
     let primary_address = validator_config.client_server_address;
-    let mut load_generator =
-        LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
 
-    let transactions;
+    // Initialize based on executor type
     if benchmark_config.workload.is_fake() {
-        todo!()
+        let load_generator = LoadGenerator::<FakeExecutor>::new(benchmark_config.clone(), primary_address);
+        run_load_generator(load_generator).await?;
     } else {
-        // Sui load.
-        transactions = load_generator.initialize().await;
-        tracing::debug!(
-            "Transactions: {:?}",
-            transactions
-                .iter()
-                .map(|tx| tx.transaction_data().input_objects())
-                .collect::<Vec<_>>()
-        );
-    };
+        let load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
+        run_load_generator(load_generator).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_load_generator<E>(
+    mut load_generator: LoadGenerator<E>,
+) -> anyhow::Result<()>
+where
+    E: Executor + Send + Sync + 'static,
+    <E as Executor>::Transaction: Send + Sync,
+{
+    let transactions = load_generator.initialize().await;
 
     // Submit transactions to the server.
     load_generator.run(transactions).await;
