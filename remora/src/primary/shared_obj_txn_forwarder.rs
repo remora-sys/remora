@@ -457,17 +457,14 @@ where
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
         if let Some(proxy_connection) = proxy_connections.get(&dest_proxy) {
-            let proxy_connection = proxy_connection.clone();
-            tokio::spawn(async move {
-                if proxy_connection.send(message).await.is_ok() {
-                    tracing::debug!("Sent transaction to proxy {}", dest_proxy);
-                } else {
-                    tracing::warn!(
-                        "Failed to send transaction to proxy {}, removing connection",
-                        dest_proxy
-                    );
-                }
-            });
+            if proxy_connection.send(message).await.is_ok() {
+                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
+            } else {
+                tracing::warn!(
+                    "Failed to send transaction to proxy {}, removing connection",
+                    dest_proxy
+                );
+            }
         } else {
             tracing::warn!("Proxy connection {} not found", dest_proxy);
         }
