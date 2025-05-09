@@ -194,20 +194,6 @@ pub enum WorkloadType {
         #[serde(default = "default_cont_level_for_shared_obj")]
         txs_per_counter: usize,
     },
-    FakedNoContention {
-        #[serde(default = "default_fake_execution_duration")]
-        execution_duration: Duration,
-        #[serde(default = "default_cont_level_for_shared_obj")]
-        number_of_inputs: usize,
-    },
-    FakedContention {
-        #[serde(default = "default_fake_execution_duration")]
-        execution_duration: Duration,
-        #[serde(default = "default_cont_level_for_shared_obj")]
-        number_of_inputs: usize,
-        #[serde(default = "default_contention_level")]
-        contention: u64,
-    },
     SolanaTransactions,
     EthereumTransfers,
     EthereumNftMint,
@@ -252,9 +238,7 @@ pub enum WorkloadType {
 impl WorkloadType {
     pub fn is_fake(&self) -> bool {
         match self {
-            WorkloadType::FakedNoContention { .. }
-            | WorkloadType::FakedContention { .. }
-            | WorkloadType::FakeSolanaTransactions { .. }
+            WorkloadType::FakeSolanaTransactions { .. }
             | WorkloadType::FakeEthereumTransfers { .. }
             | WorkloadType::FakeEthereumNftMint { .. }
             | WorkloadType::FakeUniswapNormal { .. }
@@ -290,8 +274,6 @@ impl Debug for WorkloadType {
         match self {
             WorkloadType::Transfers => write!(f, "transfers"),
             WorkloadType::SharedObjects { .. } => write!(f, "shared objects"),
-            WorkloadType::FakedNoContention { .. } => write!(f, "faked no contention"),
-            WorkloadType::FakedContention { .. } => write!(f, "faked contention"),
             WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
             WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
@@ -378,9 +360,10 @@ impl BenchmarkParameters {
         BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
-            workload: WorkloadType::FakedNoContention {
+            workload: WorkloadType::FakeZipfian {
                 execution_duration: default_fake_execution_duration(),
-                number_of_inputs: 1,
+                alpha: 0.0,
+                number_of_inputs: 2,
             },
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
         }
@@ -392,10 +375,10 @@ impl BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
-            workload: WorkloadType::FakedContention {
+            workload: WorkloadType::FakeZipfian {
                 execution_duration: default_fake_execution_duration(),
-                number_of_inputs: 1,
-                contention: 100,
+                alpha: 0.5,
+                number_of_inputs: 2,
             },
         }
     }

@@ -9,9 +9,9 @@ use remora::{
     //executor::sui::{check_logs_for_shared_object, import_from_files},
     client::load_generator::{default_metrics_address, LoadGenerator},
     config::{BenchmarkParameters, ImportExport, ValidatorConfig},
-    executor::sui::SuiExecutor,
-    executor::fake::FakeExecutor,
     executor::api::Executor,
+    executor::fake::FakeExecutor,
+    executor::sui::SuiExecutor,
 };
 
 use sui_types::transaction::TransactionDataAPI;
@@ -52,19 +52,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize based on executor type
     if benchmark_config.workload.is_fake() {
-        let load_generator = LoadGenerator::<FakeExecutor>::new(benchmark_config.clone(), primary_address);
+        let load_generator =
+            LoadGenerator::<FakeExecutor>::new(benchmark_config.clone(), primary_address);
         run_load_generator(load_generator).await?;
     } else {
-        let load_generator = LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
+        let load_generator =
+            LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);
         run_load_generator(load_generator).await?;
     }
 
     Ok(())
 }
 
-async fn run_load_generator<E>(
-    mut load_generator: LoadGenerator<E>,
-) -> anyhow::Result<()>
+async fn run_load_generator<E>(mut load_generator: LoadGenerator<E>) -> anyhow::Result<()>
 where
     E: Executor + Send + Sync + 'static,
     <E as Executor>::Transaction: Send + Sync,

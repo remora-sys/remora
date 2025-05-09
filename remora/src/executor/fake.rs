@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sui_types::{
@@ -268,14 +267,14 @@ impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
         _updates: FakeTransactionEffects,
         new_state: BTreeMap<ObjectID, Object>,
     ) {
+        self.commit_new_objects(new_state);
+    }
+
+    fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>) {
         let mut objects = self.objects.write().unwrap();
         for (object_id, object) in new_state {
             objects.insert(object_id, object);
         }
-    }
-
-    fn commit_new_objects(&self, _new_state: BTreeMap<ObjectID, Object>) {
-        todo!()
     }
 
     fn read_object(
@@ -312,20 +311,14 @@ pub struct FakeExecutor {
 impl FakeExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
         let execution_duration = match config.workload {
-            WorkloadType::FakedNoContention {
-                execution_duration,
-                number_of_inputs: _,
-            } => execution_duration,
-            WorkloadType::FakedContention {
-                execution_duration,
-                number_of_inputs: _,
-                contention: _,
-            } => execution_duration,
             WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumTransfers { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumNftMint { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapNormal { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapPeak { execution_duration } => execution_duration,
+            WorkloadType::FakeZipfian {
+                execution_duration, ..
+            } => execution_duration,
             _ => {
                 panic!("Error: Unsupported workload type for fake executor")
             }
@@ -499,97 +492,12 @@ impl Executor for FakeExecutor {
     }
 }
 
-pub fn generate_fake_owned_object_transaction(number_of_inputs: usize) -> FakeTransaction {
-    let inputs: Vec<_> = (0..number_of_inputs)
-        .map(|_| {
-            let object = fake_owned_object(0);
-            let reference = object.compute_object_reference();
-            InputObjectKind::ImmOrOwnedMoveObject(reference)
-        })
-        .collect();
-    FakeTransaction::new(inputs)
-}
-
-/// Generate a fake transaction with a given number of inputs and contention level.
-/// Setting contention to 0 will generate a transaction accessing shared objects
-/// that are not overlapped with any other transactions, while setting contention
-/// to 100 will generate a transaction accessing a same shared object with all
-/// other transactions.
-pub fn generate_fake_shared_object_transaction(
-    number_of_inputs: usize,
-    contention: u64,
-) -> FakeTransaction {
-    let contention = contention.min(100);
-    let coin = rand::thread_rng().gen_range(0..100);
-    let inputs: Vec<_> = (0..number_of_inputs)
-        .map(|i| {
-            // Depending on the contention level, the first object may have a fixed id.
-            let object = if contention > coin && i == 0 {
-                fake_shared_object_with_id(0, ObjectID::ZERO)
-            } else {
-                fake_shared_object(0)
-            };
-            let reference = object.compute_object_reference();
-            InputObjectKind::ImmOrOwnedMoveObject(reference)
-        })
-        .collect();
-    FakeTransaction::new(inputs)
-}
-
-pub async fn parallel_generate_transaction<F>(
-    cnt: u64,
-    number_of_inputs: usize,
-    func: F,
-) -> Vec<FakeTransaction>
-where
-    F: Fn(usize) -> FakeTransaction + Send + 'static + Copy,
-{
-    let tasks: FuturesUnordered<_> = Default::default();
-    for _ in 0..cnt {
-        tasks.push(tokio::spawn(async move { func(number_of_inputs) }));
-    }
-    let results: Vec<_> = tasks.collect().await;
-    results
-        .into_iter()
-        .filter_map(|res| match res {
-            Ok(tx) => Some(tx),
-            Err(err) => {
-                eprintln!("Faked Transaction generation faild {:?}", err);
-                None
-            }
-        })
-        .collect()
-}
-
 pub async fn generate_fake_transactions(
     config: &BenchmarkParameters,
 ) -> (HashSet<Object>, Vec<FakeTransaction>) {
     let pre_generation = config.load * config.duration.as_secs();
 
     match config.workload {
-        WorkloadType::FakedNoContention {
-            execution_duration: _,
-            number_of_inputs,
-        } => {
-            let transactions = parallel_generate_transaction(
-                pre_generation,
-                number_of_inputs,
-                generate_fake_owned_object_transaction,
-            )
-            .await;
-            (HashSet::new(), transactions)
-        }
-        WorkloadType::FakedContention {
-            execution_duration: _,
-            number_of_inputs,
-            contention,
-        } => {
-            let transactions = parallel_generate_transaction(pre_generation, number_of_inputs, move |x| {
-                generate_fake_shared_object_transaction(x, contention)
-            })
-            .await;
-            (HashSet::new(), transactions)
-        }
         WorkloadType::FakeSolanaTransactions { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
             generate_fake_load_objects_and_transactions(
@@ -608,11 +516,7 @@ pub async fn generate_fake_transactions(
         }
         WorkloadType::FakeEthereumNftMint { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            generate_fake_load_objects_and_transactions(
-                &mut rng,
-                pre_generation as usize,
-                eth_mint,
-            )
+            generate_fake_load_objects_and_transactions(&mut rng, pre_generation as usize, eth_mint)
         }
         WorkloadType::FakeUniswapNormal { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
@@ -636,11 +540,9 @@ pub async fn generate_fake_transactions(
             number_of_inputs,
         } => {
             let mut rng = StdRng::seed_from_u64(0);
-            generate_fake_load_objects_and_transactions(
-                &mut rng,
-                pre_generation as usize,
-                |rng| zipfian(rng, alpha, number_of_inputs),
-            )
+            generate_fake_load_objects_and_transactions(&mut rng, pre_generation as usize, |rng| {
+                zipfian(rng, alpha, number_of_inputs)
+            })
         }
 
         _ => {
@@ -715,7 +617,6 @@ mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use rand::{rngs::StdRng, SeedableRng};
-    use sui_types::base_types::ObjectID;
     use tokio::time::Instant;
 
     use crate::{
@@ -723,10 +624,8 @@ mod tests {
         executor::{
             api::{ExecutableTransaction, Executor, TransactionWithTimestamp},
             fake::{
-                fake_owned_object, fake_shared_object, fake_shared_object_with_id,
-                generate_fake_load_objects_and_transactions,
-                generate_fake_shared_object_transaction, FakeExecutor, FakeObjectStore,
-                FakeTransaction,
+                fake_owned_object, fake_shared_object, generate_fake_load_objects_and_transactions,
+                FakeExecutor, FakeObjectStore, FakeTransaction,
             },
         },
     };
@@ -783,37 +682,6 @@ mod tests {
 
         assert!(result.success());
         assert!(duration >= default_fake_execution_duration());
-    }
-
-    #[tokio::test]
-    async fn execute_fake_shared_object_transaction_with_contention() {
-        let store = Arc::new(FakeObjectStore::new());
-        let config = BenchmarkParameters::new_for_fake_tests();
-        let executor = FakeExecutor::new(&config).await;
-        let ctx = executor.context();
-
-        // Write the object to the store
-        let object = fake_shared_object_with_id(0, ObjectID::ZERO);
-        store.write_object(object);
-
-        for _ in 0..10 {
-            let contention = 100;
-            let transaction = generate_fake_shared_object_transaction(1, contention);
-            let transaction_with_timestamp = TransactionWithTimestamp::new(
-                transaction.clone(),
-                0.0,
-                transaction.shared_object_ids(),
-                Duration::from_micros(200),
-            );
-
-            let start = Instant::now();
-            let result =
-                FakeExecutor::execute(ctx.clone(), store.clone(), transaction_with_timestamp).await;
-            let duration = start.elapsed();
-
-            assert!(result.success());
-            assert!(duration >= default_fake_execution_duration());
-        }
     }
 
     #[tokio::test]

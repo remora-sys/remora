@@ -290,10 +290,12 @@ impl SuiExecutor {
     }
 
     pub fn create_in_memory_store(&self) -> Arc<InMemoryObjectStore> {
-        Arc::new(self.ctx
-            .benchmark_ctx()
-            .validator()
-            .create_in_memory_store())
+        Arc::new(
+            self.ctx
+                .benchmark_ctx()
+                .validator()
+                .create_in_memory_store(),
+        )
     }
 }
 
