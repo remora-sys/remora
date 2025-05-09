@@ -197,31 +197,12 @@ pub trait Executor: Clone {
     ) -> bool;
 
     /// Assign a shared object version.
-    #[deprecated(note = "Use assign_shared_object_versions_and_return_required_versions instead")]
-    fn assign_shared_object_versions(
-        &self,
-        _transactions: &[Self::Transaction],
-    ) -> impl Future<Output = ()> + std::marker::Send;
-
-    /// Assign versions for single transaction and return the required versions.
-    fn assign_shared_object_versions_and_return_required_versions(
-        &self,
-        transaction: &Self::Transaction,
-    ) -> impl Future<Output = Option<Vec<(ObjectID, SequenceNumber)>>> + Send;
-
-    /// Assign a shared object version.
+    /// This API is supposed to be called in the proxy node, and can run multi-threaded.
     fn assign_shared_object_versions_with_required_versions(
         &self,
         _transactions: &[Self::Transaction],
         _required_versions: &[(ObjectID, SequenceNumber)],
     ) -> impl Future<Output = ()> + std::marker::Send;
-
-    /// Get the required shared object versions for the transactions.
-    #[deprecated(note = "Use assign_shared_object_versions_and_return_required_versions instead")]
-    fn get_required_shared_object_versions(
-        &self,
-        transaction: &TransactionDigest,
-    ) -> impl Future<Output = Option<Vec<(ObjectID, SequenceNumber)>>> + Send;
 
     fn generate_transactions(
         config: &BenchmarkParameters,
@@ -230,22 +211,11 @@ pub trait Executor: Clone {
 
     fn init_store(&self) -> Arc<Self::Store>;
 
-    fn optimistically_pre_generate_objects(
-        store: Arc<Self::Store>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
-    );
-
     /// Verify the transaction authentication prior to execution
     fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = bool> + Send;
-
-    fn get_objects_for_dependency_tracking(
-        ctx: Arc<Self::ExecutionContext>,
-        store: Arc<Self::Store>,
-        transaction: TransactionWithTimestamp<Self::Transaction>,
-    ) -> Vec<(ObjectID, SequenceNumber)>;
 }
 
 /// Short for a transaction with a timestamp.

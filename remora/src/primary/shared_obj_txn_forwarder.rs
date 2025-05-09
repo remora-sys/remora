@@ -55,7 +55,7 @@ where
     /// 2. Find the maximum version among all objects
     /// 3. Assign the next version (max + 1) to all objects
     /// 4. Return the list of (ObjectID, SequenceNumber) pairs
-    fn assign_shared_object_versions(
+    pub(crate) fn assign_shared_object_versions(
         &mut self,
         transaction: &RemoraTransaction<E>,
     ) -> Vec<(ObjectID, SequenceNumber)> {

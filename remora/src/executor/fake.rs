@@ -29,7 +29,6 @@ use super::{
         TransactionWithTimestamp,
     },
     calibration::Calibration,
-    sui::get_object_ids_for_dependency_tracking,
 };
 
 /// A fake owned object for testing.
@@ -425,31 +424,12 @@ impl Executor for FakeExecutor {
     }
 
     /// Assign a shared object version.
-    async fn assign_shared_object_versions(&self, _transactions: &[Self::Transaction]) {
-        //todo!()
-    }
-
-    /// Assign a shared object version.
     async fn assign_shared_object_versions_with_required_versions(
         &self,
         _transactions: &[Self::Transaction],
         _required_versions: &[(ObjectID, SequenceNumber)],
     ) {
         //todo!()
-    }
-
-    async fn assign_shared_object_versions_and_return_required_versions(
-        &self,
-        _transaction: &Self::Transaction,
-    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
-        todo!()
-    }
-
-    async fn get_required_shared_object_versions(
-        &self,
-        _transaction: &TransactionDigest,
-    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
-        todo!()
     }
 
     async fn generate_transactions(
@@ -464,16 +444,6 @@ impl Executor for FakeExecutor {
         self.store.clone()
     }
 
-    fn optimistically_pre_generate_objects(
-        store: Arc<Self::Store>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) {
-        let obj_ids = get_object_ids_for_dependency_tracking::<FakeExecutor>(transaction.clone());
-        for obj_id in obj_ids {
-            store.write_object(fake_owned_object_with_id(0, obj_id));
-        }
-    }
-
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
         _transaction: &TransactionWithTimestamp<Self::Transaction>,
@@ -481,14 +451,6 @@ impl Executor for FakeExecutor {
         // Simulate verification
         Calibration::calibrated_work(ctx.verification_spins);
         true
-    }
-
-    fn get_objects_for_dependency_tracking(
-        _ctx: Arc<Self::ExecutionContext>,
-        _store: Arc<Self::Store>,
-        _transaction: TransactionWithTimestamp<Self::Transaction>,
-    ) -> Vec<(ObjectID, SequenceNumber)> {
-        todo!()
     }
 }
 

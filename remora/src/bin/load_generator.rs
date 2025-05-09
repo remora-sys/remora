@@ -14,8 +14,6 @@ use remora::{
     executor::sui::SuiExecutor,
 };
 
-use sui_types::transaction::TransactionDataAPI;
-
 #[derive(Parser, Debug)]
 #[clap(rename_all = "kebab-case")]
 #[command(author, version, about = "Remora load generator", long_about = None)]

@@ -651,6 +651,7 @@ mod tests {
             sui::SuiExecutor,
         },
         metrics::Metrics,
+        primary::shared_obj_txn_forwarder::VersionAssignmentTask,
         proxy::core::ProxyCore,
     };
 
@@ -720,6 +721,12 @@ mod tests {
         // Generate transactions
         let transactions = E::generate_transactions(config, None).await;
 
+        // Set up version assignment
+        let mut version_assignment_processor = VersionAssignmentTask::<E> {
+            shared_object_versions: rustc_hash::FxHashMap::default(),
+            _phantom: std::marker::PhantomData,
+        };
+
         // Send all transactions to proxy
         for tx in transactions {
             let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
@@ -729,18 +736,22 @@ mod tests {
                 PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
             tx_to_proxy.send(stateless_message).await.unwrap();
 
-            // Assign shared object versions before getting required versions
-            executor.assign_shared_object_versions(&[tx.clone()]).await;
-
-            // Get required versions for the transaction
-            let required_versions = executor
-                .get_required_shared_object_versions(&tx.digest())
-                .await;
+            use crate::executor::api::TransactionWithTimestamp;
+            use std::time::Duration;
+            let timestamp = Metrics::now().as_secs_f64();
+            let transaction_with_timestamp = TransactionWithTimestamp::new(
+                tx.clone(),
+                timestamp,
+                tx.shared_object_ids(),
+                Duration::from_secs(0),
+            );
+            let required_versions = version_assignment_processor
+                .assign_shared_object_versions(&transaction_with_timestamp);
 
             // Build required_states as a BTreeMap<(ObjectID, SequenceNumber), Option<usize>>
             // If required_versions is empty, this will be an empty BTreeMap
             let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> =
-                if let Some(required_versions) = required_versions {
+                if !required_versions.is_empty() {
                     required_versions
                         .into_iter()
                         .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
@@ -777,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "currently fake txns are not supported"]
+    // #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_processes_fake_transaction() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
@@ -847,7 +858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "currently fake txns are not supported"]
+    // #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_fake_transactions() {
         let config = BenchmarkParameters::new_for_fake_tests();
         let executor = FakeExecutor::new(&config).await;
@@ -857,7 +868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "currently fake txns are not supported"]
+    // #[ignore = "currently fake txns are not supported"]
     async fn test_proxy_fake_transactions_contention() {
         let config = BenchmarkParameters::new_for_fake_contention_tests();
         let executor = FakeExecutor::new(&config).await;

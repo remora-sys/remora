@@ -24,7 +24,7 @@ use sui_types::{
     storage::ObjectStore,
     transaction::{CheckedInputObjects, InputObjectKind, Transaction, TransactionDataAPI},
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::time::Instant;
 
 use super::{
     api::{ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore},
@@ -102,9 +102,6 @@ impl SuiExecutionContext {
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<SuiExecutionContext>,
-    /// Lock ensuring at most one proxy (or the primary) assigns the shared object transaction locks.
-    /// This is likely not the best design, but the Sui epoch store is not very forgiving.
-    shared_object_versions_assignment_lock: Arc<Mutex<()>>,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -285,7 +282,6 @@ impl SuiExecutor {
 
         Self {
             ctx: Arc::new(context),
-            shared_object_versions_assignment_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -417,27 +413,6 @@ impl Executor for SuiExecutor {
         true
     }
 
-    async fn assign_shared_object_versions(&self, transactions: &[Self::Transaction]) {
-        let _guard = self.shared_object_versions_assignment_lock.lock().await;
-        self.context()
-            .benchmark_ctx()
-            .validator()
-            .assigned_shared_object_versions_on_transaction_not_idempotent(transactions)
-            .await;
-    }
-
-    async fn assign_shared_object_versions_and_return_required_versions(
-        &self,
-        transaction: &Self::Transaction,
-    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
-        let _guard = self.shared_object_versions_assignment_lock.lock().await;
-        self.context()
-            .benchmark_ctx()
-            .validator()
-            .assign_shared_object_versions_and_return_required_versions(transaction)
-            .await
-    }
-
     async fn assign_shared_object_versions_with_required_versions(
         &self,
         transactions: &[Self::Transaction],
@@ -466,17 +441,6 @@ impl Executor for SuiExecutor {
             .await;
     }
 
-    async fn get_required_shared_object_versions(
-        &self,
-        transaction: &TransactionDigest,
-    ) -> Option<Vec<(ObjectID, SequenceNumber)>> {
-        self.context()
-            .benchmark_ctx()
-            .validator()
-            .get_required_shared_object_versions(transaction)
-            .await
-    }
-
     fn generate_transactions(
         config: &BenchmarkParameters,
         working_directory: Option<PathBuf>,
@@ -486,13 +450,6 @@ impl Executor for SuiExecutor {
 
     fn init_store(&self) -> Arc<Self::Store> {
         self.create_in_memory_store()
-    }
-
-    fn optimistically_pre_generate_objects(
-        _store: Arc<Self::Store>,
-        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
-    ) {
-        todo!()
     }
 
     async fn verify_transaction(
@@ -511,19 +468,6 @@ impl Executor for SuiExecutor {
             elapsed.as_micros()
         );
         true
-    }
-
-    fn get_objects_for_dependency_tracking(
-        ctx: Arc<Self::ExecutionContext>,
-        store: Arc<InMemoryObjectStore>,
-        transaction: SuiTransaction,
-    ) -> Vec<(ObjectID, SequenceNumber)> {
-        // filter pkg id from the obj_id
-        let input_objects = transaction.transaction_data().input_objects().unwrap();
-        let validator = ctx.benchmark_ctx().validator();
-        let epoch_store = validator.get_epoch_store();
-
-        store.get_object_id_and_versions(&**epoch_store, &transaction.key(), &input_objects)
     }
 }
 

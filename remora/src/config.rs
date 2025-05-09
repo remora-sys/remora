@@ -253,10 +253,6 @@ fn default_cont_level_for_shared_obj() -> usize {
     2
 }
 
-fn default_contention_level() -> u64 {
-    100
-}
-
 pub fn default_fake_execution_duration() -> Duration {
     Duration::from_micros(500)
 }
