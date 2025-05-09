@@ -64,6 +64,7 @@ pub fn fake_shared_object_with_id(initial_version: u64, id: ObjectID) -> Object 
 pub struct FakeTransaction {
     pub digest: TransactionDigest,
     inputs: Vec<InputObjectKind>,
+    shared_objects: Vec<(ObjectID, SequenceNumber)>,
 }
 
 impl FakeTransaction {
@@ -71,6 +72,7 @@ impl FakeTransaction {
         Self {
             digest: TransactionDigest::random(),
             inputs,
+            shared_objects: Vec::new(),
         }
     }
 
@@ -400,23 +402,24 @@ impl Executor for FakeExecutor {
 
     fn pre_execute_check(
         _ctx: Arc<FakeExecutionContext>,
-        _store: Arc<Self::Store>,
-        _transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool {
-        true
-    }
-
-    fn pre_execute_check_objects(
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         for reference in &transaction.inputs {
             let id = reference.object_id();
-            if store
-                .read_object(&id)
-                .expect("failed to access store")
-                .is_none()
-            {
+            if let Some(object) = store.read_object(&id).expect("failed to access store") {
+                if let InputObjectKind::SharedMoveObject { .. } = reference {
+                    if let Some((_, version)) = transaction
+                        .shared_objects
+                        .iter()
+                        .find(|(obj_id, _)| *obj_id == &id)
+                    {
+                        if object.version() != version.unwrap() {
+                            return false;
+                        }
+                    }
+                }
+            } else {
                 return false;
             }
         }

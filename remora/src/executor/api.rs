@@ -48,7 +48,7 @@ pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     /// The timestamp when the transaction was created.
     timestamp: Timestamp,
     /// The shared object IDs in the transaction.
-    shared_object_ids: Vec<ObjectID>,
+    pub(crate) shared_objects: BTreeMap<ObjectID, Option<SequenceNumber>>,
     /// The verification duration for the transaction.
     verification_duration: Duration,
 }
@@ -64,7 +64,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
         Self {
             transaction,
             timestamp,
-            shared_object_ids,
+            shared_objects: shared_object_ids.into_iter().map(|id| (id, None)).collect(),
             verification_duration,
         }
     }
@@ -79,14 +79,14 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
         Self {
             transaction,
             timestamp: 0.0,
-            shared_object_ids: vec![],
+            shared_objects: BTreeMap::new(),
             verification_duration: Duration::from_micros(200),
         }
     }
 
     /// Get the shared object IDs in the transaction.
-    pub fn shared_object_ids(&self) -> &Vec<ObjectID> {
-        &self.shared_object_ids
+    pub fn shared_objects(&self) -> &BTreeMap<ObjectID, Option<SequenceNumber>> {
+        &self.shared_objects
     }
 
     /// Get the verification duration for the transaction.
@@ -186,12 +186,6 @@ pub trait Executor: Clone {
     /// Check version ID prior to execution
     fn pre_execute_check(
         ctx: Arc<Self::ExecutionContext>,
-        store: Arc<Self::Store>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool;
-
-    /// Check object existence
-    fn pre_execute_check_objects(
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool;

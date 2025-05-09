@@ -405,14 +405,6 @@ impl Executor for SuiExecutor {
             .is_ok()
     }
 
-    fn pre_execute_check_objects(
-        _store: Arc<Self::Store>,
-        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool {
-        // FIXME
-        true
-    }
-
     async fn assign_shared_object_versions_with_required_versions(
         &self,
         transactions: &[Self::Transaction],

@@ -36,15 +36,19 @@ where
         mut shared_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
         sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
-        while let Some(shared_txns) = shared_txn_receiver.recv().await {
-            for transaction in shared_txns {
-                let required_versions = self.assign_shared_object_versions(&transaction);
+        while let Some(mut shared_txns) = shared_txn_receiver.recv().await {
+            for transaction in &mut shared_txns {
+                let required_versions = self.assign_shared_object_versions(transaction);
+
                 tracing::debug!(
                     "Version assignment task received transaction {:?}",
                     transaction.digest()
                 );
 
-                sender.send((transaction, required_versions)).await.unwrap();
+                sender
+                    .send((transaction.clone(), required_versions))
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -57,22 +61,22 @@ where
     /// 4. Return the list of (ObjectID, SequenceNumber) pairs
     pub(crate) fn assign_shared_object_versions(
         &mut self,
-        transaction: &RemoraTransaction<E>,
+        transaction: &mut RemoraTransaction<E>,
     ) -> Vec<(ObjectID, SequenceNumber)> {
         // Get all shared object IDs from the transaction
-        let shared_object_ids = transaction.shared_object_ids();
+        let shared_objects = transaction.shared_objects();
 
-        if shared_object_ids.is_empty() {
+        if shared_objects.is_empty() {
             return Vec::new();
         }
 
         // Find the maximum version for all objects in the transaction
         let mut max_version = SequenceNumber::from(2);
         let initial_version = SequenceNumber::from(2);
-        let mut result = Vec::with_capacity(shared_object_ids.len());
+        let mut result = Vec::with_capacity(shared_objects.len());
 
         // First collect current versions for result and find max
-        for obj_id in shared_object_ids {
+        for (obj_id, _) in shared_objects.iter() {
             let current_version = self
                 .shared_object_versions
                 .get(obj_id)
@@ -92,9 +96,15 @@ where
         let new_version = max_version.next();
 
         // Update all objects to the new version
-        for obj_id in shared_object_ids {
+        for (obj_id, _) in shared_objects.iter() {
             self.shared_object_versions.insert(*obj_id, new_version);
         }
+
+        // Update the transaction's shared_objects field
+        transaction.shared_objects = shared_objects
+            .into_iter()
+            .map(|(obj_id, _)| (*obj_id, Some(new_version)))
+            .collect();
 
         result
     }

@@ -739,14 +739,14 @@ mod tests {
             use crate::executor::api::TransactionWithTimestamp;
             use std::time::Duration;
             let timestamp = Metrics::now().as_secs_f64();
-            let transaction_with_timestamp = TransactionWithTimestamp::new(
+            let mut transaction_with_timestamp = TransactionWithTimestamp::new(
                 tx.clone(),
                 timestamp,
                 tx.shared_object_ids(),
                 Duration::from_secs(0),
             );
             let required_versions = version_assignment_processor
-                .assign_shared_object_versions(&transaction_with_timestamp);
+                .assign_shared_object_versions(&mut transaction_with_timestamp);
 
             // Build required_states as a BTreeMap<(ObjectID, SequenceNumber), Option<usize>>
             // If required_versions is empty, this will be an empty BTreeMap
