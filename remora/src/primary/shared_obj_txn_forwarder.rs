@@ -237,6 +237,7 @@ where
                 proxy_connections,
                 states_to_proxy,
                 required_versions,
+                txn_cnt,
             ),
             LoadBalancingPolicy::Dedicated => {
                 // Dedicated: proxy 0 for stateless, proxy 1 for stateful
@@ -251,6 +252,7 @@ where
                 required_versions,
                 proxy_loads,
                 verification_duration,
+                txn_cnt,
             ),
         }
     }
@@ -279,6 +281,7 @@ where
         >,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         required_versions: &[(ObjectID, SequenceNumber)],
+        txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count = proxy_connections.len();
         if proxy_count == 0 {
@@ -319,36 +322,13 @@ where
             }
         }
 
-        // If we have multiple best proxies (including the case where all counts are 0)
-        // select one using a simple deterministic approach based on object IDs
-        if best_proxies.len() > 1 {
-            // Use the first object ID as a seed for selection
-            if let Some((first_id, _)) = required_versions.first() {
-                // Ultra-fast method: Mix bits from object_id string pointer address
-                // Combined with a few bytes from the string for uniqueness
-                let object_id_str = format!("{:?}", first_id);
-                let ptr_val = object_id_str.as_ptr() as usize;
-                let len = object_id_str.len();
-
-                // Mix in the first and last few bytes if available for better distribution
-                let mut hash = ptr_val;
-                if len > 0 {
-                    hash ^= object_id_str.as_bytes()[0] as usize;
-                    if len > 4 {
-                        hash ^= (object_id_str.as_bytes()[len - 1] as usize) << 8;
-                    }
-                }
-
-                // Simple bit mixing for better distribution - extremely fast
-                hash = hash ^ (hash >> 12);
-
-                let proxy_index = best_proxies[hash % best_proxies.len()];
-                return Some((proxy_index, proxy_index));
-            }
-        }
-
-        let best_proxy = best_proxies.first().copied().unwrap_or(0);
-        Some((best_proxy, best_proxy))
+        // Select a proxy randomly if multiple proxies have the same max count
+        let proxy_index = if best_proxies.len() > 1 {
+            best_proxies[txn_cnt % best_proxies.len()]
+        } else {
+            best_proxies[0]
+        };
+        Some((proxy_index, proxy_index))
     }
 
     /// Get assigned proxy for shared objects using two-tier.
@@ -360,11 +340,13 @@ where
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         verification_duration: &Duration,
+        txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let stateful_proxy_index = Self::get_proxy_for_shared_objects_most_states(
             proxy_connections,
             states_to_proxy,
             required_versions,
+            txn_cnt,
         )
         .unwrap()
         .0;
