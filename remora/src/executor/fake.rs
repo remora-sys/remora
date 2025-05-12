@@ -537,14 +537,19 @@ where
                 bytes[..copy_len].copy_from_slice(&n_bytes[..copy_len]);
 
                 let object_id = ObjectID::from_bytes(bytes).expect("Cannot convert bytes");
-                let object = fake_shared_object_with_id(0, object_id);
+                let object = fake_shared_object_with_id(2, object_id);
                 objects.insert(object.clone());
-                let reference = object.compute_object_reference();
-                InputObjectKind::ImmOrOwnedMoveObject(reference)
+
+                InputObjectKind::SharedMoveObject {
+                    id: object.id(),
+                    initial_shared_version: SequenceNumber::from(2),
+                    mutable: true,
+                }
             })
             .collect();
         transactions.push(FakeTransaction::new(objects));
     }
+    tracing::info!("Generated {} accounts and {} transactions", objects.len(), transactions.len());
     (objects, transactions)
 }
 

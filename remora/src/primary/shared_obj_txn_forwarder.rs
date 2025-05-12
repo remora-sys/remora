@@ -100,10 +100,10 @@ where
             self.shared_object_versions.insert(*obj_id, new_version);
         }
 
-        // Update the transaction's shared_objects field
-        transaction.shared_objects = shared_objects
-            .into_iter()
-            .map(|(obj_id, _)| (*obj_id, Some(new_version)))
+        // Update the transaction's shared_objects field with current versions
+        transaction.shared_objects = result
+            .iter()
+            .map(|(obj_id, version)| (*obj_id, Some(*version)))
             .collect();
 
         result
