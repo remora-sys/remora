@@ -36,19 +36,16 @@ where
         mut shared_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
         sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
-        while let Some(mut shared_txns) = shared_txn_receiver.recv().await {
-            for transaction in &mut shared_txns {
-                let required_versions = self.assign_shared_object_versions(transaction);
+        while let Some(transactions) = shared_txn_receiver.recv().await {
+            for mut transaction in transactions {
+                let required_versions = self.assign_shared_object_versions(&mut transaction);
 
                 tracing::debug!(
                     "Version assignment task received transaction {:?}",
                     transaction.digest()
                 );
 
-                sender
-                    .send((transaction.clone(), required_versions))
-                    .await
-                    .unwrap();
+                sender.send((transaction, required_versions)).await.unwrap();
             }
         }
     }
@@ -64,7 +61,11 @@ where
         transaction: &mut RemoraTransaction<E>,
     ) -> Vec<(ObjectID, SequenceNumber)> {
         // Get all shared object IDs from the transaction
-        let shared_objects = transaction.shared_objects();
+        let shared_objects = transaction
+            .shared_objects()
+            .into_iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
 
         if shared_objects.is_empty() {
             return Vec::new();
@@ -76,7 +77,7 @@ where
         let mut result = Vec::with_capacity(shared_objects.len());
 
         // First collect current versions for result and find max
-        for (obj_id, _) in shared_objects.iter() {
+        for obj_id in shared_objects.iter() {
             let current_version = self
                 .shared_object_versions
                 .get(obj_id)
@@ -96,11 +97,11 @@ where
         let new_version = max_version.next();
 
         // Update all objects to the new version
-        for (obj_id, _) in shared_objects.iter() {
+        for obj_id in shared_objects.iter() {
             self.shared_object_versions.insert(*obj_id, new_version);
         }
 
-        // Update the transaction's shared_objects field with current versions
+        // // Update the transaction's shared_objects field with current versions
         transaction.shared_objects = result
             .iter()
             .map(|(obj_id, version)| (*obj_id, Some(*version)))
@@ -156,7 +157,8 @@ where
         let txn_cnt = self.txn_cnt;
         let verification_duration = transaction.verification_duration();
         self.txn_cnt += 1;
-        let transaction = Arc::new(transaction);
+
+        let transaction_arc = Arc::new(transaction);
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -185,13 +187,15 @@ where
                 &proxy_loads,
                 &verification_duration,
             ) {
+                // Use Arc::clone instead of creating deep copies - reduces overhead
                 // Stateless transaction doesn't need missing states
-                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(transaction.clone());
+                let stateless_msg =
+                    PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
                 Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
 
                 // Stateful transaction needs missing states
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
-                    &transaction,
+                    &transaction_arc,
                     Some(required_versions),
                     proxy_index,
                     states_to_proxy,
@@ -199,7 +203,7 @@ where
                 .await;
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
-                    transaction.clone(),
+                    transaction_arc,
                     stateless_proxy_id,
                     stateful_missing_states,
                 );
