@@ -336,9 +336,8 @@ impl FakeExecutor {
         }
     }
 
-    pub fn update_object(input: Object) -> Object {
+    pub fn update_object_with_version(input: Object, version: SequenceNumber) -> Object {
         let id = ObjectID::random();
-        let version = SequenceNumber::from_u64(input.version().value() + 1);
         let obj = MoveObject::new_gas_coin(version, id, 10);
         let owner = if input.is_shared() {
             Owner::Shared {
@@ -376,17 +375,31 @@ impl Executor for FakeExecutor {
 
         let mut modified_at_versions = Vec::new();
         let mut new_state = BTreeMap::new();
+
+        // First, find the maximum version across all input objects
+        let mut max_version = SequenceNumber::from(2);
+        for (id, version) in &transaction.shared_objects {
+            if let Some(v) = version {
+                if *v > max_version {
+                    max_version = *v;
+                }
+                modified_at_versions.push((*id, *v));
+            }
+        }
+
+        // Calculate the next version
+        let next_version = max_version.next();
+
+        // Now update all objects with the consistent next version
         for reference in &transaction.inputs {
-            // Read input objects.
             let id = reference.object_id();
             let input_object = store
                 .read_object(&id)
                 .expect("Failed to access store")
                 .unwrap_or_else(|| panic!("Unknown object {id}"));
-            modified_at_versions.push((id, input_object.version()));
 
-            // Create output objects.
-            let output_object = Self::update_object(input_object);
+            // Create output objects with consistent version
+            let output_object = Self::update_object_with_version(input_object, next_version);
             new_state.insert(id, output_object);
         }
 
@@ -414,12 +427,20 @@ impl Executor for FakeExecutor {
                         .iter()
                         .find(|(obj_id, _)| *obj_id == &id)
                     {
+                        tracing::debug!(
+                            "Checking shared object id {:?} version: expected {:?}, actual {:?}",
+                            id,
+                            version.unwrap(),
+                            object.version()
+                        );
                         if object.version() != version.unwrap() {
+                            tracing::debug!("Version mismatch for object {:?}", id);
                             return false;
                         }
                     }
                 }
             } else {
+                tracing::debug!("Object {:?} not found in store", id);
                 return false;
             }
         }
@@ -549,7 +570,11 @@ where
             .collect();
         transactions.push(FakeTransaction::new(objects));
     }
-    tracing::info!("Generated {} accounts and {} transactions", objects.len(), transactions.len());
+    tracing::info!(
+        "Generated {} accounts and {} transactions",
+        objects.len(),
+        transactions.len()
+    );
     (objects, transactions)
 }
 
