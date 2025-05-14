@@ -430,8 +430,9 @@ where
 
                 required_states.insert((object_id, seq_num), previous_owner_value);
 
-                // Update the mapping with next version to point to this proxy
+                // Update the mapping
                 states_to_proxy.insert((object_id, next_version), proxy_index);
+                states_to_proxy.remove(&(object_id, seq_num));
             }
         }
 
