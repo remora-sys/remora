@@ -86,15 +86,19 @@ where
             shared_object_versions: rustc_hash::FxHashMap::default(),
             _phantom: PhantomData,
         };
+        version_assignment_processor
+            .shared_object_versions
+            .reserve(10000000);
 
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
             txn_cnt: 0,
-            states_to_proxy: Arc::new(DashMap::new()),
+            states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
             proxy_loads: Arc::new(DashMap::new()),
+            metrics: self.metrics.clone(),
         };
 
         // Spawn a task to process owned transactions

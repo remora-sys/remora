@@ -7,6 +7,7 @@ use crate::{
         },
         versioned_dependency_controller::VersionedDependencyController,
     },
+    metrics::Metrics,
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
@@ -125,6 +126,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -157,7 +159,7 @@ where
         let txn_cnt = self.txn_cnt;
         let verification_duration = transaction.verification_duration();
         self.txn_cnt += 1;
-
+        let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
 
         tokio::spawn(async move {
@@ -203,12 +205,14 @@ where
                 .await;
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
-                    transaction_arc,
+                    Arc::clone(&transaction_arc),
                     stateless_proxy_id,
                     stateful_missing_states,
                 );
 
                 Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
+
+                metrics.update_metrics(transaction_arc.timestamp());
             } else {
                 tracing::warn!("No proxies available for transaction with shared objects");
             }

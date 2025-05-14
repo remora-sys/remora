@@ -337,6 +337,7 @@ mod tests {
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
             proxy_loads: Arc::new(DashMap::new()),
+            metrics: Arc::new(Metrics::new_for_tests()),
         };
 
         // Generate transactions
@@ -433,6 +434,7 @@ mod tests {
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
             proxy_loads: Arc::new(DashMap::new()),
+            metrics: Arc::new(Metrics::new_for_tests()),
         };
 
         // Generate transactions
