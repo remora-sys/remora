@@ -316,6 +316,9 @@ pub struct BenchmarkParameters {
     /// The verification duration.
     #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
     pub verification_duration: Duration,
+    /// The expected stateful duration, used for LB.
+    #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
+    pub expected_stateful_duration: Duration,
 }
 
 impl BenchmarkParameters {
@@ -326,6 +329,8 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -338,6 +343,8 @@ impl BenchmarkParameters {
                 txs_per_counter: default_cont_level_for_shared_obj(),
             },
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -348,6 +355,8 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(5),
             workload: WorkloadType::EthereumTransfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -362,6 +371,8 @@ impl BenchmarkParameters {
                 number_of_inputs: 2,
             },
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 
@@ -376,6 +387,8 @@ impl BenchmarkParameters {
                 alpha: 0.5,
                 number_of_inputs: 2,
             },
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 }
@@ -409,6 +422,8 @@ impl Default for BenchmarkParameters {
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            expected_stateful_duration:
+                default_benchmark_config::default_fake_verification_duration(),
         }
     }
 }

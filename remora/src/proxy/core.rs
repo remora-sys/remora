@@ -744,6 +744,7 @@ mod tests {
                 timestamp,
                 tx.shared_object_ids(),
                 Duration::from_secs(0),
+                Duration::from_secs(0),
             );
             let required_versions = version_assignment_processor
                 .assign_shared_object_versions(&mut transaction_with_timestamp);

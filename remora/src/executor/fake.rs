@@ -641,8 +641,13 @@ mod tests {
             })
             .collect();
         let transaction = FakeTransaction::from_store(&store, inputs.clone());
-        let transaction_with_timestamp =
-            TransactionWithTimestamp::new(transaction, 0.0, inputs, Duration::from_micros(200));
+        let transaction_with_timestamp = TransactionWithTimestamp::new(
+            transaction,
+            0.0,
+            inputs,
+            Duration::from_micros(200),
+            Duration::from_micros(200),
+        );
 
         let start = Instant::now();
         let result = FakeExecutor::execute(ctx, store, transaction_with_timestamp).await;
@@ -668,8 +673,13 @@ mod tests {
             })
             .collect();
         let transaction = FakeTransaction::from_store(&store, inputs.clone());
-        let transaction_with_timestamp =
-            TransactionWithTimestamp::new(transaction, 0.0, inputs, Duration::from_micros(200));
+        let transaction_with_timestamp = TransactionWithTimestamp::new(
+            transaction,
+            0.0,
+            inputs,
+            Duration::from_micros(200),
+            Duration::from_micros(200),
+        );
 
         let start = Instant::now();
         let result = FakeExecutor::execute(ctx, store, transaction_with_timestamp).await;
@@ -709,6 +719,7 @@ mod tests {
                 transaction.clone(),
                 0.0,
                 transaction.shared_object_ids(),
+                Duration::from_micros(200),
                 Duration::from_micros(200),
             );
 
@@ -761,6 +772,7 @@ mod tests {
                 transaction.clone(),
                 0.0,
                 transaction.shared_object_ids(),
+                Duration::from_micros(200),
                 Duration::from_micros(200),
             );
 

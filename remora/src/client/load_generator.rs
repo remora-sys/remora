@@ -64,6 +64,7 @@ impl<E: Executor> LoadGenerator<E> {
         sender: Sender<RemoraTransaction<E>>,
         arrival: Distribution,
         verification_duration: Duration,
+        expected_stateful_duration: Duration,
     ) where
         <E as Executor>::Transaction: std::marker::Send + 'static,
     {
@@ -83,6 +84,7 @@ impl<E: Executor> LoadGenerator<E> {
                 timestamp,
                 tx.shared_object_ids(),
                 verification_duration,
+                expected_stateful_duration,
             );
 
             // Send the transaction
@@ -163,9 +165,17 @@ impl<E: Executor> LoadGenerator<E> {
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
             let arrival = self.arrival;
             let verification_duration = self.config.verification_duration;
+            let expected_stateful_duration = self.config.expected_stateful_duration;
             let handle = tokio::spawn(async move {
                 sleep(Duration::from_secs(1)).await;
-                Self::submit_transactions(tx_chunk, tx, arrival, verification_duration).await;
+                Self::submit_transactions(
+                    tx_chunk,
+                    tx,
+                    arrival,
+                    verification_duration,
+                    expected_stateful_duration,
+                )
+                .await;
             });
             handles.push(handle);
         }

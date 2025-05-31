@@ -51,6 +51,8 @@ pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     pub(crate) shared_objects: BTreeMap<ObjectID, Option<SequenceNumber>>,
     /// The verification duration for the transaction.
     verification_duration: Duration,
+    /// The expected stateful duration for the transaction.
+    expected_stateful_duration: Duration,
 }
 
 impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
@@ -60,12 +62,14 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
         timestamp: Timestamp,
         shared_object_ids: Vec<ObjectID>,
         verification_duration: Duration,
+        expected_stateful_duration: Duration,
     ) -> Self {
         Self {
             transaction,
             timestamp,
             shared_objects: shared_object_ids.into_iter().map(|id| (id, None)).collect(),
             verification_duration,
+            expected_stateful_duration,
         }
     }
 
@@ -81,6 +85,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
             timestamp: 0.0,
             shared_objects: BTreeMap::new(),
             verification_duration: Duration::from_micros(200),
+            expected_stateful_duration: Duration::from_micros(200),
         }
     }
 
@@ -92,6 +97,11 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
     /// Get the verification duration for the transaction.
     pub fn verification_duration(&self) -> Duration {
         self.verification_duration
+    }
+
+    /// Get the expected stateful duration for the transaction.
+    pub fn expected_stateful_duration(&self) -> Duration {
+        self.expected_stateful_duration
     }
 }
 

@@ -158,6 +158,7 @@ where
         let proxy_loads = self.proxy_loads.clone();
         let txn_cnt = self.txn_cnt;
         let verification_duration = transaction.verification_duration();
+        let expected_stateful_duration = transaction.expected_stateful_duration();
         self.txn_cnt += 1;
         let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
@@ -188,6 +189,7 @@ where
                 &required_versions,
                 &proxy_loads,
                 &verification_duration,
+                &expected_stateful_duration,
             ) {
                 // Use Arc::clone instead of creating deep copies - reduces overhead
                 // Stateless transaction doesn't need missing states
@@ -236,6 +238,7 @@ where
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         verification_duration: &Duration,
+        expected_stateful_duration: &Duration,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => {
@@ -260,6 +263,7 @@ where
                 required_versions,
                 proxy_loads,
                 verification_duration,
+                expected_stateful_duration,
                 txn_cnt,
             ),
         }
@@ -348,6 +352,7 @@ where
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         verification_duration: &Duration,
+        expected_stateful_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let stateful_proxy_index = Self::get_proxy_for_shared_objects_most_states(
@@ -373,9 +378,7 @@ where
         // Stateless uses verification duration from workload config
         // Stateful uses a fixed 200us weight
         let stateless_weight = verification_duration.as_micros() as usize;
-        let stateful_weight = 200; // 200us for stateful execution
-
-        // Update stateless proxy load
+        let stateful_weight = expected_stateful_duration.as_micros() as usize;
         if let Some(mut load) = proxy_loads.get_mut(&stateless_proxy_index) {
             *load += stateless_weight;
         } else {
