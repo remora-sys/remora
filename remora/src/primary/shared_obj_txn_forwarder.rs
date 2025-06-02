@@ -13,7 +13,7 @@ use crate::{
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
-use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -126,6 +126,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -156,6 +157,7 @@ where
         let policy = self.policy.clone();
         let proxy_connections = self.proxy_connections.clone();
         let proxy_loads = self.proxy_loads.clone();
+        let stateless_forwarding_table = self.stateless_forwarding_table.clone();
         let txn_cnt = self.txn_cnt;
         let verification_duration = transaction.verification_duration();
         let expected_stateful_duration = transaction.expected_stateful_duration();
@@ -181,7 +183,7 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
+            if let Some((proxy_index, _)) = Self::get_proxy_for_shared_objects(
                 &policy,
                 &proxy_connections,
                 &states_to_proxy,
@@ -191,11 +193,19 @@ where
                 &verification_duration,
                 &expected_stateful_duration,
             ) {
+                // lookup from the stateless forwarding table
+                let stateless_proxy_id = stateless_forwarding_table
+                    .remove(&transaction_arc.digest())
+                    .map(|(_k, v)| v)
+                    .unwrap_or_else(|| {
+                        tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
+                        0
+                    });
                 // Use Arc::clone instead of creating deep copies - reduces overhead
                 // Stateless transaction doesn't need missing states
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
-                Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
+                // let stateless_msg =
+                //     PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
+                // Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
 
                 // Stateful transaction needs missing states
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
@@ -266,15 +276,13 @@ where
                 expected_stateful_duration,
                 txn_cnt,
             ),
-            LoadBalancingPolicy::LocalityLoad => {
-                Self::get_proxy_for_shared_objects_locality_load(
-                    proxy_connections,
-                    states_to_proxy,
-                    required_versions,
-                    proxy_loads,
-                    txn_cnt,
-                )
-            }
+            LoadBalancingPolicy::LocalityLoad => Self::get_proxy_for_shared_objects_locality_load(
+                proxy_connections,
+                states_to_proxy,
+                required_versions,
+                proxy_loads,
+                txn_cnt,
+            ),
         }
     }
 
@@ -566,7 +574,7 @@ where
     }
 
     /// Simplified method to send a message to a proxy
-    async fn send_to_proxy(
+    pub(crate) async fn send_to_proxy(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,

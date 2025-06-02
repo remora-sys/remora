@@ -46,6 +46,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_stateless_txns, rx_stateless_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         // For storing proxy connections
         let proxy_connections = Arc::new(DashMap::new());
@@ -73,6 +74,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let load_balancer_handle = LoadBalancer::<E>::new(
             proxy_connections,
             rx_committed_txns,
+            rx_stateless_txns,
             config.validator_parameters.load_balancing_policy.clone(),
             metrics.clone(),
         )
@@ -86,6 +88,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             config.validator_parameters.consensus_parameters.clone(),
             rx_client_transactions,
             tx_committed_txns,
+            tx_stateless_txns,
         )
         .spawn();
 

@@ -44,7 +44,7 @@ pub type Timestamp = f64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     /// The transaction.
-    transaction: T,
+    pub transaction: T,
     /// The timestamp when the transaction was created.
     timestamp: Timestamp,
     /// The shared object IDs in the transaction.

@@ -12,7 +12,10 @@ use crate::{
     config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
+        api::{
+            ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex,
+            PrimaryToProxyMessage, RemoraTransaction, Store,
+        },
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -23,6 +26,8 @@ use crate::{
     proxy::core::ProxyId,
 };
 
+use sui_types::digests::TransactionDigest;
+
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
     /// The executor trait
@@ -32,6 +37,8 @@ pub struct LoadBalancer<E: Executor> {
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
+    /// The receiver for stateless transactions
+    rx_stateless_txns: Receiver<RemoraTransaction<E>>,
     /// The load balancing policy.
     policy: LoadBalancingPolicy,
     /// The metrics for the validator.
@@ -48,6 +55,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_stateless_txns: Receiver<RemoraTransaction<E>>,
         policy: LoadBalancingPolicy,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -55,6 +63,7 @@ where
             _phantom: PhantomData,
             proxy_connections,
             rx_committed_txns,
+            rx_stateless_txns,
             metrics,
             policy,
         }
@@ -64,8 +73,10 @@ where
     fn initialize_processors(
         &self,
     ) -> (
-        Sender<Vec<RemoraTransaction<E>>>, // owned_txn_sender
-        Sender<Vec<RemoraTransaction<E>>>, // shared_txn_sender
+        Sender<Vec<RemoraTransaction<E>>>,              // owned_txn_sender
+        Sender<Vec<RemoraTransaction<E>>>,              // shared_txn_sender
+        Arc<DashMap<ExecutorIndex, usize>>,             // proxy_loads
+        Arc<DashMap<TransactionDigest, ExecutorIndex>>, // stateless_forwarding_table
     ) {
         // Create channels for transactions
         let (owned_txn_sender, owned_txn_receiver) =
@@ -90,6 +101,8 @@ where
             .shared_object_versions
             .reserve(10000000);
 
+        let proxy_loads = Arc::new(DashMap::new());
+        let stateless_forwarding_table = Arc::new(DashMap::new());
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
@@ -97,7 +110,8 @@ where
             txn_cnt: 0,
             states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
-            proxy_loads: Arc::new(DashMap::new()),
+            proxy_loads: proxy_loads.clone(),
+            stateless_forwarding_table: stateless_forwarding_table.clone(),
             metrics: self.metrics.clone(),
         };
 
@@ -122,7 +136,12 @@ where
         });
 
         // Return the senders so they can be used in the run loop
-        (owned_txn_sender, shared_txn_sender)
+        (
+            owned_txn_sender,
+            shared_txn_sender,
+            proxy_loads,
+            stateless_forwarding_table,
+        )
     }
 
     /// Run the load balancer.
@@ -130,7 +149,8 @@ where
         tracing::info!("Load balancer started");
 
         // Initialize processors and get the transaction senders
-        let (owned_txn_sender, shared_txn_sender) = self.initialize_processors();
+        let (owned_txn_sender, shared_txn_sender, proxy_loads, stateless_forwarding_table) =
+            self.initialize_processors();
 
         let mut txn_cnt = 0;
         loop {
@@ -167,6 +187,27 @@ where
                             tracing::error!("Failed to send shared transactions: {:?}", e);
                         }
                     }
+                }
+
+                Some(transaction) = self.rx_stateless_txns.recv() => {
+                    let proxy = self.proxy_connections
+                        .iter()
+                        .map(|entry| *entry.key())
+                        .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load.value()))
+                        .unwrap_or(0);
+                    let weight = transaction.verification_duration().as_micros() as usize;
+                    if let Some(mut load) = proxy_loads.get_mut(&proxy) {
+                        *load += weight;
+                    } else {
+                        proxy_loads.insert(proxy, weight);
+                    }
+                    SharedObjTxnForwarder::<E>::send_to_proxy(
+                        &self.proxy_connections,
+                        proxy,
+                        PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone())),
+                    )
+                    .await;
+                    stateless_forwarding_table.insert(transaction.transaction.digest().clone(), proxy);
                 }
 
                 else => Err(NodeError::ShuttingDown)?,

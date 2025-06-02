@@ -57,6 +57,8 @@ pub struct MockConsensus<M, T> {
     rx_load_balancer: Receiver<T>,
     /// Output channel to deliver mocked consensus commits to the primary executor.
     tx_primary_executor: Sender<ConsensusCommit<T>>,
+    /// Channel to send stateless transactions to the load balancer.
+    tx_stateless_txns: Sender<T>,
     /// Holds the current batch.
     current_batch: ConsensusCommit<T>,
     /// The number of batches currently in-flight.
@@ -70,6 +72,7 @@ impl<M, T> MockConsensus<M, T> {
         parameters: MockConsensusParameters,
         rx_load_balancer: Receiver<T>,
         tx_primary_executor: Sender<ConsensusCommit<T>>,
+        tx_stateless_txns: Sender<T>,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
@@ -77,13 +80,14 @@ impl<M, T> MockConsensus<M, T> {
             parameters,
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
             current_batch: Vec::with_capacity(batch_size),
             current_inflight_batches: 0,
         }
     }
 }
 
-impl<M: DelayModel<T>, T> MockConsensus<M, T> {
+impl<M: DelayModel<T>, T: Clone> MockConsensus<M, T> {
     /// Run the mock consensus engine.
     pub async fn run(&mut self) {
         let timer = sleep(self.parameters.max_batch_delay);
@@ -100,6 +104,7 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                 // in-flight batches, wait for some to complete before accepting new transactions.
                 Some(transaction) = self.rx_load_balancer.recv(),
                     if self.current_inflight_batches < max_inflight_batches => {
+                    self.tx_stateless_txns.send(transaction.clone()).await.unwrap();
 
                     self.current_batch.push(transaction);
                     if self.current_batch.len() >= batch_size {
@@ -230,12 +235,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, mut rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, _rx_stateless_txns) = mpsc::channel(100);
 
         MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -266,12 +273,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, mut rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, _rx_stateless_txns) = mpsc::channel(100);
 
         MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -304,12 +313,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, mut rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, _rx_stateless_txns) = mpsc::channel(100);
 
         MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -335,12 +346,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, mut rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, _rx_stateless_txns) = mpsc::channel(100);
 
         MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -368,12 +381,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, _rx_stateless_txns) = mpsc::channel(100);
 
         let consensus_handle = MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -392,12 +407,14 @@ mod test {
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
         let (tx_primary_executor, mut rx_primary_executor) = mpsc::channel(100);
+        let (tx_stateless_txns, mut rx_stateless_txns) = mpsc::channel(100);
 
         MockConsensus::new(
             model.clone(),
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            tx_stateless_txns,
         )
         .spawn();
 
@@ -412,6 +429,10 @@ mod test {
         // Wait for the consensus to commit the batches.
         for _ in 0..total_batches {
             let _ = rx_primary_executor.recv().await.unwrap();
+        }
+
+        for _ in 0..parameters.batch_size.get() * total_batches {
+            let _ = rx_stateless_txns.recv().await.unwrap();
         }
     }
 }
