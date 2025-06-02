@@ -266,6 +266,15 @@ where
                 expected_stateful_duration,
                 txn_cnt,
             ),
+            LoadBalancingPolicy::LocalityLoad => {
+                Self::get_proxy_for_shared_objects_locality_load(
+                    proxy_connections,
+                    states_to_proxy,
+                    required_versions,
+                    proxy_loads,
+                    txn_cnt,
+                )
+            }
         }
     }
 
@@ -341,6 +350,110 @@ where
             best_proxies[0]
         };
         Some((proxy_index, proxy_index))
+    }
+
+    fn get_proxy_for_shared_objects_locality_load(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        txn_cnt: usize,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
+        let proxy_count = proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        if required_versions.is_empty() {
+            let mut min_load = usize::MAX;
+            let mut candidates = Vec::new();
+            for i in 0..proxy_count {
+                let load = proxy_loads.get(&i).map_or(0, |r| *r.value());
+                if load < min_load {
+                    min_load = load;
+                    candidates.clear();
+                    candidates.push(i);
+                } else if load == min_load {
+                    candidates.push(i);
+                }
+            }
+            if candidates.is_empty() {
+                let idx = txn_cnt % proxy_count;
+                return Some((idx, idx));
+            }
+            let chosen_proxy = candidates[txn_cnt % candidates.len()];
+            return Some((chosen_proxy, chosen_proxy));
+        }
+
+        let mut locality_raw_counts = vec![0usize; proxy_count];
+        for (id, v) in required_versions {
+            if let Some(proxy_index_ref) = states_to_proxy.get(&(*id, *v)) {
+                let proxy_index = *proxy_index_ref;
+                if proxy_index < proxy_count {
+                    locality_raw_counts[proxy_index] += 1;
+                }
+            }
+        }
+
+        let total_required_versions = required_versions.len() as f64;
+        let locality_scores: Vec<f64> = locality_raw_counts
+            .iter()
+            .map(|&count| count as f64 / total_required_versions)
+            .collect();
+
+        let mut current_loads = vec![0usize; proxy_count];
+        for i in 0..proxy_count {
+            current_loads[i] = proxy_loads.get(&i).map_or(0, |r| *r.value());
+        }
+
+        let min_load = current_loads.iter().min().copied().unwrap_or(0);
+        let max_load = current_loads.iter().max().copied().unwrap_or(0);
+
+        let load_range = if max_load > min_load {
+            (max_load - min_load) as f64
+        } else {
+            0.0
+        };
+
+        let load_scores: Vec<f64> = current_loads
+            .iter()
+            .map(|&load| {
+                if load_range == 0.0 {
+                    1.0
+                } else {
+                    1.0 - ((load - min_load) as f64 / load_range)
+                }
+            })
+            .collect();
+
+        let combined_scores: Vec<f64> = locality_scores
+            .iter()
+            .zip(load_scores.iter())
+            .map(|(&loc_score, &ld_score)| 0.5 * loc_score + 0.5 * ld_score)
+            .collect();
+
+        let mut best_score = -1.0_f64;
+        let mut best_proxies = Vec::new();
+
+        for i in 0..proxy_count {
+            if combined_scores[i] > best_score {
+                best_score = combined_scores[i];
+                best_proxies.clear();
+                best_proxies.push(i);
+            } else if (combined_scores[i] - best_score).abs() < 1e-9 {
+                best_proxies.push(i);
+            }
+        }
+
+        if best_proxies.is_empty() {
+            let proxy_index = txn_cnt % proxy_count;
+            Some((proxy_index, proxy_index))
+        } else {
+            let proxy_index = best_proxies[txn_cnt % best_proxies.len()];
+            Some((proxy_index, proxy_index))
+        }
     }
 
     /// Get assigned proxy for shared objects using two-tier.

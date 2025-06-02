@@ -30,6 +30,8 @@ pub enum LoadBalancingPolicy {
     Combined,
     /// Two-tier: separate policies for stateless and stateful
     TwoTier,
+    /// LocalityLoad: Choose proxy based on 50% locality and 50% load score
+    LocalityLoad,
 }
 
 /// Default channel size for communication between components.

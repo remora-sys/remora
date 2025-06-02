@@ -109,8 +109,8 @@ where
                             tracing::warn!("Failed to send stateful txn to proxy 1");
                         }
                     }
-                    LoadBalancingPolicy::TwoTier => {
-                        unimplemented!("Two-tier load balancing policy is not implemented");
+                    _ => {
+                        unimplemented!("Load balancing policy is not implemented");
                     }
                 }
             };
