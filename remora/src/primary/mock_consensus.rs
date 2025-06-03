@@ -420,19 +420,55 @@ mod test {
 
         // Send many transactions to the mock consensus engine.
         let total_batches = 100;
+        let expected_total_stateless_txns = parameters.batch_size.get() * total_batches;
+
         tokio::spawn(async move {
             for i in 0..parameters.batch_size.get() * total_batches {
                 tx_load_balancer.send(i).await.unwrap();
             }
         });
 
-        // Wait for the consensus to commit the batches.
-        for _ in 0..total_batches {
-            let _ = rx_primary_executor.recv().await.unwrap();
+        let mut batches_received_count = 0;
+        let mut stateless_txns_received_count = 0;
+
+        // Loop until all expected items are received from both channels.
+        while batches_received_count < total_batches
+            || stateless_txns_received_count < expected_total_stateless_txns
+        {
+            tokio::select! {
+                // Only try to receive from rx_primary_executor if we still expect batches.
+                maybe_batch = rx_primary_executor.recv(), if batches_received_count < total_batches => {
+                    match maybe_batch {
+                        Some(_batch) => {
+                            batches_received_count += 1;
+                        }
+                        None => {
+                            panic!("Primary executor channel closed before all batches were received. Expected {}, got {}", total_batches, batches_received_count);
+                        }
+                    }
+                },
+                // Only try to receive from rx_stateless_txns if we still expect stateless transactions.
+                maybe_txn = rx_stateless_txns.recv(), if stateless_txns_received_count < expected_total_stateless_txns => {
+                    match maybe_txn {
+                        Some(_txn) => {
+                            stateless_txns_received_count += 1;
+                        }
+                        None => {
+                            panic!("Stateless transactions channel closed before all transactions were received. Expected {}, got {}", expected_total_stateless_txns, stateless_txns_received_count);
+                        }
+                    }
+                },
+            }
         }
 
-        for _ in 0..parameters.batch_size.get() * total_batches {
-            let _ = rx_stateless_txns.recv().await.unwrap();
-        }
+        // Assert that we received the expected number of items.
+        assert_eq!(
+            batches_received_count, total_batches,
+            "Did not receive all batches."
+        );
+        assert_eq!(
+            stateless_txns_received_count, expected_total_stateless_txns,
+            "Did not receive all stateless transactions."
+        );
     }
 }
