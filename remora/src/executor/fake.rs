@@ -470,7 +470,8 @@ impl Executor for FakeExecutor {
 
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        _transaction: &TransactionWithTimestamp<Self::Transaction>,
+        _digest: TransactionDigest,
+        _verification_duration: Duration,
     ) -> bool {
         // Simulate verification
         Calibration::calibrated_work(ctx.verification_spins);

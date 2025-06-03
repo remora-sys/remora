@@ -218,7 +218,8 @@ pub trait Executor: Clone {
     /// Verify the transaction authentication prior to execution
     fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        transaction: &TransactionWithTimestamp<Self::Transaction>,
+        digest: TransactionDigest,
+        verification_duration: Duration,
     ) -> impl Future<Output = bool> + Send;
 }
 
@@ -247,7 +248,7 @@ where
     /// Stateful transaction that requires object access and execution
     Txn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
     /// Stateless transaction that only requires signature verification
-    StatelessTxn(Arc<TransactionWithTimestamp<T>>),
+    StatelessTxn(TransactionDigest, Duration),
     /// Combined stateless+stateful
     CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
 }

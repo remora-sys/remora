@@ -214,14 +214,14 @@ mod tests {
             tokio::select! {
                 Some(msg) = rx_from_processor1.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
+                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
                 }
                 Some(msg) = rx_from_processor2.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
+                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
@@ -351,7 +351,7 @@ mod tests {
         // Check messages received by proxy 1
         while let Ok(msg) = rx_from_processor1.try_recv() {
             match msg {
-                PrimaryToProxyMessage::StatelessTxn(_) => proxy1_stateless += 1,
+                PrimaryToProxyMessage::StatelessTxn(_, _) => proxy1_stateless += 1,
                 PrimaryToProxyMessage::Txn(_, _, _) => proxy1_stateful += 1,
                 _ => unreachable!(),
             }
@@ -360,7 +360,7 @@ mod tests {
         // Check messages received by proxy 2
         while let Ok(msg) = rx_from_processor2.try_recv() {
             match msg {
-                PrimaryToProxyMessage::StatelessTxn(_) => proxy2_stateless += 1,
+                PrimaryToProxyMessage::StatelessTxn(_, _) => proxy2_stateless += 1,
                 PrimaryToProxyMessage::Txn(_, _, _) => proxy2_stateful += 1,
                 _ => unreachable!(),
             }
@@ -600,7 +600,7 @@ mod tests {
                 }
                 let tx = Arc::new(transaction);
                 (
-                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
+                    PrimaryToProxyMessage::StatelessTxn(*tx.digest(), tx.verification_duration()),
                     PrimaryToProxyMessage::Txn(tx, 0, required_states),
                 )
             })

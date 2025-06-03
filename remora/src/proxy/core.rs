@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, ops::Deref, sync::Arc, time::Duration};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
@@ -127,13 +127,13 @@ where
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
         match message {
-            PrimaryToProxyMessage::StatelessTxn(transaction) => {
+            PrimaryToProxyMessage::StatelessTxn(digest, verification_duration) => {
                 tracing::debug!(
                     "Proxy {} received stateless transaction {:?}",
                     self.id,
-                    transaction.digest()
+                    digest
                 );
-                self.process_stateless_transaction(transaction.deref().clone())
+                self.process_stateless_transaction(digest, verification_duration)
                     .await
             }
 
@@ -162,8 +162,11 @@ where
                     transaction.digest(),
                     stateless_res_proxy_id
                 );
-                self.process_stateless_transaction(transaction.deref().clone())
-                    .await;
+                self.process_stateless_transaction(
+                    *transaction.digest(),
+                    transaction.verification_duration(),
+                )
+                .await;
                 self.process_stateful_transaction(
                     transaction,
                     stateless_res_proxy_id,
@@ -204,25 +207,27 @@ where
             .await;
     }
 
-    async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
+    async fn process_stateless_transaction(
+        &self,
+        digest: TransactionDigest,
+        verification_duration: Duration,
+    ) {
         tracing::debug!(
             "Proxy {} processing stateless transaction {:?}",
             self.id,
-            transaction.digest()
+            digest
         );
 
-        let tx = self
-            .stateless_controller
-            .set_local_dependency(*transaction.digest());
+        let tx = self.stateless_controller.set_local_dependency(digest);
 
         let context = self.executor.context().clone();
         let id = self.id;
         tokio::spawn(async move {
-            let res = E::verify_transaction(context, &transaction).await;
+            let res = E::verify_transaction(context, digest, verification_duration).await;
             tracing::debug!(
                 "Proxy {} completed stateless verification for {:?}, result: {}",
                 id,
-                transaction.digest(),
+                digest,
                 res
             );
             tx.send(res).expect("Failed to send result");
@@ -732,8 +737,10 @@ mod tests {
             let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
 
             // First send the stateless transaction
-            let stateless_message =
-                PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+            let stateless_message = PrimaryToProxyMessage::StatelessTxn(
+                *transaction.digest(),
+                transaction.verification_duration(),
+            );
             tx_to_proxy.send(stateless_message).await.unwrap();
 
             use crate::executor::api::TransactionWithTimestamp;
@@ -814,7 +821,10 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy
-        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+        let message = PrimaryToProxyMessage::StatelessTxn(
+            *transaction.digest(),
+            transaction.verification_duration(),
+        );
         tx_to_proxy.send(message).await.unwrap();
 
         // Allow time for processing
@@ -849,7 +859,10 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy2
-        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+        let message = PrimaryToProxyMessage::StatelessTxn(
+            *transaction.digest(),
+            transaction.verification_duration(),
+        );
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2

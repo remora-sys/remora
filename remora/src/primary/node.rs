@@ -83,7 +83,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Boot the (mock) consensus. This component delays transactions simulating consensus and
         // then forwards them to the primary executor.
-        let consensus_handle = MockConsensus::new(
+        let consensus_handle = MockConsensus::<_, E>::new(
             config.validator_parameters.consensus_delay_model.clone(),
             config.validator_parameters.consensus_parameters.clone(),
             rx_client_transactions,

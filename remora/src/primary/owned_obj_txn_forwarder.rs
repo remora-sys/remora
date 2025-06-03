@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     config::LoadBalancingPolicy,
-    executor::api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
+    executor::api::{ExecutableTransaction, Executor, PrimaryToProxyMessage, RemoraTransaction},
     proxy::core::ProxyId,
 };
 
@@ -67,7 +67,10 @@ where
                 match policy {
                     LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
                         if let Some(proxy_conn) = proxy_connections.get(&idx) {
-                            let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
+                            let msg1 = PrimaryToProxyMessage::StatelessTxn(
+                                *tx.digest(),
+                                tx.verification_duration(),
+                            );
                             let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
 
                             if proxy_conn.send(msg1).await.is_err() {
@@ -95,7 +98,10 @@ where
                         let stateless_proxy = proxy_connections.get(&0).unwrap();
                         let stateful_proxy = proxy_connections.get(&1).unwrap();
                         if stateless_proxy
-                            .send(PrimaryToProxyMessage::StatelessTxn(tx.clone()))
+                            .send(PrimaryToProxyMessage::StatelessTxn(
+                                *tx.digest(),
+                                tx.verification_duration(),
+                            ))
                             .await
                             .is_err()
                         {

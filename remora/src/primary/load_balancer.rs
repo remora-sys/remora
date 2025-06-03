@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -13,8 +13,8 @@ use crate::{
     error::{NodeError, NodeResult},
     executor::{
         api::{
-            ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex,
-            PrimaryToProxyMessage, RemoraTransaction, Store,
+            ExecutionResults, Executor, ExecutorIndex, PrimaryToProxyMessage, RemoraTransaction,
+            Store,
         },
         versioned_dependency_controller::VersionedDependencyController,
     },
@@ -38,7 +38,7 @@ pub struct LoadBalancer<E: Executor> {
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// The receiver for stateless transactions
-    rx_stateless_txns: Receiver<RemoraTransaction<E>>,
+    rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     /// The load balancing policy.
     policy: LoadBalancingPolicy,
     /// The metrics for the validator.
@@ -55,7 +55,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_stateless_txns: Receiver<RemoraTransaction<E>>,
+        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
         policy: LoadBalancingPolicy,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -189,13 +189,13 @@ where
                     }
                 }
 
-                Some(transaction) = self.rx_stateless_txns.recv() => {
+                Some((digest, duration)) = self.rx_stateless_txns.recv() => {
                     let proxy = self.proxy_connections
                         .iter()
                         .map(|entry| *entry.key())
-                        .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load.value()))
+                        .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
                         .unwrap_or(0);
-                    let weight = transaction.verification_duration().as_micros() as usize;
+                    let weight = duration.as_micros() as usize;
                     if let Some(mut load) = proxy_loads.get_mut(&proxy) {
                         *load += weight;
                     } else {
@@ -204,10 +204,13 @@ where
                     SharedObjTxnForwarder::<E>::send_to_proxy(
                         &self.proxy_connections,
                         proxy,
-                        PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone())),
+                        PrimaryToProxyMessage::StatelessTxn(
+                            digest,
+                            duration,
+                        ),
                     )
                     .await;
-                    stateless_forwarding_table.insert(transaction.transaction.digest().clone(), proxy);
+                    stateless_forwarding_table.insert(digest, proxy);
                 }
 
                 else => Err(NodeError::ShuttingDown)?,

@@ -7,6 +7,7 @@ use std::{
     io::{BufReader, Read},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use sui_single_node_benchmark::{
@@ -446,10 +447,11 @@ impl Executor for SuiExecutor {
 
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        _transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+        digest: TransactionDigest,
+        _verification_duration: Duration,
     ) -> bool {
         let start_time = Instant::now();
-        let tx_id = _transaction.digest();
+        let tx_id = digest;
         let spins = ctx.verification_spins();
 
         Calibration::calibrated_work(spins);
