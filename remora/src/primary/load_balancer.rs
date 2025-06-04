@@ -190,7 +190,11 @@ where
                 }
 
                 Some((digest, duration)) = self.rx_stateless_txns.recv() => {
-                    let proxy = self.proxy_connections
+                    let conn = self.proxy_connections.clone();
+                    let proxy_loads = proxy_loads.clone();
+                    let stateless_forwarding_table = stateless_forwarding_table.clone();
+                    tokio::spawn(async move {
+                    let proxy = conn
                         .iter()
                         .map(|entry| *entry.key())
                         .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
@@ -202,7 +206,7 @@ where
                         proxy_loads.insert(proxy, weight);
                     }
                     SharedObjTxnForwarder::<E>::send_to_proxy(
-                        &self.proxy_connections,
+                        &conn,
                         proxy,
                         PrimaryToProxyMessage::StatelessTxn(
                             digest,
@@ -211,6 +215,7 @@ where
                     )
                     .await;
                     stateless_forwarding_table.insert(digest, proxy);
+                    });
                 }
 
                 else => Err(NodeError::ShuttingDown)?,
