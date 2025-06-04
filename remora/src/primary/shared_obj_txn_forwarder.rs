@@ -416,25 +416,24 @@ where
             current_loads[i] = proxy_loads.get(&i).map_or(0, |r| *r.value());
         }
 
-        let min_load = current_loads.iter().min().copied().unwrap_or(0);
-        let max_load = current_loads.iter().max().copied().unwrap_or(0);
-
-        let load_range = if max_load > min_load {
-            (max_load - min_load) as f64
-        } else {
-            0.0
-        };
+        let total_load: usize = current_loads.iter().sum();
 
         let load_scores: Vec<f64> = current_loads
             .iter()
             .map(|&load| {
-                if load_range == 0.0 {
+                if total_load == 0 {
+                    // If total load is 0, all proxies have 0 load, so they are equally good.
                     1.0
                 } else {
-                    1.0 - ((load - min_load) as f64 / load_range)
+                    // User's formula: score is higher for lower proportion of total load.
+                    1.0 - (load as f64 / total_load as f64)
                 }
             })
             .collect();
+
+        tracing::debug!("locality_scores: {:?}", locality_scores);
+        tracing::debug!("proxy_loads: {:?}", proxy_loads);
+        tracing::debug!("load_scores: {:?}", load_scores);
 
         let combined_scores: Vec<f64> = locality_scores
             .iter()
