@@ -281,6 +281,7 @@ where
                 states_to_proxy,
                 required_versions,
                 proxy_loads,
+                expected_stateful_duration,
                 txn_cnt,
             ),
         }
@@ -367,6 +368,7 @@ where
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        expected_stateful_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count = proxy_connections.len();
@@ -454,13 +456,21 @@ where
             }
         }
 
-        if best_proxies.is_empty() {
-            let proxy_index = txn_cnt % proxy_count;
-            Some((proxy_index, proxy_index))
+        let proxy_index = if best_proxies.is_empty() {
+            txn_cnt % proxy_count
         } else {
-            let proxy_index = best_proxies[txn_cnt % best_proxies.len()];
-            Some((proxy_index, proxy_index))
+            best_proxies[txn_cnt % best_proxies.len()]
+        };
+
+        // Update stateful proxy load
+        let stateful_weight = expected_stateful_duration.as_micros() as usize;
+        if let Some(mut load) = proxy_loads.get_mut(&proxy_index) {
+            *load += stateful_weight;
+        } else {
+            proxy_loads.insert(proxy_index, stateful_weight);
         }
+
+        Some((proxy_index, proxy_index))
     }
 
     /// Get assigned proxy for shared objects using two-tier.
