@@ -408,10 +408,36 @@ where
         }
 
         let total_required_versions = required_versions.len() as f64;
-        let locality_scores: Vec<f64> = locality_raw_counts
+        let mut locality_scores: Vec<f64> = locality_raw_counts
             .iter()
-            .map(|&count| count as f64 / total_required_versions)
+            .map(|&count| {
+                if total_required_versions == 0.0 {
+                    0.0 // Avoid division by zero if there are no required versions
+                } else {
+                    count as f64 / total_required_versions
+                }
+            })
             .collect();
+
+        tracing::debug!(
+            "Locality scores before normalization: {:?}",
+            locality_scores
+        );
+
+        const SCORE_SUM_EPSILON: f64 = 0.0; // Epsilon for sum and score comparisons
+        let sum_of_locality_scores: f64 = locality_scores.iter().sum();
+
+        if sum_of_locality_scores > SCORE_SUM_EPSILON {
+            // Normalize locality_scores so they sum to 1.0 if the sum is meaningfully positive.
+            locality_scores = locality_scores
+                .iter()
+                .map(|&score| score / sum_of_locality_scores)
+                .collect();
+            tracing::debug!(
+                "Locality scores after normalization: {:?}",
+                locality_scores
+            );
+        }
 
         let mut current_loads = vec![0usize; proxy_count];
         for i in 0..proxy_count {
@@ -451,7 +477,7 @@ where
                 best_score = combined_scores[i];
                 best_proxies.clear();
                 best_proxies.push(i);
-            } else if (combined_scores[i] - best_score).abs() < 1e-9 {
+            } else if (combined_scores[i] - best_score).abs() < SCORE_SUM_EPSILON {
                 best_proxies.push(i);
             }
         }
