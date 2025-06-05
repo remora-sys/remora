@@ -166,16 +166,23 @@ impl<E: Executor> LoadGenerator<E> {
             let arrival = self.arrival;
             let verification_duration = self.config.verification_duration;
             let expected_stateful_duration = self.config.expected_stateful_duration;
-            let handle = tokio::spawn(async move {
-                sleep(Duration::from_secs(1)).await;
-                Self::submit_transactions(
-                    tx_chunk,
-                    tx,
-                    arrival,
-                    verification_duration,
-                    expected_stateful_duration,
-                )
-                .await;
+            let handle = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async move {
+                    sleep(Duration::from_secs(1)).await;
+                    Self::submit_transactions(
+                        tx_chunk,
+                        tx,
+                        arrival,
+                        verification_duration,
+                        expected_stateful_duration,
+                    )
+                    .await;
+                });
             });
             handles.push(handle);
         }
