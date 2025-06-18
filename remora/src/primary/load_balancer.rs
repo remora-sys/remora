@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -126,30 +126,53 @@ where
             last_hot_set_proxy: None,
         };
 
-        // Spawn a task to process owned transactions
-        tokio::spawn(async move {
-            owned_txn_processor
-                .process_owned_txns(owned_txn_receiver)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                owned_txn_processor
+                    .process_owned_txns(owned_txn_receiver)
+                    .await;
+            });
         });
 
-        tokio::spawn(async move {
-            version_assignment_processor
-                .process_version_assignments(shared_txn_receiver, version_assignment_sender)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                version_assignment_processor
+                    .process_version_assignments(shared_txn_receiver, version_assignment_sender)
+                    .await;
+            });
         });
 
-        tokio::spawn(async move {
-            pre_consensus_sched_processor
-                .process_pre_consensus_txns(rx_pre_consensus_txns)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(num_cpus::get() / 2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                shared_txn_processor
+                    .process_shared_txns(version_assignment_receiver)
+                    .await;
+            });
         });
 
-        // Spawn a task to process shared transactions
-        tokio::spawn(async move {
-            shared_txn_processor
-                .process_shared_txns(version_assignment_receiver)
-                .await;
+        thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                pre_consensus_sched_processor
+                    .process_pre_consensus_txns(rx_pre_consensus_txns)
+                    .await;
+            });
         });
 
         // Return the senders so they can be used in the run loop

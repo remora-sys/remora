@@ -166,7 +166,15 @@ where
         M: Send + 'static,
         <E as Executor>::Transaction: Send + 'static,
     {
-        tokio::spawn(async move { self.run().await })
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                self.run().await;
+            })
+        })
     }
 }
 
