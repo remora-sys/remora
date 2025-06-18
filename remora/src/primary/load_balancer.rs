@@ -126,7 +126,8 @@ where
         });
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(num_cpus::get() / 2)
                 .enable_all()
                 .build()
                 .unwrap();
