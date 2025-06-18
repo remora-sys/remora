@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -101,24 +101,40 @@ where
             metrics: self.metrics.clone(),
         };
 
-        // Spawn a task to process owned transactions
-        tokio::spawn(async move {
-            owned_txn_processor
-                .process_owned_txns(owned_txn_receiver)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                owned_txn_processor
+                    .process_owned_txns(owned_txn_receiver)
+                    .await;
+            });
         });
 
-        tokio::spawn(async move {
-            version_assignment_processor
-                .process_version_assignments(shared_txn_receiver, version_assignment_sender)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                version_assignment_processor
+                    .process_version_assignments(shared_txn_receiver, version_assignment_sender)
+                    .await;
+            });
         });
 
-        // Spawn a task to process shared transactions
-        tokio::spawn(async move {
-            shared_txn_processor
-                .process_shared_txns(version_assignment_receiver)
-                .await;
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                shared_txn_processor
+                    .process_shared_txns(version_assignment_receiver)
+                    .await;
+            });
         });
 
         // Return the senders so they can be used in the run loop
