@@ -61,6 +61,8 @@ pub struct MockConsensus<M, E: Executor + Send + 'static> {
     tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
     /// Channel to send stateless transactions to the load balancer.
     tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
+    /// Channel to pre-consensus scheduling of stateful txns.
+    tx_pre_consensus_scheduling: Sender<Vec<RemoraTransaction<E>>>,
     /// Holds the current batch.
     current_batch: ConsensusCommit<RemoraTransaction<E>>,
     /// The number of batches currently in-flight.
@@ -80,6 +82,7 @@ where
         rx_load_balancer: Receiver<RemoraTransaction<E>>,
         tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
         tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
+        tx_pre_consensus_scheduling: Sender<ConsensusCommit<RemoraTransaction<E>>>,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
@@ -88,6 +91,7 @@ where
             rx_load_balancer,
             tx_primary_executor,
             tx_stateless_txns,
+            tx_pre_consensus_scheduling,
             current_batch: Vec::with_capacity(batch_size),
             current_inflight_batches: 0,
             _phantom: PhantomData,
@@ -122,7 +126,8 @@ where
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
-                        waiter.push(self.model.consensus_delay(batch));
+                        waiter.push(self.model.consensus_delay(batch.clone()));
+                        self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
                         timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
                     }
                 },
@@ -133,7 +138,8 @@ where
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
-                        waiter.push(self.model.consensus_delay(batch));
+                        waiter.push(self.model.consensus_delay(batch.clone()));
+                        self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
                     } else if self.tx_primary_executor.is_closed() {
                         tracing::warn!("Terminating consensus task: primary executor dropped the channel");
                         break

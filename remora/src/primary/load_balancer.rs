@@ -21,7 +21,9 @@ use crate::{
     metrics::Metrics,
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
-        shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
+        shared_obj_txn_forwarder::{
+            PreConsensusSchedTask, SharedObjTxnForwarder, VersionAssignmentTask,
+        },
     },
     proxy::core::ProxyId,
 };
@@ -72,6 +74,7 @@ where
     /// Initialize transaction processors and return the senders
     fn initialize_processors(
         &self,
+        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
     ) -> (
         Sender<Vec<RemoraTransaction<E>>>,              // owned_txn_sender
         Sender<Vec<RemoraTransaction<E>>>,              // shared_txn_sender
@@ -103,16 +106,22 @@ where
 
         let proxy_loads = Arc::new(DashMap::new());
         let stateless_forwarding_table = Arc::new(DashMap::new());
+        let pre_consensus_routing_plan = Arc::new(DashMap::new());
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
-            policy: self.policy.clone(),
-            txn_cnt: 0,
             states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
-            proxy_loads: proxy_loads.clone(),
-            stateless_forwarding_table: stateless_forwarding_table.clone(),
             metrics: self.metrics.clone(),
+            pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
+            stateless_forwarding_table: stateless_forwarding_table.clone(),
+        };
+        let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E> {
+            proxy_connections: self.proxy_connections.clone(),
+            pre_consensus_routing_plan,
+            index: 0,
+            _phantom: PhantomData,
+            proxy_loads: proxy_loads.clone(),
         };
 
         // Spawn a task to process owned transactions
@@ -125,6 +134,12 @@ where
         tokio::spawn(async move {
             version_assignment_processor
                 .process_version_assignments(shared_txn_receiver, version_assignment_sender)
+                .await;
+        });
+
+        tokio::spawn(async move {
+            pre_consensus_sched_processor
+                .process_pre_consensus_txns(rx_pre_consensus_txns)
                 .await;
         });
 
@@ -145,12 +160,15 @@ where
     }
 
     /// Run the load balancer.
-    pub async fn run(&mut self) -> NodeResult<()> {
+    pub async fn run(
+        &mut self,
+        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+    ) -> NodeResult<()> {
         tracing::info!("Load balancer started");
 
         // Initialize processors and get the transaction senders
         let (owned_txn_sender, shared_txn_sender, proxy_loads, stateless_forwarding_table) =
-            self.initialize_processors();
+            self.initialize_processors(rx_pre_consensus_txns);
 
         let mut txn_cnt = 0;
         loop {
@@ -224,7 +242,10 @@ where
     }
 
     /// Spawn the load balancer in a new task.
-    pub fn spawn(mut self) -> JoinHandle<NodeResult<()>>
+    pub fn spawn(
+        mut self,
+        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+    ) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
         Store<E>: Send + Sync,
@@ -232,6 +253,6 @@ where
         ExecutionResults<E>: Send,
         <E as Executor>::Transaction: Send + Sync,
     {
-        tokio::spawn(async move { self.run().await })
+        tokio::spawn(async move { self.run(rx_pre_consensus_txns).await })
     }
 }

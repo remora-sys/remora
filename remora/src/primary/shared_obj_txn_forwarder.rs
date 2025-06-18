@@ -1,5 +1,4 @@
 use crate::{
-    config::LoadBalancingPolicy,
     executor::{
         api::{
             ExecutableTransaction, Executor, ExecutorIndex, PrimaryToProxyMessage,
@@ -11,10 +10,172 @@ use crate::{
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
-use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use petgraph::graph::DiGraph;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+pub(crate) struct PreConsensusSchedTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub(crate) proxy_connections:
+        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
+    pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+    pub(crate) index: usize,
+    pub(crate) _phantom: PhantomData<E>,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+}
+
+impl<E> PreConsensusSchedTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub(crate) async fn process_pre_consensus_txns(
+        &mut self,
+        mut rx_pre_consensus: Receiver<Vec<RemoraTransaction<E>>>,
+    ) {
+        while let Some(transactions) = rx_pre_consensus.recv().await {
+            self.schedule_transaction_batch(transactions);
+        }
+    }
+
+    fn schedule_transaction_batch(&mut self, transactions: Vec<RemoraTransaction<E>>) {
+        let num_proxies = self.proxy_connections.len();
+        if num_proxies == 0 {
+            tracing::warn!("No proxies available for pre-consensus scheduling");
+            return;
+        }
+
+        let largest_subgraph_digests = self.analyze_dependencies(&transactions);
+        let (largest_component_proxy, other_proxies) = self.determine_routing(num_proxies);
+
+        self.assign_and_update_loads(
+            transactions,
+            &largest_subgraph_digests,
+            largest_component_proxy,
+            &other_proxies,
+        );
+    }
+
+    fn analyze_dependencies(
+        &self,
+        transactions: &[RemoraTransaction<E>],
+    ) -> FxHashSet<TransactionDigest> {
+        let (graph, _digest_to_node) = self.build_dependency_graph(transactions);
+        let largest_subgraph_nodes = self.find_largest_subgraph(&graph);
+        largest_subgraph_nodes
+            .into_iter()
+            .map(|node_idx| graph[node_idx])
+            .collect()
+    }
+
+    fn determine_routing(&self, num_proxies: usize) -> (ExecutorIndex, Vec<ExecutorIndex>) {
+        let least_loaded_proxy = self
+            .proxy_loads
+            .iter()
+            .min_by_key(|entry| *entry.value())
+            .map(|entry| *entry.key())
+            .unwrap_or(0);
+
+        let mut other_proxies: Vec<_> = (0..num_proxies)
+            .filter(|id| *id != least_loaded_proxy)
+            .collect();
+        if other_proxies.is_empty() {
+            other_proxies.push(least_loaded_proxy);
+        }
+        (least_loaded_proxy, other_proxies)
+    }
+
+    fn assign_and_update_loads(
+        &mut self,
+        transactions: Vec<RemoraTransaction<E>>,
+        largest_subgraph_digests: &FxHashSet<TransactionDigest>,
+        largest_component_proxy: ExecutorIndex,
+        other_proxies: &[ExecutorIndex],
+    ) {
+        let mut other_proxy_idx = 0;
+        for transaction in transactions {
+            let digest = transaction.digest();
+            let proxy_id = if largest_subgraph_digests.contains(digest) {
+                largest_component_proxy
+            } else {
+                let id = other_proxies[other_proxy_idx % other_proxies.len()];
+                other_proxy_idx += 1;
+                id
+            };
+
+            self.pre_consensus_routing_plan.insert(*digest, proxy_id);
+            let weight = transaction.expected_stateful_duration().as_micros() as usize;
+            self.proxy_loads
+                .entry(proxy_id)
+                .and_modify(|load| *load += weight)
+                .or_insert(weight);
+        }
+    }
+
+    fn build_dependency_graph(
+        &self,
+        transactions: &[RemoraTransaction<E>],
+    ) -> (
+        DiGraph<TransactionDigest, ()>,
+        FxHashMap<TransactionDigest, petgraph::graph::NodeIndex>,
+    ) {
+        let mut graph = DiGraph::new();
+        let mut digest_to_node = FxHashMap::default();
+        let mut object_to_last_accessor = FxHashMap::default();
+
+        for tx in transactions {
+            let tx_digest = *tx.digest();
+            let node = graph.add_node(tx_digest);
+            digest_to_node.insert(tx_digest, node);
+
+            for (object_id, _) in tx.shared_objects() {
+                if let Some(prior_node) = object_to_last_accessor.get(object_id) {
+                    graph.add_edge(*prior_node, node, ());
+                }
+                object_to_last_accessor.insert(*object_id, node);
+            }
+        }
+        (graph, digest_to_node)
+    }
+
+    fn find_largest_subgraph(
+        &self,
+        graph: &DiGraph<TransactionDigest, ()>,
+    ) -> Vec<petgraph::graph::NodeIndex> {
+        let mut visited = FxHashSet::default();
+        let mut components = Vec::new();
+
+        for node_idx in graph.node_indices() {
+            if !visited.contains(&node_idx) {
+                let mut component_nodes = Vec::new();
+                let mut stack = vec![node_idx];
+                visited.insert(node_idx);
+
+                while let Some(current_node) = stack.pop() {
+                    component_nodes.push(current_node);
+                    // Use neighbors_undirected to find weakly connected components
+                    for neighbor in graph.neighbors_undirected(current_node) {
+                        if visited.insert(neighbor) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+                components.push(component_nodes);
+            }
+        }
+
+        // Find the largest component by number of nodes
+        components
+            .into_iter()
+            .max_by_key(|c| c.len())
+            .unwrap_or_else(Vec::new)
+    }
+}
 
 pub(crate) struct VersionAssignmentTask<E>
 where
@@ -46,7 +207,9 @@ where
                     transaction.digest()
                 );
 
-                sender.send((transaction, required_versions)).await.unwrap();
+                if sender.send((transaction, required_versions)).await.is_err() {
+                    tracing::error!("Failed to send transaction to SharedObjTxnForwarder");
+                }
             }
         }
     }
@@ -114,6 +277,7 @@ where
 
 /// Processor for transactions that involve shared objects.
 /// Used only for load balancing policy selection.
+#[derive(Clone)]
 pub(crate) struct SharedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
@@ -121,13 +285,11 @@ where
 {
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) policy: LoadBalancingPolicy,
-    pub(crate) txn_cnt: usize,
-    pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+    pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -153,17 +315,12 @@ where
     ) {
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();
-        let states_to_proxy = self.states_to_proxy.clone();
-        let policy = self.policy.clone();
         let proxy_connections = self.proxy_connections.clone();
-        let proxy_loads = self.proxy_loads.clone();
-        let stateless_forwarding_table = self.stateless_forwarding_table.clone();
-        let txn_cnt = self.txn_cnt;
-        let verification_duration = transaction.verification_duration();
-        let expected_stateful_duration = transaction.expected_stateful_duration();
-        self.txn_cnt += 1;
+        let pre_consensus_routing_plan = self.pre_consensus_routing_plan.clone();
         let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
+        let states_to_proxy = self.states_to_proxy.clone();
+        let stateless_forwarding_table = self.stateless_forwarding_table.clone();
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -183,16 +340,9 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            if let Some((proxy_index, _)) = Self::get_proxy_for_shared_objects(
-                &policy,
-                &proxy_connections,
-                &states_to_proxy,
-                txn_cnt,
-                &required_versions,
-                &proxy_loads,
-                &verification_duration,
-                &expected_stateful_duration,
-            ) {
+            if let Some((_digest, proxy_id)) =
+                pre_consensus_routing_plan.remove(transaction_arc.digest())
+            {
                 // lookup from the stateless forwarding table
                 let stateless_proxy_id = stateless_forwarding_table
                     .remove(&transaction_arc.digest())
@@ -201,17 +351,10 @@ where
                         tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
                         0
                     });
-                // Use Arc::clone instead of creating deep copies - reduces overhead
-                // Stateless transaction doesn't need missing states
-                // let stateless_msg =
-                //     PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
-                // Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
-
-                // Stateful transaction needs missing states
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
                     Some(required_versions),
-                    proxy_index,
+                    proxy_id,
                     states_to_proxy,
                 )
                 .await;
@@ -222,11 +365,14 @@ where
                     stateful_missing_states,
                 );
 
-                Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
+                Self::send_to_proxy(&proxy_connections, proxy_id, stateful_msg).await;
 
                 metrics.update_metrics(transaction_arc.timestamp());
             } else {
-                tracing::warn!("No proxies available for transaction with shared objects");
+                tracing::warn!(
+                    "No pre-consensus routing plan found for transaction {:?}",
+                    transaction_arc.digest()
+                );
             }
 
             // Notify any dependencies waiting on this transaction
@@ -238,321 +384,6 @@ where
 
     /// Get assigned proxy for shared objects in a transaction.
     /// This is the main entry point for load balancing policy selection.
-    fn get_proxy_for_shared_objects(
-        policy: &LoadBalancingPolicy,
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        txn_cnt: usize,
-        required_versions: &[(ObjectID, SequenceNumber)],
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        verification_duration: &Duration,
-        expected_stateful_duration: &Duration,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        match policy {
-            LoadBalancingPolicy::RoundRobin => {
-                Self::get_proxy_for_shared_objects_round_robin(proxy_connections, txn_cnt)
-            }
-            LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
-                proxy_connections,
-                states_to_proxy,
-                required_versions,
-                txn_cnt,
-            ),
-            LoadBalancingPolicy::Dedicated => {
-                // Dedicated: proxy 0 for stateless, proxy 1 for stateful
-                Some((1, 0))
-            }
-            LoadBalancingPolicy::Combined => {
-                unimplemented!()
-            }
-            LoadBalancingPolicy::TwoTier => Self::get_proxy_for_shared_objects_two_tier(
-                proxy_connections,
-                states_to_proxy,
-                required_versions,
-                proxy_loads,
-                verification_duration,
-                expected_stateful_duration,
-                txn_cnt,
-            ),
-            LoadBalancingPolicy::LocalityLoad => Self::get_proxy_for_shared_objects_locality_load(
-                proxy_connections,
-                states_to_proxy,
-                required_versions,
-                proxy_loads,
-                expected_stateful_duration,
-                txn_cnt,
-            ),
-        }
-    }
-
-    /// Get assigned proxy for shared objects using round-robin.
-    fn get_proxy_for_shared_objects_round_robin(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        txn_cnt: usize,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
-        if proxy_count == 0 {
-            return None;
-        }
-
-        let proxy_index = txn_cnt % proxy_count;
-
-        Some((proxy_index, proxy_index))
-    }
-
-    /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
-    fn get_proxy_for_shared_objects_most_states(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        required_versions: &[(ObjectID, SequenceNumber)],
-        txn_cnt: usize,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
-        if proxy_count == 0 {
-            return None;
-        }
-
-        if required_versions.is_empty() {
-            // If no shared objects, use first proxy
-            return Some((0, 0));
-        }
-
-        // Count how many objects each proxy already has
-        let mut proxy_state_counts = vec![0; proxy_count];
-        for (id, v) in required_versions {
-            if let Some(proxy_index) = states_to_proxy.get(&(*id, *v)) {
-                if *proxy_index < proxy_count {
-                    proxy_state_counts[*proxy_index] += 1;
-                }
-            }
-        }
-
-        // Find the proxy with the most states
-        let mut max_count = 0;
-        let mut best_proxies = Vec::new();
-
-        // First pass to find maximum count
-        for (index, count) in proxy_state_counts.iter().enumerate() {
-            match count.cmp(&max_count) {
-                std::cmp::Ordering::Greater => {
-                    max_count = *count;
-                    best_proxies.clear();
-                    best_proxies.push(index);
-                }
-                std::cmp::Ordering::Equal => {
-                    best_proxies.push(index);
-                }
-                std::cmp::Ordering::Less => {}
-            }
-        }
-
-        // Select a proxy randomly if multiple proxies have the same max count
-        let proxy_index = if best_proxies.len() > 1 {
-            best_proxies[txn_cnt % best_proxies.len()]
-        } else {
-            best_proxies[0]
-        };
-        Some((proxy_index, proxy_index))
-    }
-
-    fn get_proxy_for_shared_objects_locality_load(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        required_versions: &[(ObjectID, SequenceNumber)],
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        expected_stateful_duration: &Duration,
-        txn_cnt: usize,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
-        if proxy_count == 0 {
-            return None;
-        }
-
-        if required_versions.is_empty() {
-            let mut min_load = usize::MAX;
-            let mut candidates = Vec::new();
-            for i in 0..proxy_count {
-                let load = proxy_loads.get(&i).map_or(0, |r| *r.value());
-                if load < min_load {
-                    min_load = load;
-                    candidates.clear();
-                    candidates.push(i);
-                } else if load == min_load {
-                    candidates.push(i);
-                }
-            }
-            if candidates.is_empty() {
-                let idx = txn_cnt % proxy_count;
-                return Some((idx, idx));
-            }
-            let chosen_proxy = candidates[txn_cnt % candidates.len()];
-            return Some((chosen_proxy, chosen_proxy));
-        }
-
-        let mut locality_raw_counts = vec![0usize; proxy_count];
-        for (id, v) in required_versions {
-            if let Some(proxy_index_ref) = states_to_proxy.get(&(*id, *v)) {
-                let proxy_index = *proxy_index_ref;
-                if proxy_index < proxy_count {
-                    locality_raw_counts[proxy_index] += 1;
-                }
-            }
-        }
-
-        let total_required_versions = required_versions.len() as f64;
-        let mut locality_scores: Vec<f64> = locality_raw_counts
-            .iter()
-            .map(|&count| {
-                if total_required_versions == 0.0 {
-                    0.0 // Avoid division by zero if there are no required versions
-                } else {
-                    count as f64 / total_required_versions
-                }
-            })
-            .collect();
-
-        tracing::debug!(
-            "Locality scores before normalization: {:?}",
-            locality_scores
-        );
-
-        const SCORE_SUM_EPSILON: f64 = 0.0; // Epsilon for sum and score comparisons
-        let sum_of_locality_scores: f64 = locality_scores.iter().sum();
-
-        if sum_of_locality_scores > SCORE_SUM_EPSILON {
-            // Normalize locality_scores so they sum to 1.0 if the sum is meaningfully positive.
-            locality_scores = locality_scores
-                .iter()
-                .map(|&score| score / sum_of_locality_scores)
-                .collect();
-            tracing::debug!(
-                "Locality scores after normalization: {:?}",
-                locality_scores
-            );
-        }
-
-        let mut current_loads = vec![0usize; proxy_count];
-        for i in 0..proxy_count {
-            current_loads[i] = proxy_loads.get(&i).map_or(0, |r| *r.value());
-        }
-
-        let total_load: usize = current_loads.iter().sum();
-
-        let load_scores: Vec<f64> = current_loads
-            .iter()
-            .map(|&load| {
-                if total_load == 0 {
-                    // If total load is 0, all proxies have 0 load, so they are equally good.
-                    1.0
-                } else {
-                    // User's formula: score is higher for lower proportion of total load.
-                    1.0 - (load as f64 / total_load as f64)
-                }
-            })
-            .collect();
-
-        tracing::debug!("locality_scores: {:?}", locality_scores);
-        tracing::debug!("proxy_loads: {:?}", proxy_loads);
-        tracing::debug!("load_scores: {:?}", load_scores);
-
-        let combined_scores: Vec<f64> = locality_scores
-            .iter()
-            .zip(load_scores.iter())
-            .map(|(&loc_score, &ld_score)| 0.5 * loc_score + 0.5 * ld_score)
-            .collect();
-
-        let mut best_score = -1.0_f64;
-        let mut best_proxies = Vec::new();
-
-        for i in 0..proxy_count {
-            if combined_scores[i] > best_score {
-                best_score = combined_scores[i];
-                best_proxies.clear();
-                best_proxies.push(i);
-            } else if (combined_scores[i] - best_score).abs() < SCORE_SUM_EPSILON {
-                best_proxies.push(i);
-            }
-        }
-
-        let proxy_index = if best_proxies.is_empty() {
-            txn_cnt % proxy_count
-        } else {
-            best_proxies[txn_cnt % best_proxies.len()]
-        };
-
-        // Update stateful proxy load
-        let stateful_weight = expected_stateful_duration.as_micros() as usize;
-        if let Some(mut load) = proxy_loads.get_mut(&proxy_index) {
-            *load += stateful_weight;
-        } else {
-            proxy_loads.insert(proxy_index, stateful_weight);
-        }
-
-        Some((proxy_index, proxy_index))
-    }
-
-    /// Get assigned proxy for shared objects using two-tier.
-    fn get_proxy_for_shared_objects_two_tier(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        required_versions: &[(ObjectID, SequenceNumber)],
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        verification_duration: &Duration,
-        expected_stateful_duration: &Duration,
-        txn_cnt: usize,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let stateful_proxy_index = Self::get_proxy_for_shared_objects_most_states(
-            proxy_connections,
-            states_to_proxy,
-            required_versions,
-            txn_cnt,
-        )
-        .unwrap()
-        .0;
-
-        // Find the least loaded proxy for stateless execution
-        let stateless_proxy_index = proxy_connections
-            .iter()
-            .min_by_key(|item| {
-                let proxy_id = *item.key();
-                proxy_loads.get(&proxy_id).map_or(0, |load| *load)
-            })
-            .map(|entry| *entry.key())
-            .unwrap_or(0);
-
-        // Update the load for the selected proxies with fine-grained weights
-        // Stateless uses verification duration from workload config
-        // Stateful uses a fixed 200us weight
-        let stateless_weight = verification_duration.as_micros() as usize;
-        let stateful_weight = expected_stateful_duration.as_micros() as usize;
-        if let Some(mut load) = proxy_loads.get_mut(&stateless_proxy_index) {
-            *load += stateless_weight;
-        } else {
-            proxy_loads.insert(stateless_proxy_index, stateless_weight);
-        }
-
-        // Update stateful proxy load
-        if let Some(mut load) = proxy_loads.get_mut(&stateful_proxy_index) {
-            *load += stateful_weight;
-        } else {
-            proxy_loads.insert(stateful_proxy_index, stateful_weight);
-        }
-
-        Some((stateful_proxy_index, stateless_proxy_index))
-    }
-
-    /// Helper method to determine missing states for a transaction
-    /// and update the states ownership map
     async fn get_missing_states_for_transaction(
         transaction: &RemoraTransaction<E>,
         required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
@@ -608,7 +439,6 @@ where
         required_states
     }
 
-    /// Simplified method to send a message to a proxy
     pub(crate) async fn send_to_proxy(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
@@ -616,17 +446,16 @@ where
         dest_proxy: ExecutorIndex,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if let Some(proxy_connection) = proxy_connections.get(&dest_proxy) {
-            if proxy_connection.send(message).await.is_ok() {
-                tracing::debug!("Sent transaction to proxy {}", dest_proxy);
-            } else {
-                tracing::warn!(
-                    "Failed to send transaction to proxy {}, removing connection",
-                    dest_proxy
+        if let Some(proxy) = proxy_connections.get(&dest_proxy) {
+            if let Err(e) = proxy.send(message).await {
+                tracing::error!(
+                    "Failed to send transaction to proxy {}: {:?}",
+                    dest_proxy,
+                    e
                 );
             }
         } else {
-            tracing::warn!("Proxy connection {} not found", dest_proxy);
+            tracing::warn!("Proxy {} not found", dest_proxy);
         }
     }
 }
