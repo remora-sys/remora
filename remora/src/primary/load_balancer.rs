@@ -107,6 +107,7 @@ where
         let proxy_loads = Arc::new(DashMap::new());
         let stateless_forwarding_table = Arc::new(DashMap::new());
         let pre_consensus_routing_plan = Arc::new(DashMap::new());
+
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
@@ -119,9 +120,10 @@ where
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E> {
             proxy_connections: self.proxy_connections.clone(),
             pre_consensus_routing_plan,
-            index: 0,
             _phantom: PhantomData,
             proxy_loads: proxy_loads.clone(),
+            last_hot_set: Default::default(),
+            last_hot_set_proxy: None,
         };
 
         // Spawn a task to process owned transactions
