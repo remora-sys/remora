@@ -12,7 +12,7 @@ use crate::{
 use dashmap::DashMap;
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -521,6 +521,55 @@ where
             }
         } else {
             tracing::warn!("Proxy {} not found", dest_proxy);
+        }
+    }
+}
+
+pub struct StatelessTxnForwarder<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub(crate) proxy_connections:
+        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+    pub(crate) rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+}
+
+impl<E> StatelessTxnForwarder<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub(crate) async fn forward_stateless_txn(&mut self) {
+        while let Some((digest, duration)) = self.rx_stateless_txns.recv().await {
+            let conn = self.proxy_connections.clone();
+            let proxy_loads = self.proxy_loads.clone();
+            let stateless_forwarding_table = self.stateless_forwarding_table.clone();
+            tokio::spawn(async move {
+                let instant = std::time::Instant::now();
+                let proxy = conn
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
+                    .unwrap_or(0);
+                let weight = duration.as_micros() as usize;
+                if let Some(mut load) = proxy_loads.get_mut(&proxy) {
+                    *load += weight;
+                } else {
+                    proxy_loads.insert(proxy, weight);
+                }
+                let duration = instant.elapsed();
+                tracing::info!("Stateless transaction forwarded in {:?}", duration);
+                SharedObjTxnForwarder::<E>::send_to_proxy(
+                    &conn,
+                    proxy,
+                    PrimaryToProxyMessage::StatelessTxn(digest, duration),
+                )
+                .await;
+                stateless_forwarding_table.insert(digest, proxy);
+            });
         }
     }
 }

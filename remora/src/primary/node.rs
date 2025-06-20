@@ -75,11 +75,10 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let load_balancer_handle = LoadBalancer::<E>::new(
             proxy_connections,
             rx_committed_txns,
-            rx_stateless_txns,
             config.validator_parameters.load_balancing_policy.clone(),
             metrics.clone(),
         )
-        .spawn(rx_pre_consensus_txns);
+        .spawn(rx_pre_consensus_txns, rx_stateless_txns);
         primary_handles.push(load_balancer_handle);
 
         // Boot the (mock) consensus. This component delays transactions simulating consensus and

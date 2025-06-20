@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc, time::Duration, thread};
+use std::{marker::PhantomData, sync::Arc, thread, time::Duration};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -12,17 +12,15 @@ use crate::{
     config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{
-            ExecutionResults, Executor, ExecutorIndex, PrimaryToProxyMessage, RemoraTransaction,
-            Store,
-        },
+        api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         shared_obj_txn_forwarder::{
-            PreConsensusSchedTask, SharedObjTxnForwarder, VersionAssignmentTask,
+            PreConsensusSchedTask, SharedObjTxnForwarder, StatelessTxnForwarder,
+            VersionAssignmentTask,
         },
     },
     proxy::core::ProxyId,
@@ -39,8 +37,6 @@ pub struct LoadBalancer<E: Executor> {
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-    /// The receiver for stateless transactions
-    rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     /// The load balancing policy.
     policy: LoadBalancingPolicy,
     /// The metrics for the validator.
@@ -57,7 +53,6 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
         policy: LoadBalancingPolicy,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -65,7 +60,6 @@ where
             _phantom: PhantomData,
             proxy_connections,
             rx_committed_txns,
-            rx_stateless_txns,
             metrics,
             policy,
         }
@@ -75,11 +69,10 @@ where
     fn initialize_processors(
         &self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> (
-        Sender<Vec<RemoraTransaction<E>>>,              // owned_txn_sender
-        Sender<Vec<RemoraTransaction<E>>>,              // shared_txn_sender
-        Arc<DashMap<ExecutorIndex, usize>>,             // proxy_loads
-        Arc<DashMap<TransactionDigest, ExecutorIndex>>, // stateless_forwarding_table
+        Sender<Vec<RemoraTransaction<E>>>, // owned_txn_sender
+        Sender<Vec<RemoraTransaction<E>>>, // shared_txn_sender
     ) {
         // Create channels for transactions
         let (owned_txn_sender, owned_txn_receiver) =
@@ -126,6 +119,13 @@ where
             last_hot_set_proxy: None,
         };
 
+        let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
+            proxy_connections: self.proxy_connections.clone(),
+            proxy_loads: proxy_loads.clone(),
+            stateless_forwarding_table: stateless_forwarding_table.clone(),
+            rx_stateless_txns,
+        };
+
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -164,7 +164,7 @@ where
         });
 
         thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
@@ -175,25 +175,32 @@ where
             });
         });
 
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(8)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                stateless_txn_processor.forward_stateless_txn().await;
+            });
+        });
+
         // Return the senders so they can be used in the run loop
-        (
-            owned_txn_sender,
-            shared_txn_sender,
-            proxy_loads,
-            stateless_forwarding_table,
-        )
+        (owned_txn_sender, shared_txn_sender)
     }
 
     /// Run the load balancer.
     pub async fn run(
         &mut self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> NodeResult<()> {
         tracing::info!("Load balancer started");
 
         // Initialize processors and get the transaction senders
-        let (owned_txn_sender, shared_txn_sender, proxy_loads, stateless_forwarding_table) =
-            self.initialize_processors(rx_pre_consensus_txns);
+        let (owned_txn_sender, shared_txn_sender) =
+            self.initialize_processors(rx_pre_consensus_txns, rx_stateless_txns);
 
         let mut txn_cnt = 0;
         loop {
@@ -232,35 +239,6 @@ where
                     }
                 }
 
-                Some((digest, duration)) = self.rx_stateless_txns.recv() => {
-                    let conn = self.proxy_connections.clone();
-                    let proxy_loads = proxy_loads.clone();
-                    let stateless_forwarding_table = stateless_forwarding_table.clone();
-                    tokio::spawn(async move {
-                    let proxy = conn
-                        .iter()
-                        .map(|entry| *entry.key())
-                        .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
-                        .unwrap_or(0);
-                    let weight = duration.as_micros() as usize;
-                    if let Some(mut load) = proxy_loads.get_mut(&proxy) {
-                        *load += weight;
-                    } else {
-                        proxy_loads.insert(proxy, weight);
-                    }
-                    SharedObjTxnForwarder::<E>::send_to_proxy(
-                        &conn,
-                        proxy,
-                        PrimaryToProxyMessage::StatelessTxn(
-                            digest,
-                            duration,
-                        ),
-                    )
-                    .await;
-                    stateless_forwarding_table.insert(digest, proxy);
-                    });
-                }
-
                 else => Err(NodeError::ShuttingDown)?,
             }
         }
@@ -270,6 +248,7 @@ where
     pub fn spawn(
         mut self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,
@@ -278,6 +257,13 @@ where
         ExecutionResults<E>: Send,
         <E as Executor>::Transaction: Send + Sync,
     {
-        tokio::spawn(async move { self.run(rx_pre_consensus_txns).await })
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move { self.run(rx_pre_consensus_txns, rx_stateless_txns).await })
+        })
     }
 }
