@@ -5,9 +5,10 @@ use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
     marker::PhantomData,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
+use dashmap::DashMap;
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -235,22 +236,22 @@ impl TransactionEffectsAPI for FakeTransactionEffects {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct FakeObjectStore<FakeTransactionEffects> {
     _phantom: PhantomData<FakeTransactionEffects>,
-    objects: Arc<RwLock<BTreeMap<ObjectID, Object>>>,
+    objects: Arc<DashMap<ObjectID, Object>>,
 }
 
 impl FakeObjectStore<FakeTransactionEffects> {
     pub fn new() -> Self {
         Self {
             _phantom: PhantomData,
-            objects: Arc::new(RwLock::new(BTreeMap::new())),
+            objects: Arc::new(DashMap::new()),
         }
     }
 
     pub fn write_object(&self, object: Object) {
-        let mut objects = self.objects.write().unwrap();
-        objects.insert(object.id(), object);
+        self.objects.insert(object.id(), object);
     }
 }
 
@@ -272,9 +273,8 @@ impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
     }
 
     fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>) {
-        let mut objects = self.objects.write().unwrap();
         for (object_id, object) in new_state {
-            objects.insert(object_id, object);
+            self.objects.insert(object_id, object);
         }
     }
 
@@ -282,8 +282,7 @@ impl<FakeTransactionEffects> StateStore<FakeTransactionEffects>
         &self,
         id: &ObjectID,
     ) -> Result<Option<Object>, sui_types::storage::error::Error> {
-        let objects = self.objects.read().unwrap();
-        Ok(objects.get(id).cloned())
+        Ok(self.objects.get(id).map(|o| o.clone()))
     }
 }
 

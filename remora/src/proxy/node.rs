@@ -9,18 +9,14 @@ use tokio::{
 };
 
 use crate::{
-    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
-    executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
-    metrics::Metrics,
-    networking::{client::NetworkClient, server::NetworkServer},
-    proxy::core::{ProxyCore, ProxyId},
+    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE}, error::NodeResult, executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage}, metrics::Metrics, networking::{client::NetworkClient, server::NetworkServer}, proxy::core::{ProxyCore, ProxyId}
 };
 use dashmap::DashMap;
 
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
-    core_handles: Vec<Vec<JoinHandle<()>>>,
+    core_handles: Vec<Vec<JoinHandle<NodeResult<()>>>>,
     /// The receiver for the proxy results.
     rx_proxy_results: Receiver<ExecutionResults<E>>,
     /// The handle for the network client.
