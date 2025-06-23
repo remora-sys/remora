@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use dashmap::DashMap;
 use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
@@ -8,7 +9,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use dashmap::DashMap;
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};

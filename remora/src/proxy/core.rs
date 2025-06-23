@@ -68,7 +68,10 @@ where
 
             self.handle_primary_message(message).await;
         }
-        tracing::info!("Primary message handler for proxy {} shutting down", self.id);
+        tracing::info!(
+            "Primary message handler for proxy {} shutting down",
+            self.id
+        );
     }
 
     async fn handle_primary_message(
@@ -379,7 +382,10 @@ where
         while let Some(message) = rx_inter_proxy_requests.recv().await {
             self.handle_proxy_message(message).await;
         }
-        tracing::info!("Inter-proxy message handler for proxy {} shutting down", self.id);
+        tracing::info!(
+            "Inter-proxy message handler for proxy {} shutting down",
+            self.id
+        );
     }
 
     async fn handle_proxy_message(&mut self, message: ProxyToProxyMessage) {

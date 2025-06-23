@@ -9,7 +9,12 @@ use tokio::{
 };
 
 use crate::{
-    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE}, error::NodeResult, executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage}, metrics::Metrics, networking::{client::NetworkClient, server::NetworkServer}, proxy::core::{ProxyCore, ProxyId}
+    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
+    error::NodeResult,
+    executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
+    metrics::Metrics,
+    networking::{client::NetworkClient, server::NetworkServer},
+    proxy::core::{ProxyCore, ProxyId},
 };
 use dashmap::DashMap;
 

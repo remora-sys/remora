@@ -13,7 +13,10 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    primary::mock_consensus::{models::FixedDelay, MockConsensusParameters},
+    primary::{
+        mock_consensus::{models::FixedDelay, MockConsensusParameters},
+        shared_obj_txn_forwarder::PreConsensusSchedulingPolicy,
+    },
     proxy::core::ProxyId,
 };
 
@@ -87,7 +90,7 @@ pub struct ValidatorParameters {
     pub consensus_parameters: MockConsensusParameters,
     /// The load balancing policy.
     #[serde(default = "default_validator_config::default_load_balancing_policy")]
-    pub load_balancing_policy: LoadBalancingPolicy,
+    pub load_balancing_policy: PreConsensusSchedulingPolicy,
 }
 
 impl ValidatorParameters {
@@ -98,8 +101,10 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
-    use crate::config::LoadBalancingPolicy;
-    use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
+    use crate::primary::{
+        mock_consensus::{models::FixedDelay, MockConsensusParameters},
+        shared_obj_txn_forwarder::PreConsensusSchedulingPolicy,
+    };
 
     pub fn default_consensus_delay_model() -> FixedDelay {
         FixedDelay::default()
@@ -109,8 +114,8 @@ mod default_validator_config {
         MockConsensusParameters::default()
     }
 
-    pub fn default_load_balancing_policy() -> LoadBalancingPolicy {
-        LoadBalancingPolicy::RoundRobin
+    pub fn default_load_balancing_policy() -> PreConsensusSchedulingPolicy {
+        PreConsensusSchedulingPolicy::LDS
     }
 }
 

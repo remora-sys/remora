@@ -19,8 +19,8 @@ use crate::{
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         shared_obj_txn_forwarder::{
-            PreConsensusSchedTask, SharedObjTxnForwarder, StatelessTxnForwarder,
-            VersionAssignmentTask,
+            PreConsensusSchedTask, PreConsensusSchedulingPolicy, SharedObjTxnForwarder,
+            StatelessTxnForwarder, VersionAssignmentTask,
         },
     },
     proxy::core::ProxyId,
@@ -38,7 +38,7 @@ pub struct LoadBalancer<E: Executor> {
     /// The receiver for committed transactions
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// The load balancing policy.
-    policy: LoadBalancingPolicy,
+    policy: PreConsensusSchedulingPolicy,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -53,7 +53,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        policy: LoadBalancingPolicy,
+        policy: PreConsensusSchedulingPolicy,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -85,7 +85,7 @@ where
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
-            policy: self.policy.clone(),
+            policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
         };
 
@@ -117,6 +117,7 @@ where
             proxy_loads: proxy_loads.clone(),
             last_hot_set: Default::default(),
             last_hot_set_proxy: None,
+            policy: self.policy.clone(),
         };
 
         let mut stateless_txn_processor = StatelessTxnForwarder::<E> {

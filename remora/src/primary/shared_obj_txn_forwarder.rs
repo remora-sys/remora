@@ -12,9 +12,16 @@ use crate::{
 use dashmap::DashMap;
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum PreConsensusSchedulingPolicy {
+    /// Largest Dependency Set
+    LDS,
+}
 
 pub(crate) struct PreConsensusSchedTask<E>
 where
@@ -28,6 +35,7 @@ where
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) last_hot_set: FxHashSet<ObjectID>,
     pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
+    pub(crate) policy: PreConsensusSchedulingPolicy,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -35,6 +43,26 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        proxy_connections: Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        policy: PreConsensusSchedulingPolicy,
+    ) -> Self {
+        Self {
+            proxy_connections,
+            pre_consensus_routing_plan,
+            _phantom: PhantomData,
+            proxy_loads,
+            last_hot_set: FxHashSet::default(),
+            last_hot_set_proxy: None,
+            policy,
+        }
+    }
+
     pub(crate) async fn process_pre_consensus_txns(
         &mut self,
         mut rx_pre_consensus: Receiver<Vec<RemoraTransaction<E>>>,
@@ -51,13 +79,32 @@ where
             return;
         }
 
+        // 1. Build dependency graph
+        let (graph, _digest_to_node) = self.build_dependency_graph(&transactions);
+
+        // 2. Decide assignment based on policy
+        // 3. Update data structures accordingly
+        match self.policy {
+            PreConsensusSchedulingPolicy::LDS => {
+                self.apply_lds_policy(&transactions, &graph);
+            }
+        }
+    }
+
+    fn apply_lds_policy(
+        &mut self,
+        transactions: &[RemoraTransaction<E>],
+        graph: &DiGraph<TransactionDigest, ()>,
+    ) {
+        let num_proxies = self.proxy_connections.len();
+
         let (largest_subgraph_digests, largest_subgraph_objects) =
-            self.analyze_dependencies(&transactions);
+            self.analyze_dependencies_for_lds(transactions, graph);
         let (largest_component_proxy, other_proxies) =
             self.determine_routing(num_proxies, &largest_subgraph_objects);
 
         self.assign_and_update_loads(
-            &transactions,
+            transactions,
             &largest_subgraph_digests,
             largest_component_proxy,
             &other_proxies,
@@ -65,18 +112,18 @@ where
 
         // Update the hot set for the next batch
         self.update_hot_set(
-            &transactions,
+            transactions,
             &largest_subgraph_digests,
             largest_component_proxy,
         );
     }
 
-    fn analyze_dependencies(
+    fn analyze_dependencies_for_lds(
         &self,
         transactions: &[RemoraTransaction<E>],
+        graph: &DiGraph<TransactionDigest, ()>,
     ) -> (FxHashSet<TransactionDigest>, FxHashSet<ObjectID>) {
-        let (graph, _digest_to_node) = self.build_dependency_graph(transactions);
-        let largest_subgraph_nodes = self.find_largest_subgraph(&graph);
+        let largest_subgraph_nodes = self.find_largest_subgraph(graph);
         let largest_subgraph_digests: FxHashSet<_> = largest_subgraph_nodes
             .iter()
             .map(|node_idx| graph[*node_idx])
