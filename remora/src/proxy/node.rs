@@ -10,7 +10,6 @@ use tokio::{
 
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
-    error::NodeResult,
     executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
@@ -21,7 +20,7 @@ use dashmap::DashMap;
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
-    core_handles: Vec<JoinHandle<NodeResult<()>>>,
+    core_handles: Vec<Vec<JoinHandle<()>>>,
     /// The receiver for the proxy results.
     rx_proxy_results: Receiver<ExecutionResults<E>>,
     /// The handle for the network client.
@@ -159,7 +158,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
 
         // Spawn a task to wait for all core handles to complete
         let mut core_completion = tokio::spawn(async move {
-            futures::future::join_all(core_handles).await;
+            for core_handle in core_handles {
+                futures::future::join_all(core_handle).await;
+            }
             tracing::info!("All core tasks have completed");
         });
 
