@@ -337,7 +337,8 @@ impl FakeExecutor {
     }
 
     pub fn update_object_with_version(input: Object, version: SequenceNumber) -> Object {
-        let id = ObjectID::random();
+        // HACK: reuse an existing id to avoid expensive random new generation
+        let id = input.id();
         let obj = MoveObject::new_gas_coin(version, id, 10);
         let owner = if input.is_shared() {
             Owner::Shared {
