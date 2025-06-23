@@ -653,7 +653,7 @@ where
     }
 
     /// Sptransaction_awn the proxy in a new task.
-    pub fn spawn(self) -> Vec<JoinHandle<()>>
+    pub fn spawn(self) -> Vec<JoinHandle<NodeResult<()>>>
     where
         <E as Executor>::Transaction: Send + Sync,
     {
@@ -685,6 +685,7 @@ where
                     .build()
                     .unwrap();
                 rt.block_on(async move { primary_processor.run(self.rx_transactions).await });
+                Ok(())
             });
 
         let proxy_handle = tokio::task::spawn_blocking(move || {
@@ -694,6 +695,7 @@ where
                 .build()
                 .unwrap();
             rt.block_on(async move { proxy_processor.run(self.rx_inter_proxy_requests).await });
+            Ok(())
         });
 
         vec![primary_handle, proxy_handle]
@@ -851,7 +853,7 @@ mod tests {
         // Clean up
         drop(tx_to_proxy);
         for handle in proxy_handles {
-            handle.await.unwrap();
+            handle.await.unwrap().unwrap();
         }
 
         success
