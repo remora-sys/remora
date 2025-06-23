@@ -548,7 +548,6 @@ where
             let proxy_loads = self.proxy_loads.clone();
             let stateless_forwarding_table = self.stateless_forwarding_table.clone();
             tokio::spawn(async move {
-                let instant = std::time::Instant::now();
                 let proxy = conn
                     .iter()
                     .map(|entry| *entry.key())
@@ -560,8 +559,6 @@ where
                 } else {
                     proxy_loads.insert(proxy, weight);
                 }
-                let duration = instant.elapsed();
-                tracing::info!("Stateless transaction forwarded in {:?}", duration);
                 SharedObjTxnForwarder::<E>::send_to_proxy(
                     &conn,
                     proxy,
