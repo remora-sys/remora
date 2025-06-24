@@ -21,6 +21,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub enum PreConsensusSchedulingPolicy {
     /// Largest Dependency Set
     LDS,
+    /// Sorted Dependency Set
+    SDS,
 }
 
 pub(crate) struct PreConsensusSchedTask<E>
@@ -36,6 +38,7 @@ where
     pub(crate) last_hot_set: FxHashSet<ObjectID>,
     pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
     pub(crate) policy: PreConsensusSchedulingPolicy,
+    pub(crate) object_last_proxy: FxHashMap<ObjectID, ExecutorIndex>,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -60,6 +63,7 @@ where
             last_hot_set: FxHashSet::default(),
             last_hot_set_proxy: None,
             policy,
+            object_last_proxy: FxHashMap::default(),
         }
     }
 
@@ -80,15 +84,22 @@ where
         }
 
         // 1. Build dependency graph
+        let start = std::time::Instant::now();
         let (graph, _digest_to_node) = self.build_dependency_graph(&transactions);
+        tracing::debug!("Dependency graph building took {:?}", start.elapsed());
 
         // 2. Decide assignment based on policy
         // 3. Update data structures accordingly
+        let start = std::time::Instant::now();
         match self.policy {
             PreConsensusSchedulingPolicy::LDS => {
                 self.apply_lds_policy(&transactions, &graph);
             }
+            PreConsensusSchedulingPolicy::SDS => {
+                self.apply_sds_policy(&transactions, &graph);
+            }
         }
+        tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
     }
 
     fn apply_lds_policy(
@@ -116,6 +127,103 @@ where
             &largest_subgraph_digests,
             largest_component_proxy,
         );
+
+        self.log_load_summary("LDS");
+    }
+
+    fn apply_sds_policy(
+        &mut self,
+        transactions: &[RemoraTransaction<E>],
+        graph: &DiGraph<TransactionDigest, ()>,
+    ) {
+        let mut subgraphs = self.find_all_subgraphs(graph);
+        subgraphs.sort_by_key(|subgraph| std::cmp::Reverse(subgraph.len()));
+
+        if subgraphs.is_empty() {
+            tracing::debug!("Found 0 subgraphs");
+        } else {
+            tracing::debug!("Found {} subgraphs", subgraphs.len());
+            tracing::debug!("Largest subgraph has {} nodes", subgraphs[0].len());
+        }
+
+        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
+
+        for subgraph_nodes in subgraphs {
+            let (proxy_id, subgraph_digests, subgraph_objects) =
+                self.assign_proxy_for_subgraph(graph, &subgraph_nodes, &tx_map);
+            self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, &tx_map);
+        }
+
+        self.log_load_summary("SDS");
+    }
+
+    fn assign_proxy_for_subgraph(
+        &self,
+        graph: &DiGraph<TransactionDigest, ()>,
+        subgraph_nodes: &[petgraph::graph::NodeIndex],
+        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
+    ) -> (
+        ExecutorIndex,
+        FxHashSet<TransactionDigest>,
+        FxHashSet<ObjectID>,
+    ) {
+        let subgraph_digests: FxHashSet<_> = subgraph_nodes.iter().map(|&idx| graph[idx]).collect();
+
+        let mut subgraph_objects = FxHashSet::default();
+        for digest in &subgraph_digests {
+            if let Some(tx) = tx_map.get(digest) {
+                for (object_id, _) in tx.shared_objects() {
+                    subgraph_objects.insert(*object_id);
+                }
+            }
+        }
+
+        let num_proxies = self.proxy_connections.len();
+        let best_proxy = (0..num_proxies)
+            .max_by(|&p1, &p2| {
+                let locality1 = subgraph_objects
+                    .iter()
+                    .filter(|obj| self.object_last_proxy.get(obj) == Some(&p1))
+                    .count();
+                let locality2 = subgraph_objects
+                    .iter()
+                    .filter(|obj| self.object_last_proxy.get(obj) == Some(&p2))
+                    .count();
+
+                let load1 = self.proxy_loads.get(&p1).map_or(0, |l| *l.value());
+                let load2 = self.proxy_loads.get(&p2).map_or(0, |l| *l.value());
+
+                // Prioritize locality, then use load to break ties.
+                (locality1, std::cmp::Reverse(load1)).cmp(&(locality2, std::cmp::Reverse(load2)))
+            })
+            .unwrap_or(0);
+
+        (best_proxy, subgraph_digests, subgraph_objects)
+    }
+
+    fn update_state_for_sds(
+        &mut self,
+        subgraph_digests: &FxHashSet<TransactionDigest>,
+        subgraph_objects: &FxHashSet<ObjectID>,
+        proxy_id: ExecutorIndex,
+        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
+    ) {
+        let mut total_weight = 0;
+        for digest in subgraph_digests {
+            self.pre_consensus_routing_plan.insert(*digest, proxy_id);
+            if let Some(tx) = tx_map.get(digest) {
+                total_weight += tx.expected_stateful_duration().as_micros() as usize;
+            }
+        }
+
+        self.proxy_loads
+            .entry(proxy_id)
+            .and_modify(|load| *load += total_weight)
+            .or_insert(total_weight);
+
+        for object_id in subgraph_objects {
+            self.object_last_proxy.insert(*object_id, proxy_id);
+        }
     }
 
     fn analyze_dependencies_for_lds(
@@ -255,10 +363,10 @@ where
         (graph, digest_to_node)
     }
 
-    fn find_largest_subgraph(
+    fn find_all_subgraphs(
         &self,
         graph: &DiGraph<TransactionDigest, ()>,
-    ) -> Vec<petgraph::graph::NodeIndex> {
+    ) -> Vec<Vec<petgraph::graph::NodeIndex>> {
         let mut visited = FxHashSet::default();
         let mut components = Vec::new();
 
@@ -280,12 +388,39 @@ where
                 components.push(component_nodes);
             }
         }
-
-        // Find the largest component by number of nodes
         components
+    }
+
+    fn find_largest_subgraph(
+        &self,
+        graph: &DiGraph<TransactionDigest, ()>,
+    ) -> Vec<petgraph::graph::NodeIndex> {
+        self.find_all_subgraphs(graph)
             .into_iter()
             .max_by_key(|c| c.len())
             .unwrap_or_else(Vec::new)
+    }
+
+    fn log_load_summary(&self, policy_name: &str) {
+        let total_load: usize = self.proxy_loads.iter().map(|e| *e.value()).sum();
+        if total_load == 0 {
+            return;
+        }
+        let load_ratios: BTreeMap<_, _> = self
+            .proxy_loads
+            .iter()
+            .map(|e| {
+                (
+                    *e.key(),
+                    format!("{:.2}", *e.value() as f64 / total_load as f64),
+                )
+            })
+            .collect();
+        tracing::debug!(
+            "{} policy decided load ratios: {:?}",
+            policy_name,
+            load_ratios
+        );
     }
 }
 

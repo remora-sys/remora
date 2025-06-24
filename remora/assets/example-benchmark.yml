@@ -1,5 +1,7 @@
 load: 10000
 duration:
-  secs: 60
+  secs: 10
   nanos: 0
-workload: !Transfers
+workload: !FakeZipfian
+  alpha: 0.00
+  number_of_inputs: 5

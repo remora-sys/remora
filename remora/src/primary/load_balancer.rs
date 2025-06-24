@@ -110,15 +110,12 @@ where
             pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
             stateless_forwarding_table: stateless_forwarding_table.clone(),
         };
-        let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E> {
-            proxy_connections: self.proxy_connections.clone(),
-            pre_consensus_routing_plan,
-            _phantom: PhantomData,
-            proxy_loads: proxy_loads.clone(),
-            last_hot_set: Default::default(),
-            last_hot_set_proxy: None,
-            policy: self.policy.clone(),
-        };
+        let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
+            self.proxy_connections.clone(),
+            pre_consensus_routing_plan.clone(),
+            proxy_loads.clone(),
+            self.policy.clone(),
+        );
 
         let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
