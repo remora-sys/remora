@@ -687,25 +687,13 @@ where
             stateless_controller: self.stateless_controller,
         };
 
-        let primary_handle =
-            // tokio::spawn(async move { primary_processor.run(self.rx_transactions).await });
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(num_cpus::get() / 2)
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move { primary_processor.run(self.rx_transactions).await });
-                Ok(())
-            });
+        let primary_handle = tokio::spawn(async move {
+            primary_processor.run(self.rx_transactions).await;
+            Ok(())
+        });
 
-        let proxy_handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get() / 2)
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move { proxy_processor.run(self.rx_inter_proxy_requests).await });
+        let proxy_handle = tokio::spawn(async move {
+            proxy_processor.run(self.rx_inter_proxy_requests).await;
             Ok(())
         });
 
