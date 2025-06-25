@@ -99,7 +99,7 @@ where
                 self.apply_sds_policy(&transactions, &graph);
             }
         }
-        tracing::info!("Pre-consensus scheduling policy took {:?}", start.elapsed());
+        tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
     }
 
     fn apply_lds_policy(
