@@ -80,6 +80,9 @@ pub struct ValidatorParameters {
     /// The load balancing policy.
     #[serde(default = "default_validator_config::default_load_balancing_policy")]
     pub load_balancing_policy: LoadBalancingPolicy,
+    /// The proxy mode (separation or no separation)
+    #[serde(default = "default_validator_config::default_proxy_mode")]
+    pub proxy_mode: ProxyMode,
 }
 
 impl ValidatorParameters {
@@ -90,7 +93,7 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
-    use crate::config::LoadBalancingPolicy;
+    use crate::config::{LoadBalancingPolicy, ProxyMode};
     use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
     pub fn default_consensus_delay_model() -> FixedDelay {
@@ -104,6 +107,10 @@ mod default_validator_config {
     pub fn default_load_balancing_policy() -> LoadBalancingPolicy {
         LoadBalancingPolicy::RoundRobin
     }
+
+    pub fn default_proxy_mode() -> ProxyMode {
+        ProxyMode::Separation
+    }
 }
 
 impl Default for ValidatorParameters {
@@ -112,6 +119,7 @@ impl Default for ValidatorParameters {
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
             load_balancing_policy: default_validator_config::default_load_balancing_policy(),
+            proxy_mode: default_validator_config::default_proxy_mode(),
         }
     }
 }
@@ -149,8 +157,6 @@ pub struct ValidatorConfig {
     pub client_server_address: SocketAddr,
     /// Fixed configuration for all proxy instances.
     pub proxies: Vec<ProxyInfo>,
-    /// The proxy mode (separation or no separation)
-    pub proxy_mode: ProxyMode,
     /// The address of the primary server where validator exposes metrics.
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
@@ -182,7 +188,6 @@ impl ValidatorConfig {
             proxy_server_address: get_test_address(),
             client_server_address: get_test_address(),
             proxies,
-            proxy_mode: ProxyMode::Separation,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
         }

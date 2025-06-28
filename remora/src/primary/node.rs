@@ -74,7 +74,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             proxy_connections,
             rx_committed_txns,
             config.validator_parameters.load_balancing_policy.clone(),
-            config.proxy_mode.clone(),
+            config.validator_parameters.proxy_mode.clone(),
             metrics.clone(),
         )
         .spawn();
