@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    config::ProxyMode,
     error::{NodeError, NodeResult},
     executor::{
         api::{
@@ -41,6 +42,7 @@ struct PrimaryMessageProcessor<E: Executor> {
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
+    mode: ProxyMode,
     metrics: Arc<Metrics>,
 }
 
@@ -78,50 +80,61 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        match message {
-            PrimaryToProxyMessage::StatelessTxn(transaction) => {
-                tracing::debug!(
-                    "Proxy {} received stateless transaction {:?}",
-                    self.id,
-                    transaction.digest()
-                );
-                self.process_stateless_transaction(transaction.deref().clone())
-                    .await
-            }
+        if self.mode == ProxyMode::Separation {
+            match message {
+                PrimaryToProxyMessage::StatelessTxn(transaction) => {
+                    tracing::debug!(
+                        "Proxy {} received stateless transaction {:?}",
+                        self.id,
+                        transaction.digest()
+                    );
+                    self.process_stateless_transaction(transaction.deref().clone())
+                        .await
+                }
 
-            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
-                tracing::debug!(
-                    "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
-                    self.id,
-                    transaction.digest(),
-                    stateless_res_proxy_id
-                );
-                self.process_stateful_transaction(
-                    transaction,
-                    stateless_res_proxy_id,
-                    missing_states,
-                )
-                .await;
-            }
-            PrimaryToProxyMessage::CombinedTxn(
-                transaction,
-                stateless_res_proxy_id,
-                missing_states,
-            ) => {
-                tracing::debug!(
-                    "Proxy {} received combined transaction {:?}, stateless proxy: {}",
-                    self.id,
-                    transaction.digest(),
-                    stateless_res_proxy_id
-                );
-                self.process_stateless_transaction(transaction.deref().clone())
+                PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
+                    tracing::debug!(
+                        "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
+                        self.id,
+                        transaction.digest(),
+                        stateless_res_proxy_id
+                    );
+                    self.process_stateful_transaction(
+                        transaction,
+                        stateless_res_proxy_id,
+                        missing_states,
+                    )
                     .await;
-                self.process_stateful_transaction(
+                }
+                _ => {
+                    panic!("Proxy {} received unexpected message", self.id);
+                }
+            }
+        } else {
+            match message {
+                PrimaryToProxyMessage::CombinedTxn(
                     transaction,
                     stateless_res_proxy_id,
                     missing_states,
-                )
-                .await;
+                ) => {
+                    tracing::debug!(
+                        "Proxy {} received combined transaction {:?}, stateless proxy: {}",
+                        self.id,
+                        transaction.digest(),
+                        stateless_res_proxy_id
+                    );
+                    //self.process_stateless_transaction(transaction.deref().clone())
+                    //    .await;
+                    self.process_stateful_transaction(
+                        transaction,
+                        stateless_res_proxy_id,
+                        missing_states,
+                    )
+                    .await;
+                }
+                _ => {
+                    panic!("Proxy {} received unexpected message", self.id);
+                }
             }
         }
     }
@@ -133,23 +146,28 @@ where
         required_states: RequiredStates,
     ) {
         // If the stateless result is from the same proxy, look up the handle
-        let rx = if stateless_res_proxy_id == self.id {
-            self.stateless_controller
-                .get_dependency(transaction.digest())
-                .unwrap()
-        } else {
-            // Otherwise, set a remote dependency
-            // Send stateless request to the appropriate proxy
-            let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
-            let tx = self
-                .tx_inter_proxy_replies
-                .get(&stateless_res_proxy_id)
-                .unwrap();
-            if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
-                tracing::error!("Failed to send stateless request: {}", e);
+        let rx = if self.mode == ProxyMode::Separation {
+            if stateless_res_proxy_id == self.id {
+                self.stateless_controller
+                    .get_dependency(transaction.digest())
+            } else {
+                // Otherwise, set a remote dependency
+                // Send stateless request to the appropriate proxy
+                let request = InterProxyRequest::Stateless(self.id, *transaction.digest());
+                let tx = self
+                    .tx_inter_proxy_replies
+                    .get(&stateless_res_proxy_id)
+                    .unwrap();
+                if let Err(e) = tx.send(ProxyToProxyMessage::Request(request)).await {
+                    tracing::error!("Failed to send stateless request: {}", e);
+                }
+                Some(
+                    self.stateless_controller
+                        .set_remote_dependency(*transaction.digest()),
+                )
             }
-            self.stateless_controller
-                .set_remote_dependency(*transaction.digest())
+        } else {
+            None
         };
 
         self.schedule_stateful_transaction(transaction, required_states, rx)
@@ -187,7 +205,7 @@ where
         &mut self,
         transaction: Arc<RemoraTransaction<E>>,
         required_states: RequiredStates,
-        rx: oneshot::Receiver<bool>,
+        rx: Option<oneshot::Receiver<bool>>,
     ) {
         tracing::debug!(
             "Proxy {} scheduling stateful transaction {:?} with {} required states",
@@ -250,7 +268,7 @@ where
     pub async fn spawn_stateful_txn(
         &mut self,
         transaction: Arc<RemoraTransaction<E>>,
-        stateless_handle: oneshot::Receiver<bool>,
+        stateless_handle: Option<oneshot::Receiver<bool>>,
         required_states: RequiredStates,
     ) -> NodeResult<()> {
         tracing::debug!(
@@ -267,6 +285,8 @@ where
         let stateful_controller = self.stateful_controller.clone();
         let stateless_controller = self.stateless_controller.clone();
         let executor = self.executor.clone();
+        let mode = self.mode.clone();
+
         tokio::spawn(async move {
             // Assign shared objects version.
             if !required_states.is_empty() {
@@ -281,6 +301,7 @@ where
                     )
                     .await;
             }
+
             // Get dependencies and schedule the transaction
             let (obj_ids, prior_handles, current_handles) =
                 Self::get_dependencies(required_states.clone(), stateful_controller.clone());
@@ -290,13 +311,16 @@ where
                 transaction.digest(),
                 obj_ids.clone()
             );
+
             // Wait for the stateless dependency to be resolved
-            stateless_handle.await.unwrap();
-            stateless_controller.remove_dependency(transaction.digest());
-            tracing::debug!(
-                "stateless dependency satisfied for transaction {:?}",
-                transaction.digest()
-            );
+            if let Some(rx) = stateless_handle {
+                rx.await.unwrap();
+                stateless_controller.remove_dependency(transaction.digest());
+                tracing::debug!(
+                    "stateless dependency satisfied for transaction {:?}",
+                    transaction.digest()
+                );
+            }
 
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
@@ -327,6 +351,9 @@ where
                     id,
                     transaction.digest()
                 );
+                if mode == ProxyMode::NoSeparation {
+                    E::verify_transaction(ctx.clone(), &transaction).await;
+                }
                 E::execute(ctx, store, transaction.deref().clone()).await
             } else {
                 tracing::warn!(
@@ -367,6 +394,7 @@ struct ProxyMessageProcessor<E: Executor> {
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
+    mode: ProxyMode,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyMessageProcessor<E>
@@ -397,6 +425,15 @@ where
                         .await;
                 }
                 InterProxyRequest::Stateless(proxy_id, txn_digest) => {
+                    if self.mode == ProxyMode::NoSeparation {
+                        tracing::error!(
+                            "Proxy {} received stateless request from proxy {} for transaction {:?}",
+                            self.id,
+                            proxy_id,
+                            txn_digest
+                        );
+                        return;
+                    }
                     tracing::debug!(
                         "Proxy {} received stateless request from proxy {} for transaction {:?}",
                         self.id,
@@ -620,6 +657,8 @@ pub struct ProxyCore<E: Executor> {
     stateful_controller: Arc<VersionedDependencyController>,
     /// The dependency controller for stateless transactions.
     stateless_controller: Arc<OneshotDependencyController>,
+    /// The proxy mode (separation or no separation)
+    mode: ProxyMode,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -642,6 +681,7 @@ where
         tx_results: Sender<ExecutionResults<E>>,
         rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
+        mode: ProxyMode,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -654,6 +694,7 @@ where
             tx_inter_proxy_replies,
             stateful_controller: Arc::new(VersionedDependencyController::new()),
             stateless_controller: Arc::new(OneshotDependencyController::new()),
+            mode,
             metrics,
         }
     }
@@ -671,7 +712,8 @@ where
             tx_inter_proxy_replies: self.tx_inter_proxy_replies.clone(),
             stateful_controller: self.stateful_controller.clone(),
             stateless_controller: self.stateless_controller.clone(),
-            metrics: self.metrics,
+            mode: self.mode.clone(),
+            metrics: self.metrics.clone(),
         };
 
         let mut proxy_processor = ProxyMessageProcessor::<E> {
@@ -680,6 +722,7 @@ where
             tx_inter_proxy_replies: self.tx_inter_proxy_replies,
             stateful_controller: self.stateful_controller,
             stateless_controller: self.stateless_controller,
+            mode: self.mode,
         };
 
         let primary_handle = tokio::spawn(async move {
@@ -704,7 +747,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        config::BenchmarkParameters,
+        config::{BenchmarkParameters, ProxyMode},
         executor::{
             api::{
                 ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
@@ -753,6 +796,7 @@ mod tests {
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies.clone(),
+            ProxyMode::Separation,
             metrics,
         );
 
