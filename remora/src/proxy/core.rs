@@ -123,8 +123,6 @@ where
                         transaction.digest(),
                         stateless_res_proxy_id
                     );
-                    //self.process_stateless_transaction(transaction.deref().clone())
-                    //    .await;
                     self.process_stateful_transaction(
                         transaction,
                         stateless_res_proxy_id,

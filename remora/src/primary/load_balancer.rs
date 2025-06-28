@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
+    config::{LoadBalancingPolicy, ProxyMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
         api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
@@ -34,6 +34,8 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// The load balancing policy.
     policy: LoadBalancingPolicy,
+    /// The proxy mode.
+    proxy_mode: ProxyMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -49,14 +51,17 @@ where
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         policy: LoadBalancingPolicy,
+        proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
     ) -> Self {
+        tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         Self {
             _phantom: PhantomData,
             proxy_connections,
             rx_committed_txns,
-            metrics,
             policy,
+            proxy_mode,
+            metrics,
         }
     }
 
@@ -80,6 +85,7 @@ where
             proxy_connections: self.proxy_connections.clone(),
             policy: self.policy.clone(),
             index: 0,
+            proxy_mode: self.proxy_mode.clone(),
         };
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
@@ -98,6 +104,7 @@ where
             states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
             metrics: self.metrics.clone(),
+            proxy_mode: self.proxy_mode.clone(),
         };
 
         thread::spawn(move || {

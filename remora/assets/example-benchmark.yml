@@ -2,4 +2,4 @@ load: 10000
 duration:
   secs: 60
   nanos: 0
-workload: !Transfers
+workload: !FakeZipfian

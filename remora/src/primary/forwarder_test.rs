@@ -9,7 +9,7 @@ mod tests {
     use tokio::sync::mpsc::{channel, Receiver, Sender};
 
     use crate::{
-        config::{BenchmarkParameters, LoadBalancingPolicy},
+        config::{BenchmarkParameters, LoadBalancingPolicy, ProxyMode},
         executor::{
             api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction},
             sui::SuiExecutor,
@@ -195,6 +195,7 @@ mod tests {
             proxy_connections,
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
+            proxy_mode: ProxyMode::Separation,
         };
 
         // Generate transactions
@@ -245,6 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shared_processor_forwarding() {
+        use crate::config::ProxyMode;
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
         use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
         use sui_types::base_types::{ObjectID, SequenceNumber};
@@ -274,6 +276,7 @@ mod tests {
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
             metrics: Arc::new(Metrics::new_for_tests()),
+            proxy_mode: ProxyMode::Separation,
         };
 
         // Generate transactions

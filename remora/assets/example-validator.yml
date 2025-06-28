@@ -16,4 +16,5 @@ validator_parameters:
   collocated_pre_executors:
     primary: 0
     proxy: 0
-parallel_proxy: true
+  load_balancing_policy: RoundRobin
+proxy_mode: Separation

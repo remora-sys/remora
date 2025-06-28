@@ -1,5 +1,5 @@
 use crate::{
-    config::LoadBalancingPolicy,
+    config::{LoadBalancingPolicy, ProxyMode},
     executor::{
         api::{
             ExecutableTransaction, Executor, ExecutorIndex, PrimaryToProxyMessage,
@@ -126,6 +126,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) proxy_mode: ProxyMode,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -156,6 +157,7 @@ where
         let proxy_connections = self.proxy_connections.clone();
         let txn_cnt = self.txn_cnt;
         self.txn_cnt += 1;
+        let proxy_mode = self.proxy_mode;
         let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
 
@@ -184,13 +186,6 @@ where
                 txn_cnt,
                 &required_versions,
             ) {
-                // Use Arc::clone instead of creating deep copies - reduces overhead
-                // Stateless transaction doesn't need missing states
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
-                Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg).await;
-
-                // Stateful transaction needs missing states
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
                     Some(required_versions),
@@ -199,13 +194,26 @@ where
                 )
                 .await;
 
-                let stateful_msg = PrimaryToProxyMessage::Txn(
-                    Arc::clone(&transaction_arc),
-                    stateless_proxy_id,
-                    stateful_missing_states,
-                );
+                if proxy_mode == ProxyMode::Separation {
+                    let stateless_msg =
+                        PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
+                    Self::send_to_proxy(&proxy_connections, stateless_proxy_id, stateless_msg)
+                        .await;
 
-                Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
+                    let stateful_msg = PrimaryToProxyMessage::Txn(
+                        Arc::clone(&transaction_arc),
+                        stateless_proxy_id,
+                        stateful_missing_states,
+                    );
+                    Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
+                } else {
+                    let stateful_msg = PrimaryToProxyMessage::CombinedTxn(
+                        Arc::clone(&transaction_arc),
+                        stateless_proxy_id,
+                        stateful_missing_states,
+                    );
+                    Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
+                }
 
                 metrics.update_metrics(transaction_arc.timestamp());
             } else {
