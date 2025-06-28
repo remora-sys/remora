@@ -144,6 +144,14 @@ pub struct ProxyInfo {
     pub metrics_address: SocketAddr,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// The proxy separates the stateful and stateless transactions.
+    Separation,
+    /// The proxy does not separate the stateful and stateless transactions.
+    NoSeparation,
+}
+
 /// The configuration for the validator, containing network addresses.
 /// Note: This now includes a vector of proxy configurations.
 #[derive(Serialize, Deserialize)]
@@ -154,6 +162,8 @@ pub struct ValidatorConfig {
     pub client_server_address: SocketAddr,
     /// Fixed configuration for all proxy instances.
     pub proxies: Vec<ProxyInfo>,
+    /// The proxy mode (separation or no separation)
+    pub proxy_mode: ProxyMode,
     /// The address of the primary server where validator exposes metrics.
     pub metrics_address: SocketAddr,
     /// The parameters for the validator.
@@ -185,6 +195,7 @@ impl ValidatorConfig {
             proxy_server_address: get_test_address(),
             client_server_address: get_test_address(),
             proxies,
+            proxy_mode: ProxyMode::Separation,
             metrics_address: get_test_address(),
             validator_parameters: ValidatorParameters::new_for_tests(),
         }
