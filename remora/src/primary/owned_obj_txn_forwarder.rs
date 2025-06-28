@@ -78,40 +78,6 @@ where
                             }
                         }
                     }
-                    LoadBalancingPolicy::Combined => {
-                        if let Some(proxy_conn) = proxy_connections.get(&idx) {
-                            let combined = PrimaryToProxyMessage::CombinedTxn(
-                                tx.clone(),
-                                idx,
-                                BTreeMap::new(),
-                            );
-                            if proxy_conn.send(combined).await.is_err() {
-                                tracing::warn!("Failed to send combined txn to proxy {}", idx);
-                            }
-                        }
-                    }
-                    LoadBalancingPolicy::Dedicated => {
-                        // stateless → proxy 0, stateful → proxy 1
-                        let stateless_proxy = proxy_connections.get(&0).unwrap();
-                        let stateful_proxy = proxy_connections.get(&1).unwrap();
-                        if stateless_proxy
-                            .send(PrimaryToProxyMessage::StatelessTxn(tx.clone()))
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("Failed to send stateless txn to proxy 0");
-                        }
-                        if stateful_proxy
-                            .send(PrimaryToProxyMessage::Txn(tx.clone(), 0, BTreeMap::new()))
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("Failed to send stateful txn to proxy 1");
-                        }
-                    }
-                    LoadBalancingPolicy::TwoTier => {
-                        unimplemented!("Two-tier load balancing policy is not implemented");
-                    }
                 }
             };
 

@@ -97,7 +97,6 @@ where
             txn_cnt: 0,
             states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
             dependency_controller: Arc::new(VersionedDependencyController::new()),
-            proxy_loads: Arc::new(DashMap::new()),
             metrics: self.metrics.clone(),
         };
 

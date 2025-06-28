@@ -244,69 +244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dedicated_policy_forwarding() {
-        let config = BenchmarkParameters::new_for_tests();
-        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
-            setup_test_environment(&config).await;
-
-        // Setup proxy channels
-        let (tx_to_proxy0, mut rx_from_processor0) = channel(100);
-        let (tx_to_proxy1, mut rx_from_processor1) = channel(100);
-
-        // Create proxy connections map
-        let proxy_connections = Arc::new(DashMap::new());
-        proxy_connections.insert(0, tx_to_proxy0);
-        proxy_connections.insert(1, tx_to_proxy1);
-
-        // Create owned processor with Dedicated policy
-        let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
-            proxy_connections,
-            policy: LoadBalancingPolicy::Dedicated,
-            index: 0,
-        };
-
-        // Generate transactions
-        let remora_txns = generate_test_transactions(&config, 5).await;
-
-        // Forward transactions
-        owned_processor
-            .forward_owned_txns_in_parallel(remora_txns)
-            .await;
-
-        // Counters for each proxy
-        let mut stateless_on_0 = 0;
-        let mut stateful_on_1 = 0;
-
-        // Check messages received by proxies
-        for _ in 0..5 {
-            if let Some(msg) = rx_from_processor0.recv().await {
-                match msg {
-                    PrimaryToProxyMessage::StatelessTxn(_) => stateless_on_0 += 1,
-                    _ => panic!("Proxy 0 should only receive stateless transactions"),
-                }
-            }
-        }
-        for _ in 0..5 {
-            if let Some(msg) = rx_from_processor1.recv().await {
-                match msg {
-                    PrimaryToProxyMessage::Txn(_, _, _) => stateful_on_1 += 1,
-                    _ => panic!("Proxy 1 should only receive stateful transactions"),
-                }
-            }
-        }
-
-        // We should have received both stateless and stateful versions of each transaction
-        assert_eq!(
-            stateless_on_0, 5,
-            "Proxy 0 should have received 5 stateless transactions"
-        );
-        assert_eq!(
-            stateful_on_1, 5,
-            "Proxy 1 should have received 5 stateful transactions"
-        );
-    }
-
-    #[tokio::test]
     async fn test_shared_processor_forwarding() {
         use crate::executor::versioned_dependency_controller::VersionedDependencyController;
         use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
@@ -336,7 +273,6 @@ mod tests {
             txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
-            proxy_loads: Arc::new(DashMap::new()),
             metrics: Arc::new(Metrics::new_for_tests()),
         };
 
@@ -400,91 +336,6 @@ mod tests {
             (proxy1_stateful == 2 || proxy1_stateful == 3)
                 && (proxy2_stateful == 2 || proxy2_stateful == 3),
             "Each proxy should receive either 2 or 3 stateful transactions"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dedicated_policy_shared_processor() {
-        use crate::executor::versioned_dependency_controller::VersionedDependencyController;
-        use crate::primary::shared_obj_txn_forwarder::SharedObjTxnForwarder;
-        use sui_types::base_types::{ObjectID, SequenceNumber};
-
-        let config = BenchmarkParameters::new_for_contention_tests();
-        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
-            setup_test_environment(&config).await;
-
-        // Setup proxy channels
-        let (tx_to_proxy0, mut rx_from_processor0) = channel(100);
-        let (tx_to_proxy1, mut rx_from_processor1) = channel(100);
-
-        // Create proxy connections map
-        let proxy_connections = Arc::new(DashMap::new());
-        proxy_connections.insert(0, tx_to_proxy0);
-        proxy_connections.insert(1, tx_to_proxy1);
-
-        // Create states_to_proxy map and dependency controller
-        let states_to_proxy = Arc::new(DashMap::new());
-        let dependency_controller = Arc::new(VersionedDependencyController::default());
-
-        // Create shared processor with Dedicated policy
-        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
-            proxy_connections: proxy_connections.clone(),
-            policy: LoadBalancingPolicy::Dedicated,
-            txn_cnt: 0,
-            states_to_proxy: states_to_proxy.clone(),
-            dependency_controller: dependency_controller.clone(),
-            proxy_loads: Arc::new(DashMap::new()),
-            metrics: Arc::new(Metrics::new_for_tests()),
-        };
-
-        // Generate transactions
-        let remora_txns = generate_test_transactions(&config, 5).await;
-        let required_versions = vec![(ObjectID::random(), SequenceNumber::new())];
-
-        // Manually forward transactions with required versions
-        for txn in remora_txns {
-            shared_processor
-                .forward_shared_object_txn(txn, required_versions.clone())
-                .await;
-        }
-
-        // Wait a bit for async processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // With Dedicated policy:
-        // - Stateless transactions should go to proxy 0
-        // - Stateful transactions should go to proxy 1
-        let mut stateless_on_0 = 0;
-        let mut stateful_on_1 = 0;
-
-        // Check messages received by proxy 0 (should be stateless)
-        for _ in 0..5 {
-            if let Some(msg) = rx_from_processor0.recv().await {
-                match msg {
-                    PrimaryToProxyMessage::StatelessTxn(_) => stateless_on_0 += 1,
-                    _ => panic!("Proxy 0 should only receive stateless transactions"),
-                }
-            }
-        }
-
-        // Check messages received by proxy 1 (should be stateful)
-        for _ in 0..5 {
-            if let Some(msg) = rx_from_processor1.recv().await {
-                match msg {
-                    PrimaryToProxyMessage::Txn(_, _, _) => stateful_on_1 += 1,
-                    _ => panic!("Proxy 1 should only receive stateful transactions"),
-                }
-            }
-        }
-
-        // We should have received both stateless on proxy 0 and stateful on proxy 1
-        assert_eq!(
-            stateless_on_0, 5,
-            "Proxy 0 should have received 5 stateless transactions"
-        );
-        assert_eq!(
-            stateful_on_1, 5,
-            "Proxy 1 should have received 5 stateful transactions"
         );
     }
 

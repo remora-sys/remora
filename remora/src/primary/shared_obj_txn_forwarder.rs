@@ -12,7 +12,7 @@ use crate::{
 };
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -125,7 +125,6 @@ where
     pub(crate) txn_cnt: usize,
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -155,10 +154,7 @@ where
         let states_to_proxy = self.states_to_proxy.clone();
         let policy = self.policy.clone();
         let proxy_connections = self.proxy_connections.clone();
-        let proxy_loads = self.proxy_loads.clone();
         let txn_cnt = self.txn_cnt;
-        let verification_duration = transaction.verification_duration();
-        let expected_stateful_duration = transaction.expected_stateful_duration();
         self.txn_cnt += 1;
         let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
@@ -187,9 +183,6 @@ where
                 &states_to_proxy,
                 txn_cnt,
                 &required_versions,
-                &proxy_loads,
-                &verification_duration,
-                &expected_stateful_duration,
             ) {
                 // Use Arc::clone instead of creating deep copies - reduces overhead
                 // Stateless transaction doesn't need missing states
@@ -236,9 +229,6 @@ where
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        verification_duration: &Duration,
-        expected_stateful_duration: &Duration,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => {
@@ -248,22 +238,6 @@ where
                 proxy_connections,
                 states_to_proxy,
                 required_versions,
-                txn_cnt,
-            ),
-            LoadBalancingPolicy::Dedicated => {
-                // Dedicated: proxy 0 for stateless, proxy 1 for stateful
-                Some((1, 0))
-            }
-            LoadBalancingPolicy::Combined => {
-                unimplemented!()
-            }
-            LoadBalancingPolicy::TwoTier => Self::get_proxy_for_shared_objects_two_tier(
-                proxy_connections,
-                states_to_proxy,
-                required_versions,
-                proxy_loads,
-                verification_duration,
-                expected_stateful_duration,
                 txn_cnt,
             ),
         }
@@ -341,58 +315,6 @@ where
             best_proxies[0]
         };
         Some((proxy_index, proxy_index))
-    }
-
-    /// Get assigned proxy for shared objects using two-tier.
-    fn get_proxy_for_shared_objects_two_tier(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        required_versions: &[(ObjectID, SequenceNumber)],
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        verification_duration: &Duration,
-        expected_stateful_duration: &Duration,
-        txn_cnt: usize,
-    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let stateful_proxy_index = Self::get_proxy_for_shared_objects_most_states(
-            proxy_connections,
-            states_to_proxy,
-            required_versions,
-            txn_cnt,
-        )
-        .unwrap()
-        .0;
-
-        // Find the least loaded proxy for stateless execution
-        let stateless_proxy_index = proxy_connections
-            .iter()
-            .min_by_key(|item| {
-                let proxy_id = *item.key();
-                proxy_loads.get(&proxy_id).map_or(0, |load| *load)
-            })
-            .map(|entry| *entry.key())
-            .unwrap_or(0);
-
-        // Update the load for the selected proxies with fine-grained weights
-        // Stateless uses verification duration from workload config
-        // Stateful uses a fixed 200us weight
-        let stateless_weight = verification_duration.as_micros() as usize;
-        let stateful_weight = expected_stateful_duration.as_micros() as usize;
-        if let Some(mut load) = proxy_loads.get_mut(&stateless_proxy_index) {
-            *load += stateless_weight;
-        } else {
-            proxy_loads.insert(stateless_proxy_index, stateless_weight);
-        }
-
-        // Update stateful proxy load
-        if let Some(mut load) = proxy_loads.get_mut(&stateful_proxy_index) {
-            *load += stateful_weight;
-        } else {
-            proxy_loads.insert(stateful_proxy_index, stateful_weight);
-        }
-
-        Some((stateful_proxy_index, stateless_proxy_index))
     }
 
     /// Helper method to determine missing states for a transaction

@@ -24,12 +24,6 @@ pub enum LoadBalancingPolicy {
     RoundRobin,
     /// Send to proxy that already has most of the required states
     Zeus,
-    /// Dedicated: one proxy for stateless, another for stateful
-    Dedicated,
-    /// Combined: one proxy for both stateless and stateful
-    Combined,
-    /// Two-tier: separate policies for stateless and stateful
-    TwoTier,
 }
 
 /// Default channel size for communication between components.
