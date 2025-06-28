@@ -83,7 +83,6 @@ where
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
-            policy: self.policy.clone(),
             index: 0,
             proxy_mode: self.proxy_mode.clone(),
         };

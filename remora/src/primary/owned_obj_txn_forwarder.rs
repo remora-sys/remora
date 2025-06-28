@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    config::{LoadBalancingPolicy, ProxyMode},
+    config::ProxyMode,
     executor::api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
     proxy::core::ProxyId,
 };
@@ -21,7 +21,6 @@ where
 {
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) policy: LoadBalancingPolicy,
     pub(crate) index: usize,
     pub(crate) proxy_mode: ProxyMode,
 }
@@ -52,7 +51,6 @@ where
         }
 
         let start = self.index;
-        let policy = self.policy.clone();
         let proxy_mode = self.proxy_mode.clone();
 
         self.index = (start + transactions.len()) % proxy_count;
@@ -61,35 +59,26 @@ where
         let mut tasks = stream::FuturesUnordered::new();
 
         for (i, tx) in transactions.into_iter().enumerate() {
-            let policy = policy.clone();
             let idx = (start + i) % proxy_count;
             let tx = Arc::new(tx);
             let proxy_connections = self.proxy_connections.clone();
             let fut = async move {
-                match policy {
-                    LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
-                        if let Some(proxy_conn) = proxy_connections.get(&idx) {
-                            if proxy_mode == ProxyMode::Separation {
-                                let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
-                                let msg2 =
-                                    PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
+                if let Some(proxy_conn) = proxy_connections.get(&idx) {
+                    if proxy_mode == ProxyMode::Separation {
+                        let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
+                        let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
 
-                                if proxy_conn.send(msg1).await.is_err() {
-                                    tracing::warn!("Failed to send stateless txn to proxy {}", idx);
-                                }
-                                if proxy_conn.send(msg2).await.is_err() {
-                                    tracing::warn!("Failed to send stateful txn to proxy {}", idx);
-                                }
-                            } else {
-                                let msg = PrimaryToProxyMessage::CombinedTxn(
-                                    tx.clone(),
-                                    idx,
-                                    BTreeMap::new(),
-                                );
-                                if proxy_conn.send(msg).await.is_err() {
-                                    tracing::warn!("Failed to send combined txn to proxy {}", idx);
-                                }
-                            }
+                        if proxy_conn.send(msg1).await.is_err() {
+                            tracing::warn!("Failed to send stateless txn to proxy {}", idx);
+                        }
+                        if proxy_conn.send(msg2).await.is_err() {
+                            tracing::warn!("Failed to send stateful txn to proxy {}", idx);
+                        }
+                    } else {
+                        let msg =
+                            PrimaryToProxyMessage::CombinedTxn(tx.clone(), idx, BTreeMap::new());
+                        if proxy_conn.send(msg).await.is_err() {
+                            tracing::warn!("Failed to send combined txn to proxy {}", idx);
                         }
                     }
                 }

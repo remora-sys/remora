@@ -193,7 +193,6 @@ mod tests {
         // Create owned processor
         let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
             proxy_connections,
-            policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
             proxy_mode: ProxyMode::Separation,
         };
