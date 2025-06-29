@@ -21,4 +21,5 @@ validator_parameters:
     primary: 0
     proxy: 0
   load_balancing_policy: !SDS
+  proxy_mode: !Separation
 parallel_proxy: true
