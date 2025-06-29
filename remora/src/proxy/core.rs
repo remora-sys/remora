@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    config::ProxyMode,
+    config::SeparationMode,
     error::{NodeError, NodeResult},
     executor::{
         api::{
@@ -42,7 +42,7 @@ struct PrimaryMessageProcessor<E: Executor> {
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
-    mode: ProxyMode,
+    mode: SeparationMode,
     metrics: Arc<Metrics>,
 }
 
@@ -80,7 +80,9 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if self.mode == ProxyMode::Separation {
+        if self.mode == SeparationMode::ProxySeparation
+            || self.mode == SeparationMode::PrimarySeparation
+        {
             match message {
                 PrimaryToProxyMessage::StatelessTxn(transaction, verification_duration) => {
                     tracing::debug!(
@@ -146,7 +148,9 @@ where
         required_states: RequiredStates,
     ) {
         // If the stateless result is from the same proxy, look up the handle
-        let rx = if self.mode == ProxyMode::Separation {
+        let rx = if self.mode == SeparationMode::ProxySeparation
+            || self.mode == SeparationMode::PrimarySeparation
+        {
             if stateless_res_proxy_id == self.id {
                 self.stateless_controller
                     .get_dependency(transaction.digest())
@@ -353,8 +357,13 @@ where
                     id,
                     transaction.digest()
                 );
-                if mode == ProxyMode::NoSeparation {
-                    E::verify_transaction(ctx.clone(), *transaction.digest(), transaction.verification_duration()).await;
+                if mode == SeparationMode::NoSeparation {
+                    E::verify_transaction(
+                        ctx.clone(),
+                        *transaction.digest(),
+                        transaction.verification_duration(),
+                    )
+                    .await;
                 }
                 E::execute(ctx, store, transaction.deref().clone()).await
             } else {
@@ -396,7 +405,7 @@ struct ProxyMessageProcessor<E: Executor> {
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
-    mode: ProxyMode,
+    mode: SeparationMode,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyMessageProcessor<E>
@@ -427,7 +436,7 @@ where
                         .await;
                 }
                 InterProxyRequest::Stateless(proxy_id, txn_digest) => {
-                    if self.mode == ProxyMode::NoSeparation {
+                    if self.mode == SeparationMode::NoSeparation {
                         tracing::error!(
                             "Proxy {} received stateless request from proxy {} for transaction {:?}",
                             self.id,
@@ -660,7 +669,7 @@ pub struct ProxyCore<E: Executor> {
     /// The dependency controller for stateless transactions.
     stateless_controller: Arc<OneshotDependencyController>,
     /// The proxy mode (separation or no separation)
-    mode: ProxyMode,
+    mode: SeparationMode,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
 }
@@ -683,7 +692,7 @@ where
         tx_results: Sender<ExecutionResults<E>>,
         rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
-        mode: ProxyMode,
+        mode: SeparationMode,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -749,7 +758,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::{
-        config::{BenchmarkParameters, ProxyMode},
+        config::{BenchmarkParameters, SeparationMode},
         executor::{
             api::{
                 ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
@@ -798,7 +807,7 @@ mod tests {
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies.clone(),
-            ProxyMode::Separation,
+            SeparationMode::NoSeparation,
             metrics,
         );
 

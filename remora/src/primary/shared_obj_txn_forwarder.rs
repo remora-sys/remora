@@ -1,4 +1,5 @@
 use crate::{
+    config::SeparationMode,
     executor::{
         api::{
             ExecutableTransaction, Executor, ExecutorIndex, PrimaryToProxyMessage,
@@ -580,6 +581,7 @@ where
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+    pub(crate) separation_mode: SeparationMode,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -611,6 +613,7 @@ where
         let transaction_arc = Arc::new(transaction);
         let states_to_proxy = self.states_to_proxy.clone();
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
+        let separation_mode = self.separation_mode;
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -633,14 +636,6 @@ where
             if let Some((_digest, proxy_id)) =
                 pre_consensus_routing_plan.remove(transaction_arc.digest())
             {
-                // lookup from the stateless forwarding table
-                let stateless_proxy_id = stateless_forwarding_table
-                    .remove(&transaction_arc.digest())
-                    .map(|(_k, v)| v)
-                    .unwrap_or_else(|| {
-                        tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
-                        0
-                    });
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
                     Some(required_versions),
@@ -649,14 +644,32 @@ where
                 )
                 .await;
 
-                let stateful_msg = PrimaryToProxyMessage::Txn(
-                    Arc::clone(&transaction_arc),
-                    stateless_proxy_id,
-                    stateful_missing_states,
-                );
+                let msg = if separation_mode != SeparationMode::PrimarySeparation {
+                    PrimaryToProxyMessage::CombinedTxn(
+                        Arc::clone(&transaction_arc),
+                        proxy_id,
+                        stateful_missing_states,
+                    )
+                } else {
+                    // lookup from the stateless forwarding table
+                    let stateless_proxy_id = stateless_forwarding_table
+                        .remove(&transaction_arc.digest())
+                        .map(|(_k, v)| v)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "No stateless proxy found for transaction, defaulting to 0"
+                            );
+                            0
+                        });
 
-                Self::send_to_proxy(&proxy_connections, proxy_id, stateful_msg).await;
+                    PrimaryToProxyMessage::Txn(
+                        Arc::clone(&transaction_arc),
+                        stateless_proxy_id,
+                        stateful_missing_states,
+                    )
+                };
 
+                Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
                 metrics.update_metrics(transaction_arc.timestamp());
             } else {
                 tracing::warn!(

@@ -76,7 +76,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             proxy_connections,
             rx_committed_txns,
             config.validator_parameters.load_balancing_policy.clone(),
-            config.validator_parameters.proxy_mode.clone(),
+            config.validator_parameters.separation_mode.clone(),
             metrics.clone(),
         )
         .spawn(rx_pre_consensus_txns, rx_stateless_txns);
@@ -91,7 +91,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_committed_txns,
             tx_stateless_txns,
             tx_pre_consensus_txns,
-            config.validator_parameters.proxy_mode,
+            config.validator_parameters.separation_mode,
         )
         .spawn();
 

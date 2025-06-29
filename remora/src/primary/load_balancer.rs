@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{LoadBalancingPolicy, DEFAULT_CHANNEL_SIZE},
+    config::{LoadBalancingPolicy, SeparationMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
         api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
@@ -39,6 +39,8 @@ pub struct LoadBalancer<E: Executor> {
     rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
     /// The load balancing policy.
     policy: PreConsensusSchedulingPolicy,
+    /// The proxy mode.
+    separation_mode: SeparationMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
 }
@@ -54,14 +56,16 @@ where
         >,
         rx_committed_txns: Receiver<Vec<RemoraTransaction<E>>>,
         policy: PreConsensusSchedulingPolicy,
+        separation_mode: SeparationMode,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             _phantom: PhantomData,
             proxy_connections,
             rx_committed_txns,
-            metrics,
             policy,
+            separation_mode,
+            metrics,
         }
     }
 
@@ -109,6 +113,7 @@ where
             metrics: self.metrics.clone(),
             pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
             stateless_forwarding_table: stateless_forwarding_table.clone(),
+            separation_mode: self.separation_mode,
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
@@ -116,13 +121,6 @@ where
             proxy_loads.clone(),
             self.policy.clone(),
         );
-
-        let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
-            proxy_connections: self.proxy_connections.clone(),
-            proxy_loads: proxy_loads.clone(),
-            stateless_forwarding_table: stateless_forwarding_table.clone(),
-            rx_stateless_txns,
-        };
 
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -148,6 +146,7 @@ where
             });
         });
 
+        // TODO: use more worker threads when not in primary separation mode
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(num_cpus::get() / 2)
@@ -173,16 +172,24 @@ where
             });
         });
 
-        thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(8)
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                stateless_txn_processor.forward_stateless_txn().await;
+        if self.separation_mode == SeparationMode::PrimarySeparation {
+            let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
+                proxy_connections: self.proxy_connections.clone(),
+                proxy_loads: proxy_loads.clone(),
+                stateless_forwarding_table: stateless_forwarding_table.clone(),
+                rx_stateless_txns,
+            };
+            thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(8)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    stateless_txn_processor.forward_stateless_txn().await;
+                });
             });
-        });
+        }
 
         // Return the senders so they can be used in the run loop
         (owned_txn_sender, shared_txn_sender)

@@ -3,6 +3,7 @@
 
 use std::{marker::PhantomData, num::NonZeroUsize};
 
+use crate::config::SeparationMode;
 use crate::executor::api::{ExecutableTransaction, Executor, RemoraTransaction};
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,8 @@ pub struct MockConsensus<M, E: Executor + Send + 'static> {
     current_batch: ConsensusCommit<RemoraTransaction<E>>,
     /// The number of batches currently in-flight.
     current_inflight_batches: usize,
+    /// The proxy mode.
+    separation_mode: SeparationMode,
     /// The phantom data for the executor.
     _phantom: PhantomData<E>,
 }
@@ -83,6 +86,7 @@ where
         tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
         tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
         tx_pre_consensus_scheduling: Sender<ConsensusCommit<RemoraTransaction<E>>>,
+        separation_mode: SeparationMode,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
@@ -94,6 +98,7 @@ where
             tx_pre_consensus_scheduling,
             current_batch: Vec::with_capacity(batch_size),
             current_inflight_batches: 0,
+            separation_mode,
             _phantom: PhantomData,
         }
     }
@@ -119,7 +124,9 @@ where
                 // in-flight batches, wait for some to complete before accepting new transactions.
                 Some(transaction) = self.rx_load_balancer.recv(),
                     if self.current_inflight_batches < max_inflight_batches => {
-                    self.tx_stateless_txns.send((*transaction.digest(), transaction.verification_duration())).await.unwrap();
+                    if self.separation_mode == SeparationMode::PrimarySeparation {
+                        self.tx_stateless_txns.send((*transaction.digest(), transaction.verification_duration())).await.unwrap();
+                    }
 
                     self.current_batch.push(transaction);
                     if self.current_batch.len() >= batch_size {

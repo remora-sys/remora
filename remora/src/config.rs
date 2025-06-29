@@ -92,8 +92,8 @@ pub struct ValidatorParameters {
     #[serde(default = "default_validator_config::default_load_balancing_policy")]
     pub load_balancing_policy: PreConsensusSchedulingPolicy,
     /// The proxy mode (separation or no separation)
-    #[serde(default = "default_validator_config::default_proxy_mode")]
-    pub proxy_mode: ProxyMode,
+    #[serde(default = "default_validator_config::default_separation_mode")]
+    pub separation_mode: SeparationMode,
 }
 
 impl ValidatorParameters {
@@ -104,7 +104,7 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
-    use crate::config::ProxyMode;
+    use crate::config::SeparationMode;
     use crate::primary::{
         mock_consensus::{models::FixedDelay, MockConsensusParameters},
         shared_obj_txn_forwarder::PreConsensusSchedulingPolicy,
@@ -122,8 +122,8 @@ mod default_validator_config {
         PreConsensusSchedulingPolicy::LDS
     }
 
-    pub fn default_proxy_mode() -> ProxyMode {
-        ProxyMode::Separation
+    pub fn default_separation_mode() -> SeparationMode {
+        SeparationMode::NoSeparation
     }
 }
 
@@ -133,7 +133,7 @@ impl Default for ValidatorParameters {
             consensus_delay_model: default_validator_config::default_consensus_delay_model(),
             consensus_parameters: default_validator_config::default_consensus_parameters(),
             load_balancing_policy: default_validator_config::default_load_balancing_policy(),
-            proxy_mode: default_validator_config::default_proxy_mode(),
+            separation_mode: default_validator_config::default_separation_mode(),
         }
     }
 }
@@ -154,11 +154,14 @@ pub struct ProxyInfo {
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub enum ProxyMode {
-    /// The proxy separates the stateful and stateless transactions.
-    Separation,
+pub enum SeparationMode {
     /// The proxy does not separate the stateful and stateless transactions.
     NoSeparation,
+    /// The proxy separates the stateful and stateless transactions.
+    ProxySeparation,
+    /// The load balancer separates the stateful and stateless transactions
+    /// and proxies also separate the stateful and stateless transactions.
+    PrimarySeparation,
 }
 
 /// The configuration for the validator, containing network addresses.
