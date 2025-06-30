@@ -1,5 +1,5 @@
 {
-  "annotations": {
+	"annotations": {
     "list": [
       {
         "builtIn": 1,
@@ -106,11 +106,24 @@
             "uid": "Fixed-UID-testbed"
           },
           "editorMode": "code",
-          "expr": "rate(latency_s_count[1m])",
+	  "expr": "rate(latency_s_count[10s])",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latency_s_count{instance!~\"node-0.*\"}[10s]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Overall exec TPS",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "TPS",
@@ -201,7 +214,7 @@
             "uid": "Fixed-UID-testbed"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(latency_s_bucket[1m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(latency_s_bucket[10s])) by (le))",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -213,7 +226,7 @@
             "uid": "Fixed-UID-testbed"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.90, sum(rate(latency_s_bucket[1m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(latency_s_bucket[10s])) by (le))",
           "hide": false,
           "instant": false,
           "legendFormat": "__auto",
