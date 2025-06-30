@@ -22,6 +22,8 @@ use crate::{
 pub enum LoadBalancingPolicy {
     /// Simple round-robin distribution
     RoundRobin,
+    /// Random selection of proxy
+    Random,
     /// Send to proxy that already has most of the required states
     Zeus,
 }

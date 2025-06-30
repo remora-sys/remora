@@ -11,6 +11,7 @@ use crate::{
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
+use rand::Rng;
 use rustc_hash::FxHashMap;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use sui_types::base_types::{ObjectID, SequenceNumber};
@@ -248,6 +249,9 @@ where
                 required_versions,
                 txn_cnt,
             ),
+            LoadBalancingPolicy::Random => {
+                Self::get_proxy_for_shared_objects_random(proxy_connections)
+            }
         }
     }
 
@@ -265,6 +269,20 @@ where
 
         let proxy_index = txn_cnt % proxy_count;
 
+        Some((proxy_index, proxy_index))
+    }
+
+    fn get_proxy_for_shared_objects_random(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
+        let proxy_count = proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        let proxy_index = rand::thread_rng().gen_range(0..proxy_count);
         Some((proxy_index, proxy_index))
     }
 
