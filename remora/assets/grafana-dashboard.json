@@ -118,7 +118,7 @@
             "uid": "Fixed-UID-testbed"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latency_s_count{instance!~\"node-0.*\"}[10s]))",
+          "expr": "sum(rate(latency_s_count{job!='instance-node-0'}[10s]))",
           "hide": false,
           "instant": false,
           "legendFormat": "Overall exec TPS",
