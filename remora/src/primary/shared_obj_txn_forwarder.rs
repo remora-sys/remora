@@ -64,7 +64,7 @@ where
             last_hot_set: FxHashSet::default(),
             last_hot_set_proxy: None,
             policy,
-            object_last_proxy: FxHashMap::default(),
+            object_last_proxy: FxHashMap::with_capacity_and_hasher(10000000, Default::default()),
         }
     }
 
@@ -142,71 +142,20 @@ where
 
         if subgraphs.is_empty() {
             tracing::debug!("Found 0 subgraphs");
-            return;
-        }
-
-        let num_proxies = self.proxy_connections.len();
-        if num_proxies == 0 {
-            tracing::warn!("No proxies available for pre-consensus scheduling");
-            return;
-        }
-
-        tracing::debug!("Found {} subgraphs", subgraphs.len());
-        if !subgraphs.is_empty() {
+        } else {
+            tracing::debug!("Found {} subgraphs", subgraphs.len());
             tracing::debug!("Largest subgraph has {} nodes", subgraphs[0].len());
         }
 
         let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
 
-        // 1. Handle the largest subgraph with locality score.
-        let largest_subgraph_nodes = &subgraphs[0];
-        let (largest_proxy_id, largest_subgraph_digests, largest_subgraph_objects) =
-            self.assign_proxy_for_subgraph(graph, largest_subgraph_nodes, &tx_map);
-        self.update_state_for_sds(
-            &largest_subgraph_digests,
-            &largest_subgraph_objects,
-            largest_proxy_id,
-            &tx_map,
-        );
-
-        // 2. Round-robin for the rest of the subgraphs.
-        let mut other_proxies: Vec<_> = (0..num_proxies)
-            .filter(|id| *id != largest_proxy_id)
-            .collect();
-        if other_proxies.is_empty() {
-            other_proxies.push(largest_proxy_id);
-        }
-
-        let mut other_proxy_idx = 0;
-        for subgraph_nodes in subgraphs.iter().skip(1) {
-            let proxy_id = other_proxies[other_proxy_idx % other_proxies.len()];
-            other_proxy_idx += 1;
-
-            let (subgraph_digests, subgraph_objects) =
-                self.get_subgraph_details(graph, subgraph_nodes, &tx_map);
+        for subgraph_nodes in subgraphs {
+            let (proxy_id, subgraph_digests, subgraph_objects) =
+                self.assign_proxy_for_subgraph(graph, &subgraph_nodes, &tx_map);
             self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, &tx_map);
         }
 
         self.log_load_summary("SDS");
-    }
-
-    fn get_subgraph_details(
-        &self,
-        graph: &DiGraph<TransactionDigest, ()>,
-        subgraph_nodes: &[petgraph::graph::NodeIndex],
-        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
-    ) -> (FxHashSet<TransactionDigest>, FxHashSet<ObjectID>) {
-        let subgraph_digests: FxHashSet<_> = subgraph_nodes.iter().map(|&idx| graph[idx]).collect();
-
-        let mut subgraph_objects = FxHashSet::default();
-        for digest in &subgraph_digests {
-            if let Some(tx) = tx_map.get(digest) {
-                for (object_id, _) in tx.shared_objects() {
-                    subgraph_objects.insert(*object_id);
-                }
-            }
-        }
-        (subgraph_digests, subgraph_objects)
     }
 
     fn assign_proxy_for_subgraph(
@@ -214,13 +163,17 @@ where
         graph: &DiGraph<TransactionDigest, ()>,
         subgraph_nodes: &[petgraph::graph::NodeIndex],
         tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
-    ) -> (
-        ExecutorIndex,
-        FxHashSet<TransactionDigest>,
-        FxHashSet<ObjectID>,
-    ) {
-        let (subgraph_digests, subgraph_objects) =
-            self.get_subgraph_details(graph, subgraph_nodes, tx_map);
+    ) -> (ExecutorIndex, FxHashSet<TransactionDigest>, Vec<ObjectID>) {
+        let subgraph_digests: FxHashSet<_> = subgraph_nodes.iter().map(|&idx| graph[idx]).collect();
+
+        let mut subgraph_objects = Vec::new();
+        for digest in &subgraph_digests {
+            if let Some(tx) = tx_map.get(digest) {
+                for (object_id, _) in tx.shared_objects() {
+                    subgraph_objects.push(*object_id);
+                }
+            }
+        }
 
         let num_proxies = self.proxy_connections.len();
         let best_proxy = (0..num_proxies)
@@ -248,7 +201,7 @@ where
     fn update_state_for_sds(
         &mut self,
         subgraph_digests: &FxHashSet<TransactionDigest>,
-        subgraph_objects: &FxHashSet<ObjectID>,
+        subgraph_objects: &Vec<ObjectID>,
         proxy_id: ExecutorIndex,
         tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
     ) {
