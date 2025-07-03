@@ -39,7 +39,7 @@ where
     pub(crate) last_hot_set: FxHashSet<ObjectID>,
     pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
     pub(crate) policy: PreConsensusSchedulingPolicy,
-    pub(crate) object_last_proxy: FxHashMap<ObjectID, ExecutorIndex>,
+    pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -64,7 +64,7 @@ where
             last_hot_set: FxHashSet::default(),
             last_hot_set_proxy: None,
             policy,
-            object_last_proxy: FxHashMap::with_capacity_and_hasher(10000000, Default::default()),
+            object_last_proxy: vec![None; 10000000],
         }
     }
 
@@ -100,7 +100,7 @@ where
                 self.apply_sds_policy(&transactions, &graph);
             }
         }
-        tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
+        tracing::info!("Pre-consensus scheduling policy took {:?}", start.elapsed());
     }
 
     fn apply_lds_policy(
@@ -149,13 +149,28 @@ where
 
         let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
 
-        for subgraph_nodes in subgraphs {
-            let (proxy_id, subgraph_digests, subgraph_objects) =
-                self.assign_proxy_for_subgraph(graph, &subgraph_nodes, &tx_map);
+        // Parallel computation of proxy assignments
+        let start = std::time::Instant::now();
+        let assignments: Vec<_> = subgraphs
+            .iter()
+            .map(|subgraph_nodes| self.assign_proxy_for_subgraph(graph, subgraph_nodes, &tx_map))
+            .collect();
+        tracing::debug!("Parallel proxy assignments took {:?}", start.elapsed());
+
+        // Sequential state updates (requires &mut self)
+        let start = std::time::Instant::now();
+        for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
             self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, &tx_map);
         }
-
+        tracing::debug!("Sequential state updates took {:?}", start.elapsed());
         self.log_load_summary("SDS");
+    }
+
+    #[inline]
+    fn object_id_24bit_index(object_id: &ObjectID) -> usize {
+        let bytes = object_id.as_ref();
+        let index = (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16);
+        index
     }
 
     fn assign_proxy_for_subgraph(
@@ -180,11 +195,15 @@ where
             .max_by(|&p1, &p2| {
                 let locality1 = subgraph_objects
                     .iter()
-                    .filter(|obj| self.object_last_proxy.get(obj) == Some(&p1))
+                    .filter(|obj| {
+                        self.object_last_proxy[Self::object_id_24bit_index(obj)] == Some(p1)
+                    })
                     .count();
                 let locality2 = subgraph_objects
                     .iter()
-                    .filter(|obj| self.object_last_proxy.get(obj) == Some(&p2))
+                    .filter(|obj| {
+                        self.object_last_proxy[Self::object_id_24bit_index(obj)] == Some(p2)
+                    })
                     .count();
 
                 let load1 = self.proxy_loads.get(&p1).map_or(0, |l| *l.value());
@@ -219,7 +238,7 @@ where
             .or_insert(total_weight);
 
         for object_id in subgraph_objects {
-            self.object_last_proxy.insert(*object_id, proxy_id);
+            self.object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
         }
     }
 
