@@ -58,6 +58,57 @@ impl<E: Executor> LoadGenerator<E> {
         arrival.sample(rng)
     }
 
+    // Helper function to send a single transaction
+    #[inline]
+    async fn send_single_transaction(
+        tx: E::Transaction,
+        sender: &Sender<RemoraTransaction<E>>,
+        verification_duration: Duration,
+        expected_stateful_duration: Duration,
+    ) -> Result<(), ()> {
+        let timestamp = Metrics::now().as_secs_f64();
+        let full_tx = TransactionWithTimestamp::new(
+            tx.clone(),
+            timestamp,
+            tx.shared_object_ids(),
+            verification_duration,
+            expected_stateful_duration,
+        );
+
+        sender.send(full_tx).await.map_err(|_| ())
+    }
+
+    // Helper function to handle timing, sending, and interval calculation
+    #[inline]
+    async fn send_with_timing(
+        tx: E::Transaction,
+        sender: &Sender<RemoraTransaction<E>>,
+        next_ts: &mut Instant,
+        rng: &mut Mt64,
+        arrival: Distribution,
+        verification_duration: Duration,
+        expected_stateful_duration: Duration,
+    ) -> Result<(), ()> {
+        // Wait until the next interval
+        while Instant::now() < *next_ts {
+            std::hint::spin_loop();
+        }
+
+        // Send the transaction
+        Self::send_single_transaction(
+            tx,
+            sender,
+            verification_duration,
+            expected_stateful_duration,
+        )
+        .await?;
+
+        // Calculate the next interval
+        *next_ts += Duration::from_nanos(Self::gen_inter_arrival(rng, arrival));
+
+        Ok(())
+    }
+
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
         transactions: Vec<E::Transaction>,
@@ -70,36 +121,65 @@ impl<E: Executor> LoadGenerator<E> {
     {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
         let mut next_ts = Instant::now();
+        let mut tx_iter = transactions.into_iter().enumerate();
 
-        for (counter, tx) in transactions.into_iter().enumerate() {
-            // Wait until the next interval before sending the next transaction
-            while Instant::now() < next_ts {
-                std::hint::spin_loop();
+        // Warm-up phase: 2 seconds at low rate (10% of normal rate)
+        let warmup_arrival = match arrival {
+            Distribution::Zero => Distribution::Zero,
+            Distribution::Constant(interval) => Distribution::Constant(interval * 10),
+            Distribution::Exponential(rate) => Distribution::Exponential(rate * 10.0),
+            Distribution::Bimodal(p, v1, v2) => Distribution::Bimodal(p, v1 * 10, v2 * 10),
+        };
+        let warmup_end = Instant::now() + Duration::from_secs(2);
+
+        tracing::debug!("Starting warm-up phase for 2 seconds");
+
+        while Instant::now() < warmup_end {
+            if let Some((_, tx)) = tx_iter.next() {
+                if Self::send_with_timing(
+                    tx,
+                    &sender,
+                    &mut next_ts,
+                    &mut rng,
+                    warmup_arrival,
+                    verification_duration,
+                    expected_stateful_duration,
+                )
+                .await
+                .is_err()
+                {
+                    tracing::error!("Failed to send transaction during warm-up");
+                    return;
+                }
+            } else {
+                break;
             }
+        }
 
-            // Get the current timestamp for metrics
-            let timestamp = Metrics::now().as_secs_f64();
-            let full_tx = TransactionWithTimestamp::new(
-                tx.clone(),
-                timestamp,
-                tx.shared_object_ids(),
+        tracing::debug!("Warm-up phase completed, starting normal rate submission");
+
+        // Normal phase: continue with remaining transactions at normal rate
+        for (counter, tx) in tx_iter {
+            if Self::send_with_timing(
+                tx,
+                &sender,
+                &mut next_ts,
+                &mut rng,
+                arrival,
                 verification_duration,
                 expected_stateful_duration,
-            );
-
-            // Send the transaction
-            if sender.send(full_tx).await.is_err() {
+            )
+            .await
+            .is_err()
+            {
                 tracing::error!("Failed to send transaction");
-                break; // Exit the loop on send failure
+                break;
             }
 
-            // Increment transaction counter for logging
+            // Log progress
             if counter > 0 && counter % 1000 == 0 {
                 tracing::debug!("Submitted {} transactions", counter);
             }
-
-            // Calculate the next interval
-            next_ts += Duration::from_nanos(Self::gen_inter_arrival(&mut rng, arrival));
         }
     }
 
