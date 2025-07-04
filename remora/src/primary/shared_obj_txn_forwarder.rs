@@ -157,7 +157,7 @@ where
             .collect();
         tracing::debug!("Parallel proxy assignments took {:?}", start.elapsed());
 
-        // Sequential state updates (requires &mut self)
+        // Sequential state updates
         let start = std::time::Instant::now();
         for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
             self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, &tx_map);
@@ -170,7 +170,7 @@ where
     fn object_id_24bit_index(object_id: &ObjectID) -> usize {
         let bytes = object_id.as_ref();
         let index = (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16);
-        index
+        index - 1
     }
 
     fn assign_proxy_for_subgraph(
@@ -191,28 +191,29 @@ where
         }
 
         let num_proxies = self.proxy_connections.len();
-        let best_proxy = (0..num_proxies)
-            .max_by(|&p1, &p2| {
-                let locality1 = subgraph_objects
-                    .iter()
-                    .filter(|obj| {
-                        self.object_last_proxy[Self::object_id_24bit_index(obj)] == Some(p1)
-                    })
-                    .count();
-                let locality2 = subgraph_objects
-                    .iter()
-                    .filter(|obj| {
-                        self.object_last_proxy[Self::object_id_24bit_index(obj)] == Some(p2)
-                    })
-                    .count();
+        let mut locality_count = vec![0usize; num_proxies];
 
-                let load1 = self.proxy_loads.get(&p1).map_or(0, |l| *l.value());
-                let load2 = self.proxy_loads.get(&p2).map_or(0, |l| *l.value());
+        for obj in &subgraph_objects {
+            let idx = Self::object_id_24bit_index(obj);
+            if let Some(proxy_id) = self.object_last_proxy[idx] {
+                locality_count[proxy_id] += 1;
+            }
+        }
 
-                // Prioritize locality, then use load to break ties.
-                (locality1, std::cmp::Reverse(load1)).cmp(&(locality2, std::cmp::Reverse(load2)))
-            })
-            .unwrap_or(0);
+        // Find max locality
+        let max_locality = *locality_count.iter().max().unwrap_or(&0);
+
+        // Collect all proxies with max locality
+        let best_candidates: Vec<_> = (0..num_proxies)
+            .filter(|&p| locality_count[p] == max_locality)
+            .collect();
+
+        // Randomly choose among the best candidates
+        let best_proxy = if best_candidates.is_empty() {
+            0
+        } else {
+            best_candidates[fastrand::usize(..best_candidates.len())]
+        };
 
         (best_proxy, subgraph_digests, subgraph_objects)
     }
