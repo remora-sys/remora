@@ -4,7 +4,7 @@
 use dashmap::DashMap;
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -106,11 +106,7 @@ where
             .shared_object_versions
             .reserve(10000000);
 
-        let proxy_loads = Arc::new(
-            (0..self.proxy_connections.len())
-                .map(|_| AtomicUsize::new(0))
-                .collect::<Vec<_>>(),
-        );
+        let proxy_loads = Arc::new(DashMap::new());
         let stateless_forwarding_table = Arc::new(DashMap::new());
         let pre_consensus_routing_plan = Arc::new(DashMap::new());
 
@@ -123,7 +119,7 @@ where
             pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
             stateless_forwarding_table: stateless_forwarding_table.clone(),
             separation_mode: self.separation_mode,
-            proxy_loads: proxy_loads.clone(),
+            counter: 0,
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),

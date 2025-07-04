@@ -17,10 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
@@ -43,7 +40,7 @@ where
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) _phantom: PhantomData<E>,
-    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) last_hot_set: FxHashSet<ObjectID>,
     pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
     pub(crate) policy: PreConsensusSchedulingPolicy,
@@ -61,7 +58,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
-        proxy_loads: Arc<Vec<AtomicUsize>>,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         policy: PreConsensusSchedulingPolicy,
     ) -> Self {
         Self {
@@ -108,7 +105,7 @@ where
                 self.apply_sds_policy(&transactions, &graph);
             }
         }
-        tracing::info!("Pre-consensus scheduling policy took {:?}", start.elapsed());
+        tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
     }
 
     fn apply_lds_policy(
@@ -267,7 +264,10 @@ where
             }
         }
 
-        self.proxy_loads[proxy_id].fetch_add(total_weight, Ordering::Relaxed);
+        self.proxy_loads
+            .entry(proxy_id)
+            .and_modify(|load| *load += total_weight)
+            .or_insert(total_weight);
 
         for object_id in subgraph_objects {
             self.object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
@@ -327,9 +327,8 @@ where
     fn find_least_loaded_proxy(&self) -> ExecutorIndex {
         self.proxy_loads
             .iter()
-            .enumerate()
-            .min_by_key(|(_, entry)| entry.load(Ordering::Relaxed))
-            .map(|(idx, _)| idx)
+            .min_by_key(|entry| *entry.value())
+            .map(|entry| *entry.key())
             .unwrap_or(0)
     }
 
@@ -353,7 +352,10 @@ where
 
             self.pre_consensus_routing_plan.insert(*digest, proxy_id);
             let weight = transaction.expected_stateful_duration().as_micros() as usize;
-            self.proxy_loads[proxy_id].fetch_add(weight, Ordering::Relaxed);
+            self.proxy_loads
+                .entry(proxy_id)
+                .and_modify(|load| *load += weight)
+                .or_insert(weight);
         }
     }
 
@@ -448,11 +450,7 @@ where
     }
 
     fn log_load_summary(&self, policy_name: &str) {
-        let total_load: usize = self
-            .proxy_loads
-            .iter()
-            .map(|e| e.load(Ordering::Relaxed))
-            .sum();
+        let total_load: usize = self.proxy_loads.iter().map(|e| *e.value()).sum();
         if total_load == 0 {
             return;
         }
@@ -460,15 +458,7 @@ where
             .proxy_loads
             .iter()
             .enumerate()
-            .map(|(idx, e)| {
-                (
-                    idx,
-                    format!(
-                        "{:.2}",
-                        e.load(Ordering::Relaxed) as f64 / total_load as f64
-                    ),
-                )
-            })
+            .map(|(idx, e)| (idx, format!("{:.2}", *e.value() as f64 / total_load as f64)))
             .collect();
         tracing::debug!(
             "{} policy decided load ratios: {:?}",
@@ -592,7 +582,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) separation_mode: SeparationMode,
-    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
+    pub(crate) counter: usize,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -610,15 +600,6 @@ where
         }
     }
 
-    fn find_least_loaded_proxy(proxy_loads: Arc<Vec<AtomicUsize>>) -> ExecutorIndex {
-        proxy_loads
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, entry)| entry.load(Ordering::Relaxed))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
-    }
-
     /// Forwards transactions with shared objects to the appropriate proxy.
     pub(crate) async fn forward_shared_object_txn(
         &mut self,
@@ -634,7 +615,8 @@ where
         let states_to_proxy = self.states_to_proxy.clone();
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
         let separation_mode = self.separation_mode;
-        let proxy_loads = self.proxy_loads.clone();
+        let counter = self.counter;
+        self.counter += 1;
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -659,7 +641,8 @@ where
             {
                 proxy_id
             } else {
-                Self::find_least_loaded_proxy(proxy_loads)
+                // Use random for small subgraphs
+                counter % proxy_connections.len()
             };
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
@@ -788,7 +771,7 @@ where
 {
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
 }
@@ -807,10 +790,13 @@ where
                 let proxy = conn
                     .iter()
                     .map(|entry| *entry.key())
-                    .min_by_key(|&proxy_id| proxy_loads[proxy_id].load(Ordering::Relaxed))
+                    .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
                     .unwrap_or(0);
                 let weight = duration.as_micros() as usize;
-                proxy_loads[proxy].fetch_add(weight, Ordering::Relaxed);
+                proxy_loads
+                    .entry(proxy)
+                    .and_modify(|load| *load += weight)
+                    .or_insert(weight);
                 SharedObjTxnForwarder::<E>::send_to_proxy(
                     &conn,
                     proxy,
