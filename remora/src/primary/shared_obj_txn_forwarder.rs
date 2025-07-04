@@ -14,7 +14,15 @@ use dashmap::DashMap;
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -35,7 +43,7 @@ where
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) _phantom: PhantomData<E>,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
     pub(crate) last_hot_set: FxHashSet<ObjectID>,
     pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
     pub(crate) policy: PreConsensusSchedulingPolicy,
@@ -53,7 +61,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
-        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        proxy_loads: Arc<Vec<AtomicUsize>>,
         policy: PreConsensusSchedulingPolicy,
     ) -> Self {
         Self {
@@ -140,30 +148,53 @@ where
         let mut subgraphs = self.find_all_subgraphs(graph);
         subgraphs.sort_by_key(|subgraph| std::cmp::Reverse(subgraph.len()));
 
-        if subgraphs.is_empty() {
-            tracing::debug!("Found 0 subgraphs");
-        } else {
-            tracing::debug!("Found {} subgraphs", subgraphs.len());
-            tracing::debug!("Largest subgraph has {} nodes", subgraphs[0].len());
+        // Split subgraphs into two collections
+        let (small_subgraphs, large_subgraphs): (Vec<_>, Vec<_>) = subgraphs
+            .into_iter()
+            .partition(|subgraph| subgraph.len() < 2);
+
+        tracing::debug!(
+            "Found {} small subgraphs (< 2 nodes)",
+            small_subgraphs.len()
+        );
+        tracing::debug!(
+            "Found {} large subgraphs (>= 2 nodes)",
+            large_subgraphs.len()
+        );
+
+        if !large_subgraphs.is_empty() {
+            tracing::debug!("Largest subgraph has {} nodes", large_subgraphs[0].len());
         }
 
         let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
 
-        // Parallel computation of proxy assignments
+        // Handle large subgraphs
         let start = std::time::Instant::now();
-        let assignments: Vec<_> = subgraphs
+        if !large_subgraphs.is_empty() {
+            self.handle_large_subgraphs(graph, &large_subgraphs, &tx_map);
+        }
+        tracing::debug!("Large subgraphs processing took {:?}", start.elapsed());
+
+        #[cfg(debug_assertions)]
+        self.log_load_summary("SDS");
+    }
+
+    fn handle_large_subgraphs(
+        &mut self,
+        graph: &DiGraph<TransactionDigest, ()>,
+        large_subgraphs: &[Vec<petgraph::graph::NodeIndex>],
+        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
+    ) {
+        // Locality-based assignment for large subgraphs
+        let assignments: Vec<_> = large_subgraphs
             .iter()
-            .map(|subgraph_nodes| self.assign_proxy_for_subgraph(graph, subgraph_nodes, &tx_map))
+            .map(|subgraph_nodes| self.assign_large_subgraph_proxy(graph, subgraph_nodes, tx_map))
             .collect();
-        tracing::debug!("Parallel proxy assignments took {:?}", start.elapsed());
 
         // Sequential state updates
-        let start = std::time::Instant::now();
         for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
-            self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, &tx_map);
+            self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, tx_map);
         }
-        tracing::debug!("Sequential state updates took {:?}", start.elapsed());
-        self.log_load_summary("SDS");
     }
 
     #[inline]
@@ -173,7 +204,7 @@ where
         index - 1
     }
 
-    fn assign_proxy_for_subgraph(
+    fn assign_large_subgraph_proxy(
         &self,
         graph: &DiGraph<TransactionDigest, ()>,
         subgraph_nodes: &[petgraph::graph::NodeIndex],
@@ -215,6 +246,10 @@ where
             best_candidates[fastrand::usize(..best_candidates.len())]
         };
 
+        for digest in &subgraph_digests {
+            self.pre_consensus_routing_plan.insert(*digest, best_proxy);
+        }
+
         (best_proxy, subgraph_digests, subgraph_objects)
     }
 
@@ -227,16 +262,12 @@ where
     ) {
         let mut total_weight = 0;
         for digest in subgraph_digests {
-            self.pre_consensus_routing_plan.insert(*digest, proxy_id);
             if let Some(tx) = tx_map.get(digest) {
                 total_weight += tx.expected_stateful_duration().as_micros() as usize;
             }
         }
 
-        self.proxy_loads
-            .entry(proxy_id)
-            .and_modify(|load| *load += total_weight)
-            .or_insert(total_weight);
+        self.proxy_loads[proxy_id].fetch_add(total_weight, Ordering::Relaxed);
 
         for object_id in subgraph_objects {
             self.object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
@@ -296,8 +327,9 @@ where
     fn find_least_loaded_proxy(&self) -> ExecutorIndex {
         self.proxy_loads
             .iter()
-            .min_by_key(|entry| *entry.value())
-            .map(|entry| *entry.key())
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.load(Ordering::Relaxed))
+            .map(|(idx, _)| idx)
             .unwrap_or(0)
     }
 
@@ -321,10 +353,7 @@ where
 
             self.pre_consensus_routing_plan.insert(*digest, proxy_id);
             let weight = transaction.expected_stateful_duration().as_micros() as usize;
-            self.proxy_loads
-                .entry(proxy_id)
-                .and_modify(|load| *load += weight)
-                .or_insert(weight);
+            self.proxy_loads[proxy_id].fetch_add(weight, Ordering::Relaxed);
         }
     }
 
@@ -419,17 +448,25 @@ where
     }
 
     fn log_load_summary(&self, policy_name: &str) {
-        let total_load: usize = self.proxy_loads.iter().map(|e| *e.value()).sum();
+        let total_load: usize = self
+            .proxy_loads
+            .iter()
+            .map(|e| e.load(Ordering::Relaxed))
+            .sum();
         if total_load == 0 {
             return;
         }
         let load_ratios: BTreeMap<_, _> = self
             .proxy_loads
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(idx, e)| {
                 (
-                    *e.key(),
-                    format!("{:.2}", *e.value() as f64 / total_load as f64),
+                    idx,
+                    format!(
+                        "{:.2}",
+                        e.load(Ordering::Relaxed) as f64 / total_load as f64
+                    ),
                 )
             })
             .collect();
@@ -555,6 +592,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) separation_mode: SeparationMode,
+    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -572,6 +610,15 @@ where
         }
     }
 
+    fn find_least_loaded_proxy(proxy_loads: Arc<Vec<AtomicUsize>>) -> ExecutorIndex {
+        proxy_loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.load(Ordering::Relaxed))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
     /// Forwards transactions with shared objects to the appropriate proxy.
     pub(crate) async fn forward_shared_object_txn(
         &mut self,
@@ -587,6 +634,7 @@ where
         let states_to_proxy = self.states_to_proxy.clone();
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
         let separation_mode = self.separation_mode;
+        let proxy_loads = self.proxy_loads.clone();
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -606,50 +654,47 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            if let Some((_digest, proxy_id)) =
+            let proxy_id = if let Some((_digest, proxy_id)) =
                 pre_consensus_routing_plan.remove(transaction_arc.digest())
             {
-                let stateful_missing_states = Self::get_missing_states_for_transaction(
-                    &transaction_arc,
-                    Some(required_versions),
-                    proxy_id,
-                    states_to_proxy,
-                )
-                .await;
-
-                let msg = if separation_mode != SeparationMode::PrimarySeparation {
-                    PrimaryToProxyMessage::CombinedTxn(
-                        Arc::clone(&transaction_arc),
-                        proxy_id,
-                        stateful_missing_states,
-                    )
-                } else {
-                    // lookup from the stateless forwarding table
-                    let stateless_proxy_id = stateless_forwarding_table
-                        .remove(&transaction_arc.digest())
-                        .map(|(_k, v)| v)
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "No stateless proxy found for transaction, defaulting to 0"
-                            );
-                            0
-                        });
-
-                    PrimaryToProxyMessage::Txn(
-                        Arc::clone(&transaction_arc),
-                        stateless_proxy_id,
-                        stateful_missing_states,
-                    )
-                };
-
-                Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
-                metrics.update_metrics(transaction_arc.timestamp());
+                proxy_id
             } else {
-                tracing::warn!(
-                    "No pre-consensus routing plan found for transaction {:?}",
-                    transaction_arc.digest()
-                );
-            }
+                Self::find_least_loaded_proxy(proxy_loads)
+            };
+
+            let stateful_missing_states = Self::get_missing_states_for_transaction(
+                &transaction_arc,
+                Some(required_versions),
+                proxy_id,
+                states_to_proxy,
+            )
+            .await;
+
+            let msg = if separation_mode != SeparationMode::PrimarySeparation {
+                PrimaryToProxyMessage::CombinedTxn(
+                    Arc::clone(&transaction_arc),
+                    proxy_id,
+                    stateful_missing_states,
+                )
+            } else {
+                // lookup from the stateless forwarding table
+                let stateless_proxy_id = stateless_forwarding_table
+                    .remove(&transaction_arc.digest())
+                    .map(|(_k, v)| v)
+                    .unwrap_or_else(|| {
+                        tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
+                        0
+                    });
+
+                PrimaryToProxyMessage::Txn(
+                    Arc::clone(&transaction_arc),
+                    stateless_proxy_id,
+                    stateful_missing_states,
+                )
+            };
+
+            Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
+            metrics.update_metrics(transaction_arc.timestamp());
 
             // Notify any dependencies waiting on this transaction
             for notify in current_handles {
@@ -743,7 +788,7 @@ where
 {
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) proxy_loads: Arc<Vec<AtomicUsize>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
 }
@@ -762,14 +807,10 @@ where
                 let proxy = conn
                     .iter()
                     .map(|entry| *entry.key())
-                    .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
+                    .min_by_key(|&proxy_id| proxy_loads[proxy_id].load(Ordering::Relaxed))
                     .unwrap_or(0);
                 let weight = duration.as_micros() as usize;
-                if let Some(mut load) = proxy_loads.get_mut(&proxy) {
-                    *load += weight;
-                } else {
-                    proxy_loads.insert(proxy, weight);
-                }
+                proxy_loads[proxy].fetch_add(weight, Ordering::Relaxed);
                 SharedObjTxnForwarder::<E>::send_to_proxy(
                     &conn,
                     proxy,
