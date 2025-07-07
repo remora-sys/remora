@@ -114,13 +114,13 @@ where
             pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
             stateless_forwarding_table: stateless_forwarding_table.clone(),
             separation_mode: self.separation_mode,
+            policy: self.policy.clone(),
             counter: 0,
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
             proxy_loads.clone(),
-            self.policy.clone(),
         );
 
         thread::spawn(move || {

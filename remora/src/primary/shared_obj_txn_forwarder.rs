@@ -20,8 +20,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PreConsensusSchedulingPolicy {
-    /// Sorted Dependency Set
-    SDS,
+    /// Sorted Dependency Set (locality-first for small subgraphs)
+    LSDS,
+    /// Sorted Dependency Set (round robin for small subgraphs)
+    RSDS,
 }
 
 pub(crate) struct PreConsensusSchedTask<E>
@@ -34,7 +36,6 @@ where
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) _phantom: PhantomData<E>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
 }
 
@@ -50,14 +51,12 @@ where
         >,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-        policy: PreConsensusSchedulingPolicy,
     ) -> Self {
         Self {
             proxy_connections,
             pre_consensus_routing_plan,
             _phantom: PhantomData,
             proxy_loads,
-            policy,
             object_last_proxy: vec![None; 10000000],
         }
     }
@@ -86,11 +85,7 @@ where
         // 2. Decide assignment based on policy
         // 3. Update data structures accordingly
         let start = std::time::Instant::now();
-        match self.policy {
-            PreConsensusSchedulingPolicy::SDS => {
-                self.apply_sds_policy(&transactions, &graph);
-            }
-        }
+        self.apply_sds_policy(&transactions, &graph);
         tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
     }
 
@@ -418,6 +413,7 @@ where
     pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub(crate) separation_mode: SeparationMode,
+    pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) counter: usize,
 }
 
@@ -452,6 +448,7 @@ where
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
         let separation_mode = self.separation_mode;
         let counter = self.counter;
+        let policy = self.policy.clone();
         self.counter += 1;
 
         tokio::spawn(async move {
@@ -477,8 +474,18 @@ where
             {
                 proxy_id
             } else {
-                // Use random for small subgraphs
-                counter % proxy_connections.len()
+                match policy {
+                    PreConsensusSchedulingPolicy::LSDS => {
+                        Self::get_proxy_for_shared_objects_most_states(
+                            &proxy_connections,
+                            &states_to_proxy,
+                            &required_versions,
+                            counter,
+                        )
+                        .unwrap_or(counter % proxy_connections.len())
+                    }
+                    PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
+                }
             };
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
@@ -520,6 +527,63 @@ where
                 notify.notify_one();
             }
         });
+    }
+
+    /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
+    fn get_proxy_for_shared_objects_most_states(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        txn_cnt: usize,
+    ) -> Option<ExecutorIndex> {
+        let proxy_count = proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        if required_versions.is_empty() {
+            // If no shared objects, use first proxy
+            return Some(0);
+        }
+
+        // Count how many objects each proxy already has
+        let mut proxy_state_counts = vec![0; proxy_count];
+        for (id, v) in required_versions {
+            if let Some(proxy_index) = states_to_proxy.get(&(*id, *v)) {
+                if *proxy_index < proxy_count {
+                    proxy_state_counts[*proxy_index] += 1;
+                }
+            }
+        }
+
+        // Find the proxy with the most states
+        let mut max_count = 0;
+        let mut best_proxies = Vec::new();
+
+        // First pass to find maximum count
+        for (index, count) in proxy_state_counts.iter().enumerate() {
+            match count.cmp(&max_count) {
+                std::cmp::Ordering::Greater => {
+                    max_count = *count;
+                    best_proxies.clear();
+                    best_proxies.push(index);
+                }
+                std::cmp::Ordering::Equal => {
+                    best_proxies.push(index);
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+
+        // Select a proxy randomly if multiple proxies have the same max count
+        let proxy_index = if best_proxies.len() > 1 {
+            best_proxies[txn_cnt % best_proxies.len()]
+        } else {
+            best_proxies[0]
+        };
+        Some(proxy_index)
     }
 
     /// Get assigned proxy for shared objects in a transaction.
