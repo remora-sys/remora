@@ -14,19 +14,12 @@ use dashmap::DashMap;
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    marker::PhantomData,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PreConsensusSchedulingPolicy {
-    /// Largest Dependency Set
-    LDS,
     /// Sorted Dependency Set
     SDS,
 }
@@ -41,8 +34,6 @@ where
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) _phantom: PhantomData<E>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    pub(crate) last_hot_set: FxHashSet<ObjectID>,
-    pub(crate) last_hot_set_proxy: Option<ExecutorIndex>,
     pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
 }
@@ -66,8 +57,6 @@ where
             pre_consensus_routing_plan,
             _phantom: PhantomData,
             proxy_loads,
-            last_hot_set: FxHashSet::default(),
-            last_hot_set_proxy: None,
             policy,
             object_last_proxy: vec![None; 10000000],
         }
@@ -98,43 +87,11 @@ where
         // 3. Update data structures accordingly
         let start = std::time::Instant::now();
         match self.policy {
-            PreConsensusSchedulingPolicy::LDS => {
-                self.apply_lds_policy(&transactions, &graph);
-            }
             PreConsensusSchedulingPolicy::SDS => {
                 self.apply_sds_policy(&transactions, &graph);
             }
         }
         tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
-    }
-
-    fn apply_lds_policy(
-        &mut self,
-        transactions: &[RemoraTransaction<E>],
-        graph: &DiGraph<TransactionDigest, ()>,
-    ) {
-        let num_proxies = self.proxy_connections.len();
-
-        let (largest_subgraph_digests, largest_subgraph_objects) =
-            self.analyze_dependencies_for_lds(transactions, graph);
-        let (largest_component_proxy, other_proxies) =
-            self.determine_routing(num_proxies, &largest_subgraph_objects);
-
-        self.assign_and_update_loads(
-            transactions,
-            &largest_subgraph_digests,
-            largest_component_proxy,
-            &other_proxies,
-        );
-
-        // Update the hot set for the next batch
-        self.update_hot_set(
-            transactions,
-            &largest_subgraph_digests,
-            largest_component_proxy,
-        );
-
-        self.log_load_summary("LDS");
     }
 
     fn apply_sds_policy(
@@ -274,117 +231,6 @@ where
         }
     }
 
-    fn analyze_dependencies_for_lds(
-        &self,
-        transactions: &[RemoraTransaction<E>],
-        graph: &DiGraph<TransactionDigest, ()>,
-    ) -> (FxHashSet<TransactionDigest>, FxHashSet<ObjectID>) {
-        let largest_subgraph_nodes = self.find_largest_subgraph(graph);
-        let largest_subgraph_digests: FxHashSet<_> = largest_subgraph_nodes
-            .iter()
-            .map(|node_idx| graph[*node_idx])
-            .collect();
-
-        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
-
-        let mut largest_subgraph_objects = FxHashSet::default();
-        for digest in &largest_subgraph_digests {
-            if let Some(tx) = tx_map.get(digest) {
-                for (object_id, _) in tx.shared_objects() {
-                    largest_subgraph_objects.insert(*object_id);
-                }
-            }
-        }
-
-        (largest_subgraph_digests, largest_subgraph_objects)
-    }
-
-    /// Route the largest dependency set to previous hot set proxy
-    /// if possible, otherwise to the least loaded proxy.
-    /// The other proxies are used to route the other transactions.
-    fn determine_routing(
-        &self,
-        num_proxies: usize,
-        largest_subgraph_objects: &FxHashSet<ObjectID>,
-    ) -> (ExecutorIndex, Vec<ExecutorIndex>) {
-        let chosen_proxy = if let Some(proxy) = self.last_hot_set_proxy {
-            if !self.last_hot_set.is_disjoint(largest_subgraph_objects) {
-                proxy
-            } else {
-                self.find_least_loaded_proxy()
-            }
-        } else {
-            self.find_least_loaded_proxy()
-        };
-
-        let mut other_proxies: Vec<_> = (0..num_proxies).filter(|id| *id != chosen_proxy).collect();
-        if other_proxies.is_empty() {
-            other_proxies.push(chosen_proxy);
-        }
-        (chosen_proxy, other_proxies)
-    }
-
-    fn find_least_loaded_proxy(&self) -> ExecutorIndex {
-        self.proxy_loads
-            .iter()
-            .min_by_key(|entry| *entry.value())
-            .map(|entry| *entry.key())
-            .unwrap_or(0)
-    }
-
-    fn assign_and_update_loads(
-        &mut self,
-        transactions: &[RemoraTransaction<E>],
-        largest_subgraph_digests: &FxHashSet<TransactionDigest>,
-        largest_component_proxy: ExecutorIndex,
-        other_proxies: &[ExecutorIndex],
-    ) {
-        let mut other_proxy_idx = 0;
-        for transaction in transactions {
-            let digest = transaction.digest();
-            let proxy_id = if largest_subgraph_digests.contains(digest) {
-                largest_component_proxy
-            } else {
-                let id = other_proxies[other_proxy_idx % other_proxies.len()];
-                other_proxy_idx += 1;
-                id
-            };
-
-            self.pre_consensus_routing_plan.insert(*digest, proxy_id);
-            let weight = transaction.expected_stateful_duration().as_micros() as usize;
-            self.proxy_loads
-                .entry(proxy_id)
-                .and_modify(|load| *load += weight)
-                .or_insert(weight);
-        }
-    }
-
-    /// Update the hot object set for the next batch.
-    /// Only trackes the top 10 most accessed objects.
-    fn update_hot_set(
-        &mut self,
-        transactions: &[RemoraTransaction<E>],
-        largest_subgraph_digests: &FxHashSet<TransactionDigest>,
-        largest_component_proxy: ExecutorIndex,
-    ) {
-        let mut access_counts_in_batch = FxHashMap::default();
-        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
-
-        for digest in largest_subgraph_digests {
-            if let Some(tx) = tx_map.get(digest) {
-                for (object_id, _) in tx.shared_objects() {
-                    *access_counts_in_batch.entry(*object_id).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let mut freqs: Vec<_> = access_counts_in_batch.into_iter().collect();
-        freqs.sort_by(|a, b| b.1.cmp(&a.1));
-
-        self.last_hot_set = freqs.into_iter().take(10).map(|(id, _)| id).collect();
-        self.last_hot_set_proxy = Some(largest_component_proxy);
-    }
-
     fn build_dependency_graph(
         &self,
         transactions: &[RemoraTransaction<E>],
@@ -437,16 +283,6 @@ where
             }
         }
         components
-    }
-
-    fn find_largest_subgraph(
-        &self,
-        graph: &DiGraph<TransactionDigest, ()>,
-    ) -> Vec<petgraph::graph::NodeIndex> {
-        self.find_all_subgraphs(graph)
-            .into_iter()
-            .max_by_key(|c| c.len())
-            .unwrap_or_else(Vec::new)
     }
 
     fn log_load_summary(&self, policy_name: &str) {

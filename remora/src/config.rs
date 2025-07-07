@@ -119,7 +119,7 @@ mod default_validator_config {
     }
 
     pub fn default_load_balancing_policy() -> PreConsensusSchedulingPolicy {
-        PreConsensusSchedulingPolicy::LDS
+        PreConsensusSchedulingPolicy::SDS
     }
 
     pub fn default_separation_mode() -> SeparationMode {

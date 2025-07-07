@@ -2,12 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{
-    marker::PhantomData,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{marker::PhantomData, sync::Arc, thread, time::Duration};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
