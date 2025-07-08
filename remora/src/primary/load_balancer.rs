@@ -116,6 +116,7 @@ where
             separation_mode: self.separation_mode,
             policy: self.policy.clone(),
             counter: 0,
+            proxy_loads: proxy_loads.clone(),
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
@@ -174,7 +175,7 @@ where
             });
         });
 
-        if self.separation_mode == SeparationMode::PrimarySeparation {
+        if self.separation_mode == SeparationMode::PrimaryPreSeparation {
             let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
                 proxy_connections: self.proxy_connections.clone(),
                 proxy_loads: proxy_loads.clone(),

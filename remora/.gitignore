@@ -1,3 +1,4 @@
 *.dat
 *.yml
 !assets/example-*.yml
+*.log

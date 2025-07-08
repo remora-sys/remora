@@ -80,7 +80,9 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if self.mode == SeparationMode::PrimarySeparation {
+        if self.mode == SeparationMode::PrimaryPreSeparation
+            || self.mode == SeparationMode::PrimaryPostSeparation
+        {
             match message {
                 PrimaryToProxyMessage::StatelessTxn(transaction, verification_duration) => {
                     tracing::debug!(
@@ -153,7 +155,8 @@ where
     ) {
         // If the stateless result is from the same proxy, look up the handle
         let rx = if self.mode == SeparationMode::ProxySeparation
-            || self.mode == SeparationMode::PrimarySeparation
+            || self.mode == SeparationMode::PrimaryPreSeparation
+            || self.mode == SeparationMode::PrimaryPostSeparation
         {
             if stateless_res_proxy_id == self.id {
                 self.stateless_controller

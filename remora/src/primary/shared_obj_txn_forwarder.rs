@@ -415,6 +415,7 @@ where
     pub(crate) separation_mode: SeparationMode,
     pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) counter: usize,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -449,6 +450,7 @@ where
         let separation_mode = self.separation_mode;
         let counter = self.counter;
         let policy = self.policy.clone();
+        let proxy_loads = self.proxy_loads.clone();
         self.counter += 1;
 
         tokio::spawn(async move {
@@ -496,21 +498,44 @@ where
             )
             .await;
 
-            let msg = if separation_mode != SeparationMode::PrimarySeparation {
+            let msg = if separation_mode != SeparationMode::PrimaryPreSeparation
+                && separation_mode != SeparationMode::PrimaryPostSeparation
+            {
                 PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
                     proxy_id,
                     stateful_missing_states,
                 )
             } else {
-                // lookup from the stateless forwarding table
-                let stateless_proxy_id = stateless_forwarding_table
-                    .remove(&transaction_arc.digest())
-                    .map(|(_k, v)| v)
-                    .unwrap_or_else(|| {
-                        tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
-                        0
-                    });
+                let stateless_proxy_id = if separation_mode == SeparationMode::PrimaryPostSeparation
+                {
+                    let proxy = StatelessTxnForwarder::<E>::pick_stateless_proxy(
+                        &proxy_connections,
+                        &proxy_loads,
+                        transaction_arc.verification_duration(),
+                    );
+                    Self::send_to_proxy(
+                        &proxy_connections,
+                        proxy,
+                        PrimaryToProxyMessage::StatelessTxn(
+                            *transaction_arc.digest(),
+                            transaction_arc.verification_duration(),
+                        ),
+                    )
+                    .await;
+                    proxy
+                } else {
+                    // lookup from the stateless forwarding table
+                    stateless_forwarding_table
+                        .remove(&transaction_arc.digest())
+                        .map(|(_k, v)| v)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "No stateless proxy found for transaction, defaulting to 0"
+                            );
+                            0
+                        })
+                };
 
                 PrimaryToProxyMessage::Txn(
                     Arc::clone(&transaction_arc),
@@ -681,22 +706,32 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    pub(crate) fn pick_stateless_proxy(
+        conn: &Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        duration: Duration,
+    ) -> ExecutorIndex {
+        let proxy = conn
+            .iter()
+            .map(|entry| *entry.key())
+            .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
+            .unwrap_or(0);
+        let weight = duration.as_micros() as usize;
+        proxy_loads
+            .entry(proxy)
+            .and_modify(|load| *load += weight)
+            .or_insert(weight);
+
+        proxy
+    }
+
     pub(crate) async fn forward_stateless_txn(&mut self) {
         while let Some((digest, duration)) = self.rx_stateless_txns.recv().await {
             let conn = self.proxy_connections.clone();
             let proxy_loads = self.proxy_loads.clone();
             let stateless_forwarding_table = self.stateless_forwarding_table.clone();
             tokio::spawn(async move {
-                let proxy = conn
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .min_by_key(|&proxy_id| proxy_loads.get(&proxy_id).map_or(0, |load| *load))
-                    .unwrap_or(0);
-                let weight = duration.as_micros() as usize;
-                proxy_loads
-                    .entry(proxy)
-                    .and_modify(|load| *load += weight)
-                    .or_insert(weight);
+                let proxy = Self::pick_stateless_proxy(&conn, &proxy_loads, duration);
                 SharedObjTxnForwarder::<E>::send_to_proxy(
                     &conn,
                     proxy,

@@ -161,7 +161,10 @@ pub enum SeparationMode {
     ProxySeparation,
     /// The load balancer separates the stateful and stateless transactions
     /// and proxies also separate the stateful and stateless transactions.
-    PrimarySeparation,
+    PrimaryPreSeparation,
+    /// The load balancer separates the stateful and stateless transactions
+    /// and proxies also separate the stateful and stateless transactions.
+    PrimaryPostSeparation,
 }
 
 /// The configuration for the validator, containing network addresses.

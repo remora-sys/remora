@@ -124,7 +124,7 @@ where
                 // in-flight batches, wait for some to complete before accepting new transactions.
                 Some(transaction) = self.rx_load_balancer.recv(),
                     if self.current_inflight_batches < max_inflight_batches => {
-                    if self.separation_mode == SeparationMode::PrimarySeparation {
+                    if self.separation_mode == SeparationMode::PrimaryPreSeparation {
                         self.tx_stateless_txns.send((*transaction.digest(), transaction.verification_duration())).await.unwrap();
                     }
 
