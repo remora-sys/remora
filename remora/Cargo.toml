@@ -59,6 +59,7 @@ sui-archival.workspace = true
 rustc-hash = "2.0.0"
 num_cpus.workspace = true
 byteorder.workspace = true
+fastrand = "2.3.0"
 
 [dev-dependencies]
 tracing-test = "0.2.5"
