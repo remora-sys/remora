@@ -66,7 +66,7 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
 
     // Generate transactions.
     let mut load_generator = LoadGenerator::<E>::new(benchmark_config, primary_address);
-    let transactions = load_generator.initialize().await;
+    let transactions = load_generator.initialize(None).await;
     load_generator.run(transactions).await;
 }
 

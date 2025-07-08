@@ -163,7 +163,7 @@ mod tests {
         let mut load_generator =
             LoadGenerator::<SuiExecutor>::new(benchmark_config, config.client_server_address);
 
-        let transactions = load_generator.initialize().await;
+        let transactions = load_generator.initialize(None).await;
         load_generator.run(transactions).await;
     }
 
@@ -189,7 +189,7 @@ mod tests {
         let mut load_generator =
             LoadGenerator::<SuiExecutor>::new(benchmark_config, primary_address);
 
-        let transactions = load_generator.initialize().await;
+        let transactions = load_generator.initialize(None).await;
         load_generator.run(transactions).await;
     }
 }

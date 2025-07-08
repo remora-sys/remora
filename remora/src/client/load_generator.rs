@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    fs,
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -49,8 +50,36 @@ impl<E: Executor> LoadGenerator<E> {
     }
 
     /// Initialize the load generator. This will generate all required genesis objects and all transactions upfront.
-    pub async fn initialize(&mut self) -> Vec<E::Transaction> {
-        E::generate_transactions(&self.config, None).await
+    pub async fn initialize(
+        &mut self,
+        path: Option<&str>,
+    ) -> Vec<TransactionWithTimestamp<E::Transaction>> {
+        if let Some(log_path) = path {
+            tracing::info!("Reading transactions from {}", log_path);
+            let serialized_log =
+                fs::read(log_path).expect("Failed to read transaction log from file");
+            let scheduled_txs: Vec<TransactionWithTimestamp<E::Transaction>> =
+                bincode::deserialize(&serialized_log)
+                    .expect("Failed to deserialize transaction log");
+
+            scheduled_txs
+        } else {
+            let transactions = E::generate_transactions(&self.config, None).await;
+            transactions
+                .into_iter()
+                .enumerate()
+                .map(|(_, tx)| {
+                    TransactionWithTimestamp::new(
+                        tx.clone(),
+                        0.0,                    // Timestamp is not used yet.
+                        tx.shared_object_ids(), // Use actual shared objects
+                        self.config.verification_duration,
+                        self.config.expected_stateful_duration,
+                        None,
+                    )
+                })
+                .collect()
+        }
     }
 
     /// Generate inter-arrival interval
@@ -60,35 +89,34 @@ impl<E: Executor> LoadGenerator<E> {
 
     // Function to run the transaction submission at a specific load
     async fn submit_transactions(
-        transactions: Vec<E::Transaction>,
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
         sender: Sender<RemoraTransaction<E>>,
         arrival: Distribution,
-        verification_duration: Duration,
-        expected_stateful_duration: Duration,
     ) where
         <E as Executor>::Transaction: std::marker::Send + 'static,
     {
         let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
         let mut next_ts = Instant::now();
 
-        for (counter, tx) in transactions.into_iter().enumerate() {
+        for (counter, tx_with_timestamp) in transactions.into_iter().enumerate() {
             // Wait until the next interval before sending the next transaction
             while Instant::now() < next_ts {
                 std::hint::spin_loop();
             }
 
-            // Get the current timestamp for metrics
+            // Get the current timestamp for metrics and create new transaction with updated timestamp
             let timestamp = Metrics::now().as_secs_f64();
-            let full_tx = TransactionWithTimestamp::new(
-                tx.clone(),
+            let updated_tx = TransactionWithTimestamp::new(
+                tx_with_timestamp.transaction.clone(),
                 timestamp,
-                tx.shared_object_ids(),
-                verification_duration,
-                expected_stateful_duration,
+                tx_with_timestamp.shared_object_ids(),
+                tx_with_timestamp.verification_duration(),
+                tx_with_timestamp.expected_stateful_duration(),
+                tx_with_timestamp.destination,
             );
 
             // Send the transaction
-            if sender.send(full_tx).await.is_err() {
+            if sender.send(updated_tx).await.is_err() {
                 tracing::error!("Failed to send transaction");
                 break; // Exit the loop on send failure
             }
@@ -128,7 +156,7 @@ impl<E: Executor> LoadGenerator<E> {
         senders
     }
 
-    pub async fn run(&mut self, transactions: Vec<E::Transaction>)
+    pub async fn run(&mut self, transactions: Vec<TransactionWithTimestamp<E::Transaction>>)
     where
         <E as Executor>::Transaction: std::marker::Send + 'static,
     {
@@ -138,8 +166,8 @@ impl<E: Executor> LoadGenerator<E> {
 
     pub fn split_transactions(
         &self,
-        transactions: Vec<E::Transaction>,
-    ) -> Vec<Vec<E::Transaction>> {
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
+    ) -> Vec<Vec<TransactionWithTimestamp<E::Transaction>>> {
         let chunk_size = (transactions.len() + NUM_CLIENTS - 1) / NUM_CLIENTS; // Ceiling division
         transactions
             .chunks(chunk_size)
@@ -149,7 +177,7 @@ impl<E: Executor> LoadGenerator<E> {
 
     async fn real_run(
         &mut self,
-        transactions: Vec<E::Transaction>,
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
         senders: Vec<Sender<RemoraTransaction<E>>>,
     ) where
         <E as Executor>::Transaction: std::marker::Send + 'static,
@@ -164,8 +192,6 @@ impl<E: Executor> LoadGenerator<E> {
         let mut handles = vec![];
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
             let arrival = self.arrival;
-            let verification_duration = self.config.verification_duration;
-            let expected_stateful_duration = self.config.expected_stateful_duration;
             let handle = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -174,14 +200,7 @@ impl<E: Executor> LoadGenerator<E> {
 
                 rt.block_on(async move {
                     sleep(Duration::from_secs(1)).await;
-                    Self::submit_transactions(
-                        tx_chunk,
-                        tx,
-                        arrival,
-                        verification_duration,
-                        expected_stateful_duration,
-                    )
-                    .await;
+                    Self::submit_transactions(tx_chunk, tx, arrival).await;
                 });
             });
             handles.push(handle);
@@ -192,6 +211,54 @@ impl<E: Executor> LoadGenerator<E> {
                 tracing::error!("Task error: {:?}", e);
             }
         }
+    }
+
+    /// This function takes a batch of transactions, computes a routing schedule, and writes the resulting transaction log to a file.
+    /// The current scheduling logic is a placeholder and can be replaced with a more sophisticated algorithm.
+    pub async fn generate_schedule_and_log(&self, path: &str)
+    where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
+        let transactions = E::generate_transactions(&self.config, None).await;
+
+        use crate::client::hermes_schedule;
+        use rustc_hash::FxHashMap;
+        use sui_types::base_types::ObjectID;
+
+        let mut scheduled_transactions = Vec::new();
+        const BATCH_SIZE: usize = 1000;
+        let mut object_node_partition: FxHashMap<ObjectID, usize> = FxHashMap::default();
+
+        for batch in transactions.chunks(BATCH_SIZE) {
+            let schedule_result = hermes_schedule::schedule_transactions_hermes(
+                batch,
+                &mut object_node_partition,
+                3, // NOTE: hardcoded with 3 proxies
+                self.config.assignment_mode,
+            );
+
+            // Process transactions in the optimal order determined by the scheduler
+            for &tx_idx in &schedule_result.transaction_order {
+                let tx = &batch[tx_idx];
+                let destination = schedule_result.destinations[tx_idx];
+                let full_tx = TransactionWithTimestamp::new(
+                    tx.clone(),
+                    0.0, // Timestamp is not used in offline mode.
+                    tx.shared_object_ids(),
+                    self.config.verification_duration,
+                    self.config.expected_stateful_duration,
+                    Some(destination),
+                );
+                scheduled_transactions.push(full_tx);
+            }
+        }
+
+        // Serialize and write the transaction log to the specified file.
+        let serialized_log = bincode::serialize(&scheduled_transactions)
+            .expect("Failed to serialize transaction log");
+        fs::write(path, serialized_log).expect("Failed to write transaction log to file");
+
+        tracing::info!("Transaction schedule generated and written to {}", path);
     }
 }
 
@@ -226,7 +293,7 @@ pub mod tests {
         // Create genesis and generate transactions.
         let config = BenchmarkParameters::new_for_tests();
         let mut load_generator: LoadGenerator<SuiExecutor> = LoadGenerator::new(config, target);
-        let transactions = load_generator.initialize().await;
+        let transactions = load_generator.initialize(None).await;
 
         // Submit transactions to the server.
         let now = Metrics::now().as_secs_f64();

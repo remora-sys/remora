@@ -186,6 +186,7 @@ where
                 &states_to_proxy,
                 txn_cnt,
                 &required_versions,
+                &transaction_arc.destination,
             ) {
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
@@ -238,6 +239,7 @@ where
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
+        destination: &Option<ProxyId>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => {
@@ -252,6 +254,7 @@ where
             LoadBalancingPolicy::Random => {
                 Self::get_proxy_for_shared_objects_random(proxy_connections)
             }
+            LoadBalancingPolicy::Hermes => destination.map(|dest| (dest, dest)),
         }
     }
 

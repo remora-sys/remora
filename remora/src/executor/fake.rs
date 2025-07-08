@@ -647,6 +647,7 @@ mod tests {
             inputs,
             Duration::from_micros(200),
             Duration::from_micros(200),
+            None,
         );
 
         let start = Instant::now();
@@ -679,6 +680,7 @@ mod tests {
             inputs,
             Duration::from_micros(200),
             Duration::from_micros(200),
+            None,
         );
 
         let start = Instant::now();
@@ -721,6 +723,7 @@ mod tests {
                 transaction.shared_object_ids(),
                 Duration::from_micros(200),
                 Duration::from_micros(200),
+                None,
             );
 
             let start = Instant::now();
@@ -774,6 +777,7 @@ mod tests {
                 transaction.shared_object_ids(),
                 Duration::from_micros(200),
                 Duration::from_micros(200),
+                None,
             );
 
             let start = Instant::now();

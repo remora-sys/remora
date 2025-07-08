@@ -44,7 +44,7 @@ pub type Timestamp = f64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     /// The transaction.
-    transaction: T,
+    pub transaction: T,
     /// The timestamp when the transaction was created.
     timestamp: Timestamp,
     /// The shared object IDs in the transaction.
@@ -53,6 +53,9 @@ pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
     verification_duration: Duration,
     /// The expected stateful duration for the transaction.
     expected_stateful_duration: Duration,
+    /// The pre-determined destination proxy ID for the transaction.
+    /// ONLY used in the load generator for hermes schedule.
+    pub destination: Option<ProxyId>,
 }
 
 impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
@@ -63,6 +66,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
         shared_object_ids: Vec<ObjectID>,
         verification_duration: Duration,
         expected_stateful_duration: Duration,
+        destination: Option<ProxyId>,
     ) -> Self {
         Self {
             transaction,
@@ -70,6 +74,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
             shared_objects: shared_object_ids.into_iter().map(|id| (id, None)).collect(),
             verification_duration,
             expected_stateful_duration,
+            destination,
         }
     }
 
@@ -86,6 +91,7 @@ impl<T: ExecutableTransaction + Clone> TransactionWithTimestamp<T> {
             shared_objects: BTreeMap::new(),
             verification_duration: Duration::from_micros(200),
             expected_stateful_duration: Duration::from_micros(200),
+            destination: None,
         }
     }
 

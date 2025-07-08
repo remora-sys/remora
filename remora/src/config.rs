@@ -13,12 +13,13 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
+    client::hermes_schedule::AssignmentMode,
     primary::mock_consensus::{models::FixedDelay, MockConsensusParameters},
     proxy::core::ProxyId,
 };
 
 /// Defines different load balancing policies for distributing transactions.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoadBalancingPolicy {
     /// Simple round-robin distribution
     RoundRobin,
@@ -26,6 +27,8 @@ pub enum LoadBalancingPolicy {
     Random,
     /// Send to proxy that already has most of the required states
     Zeus,
+    /// Hermes schedule
+    Hermes,
 }
 
 /// Default channel size for communication between components.
@@ -331,6 +334,9 @@ pub struct BenchmarkParameters {
     /// The expected stateful duration, used for LB.
     #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
     pub expected_stateful_duration: Duration,
+    /// The assignment mode for transaction scheduling.
+    #[serde(default)]
+    pub assignment_mode: AssignmentMode,
 }
 
 impl BenchmarkParameters {
@@ -343,6 +349,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 
@@ -357,6 +364,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 
@@ -369,6 +377,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 
@@ -385,6 +394,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 
@@ -401,6 +411,7 @@ impl BenchmarkParameters {
             },
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 }
@@ -436,6 +447,7 @@ impl Default for BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            assignment_mode: AssignmentMode::default(),
         }
     }
 }
