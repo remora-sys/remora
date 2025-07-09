@@ -172,6 +172,7 @@ where
                     let mut shared_txns = Vec::new();
 
                     for transaction in transactions {
+                        self.metrics.update_metrics(transaction.timestamp(), "lb-ingress");
                         let shared_object_ids = transaction.shared_objects();
                         if shared_object_ids.is_empty() {
                             owned_txns.push(transaction);

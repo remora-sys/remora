@@ -175,7 +175,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             assert!(result.success());
             let submit_timestamp = result.transaction_timestamp();
             // TODO: Record transactions success and failure.
-            self.metrics.update_metrics(submit_timestamp);
+            self.metrics.update_metrics(submit_timestamp, "default");
         }
 
         // Ensure core_completion task is done

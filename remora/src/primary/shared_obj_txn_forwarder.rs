@@ -226,7 +226,7 @@ where
                     Self::send_to_proxy(&proxy_connections, proxy_index, stateful_msg).await;
                 }
 
-                metrics.update_metrics(transaction_arc.timestamp());
+                metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
             } else {
                 tracing::warn!("No proxies available for transaction with shared objects");
             }

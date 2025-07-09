@@ -164,9 +164,8 @@ impl Metrics {
             .inc();
     }
 
-    pub fn update_metrics(&self, submit_timestamp: f64) {
-        const WORKLOAD: &str = "default";
-        self.register_transaction(submit_timestamp, WORKLOAD);
+    pub fn update_metrics(&self, submit_timestamp: f64, workload: &str) {
+        self.register_transaction(submit_timestamp, workload);
     }
 
     /// Increase the proxy load.
