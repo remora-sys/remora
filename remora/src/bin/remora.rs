@@ -102,6 +102,9 @@ async fn start_node<E>(
                 "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
+            let workload = "primary-egress".to_string();
+            let print_period = Duration::from_secs(5);
+            periodically_print_metrics(validator_config.metrics_address, workload, print_period);
             PrimaryNode::start(executor, &validator_config, metrics)
                 .await
                 .collect_results()
@@ -119,6 +122,13 @@ async fn start_node<E>(
 
             // Check if the proxy_id exists in the configuration
             if let Some(_proxy_config) = validator_config.proxies.get(proxy_id) {
+                let workload = "default".to_string();
+                let print_period = Duration::from_secs(5);
+                periodically_print_metrics(
+                    validator_config.metrics_address,
+                    workload,
+                    print_period,
+                );
                 ProxyNode::start(proxy_id, executor, &validator_config, metrics)
                     .await
                     .await_completion()
