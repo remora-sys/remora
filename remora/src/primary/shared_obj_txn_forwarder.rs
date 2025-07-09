@@ -545,7 +545,7 @@ where
             };
 
             Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
-            metrics.update_metrics(transaction_arc.timestamp());
+            metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
 
             // Notify any dependencies waiting on this transaction
             for notify in current_handles {
