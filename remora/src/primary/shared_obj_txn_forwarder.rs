@@ -18,6 +18,191 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration}
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
+/// Shared dependency scheduling utility for building dependency graphs and assigning proxies
+pub(crate) struct DependencyScheduler;
+
+impl DependencyScheduler {
+    /// Build dependency graph from transactions
+    pub(crate) fn build_dependency_graph<E>(
+        transactions: &[RemoraTransaction<E>],
+    ) -> (
+        DiGraph<TransactionDigest, ()>,
+        FxHashMap<TransactionDigest, petgraph::graph::NodeIndex>,
+    )
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+        E::Transaction: Send + Sync + 'static,
+    {
+        let mut graph = DiGraph::new();
+        let mut digest_to_node = FxHashMap::default();
+        let mut object_to_last_accessor = FxHashMap::default();
+
+        for tx in transactions {
+            let tx_digest = *tx.digest();
+            let node = graph.add_node(tx_digest);
+            digest_to_node.insert(tx_digest, node);
+
+            for (object_id, _) in tx.shared_objects() {
+                if let Some(prior_node) = object_to_last_accessor.get(object_id) {
+                    graph.add_edge(*prior_node, node, ());
+                }
+                object_to_last_accessor.insert(*object_id, node);
+            }
+        }
+        (graph, digest_to_node)
+    }
+
+    /// Find all weakly connected components in the dependency graph
+    pub(crate) fn find_all_subgraphs(
+        graph: &DiGraph<TransactionDigest, ()>,
+    ) -> Vec<Vec<petgraph::graph::NodeIndex>> {
+        let mut visited = FxHashSet::default();
+        let mut components = Vec::new();
+
+        for node_idx in graph.node_indices() {
+            if !visited.contains(&node_idx) {
+                let mut component_nodes = Vec::new();
+                let mut stack = vec![node_idx];
+                visited.insert(node_idx);
+
+                while let Some(current_node) = stack.pop() {
+                    component_nodes.push(current_node);
+                    // Use neighbors_undirected to find weakly connected components
+                    for neighbor in graph.neighbors_undirected(current_node) {
+                        if visited.insert(neighbor) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+                components.push(component_nodes);
+            }
+        }
+        components
+    }
+
+    /// Assign proxy for a large subgraph based on locality
+    pub(crate) fn assign_large_subgraph_proxy<E>(
+        object_last_proxy: &[Option<ExecutorIndex>],
+        num_proxies: usize,
+        graph: &DiGraph<TransactionDigest, ()>,
+        subgraph_nodes: &[petgraph::graph::NodeIndex],
+        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
+    ) -> (ExecutorIndex, FxHashSet<TransactionDigest>, Vec<ObjectID>)
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+        E::Transaction: Send + Sync + 'static,
+    {
+        let subgraph_digests: FxHashSet<_> = subgraph_nodes.iter().map(|&idx| graph[idx]).collect();
+
+        let mut subgraph_objects = Vec::new();
+        for digest in &subgraph_digests {
+            if let Some(tx) = tx_map.get(digest) {
+                for (object_id, _) in tx.shared_objects() {
+                    subgraph_objects.push(*object_id);
+                }
+            }
+        }
+
+        let mut locality_count = vec![0usize; num_proxies];
+
+        for obj in &subgraph_objects {
+            let idx = Self::object_id_24bit_index(obj);
+            if let Some(proxy_id) = object_last_proxy[idx] {
+                locality_count[proxy_id] += 1;
+            }
+        }
+
+        // Find max locality
+        let max_locality = *locality_count.iter().max().unwrap_or(&0);
+
+        // Collect all proxies with max locality
+        let best_candidates: Vec<_> = (0..num_proxies)
+            .filter(|&p| locality_count[p] == max_locality)
+            .collect();
+
+        // Randomly choose among the best candidates
+        let best_proxy = if best_candidates.is_empty() {
+            0
+        } else {
+            best_candidates[fastrand::usize(..best_candidates.len())]
+        };
+
+        (best_proxy, subgraph_digests, subgraph_objects)
+    }
+
+    /// Update state for SDS policy
+    pub(crate) fn update_state_for_sds<E>(
+        object_last_proxy: &mut [Option<ExecutorIndex>],
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        subgraph_digests: &FxHashSet<TransactionDigest>,
+        subgraph_objects: &Vec<ObjectID>,
+        proxy_id: ExecutorIndex,
+        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
+    ) where
+        E: Executor + Clone + Send + Sync + 'static,
+        E::Transaction: Send + Sync + 'static,
+    {
+        let mut total_weight = 0;
+        for digest in subgraph_digests {
+            if let Some(tx) = tx_map.get(digest) {
+                total_weight += tx.expected_stateful_duration().as_micros() as usize;
+            }
+        }
+
+        proxy_loads
+            .entry(proxy_id)
+            .and_modify(|load| *load += total_weight)
+            .or_insert(total_weight);
+
+        for object_id in subgraph_objects {
+            object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
+        }
+    }
+
+    /// Process a batch of transactions and return proxy assignments for large subgraphs
+    pub(crate) fn process_transaction_batch<E>(
+        transactions: &[RemoraTransaction<E>],
+        object_last_proxy: &[Option<ExecutorIndex>],
+        num_proxies: usize,
+    ) -> Vec<(ExecutorIndex, FxHashSet<TransactionDigest>, Vec<ObjectID>)>
+    where
+        E: Executor + Clone + Send + Sync + 'static,
+        E::Transaction: Send + Sync + 'static,
+    {
+        let (graph, _digest_to_node) = Self::build_dependency_graph::<E>(transactions);
+        let mut subgraphs = Self::find_all_subgraphs(&graph);
+        subgraphs.sort_by_key(|subgraph| std::cmp::Reverse(subgraph.len()));
+
+        // Split subgraphs into two collections
+        let (_, large_subgraphs): (Vec<_>, Vec<_>) = subgraphs
+            .into_iter()
+            .partition(|subgraph| subgraph.len() < 2);
+
+        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
+
+        // Return assignments for large subgraphs
+        large_subgraphs
+            .iter()
+            .map(|subgraph_nodes| {
+                Self::assign_large_subgraph_proxy::<E>(
+                    object_last_proxy,
+                    num_proxies,
+                    &graph,
+                    subgraph_nodes,
+                    &tx_map,
+                )
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn object_id_24bit_index(object_id: &ObjectID) -> usize {
+        let bytes = object_id.as_ref();
+        let index = (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16);
+        index - 1
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PreConsensusSchedulingPolicy {
     /// Sorted Dependency Set (locality-first for small subgraphs)
@@ -79,7 +264,8 @@ where
 
         // 1. Build dependency graph
         let start = std::time::Instant::now();
-        let (graph, _digest_to_node) = self.build_dependency_graph(&transactions);
+        let (graph, _digest_to_node) =
+            DependencyScheduler::build_dependency_graph::<E>(&transactions);
         tracing::debug!("Dependency graph building took {:?}", start.elapsed());
 
         // 2. Decide assignment based on policy
@@ -92,192 +278,41 @@ where
     fn apply_sds_policy(
         &mut self,
         transactions: &[RemoraTransaction<E>],
-        graph: &DiGraph<TransactionDigest, ()>,
+        _graph: &DiGraph<TransactionDigest, ()>,
     ) {
-        let mut subgraphs = self.find_all_subgraphs(graph);
-        subgraphs.sort_by_key(|subgraph| std::cmp::Reverse(subgraph.len()));
-
-        // Split subgraphs into two collections
-        let (small_subgraphs, large_subgraphs): (Vec<_>, Vec<_>) = subgraphs
-            .into_iter()
-            .partition(|subgraph| subgraph.len() < 2);
-
-        tracing::debug!(
-            "Found {} small subgraphs (< 2 nodes)",
-            small_subgraphs.len()
-        );
-        tracing::debug!(
-            "Found {} large subgraphs (>= 2 nodes)",
-            large_subgraphs.len()
-        );
-
-        if !large_subgraphs.is_empty() {
-            tracing::debug!("Largest subgraph has {} nodes", large_subgraphs[0].len());
-        }
-
-        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
-
-        // Handle large subgraphs
+        // Handle large subgraphs using shared dependency scheduler
         let start = std::time::Instant::now();
-        if !large_subgraphs.is_empty() {
-            self.handle_large_subgraphs(graph, &large_subgraphs, &tx_map);
-        }
+        self.handle_large_subgraphs(transactions);
         tracing::debug!("Large subgraphs processing took {:?}", start.elapsed());
 
         #[cfg(debug_assertions)]
         self.log_load_summary("SDS");
     }
 
-    fn handle_large_subgraphs(
-        &mut self,
-        graph: &DiGraph<TransactionDigest, ()>,
-        large_subgraphs: &[Vec<petgraph::graph::NodeIndex>],
-        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
-    ) {
-        // Locality-based assignment for large subgraphs
-        let assignments: Vec<_> = large_subgraphs
-            .iter()
-            .map(|subgraph_nodes| self.assign_large_subgraph_proxy(graph, subgraph_nodes, tx_map))
-            .collect();
+    fn handle_large_subgraphs(&mut self, transactions: &[RemoraTransaction<E>]) {
+        // Use shared dependency scheduler to get proxy assignments
+        let assignments = DependencyScheduler::process_transaction_batch::<E>(
+            transactions,
+            &self.object_last_proxy,
+            self.proxy_connections.len(),
+        );
 
-        // Sequential state updates
+        let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
+
+        // Apply assignments to pre-consensus routing plan and update state
         for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
-            self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, tx_map);
-        }
-    }
-
-    #[inline]
-    fn object_id_24bit_index(object_id: &ObjectID) -> usize {
-        let bytes = object_id.as_ref();
-        let index = (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16);
-        index - 1
-    }
-
-    fn assign_large_subgraph_proxy(
-        &self,
-        graph: &DiGraph<TransactionDigest, ()>,
-        subgraph_nodes: &[petgraph::graph::NodeIndex],
-        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
-    ) -> (ExecutorIndex, FxHashSet<TransactionDigest>, Vec<ObjectID>) {
-        let subgraph_digests: FxHashSet<_> = subgraph_nodes.iter().map(|&idx| graph[idx]).collect();
-
-        let mut subgraph_objects = Vec::new();
-        for digest in &subgraph_digests {
-            if let Some(tx) = tx_map.get(digest) {
-                for (object_id, _) in tx.shared_objects() {
-                    subgraph_objects.push(*object_id);
-                }
+            for digest in &subgraph_digests {
+                self.pre_consensus_routing_plan.insert(*digest, proxy_id);
             }
+            DependencyScheduler::update_state_for_sds::<E>(
+                &mut self.object_last_proxy,
+                self.proxy_loads.clone(),
+                &subgraph_digests,
+                &subgraph_objects,
+                proxy_id,
+                &tx_map,
+            );
         }
-
-        let num_proxies = self.proxy_connections.len();
-        let mut locality_count = vec![0usize; num_proxies];
-
-        for obj in &subgraph_objects {
-            let idx = Self::object_id_24bit_index(obj);
-            if let Some(proxy_id) = self.object_last_proxy[idx] {
-                locality_count[proxy_id] += 1;
-            }
-        }
-
-        // Find max locality
-        let max_locality = *locality_count.iter().max().unwrap_or(&0);
-
-        // Collect all proxies with max locality
-        let best_candidates: Vec<_> = (0..num_proxies)
-            .filter(|&p| locality_count[p] == max_locality)
-            .collect();
-
-        // Randomly choose among the best candidates
-        let best_proxy = if best_candidates.is_empty() {
-            0
-        } else {
-            best_candidates[fastrand::usize(..best_candidates.len())]
-        };
-
-        for digest in &subgraph_digests {
-            self.pre_consensus_routing_plan.insert(*digest, best_proxy);
-        }
-
-        (best_proxy, subgraph_digests, subgraph_objects)
-    }
-
-    fn update_state_for_sds(
-        &mut self,
-        subgraph_digests: &FxHashSet<TransactionDigest>,
-        subgraph_objects: &Vec<ObjectID>,
-        proxy_id: ExecutorIndex,
-        tx_map: &FxHashMap<&TransactionDigest, &RemoraTransaction<E>>,
-    ) {
-        let mut total_weight = 0;
-        for digest in subgraph_digests {
-            if let Some(tx) = tx_map.get(digest) {
-                total_weight += tx.expected_stateful_duration().as_micros() as usize;
-            }
-        }
-
-        self.proxy_loads
-            .entry(proxy_id)
-            .and_modify(|load| *load += total_weight)
-            .or_insert(total_weight);
-
-        for object_id in subgraph_objects {
-            self.object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
-        }
-    }
-
-    fn build_dependency_graph(
-        &self,
-        transactions: &[RemoraTransaction<E>],
-    ) -> (
-        DiGraph<TransactionDigest, ()>,
-        FxHashMap<TransactionDigest, petgraph::graph::NodeIndex>,
-    ) {
-        let mut graph = DiGraph::new();
-        let mut digest_to_node = FxHashMap::default();
-        let mut object_to_last_accessor = FxHashMap::default();
-
-        for tx in transactions {
-            let tx_digest = *tx.digest();
-            let node = graph.add_node(tx_digest);
-            digest_to_node.insert(tx_digest, node);
-
-            for (object_id, _) in tx.shared_objects() {
-                if let Some(prior_node) = object_to_last_accessor.get(object_id) {
-                    graph.add_edge(*prior_node, node, ());
-                }
-                object_to_last_accessor.insert(*object_id, node);
-            }
-        }
-        (graph, digest_to_node)
-    }
-
-    fn find_all_subgraphs(
-        &self,
-        graph: &DiGraph<TransactionDigest, ()>,
-    ) -> Vec<Vec<petgraph::graph::NodeIndex>> {
-        let mut visited = FxHashSet::default();
-        let mut components = Vec::new();
-
-        for node_idx in graph.node_indices() {
-            if !visited.contains(&node_idx) {
-                let mut component_nodes = Vec::new();
-                let mut stack = vec![node_idx];
-                visited.insert(node_idx);
-
-                while let Some(current_node) = stack.pop() {
-                    component_nodes.push(current_node);
-                    // Use neighbors_undirected to find weakly connected components
-                    for neighbor in graph.neighbors_undirected(current_node) {
-                        if visited.insert(neighbor) {
-                            stack.push(neighbor);
-                        }
-                    }
-                }
-                components.push(component_nodes);
-            }
-        }
-        components
     }
 
     fn log_load_summary(&self, policy_name: &str) {
@@ -416,6 +451,8 @@ where
     pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) counter: usize,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    /// Only used for post-consensus scheduling policy
+    pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -427,10 +464,83 @@ where
         &mut self,
         mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
-        while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
-            self.forward_shared_object_txn(transaction, required_versions)
+        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+            while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
+                self.forward_shared_object_txn(transaction, required_versions, None)
+                    .await;
+            }
+        } else {
+            self.process_post_consensus_batched_txns(shared_txn_receiver)
                 .await;
         }
+    }
+
+    /// Processes transactions in batches for post-consensus proxy separation mode.
+    /// Builds dependency graphs, assigns proxies based on locality, and forwards transactions.
+    async fn process_post_consensus_batched_txns(
+        &mut self,
+        mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+    ) {
+        let mut txns = Vec::new();
+        let mut required_versions_vec = Vec::new();
+
+        while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
+            txns.push(transaction);
+            required_versions_vec.push(required_versions);
+
+            if txns.len() >= 1000 {
+                self.process_transaction_batch(&mut txns, &mut required_versions_vec)
+                    .await;
+            }
+        }
+    }
+
+    /// Processes a batch of transactions by building dependency graphs and assigning proxies.
+    async fn process_transaction_batch(
+        &mut self,
+        txns: &mut Vec<RemoraTransaction<E>>,
+        required_versions_vec: &mut Vec<Vec<(ObjectID, SequenceNumber)>>,
+    ) {
+        // Use shared dependency scheduler to get proxy assignments
+        let assignments = DependencyScheduler::process_transaction_batch::<E>(
+            txns,
+            &self.object_last_proxy,
+            self.proxy_connections.len(),
+        );
+
+        let tx_map: FxHashMap<_, _> = txns.iter().map(|tx| (tx.digest(), tx)).collect();
+
+        // Create digest-to-proxy mapping from assignments
+        let mut digest_to_proxy: FxHashMap<TransactionDigest, ExecutorIndex> = FxHashMap::default();
+        for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
+            DependencyScheduler::update_state_for_sds::<E>(
+                &mut self.object_last_proxy,
+                self.proxy_loads.clone(),
+                &subgraph_digests,
+                &subgraph_objects,
+                proxy_id,
+                &tx_map,
+            );
+
+            // Map each digest in this subgraph to its assigned proxy
+            for digest in subgraph_digests {
+                digest_to_proxy.insert(digest, proxy_id);
+            }
+        }
+
+        // Forward all transactions with their assigned proxies
+        for (transaction, required_versions) in txns.iter().zip(required_versions_vec.iter()) {
+            let assigned_proxy = digest_to_proxy.get(transaction.digest()).copied();
+            self.forward_shared_object_txn(
+                transaction.clone(),
+                required_versions.clone(),
+                assigned_proxy,
+            )
+            .await;
+        }
+
+        txns.clear();
+        required_versions_vec.clear();
     }
 
     /// Forwards transactions with shared objects to the appropriate proxy.
@@ -438,6 +548,7 @@ where
         &mut self,
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
+        post_consensus_rsds_proxy: Option<ExecutorIndex>,
     ) {
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();
@@ -471,11 +582,15 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            let proxy_id = if let Some((_digest, proxy_id)) =
-                pre_consensus_routing_plan.remove(transaction_arc.digest())
-            {
-                proxy_id
+            let proxy_id = if separation_mode == SeparationMode::PostConsensusProxySeparation {
+                post_consensus_rsds_proxy
             } else {
+                pre_consensus_routing_plan
+                    .remove(transaction_arc.digest())
+                    .map(|(_, proxy_id)| proxy_id)
+            }
+            .unwrap_or_else(|| {
+                // Policy fallback when no specific proxy is assigned
                 match policy {
                     PreConsensusSchedulingPolicy::LSDS => {
                         Self::get_proxy_for_shared_objects_most_states(
@@ -488,7 +603,7 @@ where
                     }
                     PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
                 }
-            };
+            });
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
                 &transaction_arc,

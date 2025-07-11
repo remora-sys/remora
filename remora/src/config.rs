@@ -153,6 +153,7 @@ pub struct ProxyInfo {
     pub metrics_address: SocketAddr,
 }
 
+/// TODO: rename this this enum
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum SeparationMode {
     /// The proxy does not separate the stateful and stateless transactions.
@@ -165,6 +166,8 @@ pub enum SeparationMode {
     /// The load balancer separates the stateful and stateless transactions
     /// and proxies also separate the stateful and stateless transactions.
     PrimaryPostSeparation,
+    /// Post consensus scheduling + proxy separation
+    PostConsensusProxySeparation,
 }
 
 /// The configuration for the validator, containing network addresses.

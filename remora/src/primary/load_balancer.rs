@@ -117,6 +117,7 @@ where
             policy: self.policy.clone(),
             counter: 0,
             proxy_loads: proxy_loads.clone(),
+            object_last_proxy: vec![None; 1 << 24],
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
@@ -162,18 +163,20 @@ where
             });
         });
 
-        thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                pre_consensus_sched_processor
-                    .process_pre_consensus_txns(rx_pre_consensus_txns)
-                    .await;
+        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+            thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    pre_consensus_sched_processor
+                        .process_pre_consensus_txns(rx_pre_consensus_txns)
+                        .await;
+                });
             });
-        });
+        }
 
         if self.separation_mode == SeparationMode::PrimaryPreSeparation {
             let mut stateless_txn_processor = StatelessTxnForwarder::<E> {

@@ -134,7 +134,9 @@ where
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
-                        self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+                            self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                        }
                         timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
                     }
                 },
@@ -146,7 +148,9 @@ where
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
-                        self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+                            self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                        }
                     } else if self.tx_primary_executor.is_closed() {
                         tracing::warn!("Terminating consensus task: primary executor dropped the channel");
                         break
