@@ -164,8 +164,11 @@ pub enum SeparationMode {
     /// and proxies also separate the stateful and stateless transactions.
     PrimaryPreSeparation,
     /// The load balancer separates the stateful and stateless transactions
-    /// and proxies also separate the stateful and stateless transactions.
+    /// preconsensus scheduling
+    /// the stateless part is running after the consensus.
     PrimaryPostSeparation,
+    /// Post consensus scheduling + no separation
+    PostConsensusNoSeparation,
     /// Post consensus scheduling + proxy separation
     PostConsensusProxySeparation,
 }
@@ -185,6 +188,16 @@ impl SeparationMode {
         matches!(
             self,
             SeparationMode::PrimaryPreSeparation | SeparationMode::PrimaryPostSeparation
+        )
+    }
+
+    pub fn is_pre_consensus_sched(&self) -> bool {
+        matches!(
+            self,
+            SeparationMode::NoSeparation
+                | SeparationMode::ProxySeparation
+                | SeparationMode::PrimaryPreSeparation
+                | SeparationMode::PrimaryPostSeparation
         )
     }
 }

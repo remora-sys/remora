@@ -464,7 +464,7 @@ where
         &mut self,
         mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
-        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+        if self.separation_mode.is_pre_consensus_sched() {
             while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
                 self.forward_shared_object_txn(transaction, required_versions, None)
                     .await;
@@ -582,7 +582,7 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            let proxy_id = if separation_mode == SeparationMode::PostConsensusProxySeparation {
+            let proxy_id = if !separation_mode.is_pre_consensus_sched() {
                 post_consensus_rsds_proxy
             } else {
                 pre_consensus_routing_plan
@@ -622,8 +622,7 @@ where
             )
             .await;
 
-            let msg = if !separation_mode.is_primary_separation()
-            {
+            let msg = if !separation_mode.is_primary_separation() {
                 PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
                     proxy_id,

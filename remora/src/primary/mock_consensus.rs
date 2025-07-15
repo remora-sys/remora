@@ -134,7 +134,7 @@ where
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
-                        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+                        if self.separation_mode.is_pre_consensus_sched() {
                             self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
                         }
                         timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
@@ -148,7 +148,7 @@ where
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
-                        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+                        if self.separation_mode.is_pre_consensus_sched() {
                             self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
                         }
                     } else if self.tx_primary_executor.is_closed() {

@@ -439,7 +439,7 @@ where
                         .await;
                 }
                 InterProxyRequest::Stateless(proxy_id, txn_digest) => {
-                    if self.mode == SeparationMode::NoSeparation {
+                    if !self.mode.is_primary_separation() {
                         tracing::error!(
                             "Proxy {} received stateless request from proxy {} for transaction {:?}",
                             self.id,
