@@ -591,7 +591,7 @@ where
             }
             .unwrap_or_else(|| {
                 // Policy fallback when no specific proxy is assigned
-                match policy {
+                let fallback_proxy = match policy {
                     PreConsensusSchedulingPolicy::LSDS => {
                         Self::get_proxy_for_shared_objects_most_states(
                             &proxy_connections,
@@ -602,7 +602,16 @@ where
                         .unwrap_or(counter % proxy_connections.len())
                     }
                     PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
-                }
+                };
+
+                let transaction_load =
+                    transaction_arc.expected_stateful_duration().as_micros() as usize;
+                proxy_loads
+                    .entry(fallback_proxy)
+                    .and_modify(|load| *load += transaction_load)
+                    .or_insert(transaction_load);
+
+                fallback_proxy
             });
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
