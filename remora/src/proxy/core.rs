@@ -126,7 +126,7 @@ where
                         stateless_res_proxy_id
                     );
 
-                    if self.mode == SeparationMode::ProxySeparation {
+                    if self.mode.is_proxy_separation() {
                         self.process_stateless_transaction(
                             *transaction.digest(),
                             transaction.verification_duration(),
@@ -154,10 +154,7 @@ where
         required_states: RequiredStates,
     ) {
         // If the stateless result is from the same proxy, look up the handle
-        let rx = if self.mode == SeparationMode::ProxySeparation
-            || self.mode == SeparationMode::PrimaryPreSeparation
-            || self.mode == SeparationMode::PrimaryPostSeparation
-        {
+        let rx = if self.mode.is_proxy_separation() {
             if stateless_res_proxy_id == self.id {
                 self.stateless_controller
                     .get_dependency(transaction.digest())
@@ -364,7 +361,8 @@ where
                     id,
                     transaction.digest()
                 );
-                if mode == SeparationMode::NoSeparation {
+                // If the proxy is not in proxy separation mode, need to run stateless verification
+                if !mode.is_proxy_separation() {
                     E::verify_transaction(
                         ctx.clone(),
                         *transaction.digest(),

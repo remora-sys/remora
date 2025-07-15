@@ -622,8 +622,7 @@ where
             )
             .await;
 
-            let msg = if separation_mode != SeparationMode::PrimaryPreSeparation
-                && separation_mode != SeparationMode::PrimaryPostSeparation
+            let msg = if !separation_mode.is_primary_separation()
             {
                 PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
