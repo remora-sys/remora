@@ -80,9 +80,7 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if self.mode == SeparationMode::PrimaryPreSeparation
-            || self.mode == SeparationMode::PrimaryPostSeparation
-        {
+        if self.mode.is_primary_separation() {
             match message {
                 PrimaryToProxyMessage::StatelessTxn(transaction, verification_duration) => {
                     tracing::debug!(
