@@ -476,7 +476,7 @@ where
             {
                 proxy_id
             } else {
-                match policy {
+                let fallback_proxy_id = match policy {
                     PreConsensusSchedulingPolicy::LSDS => {
                         Self::get_proxy_for_shared_objects_most_states(
                             &proxy_connections,
@@ -487,7 +487,15 @@ where
                         .unwrap_or(counter % proxy_connections.len())
                     }
                     PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
-                }
+                };
+
+                // Calculate the load for the transaction and update proxy_loads
+                let transaction_load = transaction_arc.expected_stateful_duration().as_micros() as usize;
+                proxy_loads.entry(fallback_proxy_id)
+                    .and_modify(|load| *load += transaction_load)
+                    .or_insert(transaction_load);
+
+                fallback_proxy_id
             };
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
