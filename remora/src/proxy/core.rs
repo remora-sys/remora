@@ -80,9 +80,7 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if self.mode == SeparationMode::PrimaryPreSeparation
-            || self.mode == SeparationMode::PrimaryPostSeparation
-        {
+        if self.mode.is_primary_separation() {
             match message {
                 PrimaryToProxyMessage::StatelessTxn(transaction, verification_duration) => {
                     tracing::debug!(
@@ -126,7 +124,7 @@ where
                         stateless_res_proxy_id
                     );
 
-                    if self.mode == SeparationMode::ProxySeparation {
+                    if self.mode.is_proxy_separation() {
                         self.process_stateless_transaction(
                             *transaction.digest(),
                             transaction.verification_duration(),
@@ -154,10 +152,7 @@ where
         required_states: RequiredStates,
     ) {
         // If the stateless result is from the same proxy, look up the handle
-        let rx = if self.mode == SeparationMode::ProxySeparation
-            || self.mode == SeparationMode::PrimaryPreSeparation
-            || self.mode == SeparationMode::PrimaryPostSeparation
-        {
+        let rx = if self.mode.is_proxy_separation() {
             if stateless_res_proxy_id == self.id {
                 self.stateless_controller
                     .get_dependency(transaction.digest())
@@ -364,7 +359,7 @@ where
                     id,
                     transaction.digest()
                 );
-                if mode == SeparationMode::NoSeparation {
+                if !mode.is_proxy_separation() {
                     E::verify_transaction(
                         ctx.clone(),
                         *transaction.digest(),
@@ -443,7 +438,7 @@ where
                         .await;
                 }
                 InterProxyRequest::Stateless(proxy_id, txn_digest) => {
-                    if self.mode == SeparationMode::NoSeparation {
+                    if !self.mode.is_primary_separation() {
                         tracing::error!(
                             "Proxy {} received stateless request from proxy {} for transaction {:?}",
                             self.id,

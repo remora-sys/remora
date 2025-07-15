@@ -490,8 +490,10 @@ where
                 };
 
                 // Calculate the load for the transaction and update proxy_loads
-                let transaction_load = transaction_arc.expected_stateful_duration().as_micros() as usize;
-                proxy_loads.entry(fallback_proxy_id)
+                let transaction_load =
+                    transaction_arc.expected_stateful_duration().as_micros() as usize;
+                proxy_loads
+                    .entry(fallback_proxy_id)
                     .and_modify(|load| *load += transaction_load)
                     .or_insert(transaction_load);
 
@@ -506,9 +508,7 @@ where
             )
             .await;
 
-            let msg = if separation_mode != SeparationMode::PrimaryPreSeparation
-                && separation_mode != SeparationMode::PrimaryPostSeparation
-            {
+            let msg = if !separation_mode.is_primary_separation() {
                 PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
                     proxy_id,

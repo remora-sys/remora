@@ -167,6 +167,24 @@ pub enum SeparationMode {
     PrimaryPostSeparation,
 }
 
+impl SeparationMode {
+    pub fn is_proxy_separation(&self) -> bool {
+        matches!(
+            self,
+            SeparationMode::ProxySeparation
+                | SeparationMode::PrimaryPreSeparation
+                | SeparationMode::PrimaryPostSeparation
+        )
+    }
+
+    pub fn is_primary_separation(&self) -> bool {
+        matches!(
+            self,
+            SeparationMode::PrimaryPreSeparation | SeparationMode::PrimaryPostSeparation
+        )
+    }
+}
+
 /// The configuration for the validator, containing network addresses.
 /// Note: This now includes a vector of proxy configurations.
 #[derive(Serialize, Deserialize)]
