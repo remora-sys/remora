@@ -1,5 +1,5 @@
 {
-	"annotations": {
+  "annotations": {
     "list": [
       {
         "builtIn": 1,
@@ -106,7 +106,7 @@
             "uid": "Fixed-UID-testbed"
           },
           "editorMode": "code",
-	  "expr": "rate(latency_s_count[10s])",
+          "expr": "rate(latency_s_count[10s])",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -218,7 +218,7 @@
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
-          "refId": "A"
+          "refId": "C"
         },
         {
           "datasource": {
@@ -231,7 +231,33 @@
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
-          "refId": "B"
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(latency_s_bucket{job='instance-node-0'}[10s])) by (le))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "primary-p50",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.90, sum(rate(latency_s_bucket{job='instance-node-0'}[10s])) by (le))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "primary-p90",
+          "range": true,
+          "refId": "F"
         }
       ],
       "title": "Latency",
