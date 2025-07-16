@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -18,39 +17,29 @@ impl Calibration {
 
     /// Single calibration attempt to determine iterations needed for target_duration
     pub fn calibrate_once(target_duration: Duration) -> u64 {
-        let mut iterations = 1_000_000;
-        let mut step_size = iterations;
+        let mut low = 1;
+        let mut high = 1_000_000;
+        let mut best = high;
 
-        loop {
+        while low <= high {
+            let mid = (low + high) / 2;
+
             let start = Instant::now();
-
-            Self::calibrated_work(iterations);
-
+            Self::calibrated_work(mid);
             let elapsed = start.elapsed();
 
-            match elapsed.cmp(&target_duration) {
-                Ordering::Greater => {
-                    // Use a binary reduction approach to converge faster
-                    step_size = (step_size as f64 * 0.5) as u64;
-                    if step_size == 0 {
-                        break; // Stop when step size is too small to adjust further
-                    }
-                    iterations -= step_size;
+            if elapsed > target_duration {
+                best = mid;
+                if mid == 0 {
+                    break;
                 }
-                Ordering::Less => {
-                    // Increase faster initially, then adjust slowly
-                    step_size = (step_size as f64 * 0.5) as u64;
-                    iterations += step_size;
-                }
-                Ordering::Equal => break,
-            }
-
-            // If the duration is very close to target, break early
-            if (elapsed.as_secs_f64() - target_duration.as_secs_f64()).abs() < 0.000_001 {
-                break;
+                high = mid - 1;
+            } else {
+                low = mid + 1;
             }
         }
-        iterations
+
+        best
     }
 
     /// Calibrate with retry logic - removes outliers and ensures <5% variation
