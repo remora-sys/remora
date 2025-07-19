@@ -13,9 +13,153 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::SystemTime,
+};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Encapsulates elastic scaling logic and state for RoundRobin policy
+pub(crate) struct ElasticScaler {
+    /// Number of active nodes (starts at 1, scales up based on load) - atomic for spawned task access
+    active_nodes: Arc<AtomicUsize>,
+    /// Last time scaling check was performed
+    last_scale_check: u64,
+    /// Count of incoming transactions in current rate window
+    incoming_rate_count: usize,
+    /// Start time of current rate tracking window
+    rate_window_start: u64,
+    /// Pre-calculated per-node capacity in transactions per second (calculated once)
+    per_node_capacity_tps: Option<f64>,
+}
+
+impl ElasticScaler {
+    /// Create a new elastic scaler starting with 1 active node
+    pub fn new() -> Self {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Self {
+            active_nodes: Arc::new(AtomicUsize::new(1)),
+            last_scale_check: now,
+            incoming_rate_count: 0,
+            rate_window_start: now,
+            per_node_capacity_tps: None,
+        }
+    }
+
+    /// Record an incoming transaction for rate tracking
+    pub fn record_transaction(&mut self) {
+        self.incoming_rate_count += 1;
+    }
+
+    /// Calculate and store per-node capacity from transaction durations
+    pub fn calculate_capacity(
+        &mut self,
+        verification_duration: std::time::Duration,
+        expected_stateful_duration: std::time::Duration,
+    ) {
+        if self.per_node_capacity_tps.is_none() {
+            let total_service_time = verification_duration + expected_stateful_duration;
+            let cores_per_node = num_cpus::get() as f64;
+            let new_capacity = cores_per_node / total_service_time.as_secs_f64();
+
+            tracing::info!(
+                "Calculated per-node capacity: {:.2} tps (cores: {}, service_time: {:?})",
+                new_capacity,
+                cores_per_node,
+                total_service_time
+            );
+
+            self.per_node_capacity_tps = Some(new_capacity);
+        }
+    }
+
+    /// Check if scaling is needed and scale up if necessary
+    pub fn check_and_scale(
+        &mut self,
+        total_available_nodes: usize,
+        metrics: &Arc<crate::metrics::Metrics>,
+    ) {
+        const SCALE_CHECK_INTERVAL_SECS: u64 = 2;
+        const LOAD_THRESHOLD_MULTIPLIER: f64 = 0.8;
+        const RATE_WINDOW_SECS: u64 = 5;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Check if it's time for a scaling check
+        if now.saturating_sub(self.last_scale_check) < SCALE_CHECK_INTERVAL_SECS {
+            return;
+        }
+
+        // Update last check time
+        self.last_scale_check = now;
+
+        let current_active_nodes = self.active_nodes.load(Ordering::Relaxed);
+
+        // Don't scale beyond available nodes
+        if current_active_nodes >= total_available_nodes {
+            return;
+        }
+
+        // Calculate current incoming rate
+        let window_duration = now.saturating_sub(self.rate_window_start);
+
+        // Reset window if it's been too long or calculate rate
+        let incoming_rate = if window_duration >= RATE_WINDOW_SECS {
+            // Start new window
+            self.rate_window_start = now;
+            self.incoming_rate_count = 0;
+            0.0
+        } else if window_duration > 0 {
+            self.incoming_rate_count as f64 / window_duration as f64
+        } else {
+            0.0
+        };
+
+        // Calculate current total capacity - get capacity or use default if not calculated yet
+        let per_node_capacity = self.per_node_capacity_tps.unwrap_or(1000.0);
+        let total_current_capacity = per_node_capacity * current_active_nodes as f64;
+
+        tracing::debug!(
+            "Scaling check: incoming_rate={:.2} tps, current_capacity={:.2} tps, active_nodes={}/{}",
+            incoming_rate,
+            total_current_capacity,
+            current_active_nodes,
+            total_available_nodes
+        );
+
+        // Scale up if incoming load exceeds threshold of current capacity
+        if incoming_rate > total_current_capacity * LOAD_THRESHOLD_MULTIPLIER {
+            let new_active_nodes = (current_active_nodes + 1).min(total_available_nodes);
+            self.active_nodes.store(new_active_nodes, Ordering::Relaxed);
+
+            // Record the scaling decision
+            metrics.record_scaling_decision("scale_up");
+            metrics.update_active_nodes(new_active_nodes as u64);
+
+            tracing::info!(
+                "SCALING UP: Load spike detected! Incoming rate {:.2} tps exceeds {:.0}% of capacity {:.2} tps. Active nodes: {} -> {}",
+                incoming_rate,
+                LOAD_THRESHOLD_MULTIPLIER * 100.0,
+                total_current_capacity,
+                current_active_nodes,
+                new_active_nodes
+            );
+        }
+    }
+}
 
 pub(crate) struct VersionAssignmentTask<E>
 where
@@ -128,6 +272,8 @@ where
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) proxy_mode: ProxyMode,
+    /// Elastic scaling (only used when policy is RoundRobin)
+    pub(crate) elastic_scaler: ElasticScaler,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -151,6 +297,23 @@ where
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
     ) {
+        // Elasticity logic for RoundRobin policy
+        if self.policy == LoadBalancingPolicy::RoundRobin {
+            // Record incoming transaction for rate tracking
+            self.elastic_scaler.record_transaction();
+            self.metrics.record_incoming_transaction();
+
+            // Calculate per-node capacity from first transaction (if not already calculated)
+            self.elastic_scaler.calculate_capacity(
+                transaction.verification_duration(),
+                transaction.expected_stateful_duration(),
+            );
+
+            // Check if we need to scale
+            self.elastic_scaler
+                .check_and_scale(self.proxy_connections.len(), &self.metrics);
+        }
+
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();
         let states_to_proxy = self.states_to_proxy.clone();
@@ -161,6 +324,9 @@ where
         let proxy_mode = self.proxy_mode;
         let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
+
+        // Clone active nodes count for spawned task (only field needed for routing)
+        let active_nodes = self.elastic_scaler.active_nodes.clone();
 
         tokio::spawn(async move {
             let (prior_handles, current_handles) = match required_versions.is_empty() {
@@ -180,14 +346,31 @@ where
             // Remove the dependency when done
             dependency_controller.remove_dependency(required_versions.clone());
 
-            if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
-                &policy,
-                &proxy_connections,
-                &states_to_proxy,
-                txn_cnt,
-                &required_versions,
-                &transaction_arc.destination,
-            ) {
+            // Get proxy assignment using elastic logic for RoundRobin
+            let proxy_assignment = if policy == LoadBalancingPolicy::RoundRobin {
+                // Elastic round-robin: only use active nodes
+                let total_proxy_count = proxy_connections.len();
+                let active_node_count = active_nodes.load(Ordering::Relaxed);
+
+                if total_proxy_count == 0 || active_node_count == 0 {
+                    None
+                } else {
+                    let effective_proxy_count = active_node_count.min(total_proxy_count);
+                    let proxy_index = txn_cnt % effective_proxy_count;
+                    Some((proxy_index, proxy_index))
+                }
+            } else {
+                Self::get_proxy_for_shared_objects(
+                    &policy,
+                    &proxy_connections,
+                    &states_to_proxy,
+                    txn_cnt,
+                    &required_versions,
+                    &transaction_arc.destination,
+                )
+            };
+
+            if let Some((proxy_index, stateless_proxy_id)) = proxy_assignment {
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
                     Some(required_versions),

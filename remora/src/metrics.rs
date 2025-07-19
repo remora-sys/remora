@@ -48,6 +48,12 @@ pub struct Metrics {
     pub errors: IntCounterVec,
     /// Number of in-flight transactions in the proxy.
     pub proxy_load: IntGaugeVec,
+    /// Number of active nodes in elastic load balancing.
+    pub active_nodes: IntCounter,
+    /// Incoming transaction rate for elastic scaling decisions.
+    pub incoming_rate: IntCounter,
+    /// Scaling decisions counter.
+    pub scaling_decisions: IntCounterVec,
 }
 
 impl Metrics {
@@ -96,6 +102,25 @@ impl Metrics {
                 "proxy_load",
                 "Number of in-flight transactions in the proxy",
                 &["proxy_id"],
+                registry
+            )
+            .unwrap(),
+            active_nodes: register_int_counter_with_registry!(
+                "active_nodes",
+                "Number of active nodes in elastic load balancing",
+                registry
+            )
+            .unwrap(),
+            incoming_rate: register_int_counter_with_registry!(
+                "incoming_rate",
+                "Incoming transaction rate for elastic scaling decisions",
+                registry
+            )
+            .unwrap(),
+            scaling_decisions: register_int_counter_vec_with_registry!(
+                "scaling_decisions",
+                "Scaling decisions counter",
+                &["decision_type"],
                 registry
             )
             .unwrap(),
@@ -181,6 +206,23 @@ impl Metrics {
         self.proxy_load
             .with_label_values(&[proxy_id.to_string().as_str()])
             .dec();
+    }
+
+    /// Update the number of active nodes for elastic scaling.
+    pub fn update_active_nodes(&self, count: u64) {
+        self.active_nodes.inc_by(count);
+    }
+
+    /// Record an incoming transaction for rate tracking.
+    pub fn record_incoming_transaction(&self) {
+        self.incoming_rate.inc();
+    }
+
+    /// Record a scaling decision.
+    pub fn record_scaling_decision(&self, decision_type: &str) {
+        self.scaling_decisions
+            .with_label_values(&[decision_type])
+            .inc();
     }
 }
 

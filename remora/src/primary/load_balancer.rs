@@ -104,6 +104,8 @@ where
             dependency_controller: Arc::new(VersionedDependencyController::new()),
             metrics: self.metrics.clone(),
             proxy_mode: self.proxy_mode.clone(),
+            // Elastic scaling initialization
+            elastic_scaler: crate::primary::shared_obj_txn_forwarder::ElasticScaler::new(),
         };
 
         thread::spawn(move || {
