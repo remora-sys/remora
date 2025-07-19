@@ -17,4 +17,4 @@ validator_parameters:
     primary: 0
     proxy: 0
   load_balancing_policy: RoundRobin
-  proxy_mode: Separation
+  proxy_mode: NoSeparation

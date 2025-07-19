@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::{
     client::request_arrival_distribution::Distribution,
-    config::BenchmarkParameters,
+    config::{BenchmarkParameters, LoadConfig},
     executor::api::{ExecutableTransaction, Executor, RemoraTransaction, TransactionWithTimestamp},
     metrics::Metrics,
     networking::client::NetworkClient,
@@ -31,8 +31,10 @@ pub struct LoadGenerator<Executor> {
     config: BenchmarkParameters,
     /// The target socket address.
     target: SocketAddr,
-    /// Request inter arrival distribution.
+    /// Request inter arrival distribution (for initial load).
     arrival: Distribution,
+    /// The effective load configuration.
+    load_config: LoadConfig,
 }
 
 const NUM_CLIENTS: usize = 16;
@@ -40,12 +42,16 @@ const NUM_CLIENTS: usize = 16;
 impl<E: Executor> LoadGenerator<E> {
     /// Create a new load generator.
     pub fn new(config: BenchmarkParameters, target: SocketAddr) -> Self {
-        let ns_per_packet = 1_000_000_000 / config.load * NUM_CLIENTS as u64;
+        let load_config = config.effective_load_config();
+        let initial_load = load_config.initial_load();
+        let ns_per_packet = 1_000_000_000 / initial_load * NUM_CLIENTS as u64;
+
         LoadGenerator {
             _phantom: PhantomData,
             config,
             target,
             arrival: Distribution::Exponential(ns_per_packet as f64),
+            load_config,
         }
     }
 
@@ -87,7 +93,69 @@ impl<E: Executor> LoadGenerator<E> {
         arrival.sample(rng)
     }
 
-    // Function to run the transaction submission at a specific load
+    /// Calculate arrival distribution for a given load rate.
+    fn calculate_arrival_distribution(load: u64) -> Distribution {
+        let ns_per_packet = 1_000_000_000 / load * NUM_CLIENTS as u64;
+        Distribution::Exponential(ns_per_packet as f64)
+    }
+
+    // Function to run the transaction submission with dynamic load support
+    async fn submit_transactions_dynamic(
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
+        sender: Sender<RemoraTransaction<E>>,
+        load_config: LoadConfig,
+    ) where
+        <E as Executor>::Transaction: std::marker::Send + 'static,
+    {
+        let mut rng: Mt64 = Mt64::new(rand::thread_rng().gen::<u64>());
+        let start_time = Instant::now();
+        let mut next_ts = start_time;
+
+        for (counter, tx_with_timestamp) in transactions.into_iter().enumerate() {
+            // Wait until the next interval before sending the next transaction
+            while Instant::now() < next_ts {
+                std::hint::spin_loop();
+            }
+
+            // Get the current timestamp for metrics and create new transaction with updated timestamp
+            let timestamp = Metrics::now().as_secs_f64();
+            let updated_tx = TransactionWithTimestamp::new(
+                tx_with_timestamp.transaction.clone(),
+                timestamp,
+                tx_with_timestamp.shared_object_ids(),
+                tx_with_timestamp.verification_duration(),
+                tx_with_timestamp.expected_stateful_duration(),
+                tx_with_timestamp.destination,
+            );
+
+            // Send the transaction
+            if sender.send(updated_tx).await.is_err() {
+                tracing::error!("Failed to send transaction");
+                break; // Exit the loop on send failure
+            }
+
+            // Increment transaction counter for logging
+            if counter > 0 && counter % 1000 == 0 {
+                tracing::debug!("Submitted {} transactions", counter);
+            }
+
+            // Calculate the current load based on elapsed time
+            let elapsed_secs = start_time.elapsed().as_secs();
+            let current_load = load_config.get_load_at_time(elapsed_secs);
+
+            // If load is 0, we've gone past the configured intervals - stop sending
+            if current_load == 0 {
+                tracing::info!("Dynamic load configuration ended, stopping transaction submission");
+                break;
+            }
+
+            // Calculate the next interval based on current load
+            let current_arrival = Self::calculate_arrival_distribution(current_load);
+            next_ts += Duration::from_nanos(Self::gen_inter_arrival(&mut rng, current_arrival));
+        }
+    }
+
+    // Function to run the transaction submission at a specific load (backward compatibility)
     async fn submit_transactions(
         transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
         sender: Sender<RemoraTransaction<E>>,
@@ -182,8 +250,17 @@ impl<E: Executor> LoadGenerator<E> {
     ) where
         <E as Executor>::Transaction: std::marker::Send + 'static,
     {
-        let real_load = self.config.load;
-        tracing::info!("Starting run at {} load...", real_load);
+        let initial_load = self.load_config.initial_load();
+        let is_dynamic = self.load_config.is_dynamic();
+
+        if is_dynamic {
+            tracing::info!(
+                "Starting dynamic load run with initial load: {} TPS",
+                initial_load
+            );
+        } else {
+            tracing::info!("Starting constant load run at {} TPS", initial_load);
+        }
 
         // split the transactions
         let split = self.split_transactions(transactions);
@@ -191,6 +268,7 @@ impl<E: Executor> LoadGenerator<E> {
         // spawn for each client
         let mut handles = vec![];
         for (tx, tx_chunk) in senders.into_iter().zip(split.into_iter()) {
+            let load_config = self.load_config.clone();
             let arrival = self.arrival;
             let handle = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -200,7 +278,11 @@ impl<E: Executor> LoadGenerator<E> {
 
                 rt.block_on(async move {
                     sleep(Duration::from_secs(1)).await;
-                    Self::submit_transactions(tx_chunk, tx, arrival).await;
+                    if load_config.is_dynamic() {
+                        Self::submit_transactions_dynamic(tx_chunk, tx, load_config).await;
+                    } else {
+                        Self::submit_transactions(tx_chunk, tx, arrival).await;
+                    }
                 });
             });
             handles.push(handle);
@@ -269,7 +351,9 @@ pub mod tests {
 
     use crate::{
         client::load_generator::LoadGenerator,
-        config::{get_test_address, BenchmarkParameters},
+        config::{
+            get_test_address, BenchmarkParameters, DynamicLoadConfig, LoadConfig, LoadInterval,
+        },
         executor::sui::{SuiExecutor, SuiTransaction},
         metrics::Metrics,
         networking::server::NetworkServer,
@@ -302,6 +386,133 @@ pub mod tests {
         // Check that the transactions were received.
         let transaction = rx_transactions.recv().await.unwrap();
         assert!(transaction.timestamp() > now);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_load_configuration() {
+        // Create a dynamic load configuration
+        let dynamic_config = DynamicLoadConfig {
+            total_duration_secs: 6,
+            intervals: vec![
+                LoadInterval {
+                    start_time_secs: 0,
+                    end_time_secs: 2,
+                    target_load: 1000,
+                },
+                LoadInterval {
+                    start_time_secs: 2,
+                    end_time_secs: 4,
+                    target_load: 2000,
+                },
+                LoadInterval {
+                    start_time_secs: 4,
+                    end_time_secs: 6,
+                    target_load: 1500,
+                },
+            ],
+        };
+
+        // Validate the configuration
+        assert!(dynamic_config.validate().is_ok());
+
+        // Test getting load at different times
+        assert_eq!(dynamic_config.get_load_at_time(0), Some(1000));
+        assert_eq!(dynamic_config.get_load_at_time(1), Some(1000));
+        assert_eq!(dynamic_config.get_load_at_time(2), Some(2000));
+        assert_eq!(dynamic_config.get_load_at_time(3), Some(2000));
+        assert_eq!(dynamic_config.get_load_at_time(4), Some(1500));
+        assert_eq!(dynamic_config.get_load_at_time(5), Some(1500));
+        assert_eq!(dynamic_config.get_load_at_time(6), None); // Past the end
+
+        // Test LoadConfig wrapper
+        let load_config = LoadConfig::Dynamic(dynamic_config);
+        assert!(load_config.is_dynamic());
+        assert_eq!(load_config.initial_load(), 1000);
+        assert_eq!(load_config.get_load_at_time(2), 2000);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_load_validation() {
+        // Test invalid configuration - gap in intervals
+        let invalid_config = DynamicLoadConfig {
+            total_duration_secs: 10,
+            intervals: vec![
+                LoadInterval {
+                    start_time_secs: 0,
+                    end_time_secs: 3,
+                    target_load: 1000,
+                },
+                LoadInterval {
+                    start_time_secs: 5, // Gap from 3 to 5
+                    end_time_secs: 10,
+                    target_load: 2000,
+                },
+            ],
+        };
+
+        assert!(invalid_config.validate().is_err());
+
+        // Test invalid configuration - overlap
+        let invalid_config2 = DynamicLoadConfig {
+            total_duration_secs: 10,
+            intervals: vec![
+                LoadInterval {
+                    start_time_secs: 0,
+                    end_time_secs: 6,
+                    target_load: 1000,
+                },
+                LoadInterval {
+                    start_time_secs: 5, // Overlap at 5-6
+                    end_time_secs: 10,
+                    target_load: 2000,
+                },
+            ],
+        };
+
+        assert!(invalid_config2.validate().is_err());
+
+        // Test valid continuous configuration
+        let valid_config = DynamicLoadConfig {
+            total_duration_secs: 10,
+            intervals: vec![
+                LoadInterval {
+                    start_time_secs: 0,
+                    end_time_secs: 5,
+                    target_load: 1000,
+                },
+                LoadInterval {
+                    start_time_secs: 5,
+                    end_time_secs: 10,
+                    target_load: 2000,
+                },
+            ],
+        };
+
+        assert!(valid_config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_from_intervals() {
+        // Test the convenience method for creating dynamic load configs
+        let interval_map = vec![(0, 1000), (10, 2000), (20, 1500)];
+        let config = DynamicLoadConfig::from_intervals(30, &interval_map);
+
+        assert_eq!(config.total_duration_secs, 30);
+        assert_eq!(config.intervals.len(), 3);
+
+        assert_eq!(config.intervals[0].start_time_secs, 0);
+        assert_eq!(config.intervals[0].end_time_secs, 10);
+        assert_eq!(config.intervals[0].target_load, 1000);
+
+        assert_eq!(config.intervals[1].start_time_secs, 10);
+        assert_eq!(config.intervals[1].end_time_secs, 20);
+        assert_eq!(config.intervals[1].target_load, 2000);
+
+        assert_eq!(config.intervals[2].start_time_secs, 20);
+        assert_eq!(config.intervals[2].end_time_secs, 30);
+        assert_eq!(config.intervals[2].target_load, 1500);
+
+        assert!(config.validate().is_ok());
     }
 }
 

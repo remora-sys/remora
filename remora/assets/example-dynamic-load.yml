@@ -1,0 +1,32 @@
+# Example configuration for dynamic load rates
+# This config demonstrates variable load over different time intervals
+
+duration:
+  secs: 30
+  nanos: 0
+
+# Dynamic load configuration with time-based intervals
+load_config: !Dynamic
+  total_duration_secs: 30
+  intervals:
+    - start_time_secs: 0
+      end_time_secs: 20
+      target_load: 7000
+    - start_time_secs: 20
+      end_time_secs: 30
+      target_load: 14000
+
+workload: !FakeZipfian
+  execution_duration:
+    secs: 0
+    nanos: 2000000
+  alpha: 0.0
+  number_of_inputs: 2
+
+verification_duration:
+  secs: 0
+  nanos: 2000000
+
+expected_stateful_duration:
+  secs: 0
+  nanos: 2000000

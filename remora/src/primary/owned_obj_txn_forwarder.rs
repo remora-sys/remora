@@ -103,7 +103,8 @@ where
         use crate::config::{BenchmarkParameters, WorkloadType};
         use std::time::Duration;
         let config = BenchmarkParameters {
-            load: count as u64,
+            load_config: crate::config::LoadConfig::Constant(count as u64),
+            load: Some(count as u64),
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
             verification_duration: Duration::from_secs(0),

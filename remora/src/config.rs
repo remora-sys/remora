@@ -316,12 +316,161 @@ impl Display for ConfigErrorType {
 
 impl Error for ConfigErrorType {}
 
+/// Represents a load interval with timing and target load rate.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoadInterval {
+    /// Start time for this interval in seconds from benchmark start
+    pub start_time_secs: u64,
+    /// End time for this interval in seconds from benchmark start
+    pub end_time_secs: u64,
+    /// Target load rate in transactions per second for this interval
+    pub target_load: u64,
+}
+
+/// Configuration for dynamic load rates with time-based intervals.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DynamicLoadConfig {
+    /// Total duration of the benchmark in seconds
+    pub total_duration_secs: u64,
+    /// List of load intervals defining the load pattern
+    pub intervals: Vec<LoadInterval>,
+}
+
+impl DynamicLoadConfig {
+    /// Create a new dynamic load configuration from the user's format.
+    /// Example input format:
+    /// duration: 30
+    /// intervals:
+    ///   0: 10000
+    ///   10: 20000
+    ///   20: 10000
+    pub fn from_intervals(duration_secs: u64, interval_map: &[(u64, u64)]) -> Self {
+        let mut intervals = Vec::new();
+        let mut sorted_intervals: Vec<_> = interval_map.iter().collect();
+        sorted_intervals.sort_by_key(|(start, _)| *start);
+
+        for i in 0..sorted_intervals.len() {
+            let (start_time, target_load) = sorted_intervals[i];
+            let end_time = if i + 1 < sorted_intervals.len() {
+                sorted_intervals[i + 1].0
+            } else {
+                duration_secs
+            };
+
+            intervals.push(LoadInterval {
+                start_time_secs: *start_time,
+                end_time_secs: end_time,
+                target_load: *target_load,
+            });
+        }
+
+        DynamicLoadConfig {
+            total_duration_secs: duration_secs,
+            intervals,
+        }
+    }
+
+    /// Get the target load rate for a given time offset from benchmark start.
+    pub fn get_load_at_time(&self, elapsed_secs: u64) -> Option<u64> {
+        for interval in &self.intervals {
+            if elapsed_secs >= interval.start_time_secs && elapsed_secs < interval.end_time_secs {
+                return Some(interval.target_load);
+            }
+        }
+        None
+    }
+
+    /// Validate that the configuration is well-formed.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.intervals.is_empty() {
+            return Err("Dynamic load config must have at least one interval".to_string());
+        }
+
+        let mut prev_end = 0;
+        for interval in &self.intervals {
+            if interval.start_time_secs != prev_end {
+                return Err(format!(
+                    "Gap or overlap in intervals: expected start {} but got {}",
+                    prev_end, interval.start_time_secs
+                ));
+            }
+            if interval.end_time_secs <= interval.start_time_secs {
+                return Err(format!(
+                    "Invalid interval: end time {} <= start time {}",
+                    interval.end_time_secs, interval.start_time_secs
+                ));
+            }
+            prev_end = interval.end_time_secs;
+        }
+
+        if prev_end != self.total_duration_secs {
+            return Err(format!(
+                "Intervals don't cover full duration: {} vs {}",
+                prev_end, self.total_duration_secs
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Load configuration that supports both constant and dynamic load rates.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum LoadConfig {
+    /// Constant load rate throughout the benchmark
+    Constant(u64),
+    /// Dynamic load rates with time-based intervals
+    Dynamic(DynamicLoadConfig),
+}
+
+impl LoadConfig {
+    /// Get the load rate for a given time offset, or constant load if not dynamic.
+    pub fn get_load_at_time(&self, elapsed_secs: u64) -> u64 {
+        match self {
+            LoadConfig::Constant(load) => *load,
+            LoadConfig::Dynamic(config) => config.get_load_at_time(elapsed_secs).unwrap_or(0),
+        }
+    }
+
+    /// Get the initial load rate.
+    pub fn initial_load(&self) -> u64 {
+        match self {
+            LoadConfig::Constant(load) => *load,
+            LoadConfig::Dynamic(config) => {
+                config.intervals.first().map(|i| i.target_load).unwrap_or(0)
+            }
+        }
+    }
+
+    /// Check if this is a dynamic load configuration.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, LoadConfig::Dynamic(_))
+    }
+
+    /// Get total duration for this load configuration.
+    pub fn get_duration(&self) -> Option<Duration> {
+        match self {
+            LoadConfig::Constant(_) => None,
+            LoadConfig::Dynamic(config) => Some(Duration::from_secs(config.total_duration_secs)),
+        }
+    }
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        LoadConfig::Constant(default_benchmark_config::default_load())
+    }
+}
+
 /// The configuration for the benchmark.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BenchmarkParameters {
-    /// The load to generate in transactions per second.
-    #[serde(default = "default_benchmark_config::default_load")]
-    pub load: u64,
+    /// The load to generate - either constant or dynamic.
+    #[serde(default = "default_load_config")]
+    pub load_config: LoadConfig,
+    /// The load to generate in transactions per second (deprecated, use load_config instead).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<u64>,
     /// The duration to run the benchmark for.
     #[serde(default = "default_benchmark_config::default_duration")]
     pub duration: Duration,
@@ -339,11 +488,36 @@ pub struct BenchmarkParameters {
     pub assignment_mode: AssignmentMode,
 }
 
+fn default_load_config() -> LoadConfig {
+    LoadConfig::Constant(default_benchmark_config::default_load())
+}
+
 impl BenchmarkParameters {
+    /// Get the effective load configuration, handling backward compatibility.
+    pub fn effective_load_config(&self) -> LoadConfig {
+        if let Some(legacy_load) = self.load {
+            LoadConfig::Constant(legacy_load)
+        } else {
+            self.load_config.clone()
+        }
+    }
+
+    /// Get the initial load rate for backward compatibility.
+    pub fn get_initial_load(&self) -> u64 {
+        self.effective_load_config().initial_load()
+    }
+
+    /// Get the effective duration, considering dynamic load configuration.
+    pub fn effective_duration(&self) -> Duration {
+        let load_config = self.effective_load_config();
+        load_config.get_duration().unwrap_or(self.duration)
+    }
+
     /// Create a new benchmark configuration for tests.
     pub fn new_for_tests() -> Self {
         BenchmarkParameters {
-            load: 10,
+            load_config: LoadConfig::Constant(10),
+            load: Some(10),
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
@@ -356,7 +530,8 @@ impl BenchmarkParameters {
     /// Create a new benchmark configuration for contention tests using SharedObjects workload.
     pub fn new_for_contention_tests() -> Self {
         BenchmarkParameters {
-            load: 10,
+            load_config: LoadConfig::Constant(10),
+            load: Some(10),
             duration: Duration::from_secs(1),
             workload: WorkloadType::SharedObjects {
                 txs_per_counter: default_cont_level_for_shared_obj(),
@@ -371,7 +546,8 @@ impl BenchmarkParameters {
     /// Create a new benchmark configuration for contention tests using Ethereum workload.
     pub fn new_for_ethereum_tests() -> Self {
         BenchmarkParameters {
-            load: 100,
+            load_config: LoadConfig::Constant(100),
+            load: Some(100),
             duration: Duration::from_secs(5),
             workload: WorkloadType::EthereumTransfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
@@ -384,7 +560,8 @@ impl BenchmarkParameters {
     /// Create a new benchmark configuration for fake txn tests.
     pub fn new_for_fake_tests() -> Self {
         BenchmarkParameters {
-            load: 10,
+            load_config: LoadConfig::Constant(10),
+            load: Some(10),
             duration: Duration::from_secs(1),
             workload: WorkloadType::FakeZipfian {
                 execution_duration: default_fake_execution_duration(),
@@ -401,7 +578,8 @@ impl BenchmarkParameters {
     /// Create a new benchmark configuration for fake txn tests.
     pub fn new_for_fake_contention_tests() -> Self {
         BenchmarkParameters {
-            load: 10,
+            load_config: LoadConfig::Constant(10),
+            load: Some(10),
             duration: Duration::from_secs(1),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             workload: WorkloadType::FakeZipfian {
@@ -441,7 +619,8 @@ mod default_benchmark_config {
 impl Default for BenchmarkParameters {
     fn default() -> Self {
         BenchmarkParameters {
-            load: default_benchmark_config::default_load(),
+            load_config: LoadConfig::Constant(default_benchmark_config::default_load()),
+            load: Some(default_benchmark_config::default_load()),
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),

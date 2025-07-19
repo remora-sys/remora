@@ -105,7 +105,7 @@ pub struct SuiExecutor {
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
-    let pre_generation = config.load * config.duration.as_secs();
+    let pre_generation = config.get_initial_load() * config.effective_duration().as_secs();
 
     // Determine the workload.
     let workload_type = match config.workload {
@@ -536,8 +536,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "slow"]
     async fn test_generate_transactions_with_exportable_state() {
+        use crate::config::LoadConfig;
+
         let config = BenchmarkParameters {
-            load: 100,
+            load_config: LoadConfig::Constant(100),
+            load: Some(100),
             duration: Duration::from_secs(1000),
             ..BenchmarkParameters::new_for_tests()
         };
