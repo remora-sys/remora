@@ -90,9 +90,9 @@ impl ElasticScaler {
         total_available_nodes: usize,
         metrics: &Arc<crate::metrics::Metrics>,
     ) {
-        const SCALE_CHECK_INTERVAL_SECS: u64 = 1;
+        const SCALE_CHECK_INTERVAL_SECS: u64 = 2;
         const LOAD_THRESHOLD_MULTIPLIER: f64 = 0.8;
-        const RATE_WINDOW_SECS: u64 = 1;
+        const RATE_WINDOW_SECS: u64 = 5;
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
