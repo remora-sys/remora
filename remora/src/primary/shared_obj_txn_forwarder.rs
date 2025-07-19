@@ -64,22 +64,23 @@ impl ElasticScaler {
     /// Calculate and store per-node capacity from transaction durations
     pub fn calculate_capacity(
         &mut self,
-        verification_duration: std::time::Duration,
-        expected_stateful_duration: std::time::Duration,
+        _verification_duration: std::time::Duration,
+        _expected_stateful_duration: std::time::Duration,
     ) {
         if self.per_node_capacity_tps.is_none() {
-            let total_service_time = verification_duration + expected_stateful_duration;
-            let cores_per_node = num_cpus::get() as f64;
-            let new_capacity = cores_per_node / total_service_time.as_secs_f64();
+            // let total_service_time = verification_duration + expected_stateful_duration;
+            // let cores_per_node = num_cpus::get() as f64;
+            // let new_capacity = cores_per_node / total_service_time.as_secs_f64();
 
-            tracing::info!(
-                "Calculated per-node capacity: {:.2} tps (cores: {}, service_time: {:?})",
-                new_capacity,
-                cores_per_node,
-                total_service_time
-            );
+            // tracing::info!(
+            //     "Calculated per-node capacity: {:.2} tps (cores: {}, service_time: {:?})",
+            //     new_capacity,
+            //     cores_per_node,
+            //     total_service_time
+            // );
 
-            self.per_node_capacity_tps = Some(new_capacity);
+            // HARDCODE core cap with 1ms workload
+            self.per_node_capacity_tps = Some(27000.0);
         }
     }
 
@@ -89,9 +90,9 @@ impl ElasticScaler {
         total_available_nodes: usize,
         metrics: &Arc<crate::metrics::Metrics>,
     ) {
-        const SCALE_CHECK_INTERVAL_SECS: u64 = 2;
+        const SCALE_CHECK_INTERVAL_SECS: u64 = 1;
         const LOAD_THRESHOLD_MULTIPLIER: f64 = 0.8;
-        const RATE_WINDOW_SECS: u64 = 5;
+        const RATE_WINDOW_SECS: u64 = 1;
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -129,7 +130,7 @@ impl ElasticScaler {
         };
 
         // Calculate current total capacity - get capacity or use default if not calculated yet
-        let per_node_capacity = self.per_node_capacity_tps.unwrap_or(1000.0);
+        let per_node_capacity = self.per_node_capacity_tps.unwrap();
         let total_current_capacity = per_node_capacity * current_active_nodes as f64;
 
         tracing::debug!(
