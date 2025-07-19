@@ -117,6 +117,16 @@ impl<E: Executor> LoadGenerator<E> {
                 std::hint::spin_loop();
             }
 
+            // Calculate the current load based on elapsed time
+            let elapsed_secs = start_time.elapsed().as_secs();
+            let current_load = load_config.get_load_at_time(elapsed_secs);
+
+            // If load is 0, we've gone past the configured intervals - stop sending
+            if current_load == 0 {
+                tracing::info!("Dynamic load configuration ended, stopping transaction submission");
+                break;
+            }
+
             // Get the current timestamp for metrics and create new transaction with updated timestamp
             let timestamp = Metrics::now().as_secs_f64();
             let updated_tx = TransactionWithTimestamp::new(
@@ -137,16 +147,6 @@ impl<E: Executor> LoadGenerator<E> {
             // Increment transaction counter for logging
             if counter > 0 && counter % 1000 == 0 {
                 tracing::debug!("Submitted {} transactions", counter);
-            }
-
-            // Calculate the current load based on elapsed time
-            let elapsed_secs = start_time.elapsed().as_secs();
-            let current_load = load_config.get_load_at_time(elapsed_secs);
-
-            // If load is 0, we've gone past the configured intervals - stop sending
-            if current_load == 0 {
-                tracing::info!("Dynamic load configuration ended, stopping transaction submission");
-                break;
             }
 
             // Calculate the next interval based on current load
@@ -513,6 +513,77 @@ pub mod tests {
         assert_eq!(config.intervals[2].target_load, 1500);
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dynamic_load_transaction_calculation() {
+        use crate::config::{BenchmarkParameters, DynamicLoadConfig, LoadConfig, LoadInterval};
+        use std::time::Duration;
+
+        // Test that transaction calculation works correctly for dynamic loads
+        let dynamic_config = DynamicLoadConfig {
+            total_duration_secs: 30,
+            intervals: vec![
+                LoadInterval {
+                    start_time_secs: 0,
+                    end_time_secs: 10,
+                    target_load: 1000, // 1000 TPS for 10s = 10,000 transactions
+                },
+                LoadInterval {
+                    start_time_secs: 10,
+                    end_time_secs: 20,
+                    target_load: 2000, // 2000 TPS for 10s = 20,000 transactions
+                },
+                LoadInterval {
+                    start_time_secs: 20,
+                    end_time_secs: 30,
+                    target_load: 1500, // 1500 TPS for 10s = 15,000 transactions
+                },
+            ],
+        };
+
+        let config = BenchmarkParameters {
+            load_config: LoadConfig::Dynamic(dynamic_config),
+            load: None,
+            duration: Duration::from_secs(30),
+            ..BenchmarkParameters::new_for_tests()
+        };
+
+        // Should calculate total: 10,000 + 20,000 + 15,000 = 45,000 transactions
+        assert_eq!(config.calculate_total_transactions(), 45000);
+
+        // Compare with old method which would be incorrect: 1000 * 30 = 30,000
+        assert_eq!(
+            config.get_initial_load() * config.effective_duration().as_secs(),
+            30000
+        );
+
+        // Verify the new method generates more transactions than the old method
+        assert!(
+            config.calculate_total_transactions()
+                > config.get_initial_load() * config.effective_duration().as_secs()
+        );
+    }
+
+    #[test]
+    fn test_constant_load_transaction_calculation() {
+        use crate::config::{BenchmarkParameters, LoadConfig};
+        use std::time::Duration;
+
+        // Test that constant load calculation remains the same
+        let config = BenchmarkParameters {
+            load_config: LoadConfig::Constant(5000),
+            load: None,
+            duration: Duration::from_secs(60),
+            ..BenchmarkParameters::new_for_tests()
+        };
+
+        // Should be 5000 * 60 = 300,000 transactions
+        assert_eq!(config.calculate_total_transactions(), 300000);
+        assert_eq!(
+            config.get_initial_load() * config.effective_duration().as_secs(),
+            300000
+        );
     }
 }
 

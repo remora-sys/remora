@@ -454,6 +454,22 @@ impl LoadConfig {
             LoadConfig::Dynamic(config) => Some(Duration::from_secs(config.total_duration_secs)),
         }
     }
+
+    /// Calculate the total number of transactions needed for the entire load profile.
+    /// For constant loads, uses load * duration. For dynamic loads, sums up all intervals.
+    pub fn calculate_total_transactions(&self, fallback_duration: Duration) -> u64 {
+        match self {
+            LoadConfig::Constant(load) => load * fallback_duration.as_secs(),
+            LoadConfig::Dynamic(config) => config
+                .intervals
+                .iter()
+                .map(|interval| {
+                    let duration_secs = interval.end_time_secs - interval.start_time_secs;
+                    interval.target_load * duration_secs
+                })
+                .sum(),
+        }
+    }
 }
 
 impl Default for LoadConfig {
@@ -511,6 +527,13 @@ impl BenchmarkParameters {
     pub fn effective_duration(&self) -> Duration {
         let load_config = self.effective_load_config();
         load_config.get_duration().unwrap_or(self.duration)
+    }
+
+    /// Calculate the total number of transactions needed for the complete load profile.
+    /// This properly handles dynamic loads by calculating transactions for each interval.
+    pub fn calculate_total_transactions(&self) -> u64 {
+        let load_config = self.effective_load_config();
+        load_config.calculate_total_transactions(self.duration)
     }
 
     /// Create a new benchmark configuration for tests.

@@ -481,7 +481,7 @@ impl Executor for FakeExecutor {
 pub async fn generate_fake_transactions(
     config: &BenchmarkParameters,
 ) -> (HashSet<Object>, Vec<FakeTransaction>) {
-    let pre_generation = config.get_initial_load() * config.effective_duration().as_secs();
+    let pre_generation = config.calculate_total_transactions();
 
     match config.workload {
         WorkloadType::FakeSolanaTransactions { .. } => {
