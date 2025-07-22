@@ -276,6 +276,7 @@ mod tests {
             dependency_controller: dependency_controller.clone(),
             metrics: Arc::new(Metrics::new_for_tests()),
             proxy_mode: ProxyMode::Separation,
+            proxy_loads: Arc::new(DashMap::new()),
         };
 
         // Generate transactions

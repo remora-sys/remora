@@ -29,6 +29,8 @@ pub enum LoadBalancingPolicy {
     Zeus,
     /// Hermes schedule
     Hermes,
+    /// Normalized locality and load scores
+    LocalityLoad,
 }
 
 /// Default channel size for communication between components.

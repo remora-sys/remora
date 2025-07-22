@@ -104,6 +104,7 @@ where
             dependency_controller: Arc::new(VersionedDependencyController::new()),
             metrics: self.metrics.clone(),
             proxy_mode: self.proxy_mode.clone(),
+            proxy_loads: Arc::new(DashMap::with_capacity(self.proxy_connections.len())),
         };
 
         thread::spawn(move || {

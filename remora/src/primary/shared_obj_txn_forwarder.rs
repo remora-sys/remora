@@ -13,7 +13,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -128,6 +128,7 @@ where
     pub(crate) dependency_controller: Arc<VersionedDependencyController>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) proxy_mode: ProxyMode,
+    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -160,6 +161,9 @@ where
         self.txn_cnt += 1;
         let proxy_mode = self.proxy_mode;
         let metrics = self.metrics.clone();
+        let proxy_loads = self.proxy_loads.clone();
+        let txn_duration =
+            transaction.expected_stateful_duration() + transaction.verification_duration();
         let transaction_arc = Arc::new(transaction);
 
         tokio::spawn(async move {
@@ -187,6 +191,8 @@ where
                 txn_cnt,
                 &required_versions,
                 &transaction_arc.destination,
+                &proxy_loads,
+                &txn_duration,
             ) {
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
                     &transaction_arc,
@@ -240,6 +246,8 @@ where
         txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
         destination: &Option<ProxyId>,
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        txn_duration: &Duration,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => {
@@ -255,6 +263,14 @@ where
                 Self::get_proxy_for_shared_objects_random(proxy_connections)
             }
             LoadBalancingPolicy::Hermes => destination.map(|dest| (dest, dest)),
+            LoadBalancingPolicy::LocalityLoad => Self::get_proxy_for_shared_objects_locality_load(
+                proxy_connections,
+                states_to_proxy,
+                required_versions,
+                proxy_loads,
+                txn_duration,
+                txn_cnt,
+            ),
         }
     }
 
@@ -343,6 +359,118 @@ where
         } else {
             best_proxies[0]
         };
+        Some((proxy_index, proxy_index))
+    }
+
+    fn get_proxy_for_shared_objects_locality_load(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        txn_duration: &Duration,
+        txn_cnt: usize,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
+        let proxy_count = proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        let mut locality_raw_counts = vec![0usize; proxy_count];
+        for (id, v) in required_versions {
+            if let Some(proxy_index_ref) = states_to_proxy.get(&(*id, *v)) {
+                let proxy_index = *proxy_index_ref;
+                if proxy_index < proxy_count {
+                    locality_raw_counts[proxy_index] += 1;
+                }
+            }
+        }
+
+        let total_required_versions = required_versions.len() as f64;
+        let mut locality_scores: Vec<f64> = locality_raw_counts
+            .iter()
+            .map(|&count| {
+                if total_required_versions == 0.0 {
+                    0.0 // Avoid division by zero if there are no required versions
+                } else {
+                    count as f64 / total_required_versions
+                }
+            })
+            .collect();
+
+        tracing::debug!(
+            "Locality scores before normalization: {:?}",
+            locality_scores
+        );
+
+        const SCORE_SUM_EPSILON: f64 = 0.0; // Epsilon for sum and score comparisons
+        let sum_of_locality_scores: f64 = locality_scores.iter().sum();
+
+        if sum_of_locality_scores > SCORE_SUM_EPSILON {
+            // Normalize locality_scores so they sum to 1.0 if the sum is meaningfully positive.
+            locality_scores = locality_scores
+                .iter()
+                .map(|&score| score / sum_of_locality_scores)
+                .collect();
+            tracing::debug!("Locality scores after normalization: {:?}", locality_scores);
+        }
+
+        let mut current_loads = vec![0usize; proxy_count];
+        for i in 0..proxy_count {
+            current_loads[i] = proxy_loads.get(&i).map_or(0, |r| *r.value());
+        }
+
+        let total_load: usize = current_loads.iter().sum();
+
+        let load_scores: Vec<f64> = current_loads
+            .iter()
+            .map(|&load| {
+                if total_load == 0 {
+                    1.0
+                } else {
+                    1.0 - (load as f64 / total_load as f64)
+                }
+            })
+            .collect();
+
+        tracing::debug!("locality_scores: {:?}", locality_scores);
+        tracing::debug!("proxy_loads: {:?}", proxy_loads);
+        tracing::debug!("load_scores: {:?}", load_scores);
+
+        let combined_scores: Vec<f64> = locality_scores
+            .iter()
+            .zip(load_scores.iter())
+            .map(|(&loc_score, &ld_score)| 0.5 * loc_score + 0.5 * ld_score)
+            .collect();
+
+        let mut best_score = -1.0_f64;
+        let mut best_proxies = Vec::new();
+
+        for i in 0..proxy_count {
+            if combined_scores[i] > best_score {
+                best_score = combined_scores[i];
+                best_proxies.clear();
+                best_proxies.push(i);
+            } else if (combined_scores[i] - best_score).abs() < SCORE_SUM_EPSILON {
+                best_proxies.push(i);
+            }
+        }
+
+        let proxy_index = if best_proxies.is_empty() {
+            txn_cnt % proxy_count
+        } else {
+            best_proxies[txn_cnt % best_proxies.len()]
+        };
+
+        // Update stateful proxy load
+        let load_inc = txn_duration.as_micros() as usize;
+        if let Some(mut load) = proxy_loads.get_mut(&proxy_index) {
+            *load += load_inc;
+        } else {
+            proxy_loads.insert(proxy_index, load_inc);
+        }
+
         Some((proxy_index, proxy_index))
     }
 
