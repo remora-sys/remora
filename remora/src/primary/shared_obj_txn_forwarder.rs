@@ -29,11 +29,11 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub(crate) struct ElasticScaler {
     /// Number of active nodes (starts at 1, scales up based on load) - atomic for spawned task access
     active_nodes: Arc<AtomicUsize>,
-    /// Last time scaling check was performed
+    /// Last time scaling check was performed (milliseconds since epoch)
     last_scale_check: u64,
     /// Count of incoming transactions in current rate window
     incoming_rate_count: usize,
-    /// Start time of current rate tracking window
+    /// Start time of current rate tracking window (milliseconds since epoch)
     rate_window_start: u64,
     /// Pre-calculated per-node capacity in transactions per second (calculated once)
     per_node_capacity_tps: Option<f64>,
@@ -45,7 +45,7 @@ impl ElasticScaler {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_millis() as u64;
 
         Self {
             active_nodes: Arc::new(AtomicUsize::new(1)),
@@ -90,17 +90,17 @@ impl ElasticScaler {
         total_available_nodes: usize,
         metrics: &Arc<crate::metrics::Metrics>,
     ) {
-        const SCALE_CHECK_INTERVAL_SECS: u64 = 2;
+        const SCALE_CHECK_INTERVAL_MS: u64 = 500; // 500ms - very responsive
         const LOAD_THRESHOLD_MULTIPLIER: f64 = 0.8;
-        const RATE_WINDOW_SECS: u64 = 5;
+        const RATE_WINDOW_MS: u64 = 1000; // 1000ms (1 second) rate calculation window
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_millis() as u64;
 
         // Check if it's time for a scaling check
-        if now.saturating_sub(self.last_scale_check) < SCALE_CHECK_INTERVAL_SECS {
+        if now.saturating_sub(self.last_scale_check) < SCALE_CHECK_INTERVAL_MS {
             return;
         }
 
@@ -118,13 +118,14 @@ impl ElasticScaler {
         let window_duration = now.saturating_sub(self.rate_window_start);
 
         // Reset window if it's been too long or calculate rate
-        let incoming_rate = if window_duration >= RATE_WINDOW_SECS {
+        let incoming_rate = if window_duration >= RATE_WINDOW_MS {
             // Start new window
             self.rate_window_start = now;
             self.incoming_rate_count = 0;
             0.0
         } else if window_duration > 0 {
-            self.incoming_rate_count as f64 / window_duration as f64
+            // Convert to transactions per second: count / (ms / 1000)
+            self.incoming_rate_count as f64 / (window_duration as f64 / 1000.0)
         } else {
             0.0
         };
@@ -134,11 +135,13 @@ impl ElasticScaler {
         let total_current_capacity = per_node_capacity * current_active_nodes as f64;
 
         tracing::debug!(
-            "Scaling check: incoming_rate={:.2} tps, current_capacity={:.2} tps, active_nodes={}/{}",
+            "Scaling check ({}ms intervals): incoming_rate={:.2} tps, current_capacity={:.2} tps, active_nodes={}/{}, window_duration={}ms",
+            SCALE_CHECK_INTERVAL_MS,
             incoming_rate,
             total_current_capacity,
             current_active_nodes,
-            total_available_nodes
+            total_available_nodes,
+            window_duration
         );
 
         // Scale up if incoming load exceeds threshold of current capacity
