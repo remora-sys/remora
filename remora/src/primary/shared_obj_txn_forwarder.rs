@@ -129,6 +129,7 @@ where
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) proxy_mode: ProxyMode,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -162,6 +163,7 @@ where
         let proxy_mode = self.proxy_mode;
         let metrics = self.metrics.clone();
         let proxy_loads = self.proxy_loads.clone();
+        let proxy_access_histories = self.proxy_access_histories.clone();
         let txn_duration =
             transaction.expected_stateful_duration() + transaction.verification_duration();
         let transaction_arc = Arc::new(transaction);
@@ -192,6 +194,7 @@ where
                 &required_versions,
                 &transaction_arc.destination,
                 &proxy_loads,
+                &proxy_access_histories,
                 &txn_duration,
             ) {
                 let stateful_missing_states = Self::get_missing_states_for_transaction(
@@ -247,6 +250,7 @@ where
         required_versions: &[(ObjectID, SequenceNumber)],
         destination: &Option<ProxyId>,
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
         txn_duration: &Duration,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
@@ -271,6 +275,17 @@ where
                 txn_duration,
                 txn_cnt,
             ),
+            LoadBalancingPolicy::AffinityAware => {
+                Self::get_proxy_for_shared_objects_affinity_aware(
+                    proxy_connections,
+                    states_to_proxy,
+                    required_versions,
+                    proxy_loads,
+                    proxy_access_histories,
+                    txn_duration,
+                    txn_cnt,
+                )
+            }
         }
     }
 
@@ -377,6 +392,7 @@ where
             return None;
         }
 
+        // Calculate locality based on current state ownership
         let mut locality_raw_counts = vec![0usize; proxy_count];
         for (id, v) in required_versions {
             if let Some(proxy_index_ref) = states_to_proxy.get(&(*id, *v)) {
@@ -385,6 +401,70 @@ where
                     locality_raw_counts[proxy_index] += 1;
                 }
             }
+        }
+
+        Self::compute_locality_load_proxy(
+            locality_raw_counts,
+            required_versions,
+            proxy_loads,
+            None, // No access history updates for locality-based policy
+            txn_duration,
+            txn_cnt,
+            "Locality",
+        )
+    }
+
+    fn get_proxy_for_shared_objects_affinity_aware(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        _states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
+        txn_duration: &Duration,
+        txn_cnt: usize,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
+        let proxy_count = proxy_connections.len();
+        if proxy_count == 0 {
+            return None;
+        }
+
+        // Calculate affinity based on historical access patterns
+        let mut locality_raw_counts = vec![0usize; proxy_count];
+        for (id, _v) in required_versions {
+            for proxy_index in 0..proxy_count {
+                let access_count = proxy_access_histories[proxy_index]
+                    .get(id)
+                    .map_or(0, |r| *r.value());
+                locality_raw_counts[proxy_index] += access_count;
+            }
+        }
+
+        Self::compute_locality_load_proxy(
+            locality_raw_counts,
+            required_versions,
+            proxy_loads,
+            Some(proxy_access_histories), // Update access history for affinity-aware policy
+            txn_duration,
+            txn_cnt,
+            "Affinity",
+        )
+    }
+
+    /// Common logic for locality/affinity-based load balancing policies
+    fn compute_locality_load_proxy(
+        locality_raw_counts: Vec<usize>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
+        proxy_access_histories: Option<&Vec<Arc<DashMap<ObjectID, usize>>>>,
+        txn_duration: &Duration,
+        txn_cnt: usize,
+        policy_name: &str,
+    ) -> Option<(ExecutorIndex, ExecutorIndex)> {
+        let proxy_count = locality_raw_counts.len();
+        if proxy_count == 0 {
+            return None;
         }
 
         let total_required_versions = required_versions.len() as f64;
@@ -400,7 +480,8 @@ where
             .collect();
 
         tracing::debug!(
-            "Locality scores before normalization: {:?}",
+            "{} scores before normalization: {:?}",
+            policy_name,
             locality_scores
         );
 
@@ -413,7 +494,11 @@ where
                 .iter()
                 .map(|&score| score / sum_of_locality_scores)
                 .collect();
-            tracing::debug!("Locality scores after normalization: {:?}", locality_scores);
+            tracing::debug!(
+                "{} scores after normalization: {:?}",
+                policy_name,
+                locality_scores
+            );
         }
 
         let mut current_loads = vec![0usize; proxy_count];
@@ -434,7 +519,11 @@ where
             })
             .collect();
 
-        tracing::debug!("locality_scores: {:?}", locality_scores);
+        tracing::debug!(
+            "{}_scores: {:?}",
+            policy_name.to_lowercase(),
+            locality_scores
+        );
         tracing::debug!("proxy_loads: {:?}", proxy_loads);
         tracing::debug!("load_scores: {:?}", load_scores);
 
@@ -469,6 +558,16 @@ where
             *load += load_inc;
         } else {
             proxy_loads.insert(proxy_index, load_inc);
+        }
+
+        // Update access history if provided (for affinity-aware policy)
+        if let Some(histories) = proxy_access_histories {
+            for (obj_id, _v) in required_versions {
+                histories[proxy_index]
+                    .entry(*obj_id)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
         }
 
         Some((proxy_index, proxy_index))

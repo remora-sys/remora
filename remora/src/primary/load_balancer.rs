@@ -105,6 +105,9 @@ where
             metrics: self.metrics.clone(),
             proxy_mode: self.proxy_mode.clone(),
             proxy_loads: Arc::new(DashMap::with_capacity(self.proxy_connections.len())),
+            proxy_access_histories: (0..self.proxy_connections.len())
+                .map(|_| Arc::new(DashMap::with_capacity(10000)))
+                .collect(),
         };
 
         thread::spawn(move || {

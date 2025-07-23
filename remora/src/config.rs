@@ -31,6 +31,8 @@ pub enum LoadBalancingPolicy {
     Hermes,
     /// Normalized locality and load scores
     LocalityLoad,
+    /// Affinity-aware policy based on historical access patterns
+    AffinityAware,
 }
 
 /// Default channel size for communication between components.

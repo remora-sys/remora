@@ -277,6 +277,9 @@ mod tests {
             metrics: Arc::new(Metrics::new_for_tests()),
             proxy_mode: ProxyMode::Separation,
             proxy_loads: Arc::new(DashMap::new()),
+            proxy_access_histories: (0..proxy_connections.len())
+                .map(|_| Arc::new(DashMap::new()))
+                .collect(),
         };
 
         // Generate transactions
@@ -385,7 +388,12 @@ mod tests {
             txn_cnt: 0,
             states_to_proxy: states_to_proxy.clone(),
             dependency_controller: dependency_controller.clone(),
+            metrics: Arc::new(Metrics::new_for_tests()),
+            proxy_mode: ProxyMode::Separation,
             proxy_loads: Arc::new(DashMap::new()),
+            proxy_access_histories: (0..proxy_connections.len())
+                .map(|_| Arc::new(DashMap::new()))
+                .collect(),
         };
 
         // Spawn tasks for version assignment and shared processing
