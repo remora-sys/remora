@@ -6,10 +6,12 @@ proxies:
     listen_proxy_address: 127.0.0.1:19000
     listen_primary_address: 127.0.0.1:19002
     metrics_address: 127.0.0.1:19090
+    initial_version: 2
   - proxy_id: 1
     listen_proxy_address: 127.0.0.1:19001
     listen_primary_address: 127.0.0.1:19003
     metrics_address: 127.0.0.1:19091
+    initial_version: 2
 
 metrics_address: "127.0.0.1:9090"
 validator_parameters:

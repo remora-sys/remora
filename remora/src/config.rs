@@ -142,6 +142,8 @@ pub struct ProxyInfo {
     pub listen_primary_address: SocketAddr,
     /// The address for metrics
     pub metrics_address: SocketAddr,
+    /// The initial version for the versioned dependency controller
+    pub initial_version: u64,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -180,12 +182,14 @@ impl ValidatorConfig {
                 listen_proxy_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 1),
                 listen_primary_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 2),
                 metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 3),
+                initial_version: 0,
             },
             ProxyInfo {
                 proxy_id: 1,
                 listen_proxy_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 4),
                 listen_primary_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 5),
                 metrics_address: SocketAddr::new(base_addr.ip(), base_addr.port() + 6),
+                initial_version: 0,
             },
         ];
 

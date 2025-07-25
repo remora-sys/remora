@@ -39,6 +39,15 @@ impl VersionedDependencyController {
         }
     }
 
+    pub fn new_with_initial_version(initial_version: u64) -> Self {
+        let obj_task_map: ObjectTaskMap = DashMap::new();
+
+        Self {
+            obj_task_map,
+            initial_version: SequenceNumber::from(initial_version),
+        }
+    }
+
     /// Checks if a given `(ObjectID, SequenceNumber)` has an associated task.
     pub fn has_task_for_object(&self, obj_id: &ObjectID, seq_num: SequenceNumber) -> bool {
         self.obj_task_map.contains_key(&(*obj_id, seq_num))

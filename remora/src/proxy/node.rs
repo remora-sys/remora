@@ -138,6 +138,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
             config.validator_parameters.proxy_mode,
+            our_proxy_info.initial_version,
             metrics.clone(),
         )
         .spawn();

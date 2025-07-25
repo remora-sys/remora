@@ -680,6 +680,7 @@ where
         rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
         mode: ProxyMode,
+        initial_version: u64,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -690,7 +691,9 @@ where
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
-            stateful_controller: Arc::new(VersionedDependencyController::new()),
+            stateful_controller: Arc::new(VersionedDependencyController::new_with_initial_version(
+                initial_version,
+            )),
             stateless_controller: Arc::new(OneshotDependencyController::new()),
             mode,
             metrics,
@@ -795,6 +798,7 @@ mod tests {
             rx_inter_proxy_requests,
             tx_inter_proxy_replies.clone(),
             ProxyMode::Separation,
+            2, // Default initial_version for tests
             metrics,
         );
 
