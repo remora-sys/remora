@@ -561,16 +561,23 @@ where
             let next_version = max_version.next();
 
             for (object_id, seq_num) in required_versions {
-                let previous_owner = states_to_proxy.get(&(object_id, seq_num));
+                let previous_owner_value = if proxy_index == 2 && seq_num == SequenceNumber::from(2)
+                {
+                    // direct the object migration from other proxies.
+                    // to emulate cold start.
+                    Some(rand::thread_rng().gen_range(0..proxy_index))
+                } else {
+                    let previous_owner = states_to_proxy.get(&(object_id, seq_num));
 
-                let previous_owner_value = if let Some(owner) = previous_owner {
-                    if *owner != proxy_index {
-                        Some(*owner)
+                    if let Some(owner) = previous_owner {
+                        if *owner != proxy_index {
+                            Some(*owner)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
                 };
 
                 required_states.insert((object_id, seq_num), previous_owner_value);
