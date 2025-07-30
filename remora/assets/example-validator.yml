@@ -20,6 +20,6 @@ validator_parameters:
   collocated_pre_executors:
     primary: 0
     proxy: 0
-  load_balancing_policy: !SDS
-  proxy_mode: !PrimarySeparation
+  load_balancing_policy: !RSDS
+  separation_mode: !PostConsensusProxySeparation
 parallel_proxy: true

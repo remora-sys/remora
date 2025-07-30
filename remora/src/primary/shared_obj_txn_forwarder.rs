@@ -176,7 +176,7 @@ impl DependencyScheduler {
         // Split subgraphs into two collections
         let (_, large_subgraphs): (Vec<_>, Vec<_>) = subgraphs
             .into_iter()
-            .partition(|subgraph| subgraph.len() < 2);
+            .partition(|subgraph| subgraph.len() < 1);
 
         let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
 
@@ -483,14 +483,46 @@ where
     ) {
         let mut txns = Vec::new();
         let mut required_versions_vec = Vec::new();
+        let batch_timeout = Duration::from_millis(15);
 
-        while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
-            txns.push(transaction);
-            required_versions_vec.push(required_versions);
+        let timer = tokio::time::sleep(batch_timeout);
+        tokio::pin!(timer);
 
-            if txns.len() >= 1000 {
-                self.process_transaction_batch(&mut txns, &mut required_versions_vec)
-                    .await;
+        loop {
+            tokio::select! {
+                // Receive new transaction
+                result = shared_txn_receiver.recv() => {
+                    match result {
+                        Some((transaction, required_versions)) => {
+                            txns.push(transaction);
+                            required_versions_vec.push(required_versions);
+
+                            // Process batch if it reaches size threshold
+                            if txns.len() >= 1000 {
+                                self.process_transaction_batch(&mut txns, &mut required_versions_vec)
+                                    .await;
+                                timer.as_mut().reset(tokio::time::Instant::now() + batch_timeout);
+                            }
+                        }
+                        None => {
+                            // Channel closed, process any remaining transactions
+                            if !txns.is_empty() {
+                                self.process_transaction_batch(&mut txns, &mut required_versions_vec)
+                                    .await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Timeout for adaptive batching
+                () = &mut timer => {
+                    if !txns.is_empty() {
+                        tracing::debug!("timeout triggered in post-consensus batched txns");
+                        self.process_transaction_batch(&mut txns, &mut required_versions_vec)
+                            .await;
+                    }
+                    timer.as_mut().reset(tokio::time::Instant::now() + batch_timeout);
+                }
             }
         }
     }
