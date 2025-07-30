@@ -149,10 +149,18 @@ where
             });
         });
 
-        // TODO: use more worker threads when not in primary separation mode
+        // Calculate available threads accounting for existing processors
+        let total_cpus = num_cpus::get();
+        const STATLESS_THREADS: usize = 8;
+        const PRE_CONSENSUS_THREADS: usize = 2;
+        let used_threads = 2 // owned (1) + version_assignment (1)
+            + if self.separation_mode.is_pre_consensus_sched() { PRE_CONSENSUS_THREADS } else { 0 } // pre_consensus
+            + if self.separation_mode == SeparationMode::PrimaryPreSeparation { STATLESS_THREADS } else { 0 }; // stateless
+
+        let forwarder_threads = (total_cpus.saturating_sub(used_threads)).max(1);
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get() / 2)
+                .worker_threads(forwarder_threads)
                 .enable_all()
                 .build()
                 .unwrap();
@@ -163,10 +171,10 @@ where
             });
         });
 
-        if self.separation_mode != SeparationMode::PostConsensusProxySeparation {
+        if self.separation_mode.is_pre_consensus_sched() {
             thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    .worker_threads(PRE_CONSENSUS_THREADS)
                     .enable_all()
                     .build()
                     .unwrap();
@@ -187,7 +195,7 @@ where
             };
             thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(8)
+                    .worker_threads(STATLESS_THREADS)
                     .enable_all()
                     .build()
                     .unwrap();
