@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc, thread, time::Duration};
+use std::{
+    marker::PhantomData,
+    sync::{atomic::AtomicUsize, Arc},
+    thread,
+    time::Duration,
+};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -72,11 +77,11 @@ where
     /// Initialize transaction processors and return the senders
     fn initialize_processors(
         &self,
-        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_pre_consensus_txns: Receiver<(Vec<RemoraTransaction<E>>, usize)>,
         rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> (
-        Sender<Vec<RemoraTransaction<E>>>, // owned_txn_sender
-        Sender<Vec<RemoraTransaction<E>>>, // shared_txn_sender
+        Sender<Vec<RemoraTransaction<E>>>,          // owned_txn_sender
+        Sender<(Vec<RemoraTransaction<E>>, usize)>, // shared_txn_sender
     ) {
         // Create channels for transactions
         let (owned_txn_sender, owned_txn_receiver) =
@@ -104,6 +109,7 @@ where
         let proxy_loads = Arc::new(DashMap::new());
         let stateless_forwarding_table = Arc::new(DashMap::new());
         let pre_consensus_routing_plan = Arc::new(DashMap::new());
+        let batch_idx = Arc::new(AtomicUsize::new(0));
 
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
@@ -118,11 +124,13 @@ where
             counter: 0,
             proxy_loads: proxy_loads.clone(),
             object_last_proxy: vec![None; 1 << 24],
+            batch_idx: batch_idx.clone(),
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
             proxy_loads.clone(),
+            batch_idx.clone(),
         );
 
         thread::spawn(move || {
@@ -212,7 +220,7 @@ where
     /// Run the load balancer.
     pub async fn run(
         &mut self,
-        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_pre_consensus_txns: Receiver<(Vec<RemoraTransaction<E>>, usize)>,
         rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> NodeResult<()> {
         tracing::info!("Load balancer started");
@@ -222,6 +230,7 @@ where
             self.initialize_processors(rx_pre_consensus_txns, rx_stateless_txns);
 
         let mut txn_cnt = 0;
+        let mut batch_idx = 0;
         loop {
             tokio::select! {
                 Some(transactions) = self.rx_committed_txns.recv() => {
@@ -253,10 +262,12 @@ where
 
                     // Send shared-object transactions to the dedicated task
                     if !shared_txns.is_empty() {
-                        if let Err(e) = shared_txn_sender.send(shared_txns).await {
+                        if let Err(e) = shared_txn_sender.send((shared_txns, batch_idx)).await {
                             tracing::error!("Failed to send shared transactions: {:?}", e);
                         }
                     }
+
+                    batch_idx += 1;
                 }
 
                 else => Err(NodeError::ShuttingDown)?,
@@ -267,7 +278,7 @@ where
     /// Spawn the load balancer in a new task.
     pub fn spawn(
         mut self,
-        rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
+        rx_pre_consensus_txns: Receiver<(Vec<RemoraTransaction<E>>, usize)>,
         rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
     ) -> JoinHandle<NodeResult<()>>
     where

@@ -63,7 +63,7 @@ pub struct MockConsensus<M, E: Executor + Send + 'static> {
     /// Channel to send stateless transactions to the load balancer.
     tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
     /// Channel to pre-consensus scheduling of stateful txns.
-    tx_pre_consensus_scheduling: Sender<Vec<RemoraTransaction<E>>>,
+    tx_pre_consensus_scheduling: Sender<(ConsensusCommit<RemoraTransaction<E>>, usize)>,
     /// Holds the current batch.
     current_batch: ConsensusCommit<RemoraTransaction<E>>,
     /// The number of batches currently in-flight.
@@ -85,7 +85,7 @@ where
         rx_load_balancer: Receiver<RemoraTransaction<E>>,
         tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
         tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
-        tx_pre_consensus_scheduling: Sender<ConsensusCommit<RemoraTransaction<E>>>,
+        tx_pre_consensus_scheduling: Sender<(ConsensusCommit<RemoraTransaction<E>>, usize)>,
         separation_mode: SeparationMode,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
@@ -118,6 +118,8 @@ where
 
         let max_inflight_batches = self.parameters.max_inflight_batches.get();
         let batch_size = self.parameters.batch_size.get();
+        let mut batch_idx: usize = 0;
+
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size. If there are too many
@@ -135,7 +137,8 @@ where
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
                         if self.separation_mode.is_pre_consensus_sched() {
-                            self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                            self.tx_pre_consensus_scheduling.send((batch, batch_idx)).await.unwrap();
+                            batch_idx += 1;
                         }
                         timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
                     }
@@ -149,7 +152,8 @@ where
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
                         if self.separation_mode.is_pre_consensus_sched() {
-                            self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
+                            self.tx_pre_consensus_scheduling.send((batch, batch_idx)).await.unwrap();
+                            batch_idx += 1;
                         }
                     } else if self.tx_primary_executor.is_closed() {
                         tracing::warn!("Terminating consensus task: primary executor dropped the channel");

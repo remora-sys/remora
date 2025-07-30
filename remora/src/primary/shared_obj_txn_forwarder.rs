@@ -14,7 +14,15 @@ use dashmap::DashMap;
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -222,6 +230,7 @@ where
     pub(crate) _phantom: PhantomData<E>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
+    pub(crate) batch_idx: Arc<AtomicUsize>,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -236,6 +245,7 @@ where
         >,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        batch_idx: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             proxy_connections,
@@ -243,19 +253,24 @@ where
             _phantom: PhantomData,
             proxy_loads,
             object_last_proxy: vec![None; 10000000],
+            batch_idx,
         }
     }
 
     pub(crate) async fn process_pre_consensus_txns(
         &mut self,
-        mut rx_pre_consensus: Receiver<Vec<RemoraTransaction<E>>>,
+        mut rx_pre_consensus: Receiver<(Vec<RemoraTransaction<E>>, usize)>,
     ) {
-        while let Some(transactions) = rx_pre_consensus.recv().await {
-            self.schedule_transaction_batch(transactions);
+        while let Some((transactions, batch_idx)) = rx_pre_consensus.recv().await {
+            self.schedule_transaction_batch(transactions, batch_idx);
         }
     }
 
-    fn schedule_transaction_batch(&mut self, transactions: Vec<RemoraTransaction<E>>) {
+    fn schedule_transaction_batch(
+        &mut self,
+        transactions: Vec<RemoraTransaction<E>>,
+        batch_idx: usize,
+    ) {
         let num_proxies = self.proxy_connections.len();
         if num_proxies == 0 {
             tracing::warn!("No proxies available for pre-consensus scheduling");
@@ -273,6 +288,8 @@ where
         let start = std::time::Instant::now();
         self.apply_sds_policy(&transactions, &graph);
         tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
+
+        self.batch_idx.store(batch_idx, Ordering::Relaxed);
     }
 
     fn apply_sds_policy(
@@ -352,10 +369,10 @@ where
 {
     pub(crate) async fn process_version_assignments(
         &mut self,
-        mut shared_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
-        sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(Vec<RemoraTransaction<E>>, usize)>,
+        sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>, usize)>,
     ) {
-        while let Some(transactions) = shared_txn_receiver.recv().await {
+        while let Some((transactions, batch_idx)) = shared_txn_receiver.recv().await {
             for mut transaction in transactions {
                 let required_versions = self.assign_shared_object_versions(&mut transaction);
 
@@ -364,7 +381,11 @@ where
                     transaction.digest()
                 );
 
-                if sender.send((transaction, required_versions)).await.is_err() {
+                if sender
+                    .send((transaction, required_versions, batch_idx))
+                    .await
+                    .is_err()
+                {
                     tracing::error!("Failed to send transaction to SharedObjTxnForwarder");
                 }
             }
@@ -453,6 +474,7 @@ where
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     /// Only used for post-consensus scheduling policy
     pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
+    pub(crate) batch_idx: Arc<AtomicUsize>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -462,11 +484,17 @@ where
 {
     pub(crate) async fn process_shared_txns(
         &mut self,
-        mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(
+            RemoraTransaction<E>,
+            Vec<(ObjectID, SequenceNumber)>,
+            usize,
+        )>,
     ) {
         if self.separation_mode.is_pre_consensus_sched() {
-            while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
-                self.forward_shared_object_txn(transaction, required_versions, None)
+            while let Some((transaction, required_versions, batch_idx)) =
+                shared_txn_receiver.recv().await
+            {
+                self.forward_shared_object_txn(transaction, required_versions, None, batch_idx)
                     .await;
             }
         } else {
@@ -479,7 +507,11 @@ where
     /// Builds dependency graphs, assigns proxies based on locality, and forwards transactions.
     async fn process_post_consensus_batched_txns(
         &mut self,
-        mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(
+            RemoraTransaction<E>,
+            Vec<(ObjectID, SequenceNumber)>,
+            usize,
+        )>,
     ) {
         let mut txns = Vec::new();
         let mut required_versions_vec = Vec::new();
@@ -493,7 +525,7 @@ where
                 // Receive new transaction
                 result = shared_txn_receiver.recv() => {
                     match result {
-                        Some((transaction, required_versions)) => {
+                        Some((transaction, required_versions, _batch_idx)) => {
                             txns.push(transaction);
                             required_versions_vec.push(required_versions);
 
@@ -567,6 +599,7 @@ where
                 transaction.clone(),
                 required_versions.clone(),
                 assigned_proxy,
+                0, // Ignored
             )
             .await;
         }
@@ -581,6 +614,7 @@ where
         transaction: RemoraTransaction<E>,
         required_versions: Vec<(ObjectID, SequenceNumber)>,
         post_consensus_rsds_proxy: Option<ExecutorIndex>,
+        batch_idx: usize,
     ) {
         // Clone all needed fields to move into the spawned task
         let dependency_controller = self.dependency_controller.clone();
@@ -594,6 +628,7 @@ where
         let counter = self.counter;
         let policy = self.policy.clone();
         let proxy_loads = self.proxy_loads.clone();
+        let finished_batch_idx = self.batch_idx.clone();
         self.counter += 1;
 
         tokio::spawn(async move {
@@ -617,11 +652,19 @@ where
             let proxy_id = if !separation_mode.is_pre_consensus_sched() {
                 post_consensus_rsds_proxy
             } else {
+                let finished_batch_idx = finished_batch_idx.load(Ordering::Relaxed);
+                if batch_idx > finished_batch_idx {
+                    tracing::error!("Transaction {:?} not found in pre-consensus routing plan and batch_idx {:?} is already finished",
+                        transaction_arc.digest(), finished_batch_idx);
+                }
+
                 pre_consensus_routing_plan
                     .remove(transaction_arc.digest())
                     .map(|(_, proxy_id)| proxy_id)
             }
             .unwrap_or_else(|| {
+                // FIXME
+                tracing::error!("should not be here");
                 // Policy fallback when no specific proxy is assigned
                 let fallback_proxy = match policy {
                     PreConsensusSchedulingPolicy::LSDS => {
