@@ -126,6 +126,10 @@ where
 
         #[cfg(debug_assertions)]
         self.log_load_summary("SDS");
+
+        // Always log load distribution for monitoring
+        #[cfg(debug_assertions)]
+        self.log_load_distribution();
     }
 
     fn handle_large_subgraphs(
@@ -141,9 +145,12 @@ where
             .collect();
 
         // Sequential state updates
+        let mut proxy_load_distribution = vec![0usize; self.proxy_connections.len()];
         for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
             self.update_state_for_sds(&subgraph_digests, &subgraph_objects, proxy_id, tx_map);
+            proxy_load_distribution[proxy_id] += subgraph_digests.len();
         }
+        tracing::debug!("Proxy load distribution: {:?}", proxy_load_distribution);
     }
 
     #[inline]
@@ -171,21 +178,54 @@ where
         }
 
         let num_proxies = self.proxy_connections.len();
-        let mut locality_count = vec![0usize; num_proxies];
+        let mut locality_scores = vec![0usize; num_proxies];
+        let mut load_scores = vec![0usize; num_proxies];
 
+        // Calculate locality scores
         for obj in &subgraph_objects {
             let idx = Self::object_id_24bit_index(obj);
             if let Some(proxy_id) = self.object_last_proxy[idx] {
-                locality_count[proxy_id] += 1;
+                locality_scores[proxy_id] += 1;
             }
         }
 
-        // Find max locality
-        let max_locality = *locality_count.iter().max().unwrap_or(&0);
+        // Calculate load scores (current loads)
+        for proxy_id in 0..num_proxies {
+            load_scores[proxy_id] = self.proxy_loads.get(&proxy_id).map_or(0, |load| *load);
+        }
 
-        // Collect all proxies with max locality
+        // Normalize scores to [0.0, 1.0] range
+        let max_locality = *locality_scores.iter().max().unwrap_or(&1).max(&1) as f64;
+        let max_load = *load_scores.iter().max().unwrap_or(&1).max(&1) as f64;
+
+        let normalized_locality: Vec<f64> = locality_scores
+            .iter()
+            .map(|&score| score as f64 / max_locality)
+            .collect();
+
+        // For load scores, we want lower load to be better, so invert the normalization
+        let normalized_load: Vec<f64> = load_scores
+            .iter()
+            .map(|&load| 1.0 - (load as f64 / max_load))
+            .collect();
+
+        // Combine scores with equal weighting (can be adjusted)
+        let locality_weight = 0.5;
+        let load_weight = 0.5;
+
+        let combined_scores: Vec<f64> = (0..num_proxies)
+            .map(|i| locality_weight * normalized_locality[i] + load_weight * normalized_load[i])
+            .collect();
+
+        // Find the maximum combined score
+        let max_combined_score = combined_scores
+            .iter()
+            .fold(0.0f64, |acc, &score| acc.max(score));
+
+        // Collect all proxies with the maximum combined score (with small epsilon for float comparison)
+        let epsilon = 1e-9;
         let best_candidates: Vec<_> = (0..num_proxies)
-            .filter(|&p| locality_count[p] == max_locality)
+            .filter(|&p| (combined_scores[p] - max_combined_score).abs() < epsilon)
             .collect();
 
         // Randomly choose among the best candidates
@@ -194,6 +234,14 @@ where
         } else {
             best_candidates[fastrand::usize(..best_candidates.len())]
         };
+
+        tracing::debug!(
+            "Large subgraph assignment - Proxy {}: locality={:.3}, load={:.3}, combined={:.3}",
+            best_proxy,
+            normalized_locality[best_proxy],
+            normalized_load[best_proxy],
+            combined_scores[best_proxy]
+        );
 
         for digest in &subgraph_digests {
             self.pre_consensus_routing_plan.insert(*digest, best_proxy);
@@ -296,6 +344,65 @@ where
             policy_name,
             load_ratios
         );
+    }
+
+    fn log_load_distribution(&self) {
+        let num_proxies = self.proxy_connections.len();
+        if num_proxies == 0 {
+            return;
+        }
+
+        let mut loads = Vec::with_capacity(num_proxies);
+        let mut total_load = 0usize;
+
+        // Collect loads for all proxies
+        for proxy_id in 0..num_proxies {
+            let load = self.proxy_loads.get(&proxy_id).map_or(0, |load| *load);
+            loads.push(load);
+            total_load += load;
+        }
+
+        if total_load == 0 {
+            tracing::debug!("Load distribution: All proxies have zero load");
+            return;
+        }
+
+        // Calculate statistics
+        let avg_load = total_load as f64 / num_proxies as f64;
+        let max_load = *loads.iter().max().unwrap_or(&0);
+        let min_load = *loads.iter().min().unwrap_or(&0);
+
+        // Calculate load imbalance ratio
+        let imbalance_ratio = if min_load > 0 {
+            max_load as f64 / min_load as f64
+        } else {
+            f64::INFINITY
+        };
+
+        tracing::debug!(
+            "Load distribution - Total: {}, Avg: {:.1}, Min: {}, Max: {}, Imbalance: {:.2}x",
+            total_load,
+            avg_load,
+            min_load,
+            max_load,
+            imbalance_ratio
+        );
+
+        // Log individual proxy loads with percentages
+        let proxy_loads: Vec<String> = loads
+            .iter()
+            .enumerate()
+            .map(|(proxy_id, &load)| {
+                let percentage = if total_load > 0 {
+                    (load as f64 / total_load as f64) * 100.0
+                } else {
+                    0.0
+                };
+                format!("P{}: {}({:.1}%)", proxy_id, load, percentage)
+            })
+            .collect();
+
+        tracing::debug!("Per-proxy loads: [{}]", proxy_loads.join(", "));
     }
 }
 
