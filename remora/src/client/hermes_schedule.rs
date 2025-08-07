@@ -87,7 +87,7 @@ pub fn schedule_transactions_hermes<T: ExecutableTransaction>(
     for &node_id in assignments.values() {
         loads[node_id] += 1;
     }
-    tracing::debug!(
+    tracing::info!(
         "Load distribution after initial assignment ({} txns): {:?}",
         assignments.len(),
         loads
@@ -225,52 +225,145 @@ fn rebalance_assignments(
     num_nodes: usize,
 ) {
     let overload_threshold = (num_txns as f64 / num_nodes as f64 * 2.0) as usize;
+    let mut increase_tolerance = 0; // Start with strict tolerance
 
-    loop {
-        let mut loads = vec![0; num_nodes];
-        for &node_id in assignments.values() {
-            loads[node_id] += 1;
-        }
+    // Track partition states
+    let mut loads = vec![0; num_nodes];
+    for &node_id in assignments.values() {
+        loads[node_id] += 1;
+    }
 
-        let overloaded_nodes: Vec<usize> = (0..num_nodes)
-            .filter(|&i| loads[i] > overload_threshold)
-            .collect();
-        let underloaded_nodes: Vec<usize> = (0..num_nodes)
-            .filter(|&i| loads[i] < overload_threshold) // Simple definition
-            .collect();
+    let mut overloaded_parts: FxHashSet<usize> = (0..num_nodes)
+        .filter(|&i| loads[i] > overload_threshold)
+        .collect();
 
-        if overloaded_nodes.is_empty() || underloaded_nodes.is_empty() {
+    // Start with all transactions from overloaded partitions as candidates
+    let mut candidate_txns: Vec<usize> = assignment_order
+        .iter()
+        .rev() // Process most recent transactions first
+        .filter(|&&txn_id| overloaded_parts.contains(&assignments[&txn_id]))
+        .copied()
+        .collect();
+
+    // Outer loop: progressively increase tolerance until all partitions are balanced
+    while !overloaded_parts.is_empty() {
+        tracing::debug!(
+            "Rebalancing with tolerance {}: overloaded_parts={:?}, loads={:?}",
+            increase_tolerance,
+            overloaded_parts,
+            loads
+        );
+
+        candidate_txns = reroute_txns_to_underloaded_parts(
+            candidate_txns,
+            assignments,
+            dep_graph,
+            &mut loads,
+            &mut overloaded_parts,
+            overload_threshold,
+            increase_tolerance,
+            num_nodes,
+        );
+
+        increase_tolerance += 1;
+
+        if increase_tolerance > 100 {
+            tracing::error!("Rebalancing failed to converge after 100 iterations");
             break;
         }
+    }
+}
 
-        let mut moved = false;
-        // Iterate over the assignment order in reverse to move the most recent transactions first.
-        // to minimize the impact to subsequent transactions.
-        for &txn_id in assignment_order.iter().rev() {
-            let current_node = assignments[&txn_id];
-            if !overloaded_nodes.contains(&current_node) {
+fn reroute_txns_to_underloaded_parts(
+    candidate_txns: Vec<usize>,
+    assignments: &mut Assignments,
+    dep_graph: &DepGraph,
+    loads: &mut Vec<usize>,
+    overloaded_parts: &mut FxHashSet<usize>,
+    overload_threshold: usize,
+    increase_tolerance: usize,
+    num_nodes: usize,
+) -> Vec<usize> {
+    let mut next_candidates = Vec::new();
+
+    let mut saturated_parts: FxHashSet<usize> = (0..num_nodes)
+        .filter(|&i| loads[i] == overload_threshold)
+        .collect();
+
+    for &txn_id in &candidate_txns {
+        let current_part_id = assignments[&txn_id];
+
+        // If the home partition is no longer overloaded, skip it
+        if !overloaded_parts.contains(&current_part_id) {
+            continue;
+        }
+
+        let current_remote_edges =
+            count_remote_edges(txn_id, current_part_id, assignments, dep_graph);
+        let mut best_delta = increase_tolerance as i32 + 1;
+        let mut best_part_id = current_part_id;
+
+        // Find a better partition
+        for part_id in 0..num_nodes {
+            // Skip home partition
+            if part_id == current_part_id {
                 continue;
             }
 
-            let (best_node, _min_edges) = underloaded_nodes
-                .iter()
-                .map(|&candidate_node| {
-                    let remote_edges =
-                        count_remote_edges(txn_id, candidate_node, assignments, dep_graph);
-                    (candidate_node, remote_edges)
-                })
-                .min_by_key(|&(_, edges)| edges)
-                .unwrap();
+            // Skip overloaded partitions
+            if overloaded_parts.contains(&part_id) {
+                continue;
+            }
 
-            assignments.insert(txn_id, best_node);
-            moved = true;
-            break; // Re-evaluate loads after one move
+            // Skip saturated partitions
+            if saturated_parts.contains(&part_id) {
+                continue;
+            }
+
+            // Count remote edges for this candidate partition
+            let remote_edge_count = count_remote_edges(txn_id, part_id, assignments, dep_graph);
+
+            // Calculate the difference
+            let delta = remote_edge_count as i32 - current_remote_edges as i32;
+            if delta <= increase_tolerance as i32 {
+                // Prefer the partition with lower load, or lower delta if loads are equal
+                if (delta < best_delta)
+                    || (delta == best_delta && loads[part_id] < loads[best_part_id])
+                {
+                    best_delta = delta;
+                    best_part_id = part_id;
+                }
+            }
         }
 
-        if !moved {
-            break; // No beneficial move found
+        // If there is no suitable partition, add to next candidates
+        if best_part_id == current_part_id {
+            next_candidates.push(txn_id);
+            continue;
+        }
+
+        // Move the transaction
+        assignments.insert(txn_id, best_part_id);
+
+        // Update loads and partition states
+        loads[current_part_id] -= 1;
+        if loads[current_part_id] == overload_threshold {
+            overloaded_parts.remove(&current_part_id);
+            saturated_parts.insert(current_part_id);
+        }
+
+        loads[best_part_id] += 1;
+        if loads[best_part_id] == overload_threshold {
+            saturated_parts.insert(best_part_id);
+        }
+
+        // Early termination if no overloaded partitions remain
+        if overloaded_parts.is_empty() {
+            return Vec::new();
         }
     }
+
+    next_candidates
 }
 
 fn count_remote_edges(
