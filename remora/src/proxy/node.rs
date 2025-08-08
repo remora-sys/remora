@@ -129,6 +129,17 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         }
 
         let store = executor.init_store();
+
+        // Create decentralized scheduler for this proxy
+        use crate::proxy::decentralized_scheduler::DecentralizedScheduler;
+        let decentralized_scheduler = DecentralizedScheduler::new(
+            id,
+            config.proxies.len(), // proxy_count
+            config.validator_parameters.load_balancing_policy.clone(),
+            config.validator_parameters.proxy_mode.clone(),
+            metrics.clone(),
+        );
+
         let core_handle = ProxyCore::new(
             id,
             executor.clone(),
@@ -139,6 +150,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_inter_proxy_replies,
             config.validator_parameters.proxy_mode,
             metrics.clone(),
+            decentralized_scheduler,
         )
         .spawn();
         core_handles.push(core_handle);

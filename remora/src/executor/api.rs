@@ -256,6 +256,8 @@ where
     StatelessTxn(Arc<TransactionWithTimestamp<T>>),
     /// Combined stateless+stateful
     CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
+    /// Broadcast transaction batch for decentralized scheduling
+    TransactionBatch(Vec<TransactionWithTimestamp<T>>, u64), // batch + sequence number for determinism
 }
 
 #[derive(Clone, Serialize, Deserialize)]

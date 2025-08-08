@@ -24,17 +24,21 @@ use crate::{
         api::{
             ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, InterProxyReply,
             InterProxyRequest, PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction,
-            RequiredStates, StateStore, Store,
+            RequiredStates, StateStore, Store, TransactionWithTimestamp,
         },
         oneshot_dependency_controller::OneshotDependencyController,
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
+    proxy::decentralized_scheduler::DecentralizedScheduler,
 };
 
 pub type ProxyId = ExecutorIndex;
 
-struct PrimaryMessageProcessor<E: Executor> {
+struct PrimaryMessageProcessor<E: Executor + Send + Sync + Clone + 'static>
+where
+    <E as Executor>::Transaction: Send + Sync,
+{
     id: ProxyId,
     executor: E,
     store: Store<E>,
@@ -44,16 +48,17 @@ struct PrimaryMessageProcessor<E: Executor> {
     stateless_controller: Arc<OneshotDependencyController>,
     mode: ProxyMode,
     metrics: Arc<Metrics>,
+    decentralized_scheduler: DecentralizedScheduler<E>,
 }
 
-impl<E: Executor + Send + Sync + 'static> PrimaryMessageProcessor<E>
+impl<E: Executor + Send + Sync + Clone + 'static> PrimaryMessageProcessor<E>
 where
     E: Send + 'static,
     Store<E>: Send + Sync,
     RemoraTransaction<E>: Send + Sync,
     ExecutionResults<E>: Send + Sync,
     <E as Executor>::ExecutionContext: Send + Sync,
-    <E as Executor>::Transaction: Send,
+    <E as Executor>::Transaction: Send + Sync,
 {
     async fn run(
         &mut self,
@@ -80,60 +85,108 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
-        if self.mode == ProxyMode::Separation {
-            match message {
-                PrimaryToProxyMessage::StatelessTxn(transaction) => {
-                    tracing::debug!(
-                        "Proxy {} received stateless transaction {:?}",
-                        self.id,
-                        transaction.digest()
-                    );
-                    self.process_stateless_transaction(transaction.deref().clone())
-                        .await
-                }
-
-                PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
-                    tracing::debug!(
-                        "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
-                        self.id,
-                        transaction.digest(),
-                        stateless_res_proxy_id
-                    );
-                    self.process_stateful_transaction(
-                        transaction,
-                        stateless_res_proxy_id,
-                        missing_states,
-                    )
+        match message {
+            PrimaryToProxyMessage::TransactionBatch(transactions, batch_sequence) => {
+                tracing::debug!(
+                    "Proxy {} received transaction batch {} with {} transactions",
+                    self.id,
+                    batch_sequence,
+                    transactions.len()
+                );
+                self.process_transaction_batch(transactions, batch_sequence)
                     .await;
-                }
-                _ => {
-                    panic!("Proxy {} received unexpected message", self.id);
-                }
             }
-        } else {
-            match message {
-                PrimaryToProxyMessage::CombinedTxn(
+            PrimaryToProxyMessage::StatelessTxn(transaction)
+                if self.mode == ProxyMode::Separation =>
+            {
+                tracing::debug!(
+                    "Proxy {} received stateless transaction {:?}",
+                    self.id,
+                    transaction.digest()
+                );
+                self.process_stateless_transaction(transaction.deref().clone())
+                    .await
+            }
+            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states)
+                if self.mode == ProxyMode::Separation =>
+            {
+                tracing::debug!(
+                    "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
+                    self.id,
+                    transaction.digest(),
+                    stateless_res_proxy_id
+                );
+                self.process_stateful_transaction(
                     transaction,
                     stateless_res_proxy_id,
                     missing_states,
-                ) => {
-                    tracing::debug!(
-                        "Proxy {} received combined transaction {:?}, stateless proxy: {}",
-                        self.id,
-                        transaction.digest(),
-                        stateless_res_proxy_id
-                    );
-                    self.process_stateful_transaction(
-                        transaction,
-                        stateless_res_proxy_id,
-                        missing_states,
-                    )
-                    .await;
-                }
-                _ => {
-                    panic!("Proxy {} received unexpected message", self.id);
-                }
+                )
+                .await;
             }
+            PrimaryToProxyMessage::CombinedTxn(
+                transaction,
+                stateless_res_proxy_id,
+                missing_states,
+            ) => {
+                tracing::debug!(
+                    "Proxy {} received combined transaction {:?}, stateless proxy: {}",
+                    self.id,
+                    transaction.digest(),
+                    stateless_res_proxy_id
+                );
+                self.process_stateful_transaction(
+                    transaction,
+                    stateless_res_proxy_id,
+                    missing_states,
+                )
+                .await;
+            }
+            _ => {
+                panic!("Proxy {} received unexpected message", self.id);
+            }
+        }
+    }
+
+    /// Process a transaction batch using decentralized scheduling
+    async fn process_transaction_batch(
+        &mut self,
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
+        batch_sequence: u64,
+    ) {
+        let total_transactions = transactions.len();
+        tracing::debug!(
+            "Proxy {} processing transaction batch {} with {} transactions",
+            self.id,
+            batch_sequence,
+            total_transactions
+        );
+
+        // Use DecentralizedScheduler to determine which transactions to execute locally
+        let local_executions = self
+            .decentralized_scheduler
+            .process_transaction_batch(transactions, batch_sequence)
+            .await;
+
+        tracing::debug!(
+            "Proxy {} will execute {} out of {} transactions from batch {}",
+            self.id,
+            local_executions.len(),
+            total_transactions,
+            batch_sequence
+        );
+
+        // Execute the transactions that were assigned to this proxy
+        for (transaction, _required_versions, missing_states) in local_executions {
+            let transaction_arc = Arc::new(transaction);
+
+            // Process as a stateful transaction with the missing states for now
+
+            self.process_stateful_transaction(
+                transaction_arc,
+                self.id, // Use self as stateless proxy for now
+                missing_states,
+            )
+            .await;
         }
     }
 
@@ -636,7 +689,10 @@ where
 }
 
 /// A proxy is responsible for pre-executing transactions.
-pub struct ProxyCore<E: Executor> {
+pub struct ProxyCore<E: Executor + Send + Sync + Clone + 'static>
+where
+    <E as Executor>::Transaction: Send + Sync,
+{
     /// The ID of the proxy.
     id: ProxyId,
     /// The executor for the transactions.
@@ -659,16 +715,18 @@ pub struct ProxyCore<E: Executor> {
     mode: ProxyMode,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
+    /// The decentralized scheduler for local load balancing decisions
+    decentralized_scheduler: DecentralizedScheduler<E>,
 }
 
-impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
+impl<E: Executor + Send + Sync + Clone + 'static> ProxyCore<E>
 where
     E: Send + 'static,
     Store<E>: Send + Sync,
     RemoraTransaction<E>: Send + Sync,
     ExecutionResults<E>: Send + Sync,
     <E as Executor>::ExecutionContext: Send + Sync,
-    <E as Executor>::Transaction: Send,
+    <E as Executor>::Transaction: Send + Sync,
 {
     /// Create a new proxy.
     pub fn new(
@@ -681,6 +739,7 @@ where
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
         mode: ProxyMode,
         metrics: Arc<Metrics>,
+        decentralized_scheduler: DecentralizedScheduler<E>,
     ) -> Self {
         Self {
             id,
@@ -694,6 +753,7 @@ where
             stateless_controller: Arc::new(OneshotDependencyController::new()),
             mode,
             metrics,
+            decentralized_scheduler,
         }
     }
 
@@ -712,6 +772,7 @@ where
             stateless_controller: self.stateless_controller.clone(),
             mode: self.mode.clone(),
             metrics: self.metrics.clone(),
+            decentralized_scheduler: self.decentralized_scheduler,
         };
 
         let mut proxy_processor = ProxyMessageProcessor::<E> {
@@ -785,6 +846,17 @@ mod tests {
         let store = executor.init_store();
         let metrics = Arc::new(Metrics::new_for_tests());
 
+        // Create decentralized scheduler for tests
+        use crate::config::LoadBalancingPolicy;
+        use crate::proxy::decentralized_scheduler::DecentralizedScheduler;
+        let decentralized_scheduler = DecentralizedScheduler::new(
+            proxy_id,
+            4,                               // proxy_count for tests
+            LoadBalancingPolicy::RoundRobin, // default policy for tests
+            ProxyMode::Separation,
+            metrics.clone(),
+        );
+
         // Create proxy
         let proxy = ProxyCore::<E>::new(
             proxy_id,
@@ -796,6 +868,7 @@ mod tests {
             tx_inter_proxy_replies.clone(),
             ProxyMode::Separation,
             metrics,
+            decentralized_scheduler,
         );
 
         (

@@ -1,0 +1,454 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{
+    config::{LoadBalancingPolicy, ProxyMode},
+    executor::api::{
+        ExecutableTransaction, Executor, ExecutorIndex, RequiredStates, TransactionWithTimestamp,
+    },
+    metrics::Metrics,
+    proxy::core::ProxyId,
+};
+use dashmap::DashMap;
+use rand::{Rng, SeedableRng};
+use rustc_hash::FxHashMap;
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use sui_types::base_types::{ObjectID, SequenceNumber};
+
+/// Decentralized scheduler that runs on each proxy node
+/// Each proxy receives the same transaction batch and makes deterministic scheduling decisions
+pub struct DecentralizedScheduler<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    /// This proxy's ID
+    pub proxy_id: ProxyId,
+    /// Total number of proxies in the system
+    pub proxy_count: usize,
+    /// Load balancing policy
+    pub policy: LoadBalancingPolicy,
+    /// Proxy mode (separation vs no separation)
+    pub proxy_mode: ProxyMode,
+    /// Mapping of object ID to its current version for shared objects
+    pub shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    /// Mapping of (ObjectID, SequenceNumber) to which proxy owns that state
+    pub states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+    /// Current load on each proxy
+    pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    /// Access history for affinity-aware scheduling
+    pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
+    /// Metrics
+    pub metrics: Arc<Metrics>,
+    /// PhantomData for the executor type
+    pub _phantom: PhantomData<E>,
+}
+
+impl<E> DecentralizedScheduler<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub fn new(
+        proxy_id: ProxyId,
+        proxy_count: usize,
+        policy: LoadBalancingPolicy,
+        proxy_mode: ProxyMode,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        // Initialize access histories for each proxy
+        let proxy_access_histories = (0..proxy_count).map(|_| Arc::new(DashMap::new())).collect();
+
+        Self {
+            proxy_id,
+            proxy_count,
+            policy,
+            proxy_mode,
+            shared_object_versions: FxHashMap::default(),
+            states_to_proxy: Arc::new(DashMap::new()),
+            proxy_loads: Arc::new(DashMap::new()),
+            proxy_access_histories,
+            metrics,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Process a batch of transactions and return those that should be executed on this proxy
+    pub async fn process_transaction_batch(
+        &mut self,
+        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
+        batch_sequence: u64,
+    ) -> Vec<(
+        TransactionWithTimestamp<E::Transaction>,
+        Vec<(ObjectID, SequenceNumber)>,
+        RequiredStates,
+    )> {
+        let mut local_executions = Vec::new();
+
+        for (txn_index, mut transaction) in transactions.into_iter().enumerate() {
+            // 1. Assign versions to shared objects (deterministic across all proxies)
+            let required_versions = self.assign_shared_object_versions(&mut transaction);
+
+            // 2. Make scheduling decision using the same logic as centralized approach
+            // Use deterministic txn_cnt: base it on batch_sequence and transaction index
+            let txn_cnt = (batch_sequence * 1000 + txn_index as u64) as usize;
+            let selected_proxy =
+                self.get_proxy_for_shared_objects(&required_versions, txn_cnt, &transaction);
+
+            // 3. Update states_to_proxy mapping (all proxies do this for consistency)
+            let missing_states = self
+                .update_state_mapping(required_versions.clone(), selected_proxy, &transaction)
+                .await;
+
+            // 4. Decide: execute locally or discard
+            if selected_proxy == self.proxy_id {
+                // This transaction should be executed on this proxy
+                local_executions.push((transaction, required_versions, missing_states));
+            } else {
+                // This transaction should be executed elsewhere - discard locally
+                tracing::debug!(
+                    "Proxy {} discarding transaction {:?}, assigned to proxy {}",
+                    self.proxy_id,
+                    transaction.digest(),
+                    selected_proxy
+                );
+            }
+        }
+
+        local_executions
+    }
+
+    /// Assign versions to shared objects (reused from centralized version)
+    fn assign_shared_object_versions(
+        &mut self,
+        transaction: &mut TransactionWithTimestamp<E::Transaction>,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        // Get all shared object IDs from the transaction
+        let shared_objects = transaction
+            .shared_objects()
+            .into_iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+
+        if shared_objects.is_empty() {
+            return Vec::new();
+        }
+
+        // Find the maximum version for all objects in the transaction
+        let mut max_version = SequenceNumber::from(2);
+        let initial_version = SequenceNumber::from(2);
+        let mut result = Vec::with_capacity(shared_objects.len());
+
+        // First collect current versions for result and find max
+        for obj_id in shared_objects.iter() {
+            let current_version = self
+                .shared_object_versions
+                .get(obj_id)
+                .copied()
+                .unwrap_or(initial_version);
+
+            // Add current version to result
+            result.push((*obj_id, current_version));
+
+            // Update max version if needed
+            if current_version > max_version {
+                max_version = current_version;
+            }
+        }
+
+        // Calculate the new version (max + 1)
+        let new_version = max_version.next();
+
+        // Update all objects to the new version
+        for obj_id in shared_objects.iter() {
+            self.shared_object_versions.insert(*obj_id, new_version);
+        }
+
+        // Update the transaction's shared_objects field with current versions
+        transaction.shared_objects = result
+            .iter()
+            .map(|(obj_id, version)| (*obj_id, Some(*version)))
+            .collect();
+
+        result
+    }
+
+    /// Make proxy selection decision (reused from centralized logic)
+    fn get_proxy_for_shared_objects(
+        &self,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        txn_cnt: usize,
+        transaction: &TransactionWithTimestamp<E::Transaction>,
+    ) -> ExecutorIndex {
+        let txn_duration =
+            transaction.expected_stateful_duration() + transaction.verification_duration();
+
+        let result = match self.policy {
+            LoadBalancingPolicy::RoundRobin => self.get_proxy_round_robin(txn_cnt),
+            LoadBalancingPolicy::Zeus => self.get_proxy_most_states(required_versions, txn_cnt),
+            LoadBalancingPolicy::Random => {
+                // For determinism, use txn_cnt as seed
+                let mut rng = rand::rngs::StdRng::seed_from_u64(txn_cnt as u64);
+                rng.gen_range(0..self.proxy_count)
+            }
+            LoadBalancingPolicy::Hermes => transaction.destination.unwrap_or(0),
+            LoadBalancingPolicy::LocalityLoad => {
+                self.get_proxy_locality_load(required_versions, &txn_duration, txn_cnt)
+            }
+            LoadBalancingPolicy::AffinityAware => {
+                self.get_proxy_affinity_aware(required_versions, &txn_duration, txn_cnt)
+            }
+        };
+
+        result
+    }
+
+    // Reuse the scheduling algorithms from centralized approach
+    fn get_proxy_round_robin(&self, txn_cnt: usize) -> ExecutorIndex {
+        txn_cnt % self.proxy_count
+    }
+
+    fn get_proxy_most_states(
+        &self,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        txn_cnt: usize,
+    ) -> ExecutorIndex {
+        if required_versions.is_empty() {
+            return 0;
+        }
+
+        // Count how many objects each proxy already has
+        let mut proxy_state_counts = vec![0; self.proxy_count];
+        for (id, v) in required_versions {
+            if let Some(proxy_index) = self.states_to_proxy.get(&(*id, *v)) {
+                if *proxy_index < self.proxy_count {
+                    proxy_state_counts[*proxy_index] += 1;
+                }
+            }
+        }
+
+        // Find the proxy with the most states
+        let mut max_count = 0;
+        let mut best_proxies = Vec::new();
+
+        for (index, count) in proxy_state_counts.iter().enumerate() {
+            match count.cmp(&max_count) {
+                std::cmp::Ordering::Greater => {
+                    max_count = *count;
+                    best_proxies.clear();
+                    best_proxies.push(index);
+                }
+                std::cmp::Ordering::Equal => {
+                    best_proxies.push(index);
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+
+        // Select deterministically
+        if best_proxies.len() > 1 {
+            best_proxies[txn_cnt % best_proxies.len()]
+        } else {
+            best_proxies[0]
+        }
+    }
+
+    fn get_proxy_locality_load(
+        &self,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        txn_duration: &Duration,
+        txn_cnt: usize,
+    ) -> ExecutorIndex {
+        // Calculate locality based on current state ownership
+        let mut locality_raw_counts = vec![0usize; self.proxy_count];
+        for (id, v) in required_versions {
+            if let Some(proxy_index_ref) = self.states_to_proxy.get(&(*id, *v)) {
+                let proxy_index = *proxy_index_ref;
+                if proxy_index < self.proxy_count {
+                    locality_raw_counts[proxy_index] += 1;
+                }
+            }
+        }
+
+        self.compute_locality_load_proxy(
+            locality_raw_counts,
+            required_versions,
+            None,
+            txn_duration,
+            txn_cnt,
+            "Locality",
+        )
+    }
+
+    fn get_proxy_affinity_aware(
+        &self,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        txn_duration: &Duration,
+        txn_cnt: usize,
+    ) -> ExecutorIndex {
+        // Calculate affinity based on historical access patterns
+        let mut locality_raw_counts = vec![0usize; self.proxy_count];
+        for (id, _v) in required_versions {
+            for proxy_index in 0..self.proxy_count {
+                let access_count = self.proxy_access_histories[proxy_index]
+                    .get(id)
+                    .map_or(0, |r| *r.value());
+                locality_raw_counts[proxy_index] += access_count;
+            }
+        }
+
+        self.compute_locality_load_proxy(
+            locality_raw_counts,
+            required_versions,
+            Some(&self.proxy_access_histories),
+            txn_duration,
+            txn_cnt,
+            "Affinity",
+        )
+    }
+
+    /// Common logic for locality/affinity-based load balancing (reused from centralized)
+    fn compute_locality_load_proxy(
+        &self,
+        locality_raw_counts: Vec<usize>,
+        required_versions: &[(ObjectID, SequenceNumber)],
+        _proxy_access_histories: Option<&Vec<Arc<DashMap<ObjectID, usize>>>>,
+        _txn_duration: &Duration,
+        txn_cnt: usize,
+        _policy_name: &str,
+    ) -> ExecutorIndex {
+        let total_required_versions = required_versions.len() as f64;
+        let mut locality_scores: Vec<f64> = locality_raw_counts
+            .iter()
+            .map(|&count| {
+                if total_required_versions == 0.0 {
+                    0.0
+                } else {
+                    count as f64 / total_required_versions
+                }
+            })
+            .collect();
+
+        const SCORE_SUM_EPSILON: f64 = 0.0;
+        let sum_of_locality_scores: f64 = locality_scores.iter().sum();
+
+        if sum_of_locality_scores > SCORE_SUM_EPSILON {
+            locality_scores = locality_scores
+                .iter()
+                .map(|&score| score / sum_of_locality_scores)
+                .collect();
+        }
+
+        let mut current_loads = vec![0usize; self.proxy_count];
+        for i in 0..self.proxy_count {
+            current_loads[i] = self.proxy_loads.get(&i).map_or(0, |r| *r.value());
+        }
+
+        let total_load: usize = current_loads.iter().sum();
+
+        let load_scores: Vec<f64> = current_loads
+            .iter()
+            .map(|&load| {
+                if total_load == 0 {
+                    1.0
+                } else {
+                    1.0 - (load as f64 / total_load as f64)
+                }
+            })
+            .collect();
+
+        let combined_scores: Vec<f64> = locality_scores
+            .iter()
+            .zip(load_scores.iter())
+            .map(|(&loc_score, &ld_score)| 0.5 * loc_score + 0.5 * ld_score)
+            .collect();
+
+        let mut best_score = -1.0_f64;
+        let mut best_proxies = Vec::new();
+
+        for i in 0..self.proxy_count {
+            if combined_scores[i] > best_score {
+                best_score = combined_scores[i];
+                best_proxies.clear();
+                best_proxies.push(i);
+            } else if (combined_scores[i] - best_score).abs() < SCORE_SUM_EPSILON {
+                best_proxies.push(i);
+            }
+        }
+
+        let proxy_index = if best_proxies.is_empty() {
+            txn_cnt % self.proxy_count
+        } else {
+            best_proxies[txn_cnt % best_proxies.len()]
+        };
+
+        proxy_index
+    }
+
+    /// Update state mapping and return missing states
+    async fn update_state_mapping(
+        &self,
+        required_versions: Vec<(ObjectID, SequenceNumber)>,
+        selected_proxy: ExecutorIndex,
+        transaction: &TransactionWithTimestamp<E::Transaction>,
+    ) -> RequiredStates {
+        let mut required_states = BTreeMap::new();
+
+        if required_versions.is_empty() {
+            return required_states;
+        }
+
+        let mut max_version = SequenceNumber::from(2);
+        for (_, seq_num) in &required_versions {
+            if *seq_num > max_version {
+                max_version = *seq_num;
+            }
+        }
+
+        // Calculate the new version (max + 1) for mapping updates
+        let next_version = max_version.next();
+
+        for (object_id, seq_num) in required_versions {
+            let previous_owner = self.states_to_proxy.get(&(object_id, seq_num));
+
+            let previous_owner_value = if let Some(owner) = previous_owner {
+                if *owner != selected_proxy {
+                    Some(*owner)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            required_states.insert((object_id, seq_num), previous_owner_value);
+
+            // Update the mapping (all proxies do this to stay consistent)
+            self.states_to_proxy
+                .insert((object_id, next_version), selected_proxy);
+            self.states_to_proxy.remove(&(object_id, seq_num));
+        }
+
+        // Update load tracking
+        let load_inc = (transaction.expected_stateful_duration()
+            + transaction.verification_duration())
+        .as_micros() as usize;
+        if let Some(mut load) = self.proxy_loads.get_mut(&selected_proxy) {
+            *load += load_inc;
+        } else {
+            self.proxy_loads.insert(selected_proxy, load_inc);
+        }
+
+        // Update access history if needed
+        if matches!(self.policy, LoadBalancingPolicy::AffinityAware) {
+            for (obj_id, _v) in &required_states {
+                self.proxy_access_histories[selected_proxy]
+                    .entry(obj_id.0)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+        }
+
+        required_states
+    }
+}

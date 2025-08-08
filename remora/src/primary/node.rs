@@ -10,7 +10,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
+use super::{decentralized_forwarder::DecentralizedForwarder, mock_consensus::MockConsensus};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -69,16 +69,14 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             proxy_connections.insert(proxy_info.proxy_id, tx_proxy);
         }
 
-        // Boot the load balancer. This component forwards transactions to the consensus and proxies.
-        let load_balancer_handle = LoadBalancer::<E>::new(
+        // Boot the decentralized forwarder. This component broadcasts transaction batches to all proxies.
+        let decentralized_forwarder = DecentralizedForwarder::<E>::new(
             proxy_connections,
-            rx_committed_txns,
-            config.validator_parameters.load_balancing_policy.clone(),
             config.validator_parameters.proxy_mode.clone(),
             metrics.clone(),
-        )
-        .spawn();
-        primary_handles.push(load_balancer_handle);
+        );
+        let decentralized_forwarder_handle = decentralized_forwarder.spawn(rx_committed_txns);
+        primary_handles.push(decentralized_forwarder_handle);
 
         // Boot the (mock) consensus. This component delays transactions simulating consensus and
         // then forwards them to the primary executor.
