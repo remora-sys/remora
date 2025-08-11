@@ -284,7 +284,7 @@ pub fn periodically_print_metrics(
                 .await
                 .expect("Failed to print metrics");
             if !summary.is_empty() {
-                println!("{summary}\n");
+                tracing::info!("{summary}\n");
             }
         }
     })

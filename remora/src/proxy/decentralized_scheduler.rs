@@ -40,6 +40,7 @@ where
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
     /// Metrics
     pub metrics: Arc<Metrics>,
+    pub txn_cnt: usize,
     /// PhantomData for the executor type
     pub _phantom: PhantomData<E>,
 }
@@ -69,6 +70,7 @@ where
             proxy_loads: Arc::new(DashMap::new()),
             proxy_access_histories,
             metrics,
+            txn_cnt: 0,
             _phantom: PhantomData,
         }
     }
@@ -77,7 +79,7 @@ where
     pub async fn process_transaction_batch(
         &mut self,
         transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
-        batch_sequence: u64,
+        _batch_sequence: u64,
     ) -> Vec<(
         TransactionWithTimestamp<E::Transaction>,
         Vec<(ObjectID, SequenceNumber)>,
@@ -85,15 +87,15 @@ where
     )> {
         let mut local_executions = Vec::new();
 
-        for (txn_index, mut transaction) in transactions.into_iter().enumerate() {
+        for mut transaction in transactions.into_iter() {
             // 1. Assign versions to shared objects (deterministic across all proxies)
             let required_versions = self.assign_shared_object_versions(&mut transaction);
 
             // 2. Make scheduling decision using the same logic as centralized approach
             // Use deterministic txn_cnt: base it on batch_sequence and transaction index
-            let txn_cnt = (batch_sequence * 1000 + txn_index as u64) as usize;
+            // let txn_cnt = (batch_sequence * 1000 + txn_index as u64) as usize;
             let selected_proxy =
-                self.get_proxy_for_shared_objects(&required_versions, txn_cnt, &transaction);
+                self.get_proxy_for_shared_objects(&required_versions, self.txn_cnt, &transaction);
 
             // 3. Update states_to_proxy mapping (all proxies do this for consistency)
             let missing_states = self
@@ -113,6 +115,7 @@ where
                     selected_proxy
                 );
             }
+            self.txn_cnt += 1;
         }
 
         local_executions
