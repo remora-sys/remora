@@ -3,19 +3,16 @@
 
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, marker::PhantomData, ops::Deref, sync::Arc, thread};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
     object::Object,
     transaction::InputObjectKind,
 };
-use tokio::{
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        oneshot, Notify,
-    },
-    task::JoinHandle,
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot, Notify,
 };
 
 use crate::{
@@ -791,7 +788,7 @@ where
     }
 
     /// Spawn the proxy in a new task.
-    pub fn spawn(self) -> Vec<JoinHandle<NodeResult<()>>>
+    pub fn spawn(self) -> Vec<thread::JoinHandle<NodeResult<()>>>
     where
         <E as Executor>::Transaction: Send + Sync,
     {
@@ -803,19 +800,31 @@ where
         // Create the version assignment task
         let mut version_assignment_task = ProxyVersionAssignmentTask::<E>::new();
         let rx_transactions = self.rx_transactions;
-        let version_assignment_handle = tokio::spawn(async move {
-            version_assignment_task
-                .process_transaction_batches(rx_transactions, tx_to_scheduler)
-                .await;
+        let version_assignment_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                version_assignment_task
+                    .process_transaction_batches(rx_transactions, tx_to_scheduler)
+                    .await;
+            });
             Ok(())
         });
 
         // Create the scheduler task
         let mut scheduler = self.decentralized_scheduler;
-        let scheduler_handle = tokio::spawn(async move {
-            scheduler
-                .run_scheduler_task(rx_from_version_assignment, tx_to_primary_processor)
-                .await;
+        let scheduler_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                scheduler
+                    .run_scheduler_task(rx_from_version_assignment, tx_to_primary_processor)
+                    .await;
+            });
             Ok(())
         });
 
@@ -832,10 +841,16 @@ where
             metrics: self.metrics.clone(),
         };
 
-        let primary_handle = tokio::spawn(async move {
-            primary_processor
-                .run(rx_scheduled_transactions, rx_other_messages)
-                .await;
+        let primary_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                primary_processor
+                    .run(rx_scheduled_transactions, rx_other_messages)
+                    .await;
+            });
             Ok(())
         });
 
@@ -849,8 +864,14 @@ where
             mode: self.mode,
         };
 
-        let proxy_handle = tokio::spawn(async move {
-            proxy_processor.run(self.rx_inter_proxy_requests).await;
+        let proxy_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                proxy_processor.run(self.rx_inter_proxy_requests).await;
+            });
             Ok(())
         });
 
@@ -1028,7 +1049,7 @@ mod tests {
         // Clean up
         drop(tx_to_proxy);
         for handle in proxy_handles {
-            handle.await.unwrap().unwrap();
+            handle.join().unwrap().unwrap();
         }
 
         success

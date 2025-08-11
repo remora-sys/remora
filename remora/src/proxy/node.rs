@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{de::DeserializeOwned, Serialize};
-use std::{io, marker::PhantomData, sync::Arc};
+use std::{io, marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -21,14 +21,14 @@ use dashmap::DashMap;
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
     /// The handles for the core components.
-    core_handles: Vec<Vec<JoinHandle<NodeResult<()>>>>,
+    core_handles: Vec<Vec<thread::JoinHandle<NodeResult<()>>>>,
     /// The receiver for the proxy results.
     rx_proxy_results: Receiver<ExecutionResults<E>>,
     /// The handle for the network client.
     _network_handles: Vec<JoinHandle<io::Result<()>>>,
     /// The handles for the connection listeners.
     _connection_listener_handles: Vec<JoinHandle<()>>,
-    /// The metrics for the proxy
+    /// The metrics for the proxy.
     metrics: Arc<Metrics>,
 }
 
@@ -170,10 +170,12 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         // Take ownership of the core_handles to avoid ownership issues
         let core_handles = std::mem::take(&mut self.core_handles);
 
-        // Spawn a task to wait for all core handles to complete
-        let mut core_completion = tokio::spawn(async move {
+        // Spawn a blocking task to wait for all core handles to complete
+        let mut core_completion = tokio::task::spawn_blocking(move || {
             for core_handle in core_handles {
-                futures::future::join_all(core_handle).await;
+                for handle in core_handle {
+                    let _ = handle.join();
+                }
             }
             tracing::info!("All core tasks have completed");
         });
@@ -188,11 +190,6 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             let submit_timestamp = result.transaction_timestamp();
             // TODO: Record transactions success and failure.
             self.metrics.update_metrics(submit_timestamp);
-        }
-
-        // Ensure core_completion task is done
-        if let Err(e) = core_completion.await {
-            tracing::error!("Error in core completion task: {:?}", e);
         }
     }
 }
