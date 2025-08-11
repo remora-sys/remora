@@ -11,7 +11,6 @@ use crate::{
 };
 use dashmap::DashMap;
 use rand::{Rng, SeedableRng};
-use rustc_hash::FxHashMap;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 
@@ -30,8 +29,6 @@ where
     pub policy: LoadBalancingPolicy,
     /// Proxy mode (separation vs no separation)
     pub proxy_mode: ProxyMode,
-    /// Mapping of object ID to its current version for shared objects
-    pub shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
     /// Mapping of (ObjectID, SequenceNumber) to which proxy owns that state
     pub states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     /// Current load on each proxy
@@ -65,7 +62,6 @@ where
             proxy_count,
             policy,
             proxy_mode,
-            shared_object_versions: FxHashMap::default(),
             states_to_proxy: Arc::new(DashMap::new()),
             proxy_loads: Arc::new(DashMap::new()),
             proxy_access_histories,
@@ -75,105 +71,80 @@ where
         }
     }
 
-    /// Process a batch of transactions and return those that should be executed on this proxy
-    pub async fn process_transaction_batch(
+    /// Process a single transaction and return scheduling decision
+    /// This is the new pipeline-friendly method
+    pub async fn process_single_transaction(
         &mut self,
-        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
-        _batch_sequence: u64,
-    ) -> Vec<(
+        transaction: TransactionWithTimestamp<E::Transaction>,
+    ) -> Option<(
         TransactionWithTimestamp<E::Transaction>,
         Vec<(ObjectID, SequenceNumber)>,
         RequiredStates,
+        ExecutorIndex,
     )> {
-        let mut local_executions = Vec::new();
-
-        for mut transaction in transactions.into_iter() {
-            // 1. Assign versions to shared objects (deterministic across all proxies)
-            let required_versions = self.assign_shared_object_versions(&mut transaction);
-
-            // 2. Make scheduling decision using the same logic as centralized approach
-            // Use deterministic txn_cnt: base it on batch_sequence and transaction index
-            // let txn_cnt = (batch_sequence * 1000 + txn_index as u64) as usize;
-            let selected_proxy =
-                self.get_proxy_for_shared_objects(&required_versions, self.txn_cnt, &transaction);
-
-            // 3. Update states_to_proxy mapping (all proxies do this for consistency)
-            let missing_states = self
-                .update_state_mapping(required_versions.clone(), selected_proxy, &transaction)
-                .await;
-
-            // 4. Decide: execute locally or discard
-            if selected_proxy == self.proxy_id {
-                // This transaction should be executed on this proxy
-                local_executions.push((transaction, required_versions, missing_states));
-            } else {
-                // This transaction should be executed elsewhere - discard locally
-                tracing::debug!(
-                    "Proxy {} discarding transaction {:?}, assigned to proxy {}",
-                    self.proxy_id,
-                    transaction.digest(),
-                    selected_proxy
-                );
-            }
-            self.txn_cnt += 1;
-        }
-
-        local_executions
-    }
-
-    /// Assign versions to shared objects (reused from centralized version)
-    fn assign_shared_object_versions(
-        &mut self,
-        transaction: &mut TransactionWithTimestamp<E::Transaction>,
-    ) -> Vec<(ObjectID, SequenceNumber)> {
-        // Get all shared object IDs from the transaction
-        let shared_objects = transaction
+        // Extract required versions from the transaction (already assigned by VersionAssignmentTask)
+        let required_versions: Vec<(ObjectID, SequenceNumber)> = transaction
             .shared_objects()
             .into_iter()
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-
-        if shared_objects.is_empty() {
-            return Vec::new();
-        }
-
-        // Find the maximum version for all objects in the transaction
-        let mut max_version = SequenceNumber::from(2);
-        let initial_version = SequenceNumber::from(2);
-        let mut result = Vec::with_capacity(shared_objects.len());
-
-        // First collect current versions for result and find max
-        for obj_id in shared_objects.iter() {
-            let current_version = self
-                .shared_object_versions
-                .get(obj_id)
-                .copied()
-                .unwrap_or(initial_version);
-
-            // Add current version to result
-            result.push((*obj_id, current_version));
-
-            // Update max version if needed
-            if current_version > max_version {
-                max_version = current_version;
-            }
-        }
-
-        // Calculate the new version (max + 1)
-        let new_version = max_version.next();
-
-        // Update all objects to the new version
-        for obj_id in shared_objects.iter() {
-            self.shared_object_versions.insert(*obj_id, new_version);
-        }
-
-        // Update the transaction's shared_objects field with current versions
-        transaction.shared_objects = result
-            .iter()
-            .map(|(obj_id, version)| (*obj_id, Some(*version)))
+            .filter_map(|(id, version_opt)| version_opt.map(|v| (*id, v)))
             .collect();
 
-        result
+        // Make scheduling decision using the same logic as centralized approach
+        let selected_proxy =
+            self.get_proxy_for_shared_objects(&required_versions, self.txn_cnt, &transaction);
+
+        // Update states_to_proxy mapping (all proxies do this for consistency)
+        let missing_states = self
+            .update_state_mapping(required_versions.clone(), selected_proxy, &transaction)
+            .await;
+
+        self.txn_cnt += 1;
+
+        // Return the scheduling decision
+        Some((
+            transaction,
+            required_versions,
+            missing_states,
+            selected_proxy,
+        ))
+    }
+
+    /// Run the scheduler as a continuous task processing individual transactions
+    pub async fn run_scheduler_task(
+        &mut self,
+        mut rx_from_version_assignment: tokio::sync::mpsc::Receiver<
+            TransactionWithTimestamp<E::Transaction>,
+        >,
+        tx_to_primary_processor: tokio::sync::mpsc::Sender<
+            crate::proxy::core::ScheduledTransaction<E>,
+        >,
+    ) {
+        while let Some(transaction) = rx_from_version_assignment.recv().await {
+            tracing::debug!(
+                "Scheduler received transaction {:?} for processing",
+                transaction.digest()
+            );
+
+            if let Some((transaction, required_versions, missing_states, assigned_proxy)) =
+                self.process_single_transaction(transaction).await
+            {
+                let scheduled_txn = crate::proxy::core::ScheduledTransaction {
+                    transaction,
+                    required_versions,
+                    missing_states,
+                    assigned_proxy,
+                };
+
+                if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
+                    tracing::error!(
+                        "Failed to send scheduled transaction to primary processor: {}",
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+        tracing::info!("Scheduler task shutting down");
     }
 
     /// Make proxy selection decision (reused from centralized logic)

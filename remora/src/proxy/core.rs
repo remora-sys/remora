@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use rustc_hash::FxHashMap;
+use std::{collections::BTreeMap, marker::PhantomData, ops::Deref, sync::Arc};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
@@ -11,7 +12,7 @@ use sui_types::{
 };
 use tokio::{
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
         oneshot, Notify,
     },
     task::JoinHandle,
@@ -35,6 +36,132 @@ use crate::{
 
 pub type ProxyId = ExecutorIndex;
 
+/// Version assignment task for proxy pipeline
+/// Similar to the primary's VersionAssignmentTask but adapted for proxy use
+pub struct ProxyVersionAssignmentTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    /// Mapping of object ID to its current version for shared objects
+    pub shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    /// PhantomData to indicate we're using the generic parameter
+    pub _phantom: PhantomData<E>,
+}
+
+impl<E> ProxyVersionAssignmentTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub fn new() -> Self {
+        Self {
+            shared_object_versions: FxHashMap::default(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Process incoming transaction batches and assign versions to individual transactions
+    pub async fn process_transaction_batches(
+        &mut self,
+        mut rx_transactions: Receiver<PrimaryToProxyMessage<E::Transaction>>,
+        tx_to_scheduler: Sender<TransactionWithTimestamp<E::Transaction>>,
+    ) {
+        while let Some(message) = rx_transactions.recv().await {
+            match message {
+                PrimaryToProxyMessage::TransactionBatch(transactions, batch_sequence) => {
+                    tracing::debug!(
+                        "VersionAssignmentTask received transaction batch {} with {} transactions",
+                        batch_sequence,
+                        transactions.len()
+                    );
+
+                    for mut transaction in transactions {
+                        // Assign versions to shared objects
+                        let required_versions =
+                            self.assign_shared_object_versions(&mut transaction);
+
+                        // Update the transaction's shared objects with assigned versions
+                        transaction.shared_objects = required_versions
+                            .iter()
+                            .map(|(obj_id, version)| (*obj_id, Some(*version)))
+                            .collect();
+
+                        // Send individual transaction to scheduler
+                        if let Err(e) = tx_to_scheduler.send(transaction).await {
+                            tracing::error!("Failed to send transaction to scheduler: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!("VersionAssignmentTask received unexpected message type");
+                }
+            }
+        }
+        tracing::info!("VersionAssignmentTask shutting down");
+    }
+
+    /// Assign versions to shared objects in a transaction
+    /// Similar to the primary's version assignment but adapted for proxy use
+    pub fn assign_shared_object_versions(
+        &mut self,
+        transaction: &mut TransactionWithTimestamp<E::Transaction>,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        // Get all shared object IDs from the transaction
+        let shared_objects = transaction
+            .shared_objects()
+            .into_iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+
+        if shared_objects.is_empty() {
+            return Vec::new();
+        }
+
+        // Find the maximum version for all objects in the transaction
+        let mut max_version = SequenceNumber::from(2);
+        let initial_version = SequenceNumber::from(2);
+        let mut result = Vec::with_capacity(shared_objects.len());
+
+        // First collect current versions for result and find max
+        for obj_id in shared_objects.iter() {
+            let current_version = self
+                .shared_object_versions
+                .get(obj_id)
+                .copied()
+                .unwrap_or(initial_version);
+
+            // Add current version to result
+            result.push((*obj_id, current_version));
+
+            // Update max version if needed
+            if current_version > max_version {
+                max_version = current_version;
+            }
+        }
+
+        // Calculate the new version (max + 1)
+        let new_version = max_version.next();
+
+        // Update all objects to the new version
+        for obj_id in shared_objects.iter() {
+            self.shared_object_versions.insert(*obj_id, new_version);
+        }
+
+        result
+    }
+}
+
+/// Message type for scheduler output
+#[derive(Debug)]
+pub struct ScheduledTransaction<E: Executor> {
+    pub transaction: TransactionWithTimestamp<E::Transaction>,
+    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
+    pub missing_states: RequiredStates,
+    pub assigned_proxy: ExecutorIndex,
+}
+
 struct PrimaryMessageProcessor<E: Executor + Send + Sync + Clone + 'static>
 where
     <E as Executor>::Transaction: Send + Sync,
@@ -48,7 +175,6 @@ where
     stateless_controller: Arc<OneshotDependencyController>,
     mode: ProxyMode,
     metrics: Arc<Metrics>,
-    decentralized_scheduler: DecentralizedScheduler<E>,
 }
 
 impl<E: Executor + Send + Sync + Clone + 'static> PrimaryMessageProcessor<E>
@@ -60,133 +186,65 @@ where
     <E as Executor>::ExecutionContext: Send + Sync,
     <E as Executor>::Transaction: Send + Sync,
 {
+    /// Run the primary message processor - now handles individual scheduled transactions
     async fn run(
         &mut self,
-        mut rx_transactions: Receiver<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
+        mut rx_scheduled_transactions: Receiver<ScheduledTransaction<E>>,
+        mut _rx_other_messages: Receiver<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
     ) where
         <E as Executor>::Transaction: Send + Sync,
     {
         let mut task_id = 0;
-        while let Some(message) = rx_transactions.recv().await {
+
+        // In pipeline mode, we only process scheduled transactions
+        while let Some(scheduled_txn) = rx_scheduled_transactions.recv().await {
             if task_id == 0 {
                 self.metrics.register_start_time();
             }
             task_id += 1;
 
-            self.handle_primary_message(message).await;
+            self.handle_scheduled_transaction(scheduled_txn).await;
         }
+
         tracing::info!(
             "Primary message handler for proxy {} shutting down",
             self.id
         );
     }
 
-    async fn handle_primary_message(
-        &mut self,
-        message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
-    ) {
-        match message {
-            PrimaryToProxyMessage::TransactionBatch(transactions, batch_sequence) => {
-                tracing::debug!(
-                    "Proxy {} received transaction batch {} with {} transactions",
-                    self.id,
-                    batch_sequence,
-                    transactions.len()
-                );
-                self.process_transaction_batch(transactions, batch_sequence)
-                    .await;
-            }
-            PrimaryToProxyMessage::StatelessTxn(transaction)
-                if self.mode == ProxyMode::Separation =>
-            {
-                tracing::debug!(
-                    "Proxy {} received stateless transaction {:?}",
-                    self.id,
-                    transaction.digest()
-                );
-                self.process_stateless_transaction(transaction.deref().clone())
-                    .await
-            }
-            PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states)
-                if self.mode == ProxyMode::Separation =>
-            {
-                tracing::debug!(
-                    "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
-                    self.id,
-                    transaction.digest(),
-                    stateless_res_proxy_id
-                );
-                self.process_stateful_transaction(
-                    transaction,
-                    stateless_res_proxy_id,
-                    missing_states,
-                )
-                .await;
-            }
-            PrimaryToProxyMessage::CombinedTxn(
-                transaction,
-                stateless_res_proxy_id,
-                missing_states,
-            ) => {
-                tracing::debug!(
-                    "Proxy {} received combined transaction {:?}, stateless proxy: {}",
-                    self.id,
-                    transaction.digest(),
-                    stateless_res_proxy_id
-                );
-                self.process_stateful_transaction(
-                    transaction,
-                    stateless_res_proxy_id,
-                    missing_states,
-                )
-                .await;
-            }
-            _ => {
-                panic!("Proxy {} received unexpected message", self.id);
-            }
-        }
-    }
+    /// Handle a scheduled transaction from the pipeline
+    async fn handle_scheduled_transaction(&mut self, scheduled_txn: ScheduledTransaction<E>) {
+        let ScheduledTransaction {
+            transaction,
+            required_versions: _,
+            missing_states,
+            assigned_proxy,
+        } = scheduled_txn;
 
-    /// Process a transaction batch using decentralized scheduling
-    async fn process_transaction_batch(
-        &mut self,
-        transactions: Vec<TransactionWithTimestamp<E::Transaction>>,
-        batch_sequence: u64,
-    ) {
-        let total_transactions = transactions.len();
-        tracing::debug!(
-            "Proxy {} processing transaction batch {} with {} transactions",
-            self.id,
-            batch_sequence,
-            total_transactions
-        );
+        // Only process transactions assigned to this proxy
+        if assigned_proxy == self.id {
+            tracing::debug!(
+                "Proxy {} processing scheduled transaction {:?}",
+                self.id,
+                transaction.digest()
+            );
 
-        // Use DecentralizedScheduler to determine which transactions to execute locally
-        let local_executions = self
-            .decentralized_scheduler
-            .process_transaction_batch(transactions, batch_sequence)
-            .await;
-
-        tracing::debug!(
-            "Proxy {} will execute {} out of {} transactions from batch {}",
-            self.id,
-            local_executions.len(),
-            total_transactions,
-            batch_sequence
-        );
-
-        // Execute the transactions that were assigned to this proxy
-        for (transaction, _required_versions, missing_states) in local_executions {
             let transaction_arc = Arc::new(transaction);
 
-            // Process as a stateful transaction with the missing states for now
-
+            // Process as a stateful transaction with the missing states
             self.process_stateful_transaction(
                 transaction_arc,
-                self.id, // Use self as stateless proxy for now
+                self.id, // Use self as stateless proxy for pipeline mode
                 missing_states,
             )
             .await;
+        } else {
+            tracing::debug!(
+                "Proxy {} ignoring transaction {:?} assigned to proxy {}",
+                self.id,
+                transaction.digest(),
+                assigned_proxy
+            );
         }
     }
 
@@ -223,31 +281,6 @@ where
 
         self.schedule_stateful_transaction(transaction, required_states, rx)
             .await;
-    }
-
-    async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
-        tracing::debug!(
-            "Proxy {} processing stateless transaction {:?}",
-            self.id,
-            transaction.digest()
-        );
-
-        let tx = self
-            .stateless_controller
-            .set_local_dependency(*transaction.digest());
-
-        let context = self.executor.context().clone();
-        let id = self.id;
-        tokio::spawn(async move {
-            let res = E::verify_transaction(context, &transaction).await;
-            tracing::debug!(
-                "Proxy {} completed stateless verification for {:?}, result: {}",
-                id,
-                transaction.digest(),
-                res
-            );
-            tx.send(res).expect("Failed to send result");
-        });
     }
 
     /// Schedule a stateful transaction in multi-threaded mode.
@@ -757,11 +790,36 @@ where
         }
     }
 
-    /// Sptransaction_awn the proxy in a new task.
+    /// Spawn the proxy in a new task.
     pub fn spawn(self) -> Vec<JoinHandle<NodeResult<()>>>
     where
         <E as Executor>::Transaction: Send + Sync,
     {
+        // Create channels for the pipeline
+        let (tx_to_scheduler, rx_from_version_assignment) = mpsc::channel(100);
+        let (tx_to_primary_processor, rx_scheduled_transactions) = mpsc::channel(100);
+        let (_tx_other_messages, rx_other_messages) = mpsc::channel(100);
+
+        // Create the version assignment task
+        let mut version_assignment_task = ProxyVersionAssignmentTask::<E>::new();
+        let rx_transactions = self.rx_transactions;
+        let version_assignment_handle = tokio::spawn(async move {
+            version_assignment_task
+                .process_transaction_batches(rx_transactions, tx_to_scheduler)
+                .await;
+            Ok(())
+        });
+
+        // Create the scheduler task
+        let mut scheduler = self.decentralized_scheduler;
+        let scheduler_handle = tokio::spawn(async move {
+            scheduler
+                .run_scheduler_task(rx_from_version_assignment, tx_to_primary_processor)
+                .await;
+            Ok(())
+        });
+
+        // Create the primary message processor
         let mut primary_processor = PrimaryMessageProcessor {
             id: self.id,
             executor: self.executor.clone(),
@@ -772,9 +830,16 @@ where
             stateless_controller: self.stateless_controller.clone(),
             mode: self.mode.clone(),
             metrics: self.metrics.clone(),
-            decentralized_scheduler: self.decentralized_scheduler,
         };
 
+        let primary_handle = tokio::spawn(async move {
+            primary_processor
+                .run(rx_scheduled_transactions, rx_other_messages)
+                .await;
+            Ok(())
+        });
+
+        // Create the proxy message processor (unchanged)
         let mut proxy_processor = ProxyMessageProcessor::<E> {
             id: self.id,
             store: self.store,
@@ -784,17 +849,17 @@ where
             mode: self.mode,
         };
 
-        let primary_handle = tokio::spawn(async move {
-            primary_processor.run(self.rx_transactions).await;
-            Ok(())
-        });
-
         let proxy_handle = tokio::spawn(async move {
             proxy_processor.run(self.rx_inter_proxy_requests).await;
             Ok(())
         });
 
-        vec![primary_handle, proxy_handle]
+        vec![
+            version_assignment_handle,
+            scheduler_handle,
+            primary_handle,
+            proxy_handle,
+        ]
     }
 }
 
