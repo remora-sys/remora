@@ -597,7 +597,7 @@ mod tests {
                 // Create dummy required states for stateful transactions
                 let mut required_states = RequiredStates::new();
                 for obj_id in transaction.input_objects() {
-                    required_states.insert((obj_id.object_id(), SequenceNumber::from(2)), None);
+                    required_states.push(((obj_id.object_id(), SequenceNumber::from(2)), None));
                 }
                 let tx = Arc::new(transaction);
                 (

@@ -3,7 +3,7 @@
 
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
@@ -71,7 +71,7 @@ where
                                 *tx.digest(),
                                 tx.verification_duration(),
                             );
-                            let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
+                            let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, Vec::new());
 
                             if proxy_conn.send(msg1).await.is_err() {
                                 tracing::warn!("Failed to send stateless txn to proxy {}", idx);
@@ -83,11 +83,8 @@ where
                     }
                     LoadBalancingPolicy::Combined => {
                         if let Some(proxy_conn) = proxy_connections.get(&idx) {
-                            let combined = PrimaryToProxyMessage::CombinedTxn(
-                                tx.clone(),
-                                idx,
-                                BTreeMap::new(),
-                            );
+                            let combined =
+                                PrimaryToProxyMessage::CombinedTxn(tx.clone(), idx, Vec::new());
                             if proxy_conn.send(combined).await.is_err() {
                                 tracing::warn!("Failed to send combined txn to proxy {}", idx);
                             }
@@ -108,7 +105,7 @@ where
                             tracing::warn!("Failed to send stateless txn to proxy 0");
                         }
                         if stateful_proxy
-                            .send(PrimaryToProxyMessage::Txn(tx.clone(), 0, BTreeMap::new()))
+                            .send(PrimaryToProxyMessage::Txn(tx.clone(), 0, Vec::new()))
                             .await
                             .is_err()
                         {
