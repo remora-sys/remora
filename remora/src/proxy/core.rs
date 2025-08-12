@@ -258,8 +258,8 @@ where
         Vec<Arc<Notify>>,
     ) {
         let obj_ids: Vec<(ObjectID, SequenceNumber)> = required_states
-            .keys()
-            .map(|state| (state.0, state.1))
+            .iter()
+            .map(|((obj_id, seq_num), _)| (*obj_id, *seq_num))
             .collect();
 
         // If there are no object dependencies, return empty vectors for handles
@@ -299,8 +299,8 @@ where
             // Assign shared objects version.
             if !required_states.is_empty() {
                 let required_versions: Vec<(ObjectID, SequenceNumber)> = required_states
-                    .keys()
-                    .map(|state| (state.0, state.1))
+                    .iter()
+                    .map(|((obj_id, seq_num), _)| (*obj_id, *seq_num))
                     .collect();
                 executor
                     .assign_shared_object_versions_with_required_versions(
@@ -872,16 +872,16 @@ mod tests {
             let required_versions = version_assignment_processor
                 .assign_shared_object_versions(&mut transaction_with_timestamp);
 
-            // Build required_states as a BTreeMap<(ObjectID, SequenceNumber), Option<usize>>
-            // If required_versions is empty, this will be an empty BTreeMap
-            let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> =
+            // Build required_states as a Vec<((ObjectID, SequenceNumber), Option<usize>)>
+            // If required_versions is empty, this will be an empty Vec
+            let required_states: Vec<((ObjectID, SequenceNumber), Option<usize>)> =
                 if !required_versions.is_empty() {
                     required_versions
                         .into_iter()
                         .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                         .collect()
                 } else {
-                    BTreeMap::new()
+                    Vec::new()
                 };
 
             // Then send the stateful transaction with required_states (empty or not)
@@ -949,7 +949,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Now send the stateful part
-        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 0, BTreeMap::new());
+        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 0, Vec::new());
         tx_to_proxy.send(message).await.unwrap();
     }
 
@@ -984,7 +984,7 @@ mod tests {
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
-        let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> = BTreeMap::new();
+        let required_states: Vec<((ObjectID, SequenceNumber), Option<usize>)> = Vec::new();
         let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 1, required_states);
         tx_to_proxy1.send(message).await.unwrap();
     }

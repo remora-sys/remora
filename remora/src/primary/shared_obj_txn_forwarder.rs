@@ -816,7 +816,7 @@ where
         proxy_index: ExecutorIndex,
         states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     ) -> RequiredStates {
-        let mut required_states = BTreeMap::new();
+        let mut required_states = Vec::new();
 
         tracing::debug!(
             "Transaction {:?} required versions: {:?}",
@@ -848,7 +848,7 @@ where
                     None
                 };
 
-                required_states.insert((object_id, seq_num), previous_owner_value);
+                required_states.push(((object_id, seq_num), previous_owner_value));
 
                 // Update the mapping
                 states_to_proxy.insert((object_id, next_version), proxy_index);

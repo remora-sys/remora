@@ -236,7 +236,7 @@ pub type Store<E> = Arc<<E as Executor>::Store>;
 pub type NewStates = BTreeMap<ObjectID, Object>;
 
 // if the proxy id is none, the state is not required
-pub type RequiredStates = BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>>;
+pub type RequiredStates = Vec<((ObjectID, SequenceNumber), Option<ProxyId>)>;
 
 pub type ExecutorIndex = usize;
 
