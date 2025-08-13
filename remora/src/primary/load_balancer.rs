@@ -123,8 +123,10 @@ where
             policy: self.policy.clone(),
             counter: 0,
             proxy_loads: proxy_loads.clone(),
-            object_last_proxy: vec![None; 1 << 24],
-            batch_idx: batch_idx.clone(),
+            dependency_scheduler:
+                crate::primary::shared_obj_txn_forwarder::DependencyScheduler::new(
+                    batch_idx.clone(),
+                ),
         };
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),

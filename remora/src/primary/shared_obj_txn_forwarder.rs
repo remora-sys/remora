@@ -27,9 +27,23 @@ use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Shared dependency scheduling utility for building dependency graphs and assigning proxies
-pub(crate) struct DependencyScheduler;
+#[derive(Clone)]
+pub(crate) struct DependencyScheduler {
+    /// Object to proxy mapping for locality tracking (24-bit indexed)
+    pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
+    /// Batch index tracker for pre-consensus scheduling
+    pub(crate) batch_idx: Arc<AtomicUsize>,
+}
 
 impl DependencyScheduler {
+    /// Create a new DependencyScheduler
+    pub(crate) fn new(batch_idx: Arc<AtomicUsize>) -> Self {
+        Self {
+            object_last_proxy: vec![None; 1 << 24], // 24-bit indexing
+            batch_idx,
+        }
+    }
+
     /// Build dependency graph from transactions
     pub(crate) fn build_dependency_graph<E>(
         transactions: &[RemoraTransaction<E>],
@@ -90,7 +104,7 @@ impl DependencyScheduler {
 
     /// Assign proxy for a large subgraph based on locality
     pub(crate) fn assign_large_subgraph_proxy<E>(
-        object_last_proxy: &[Option<ExecutorIndex>],
+        &self,
         num_proxies: usize,
         graph: &DiGraph<TransactionDigest, ()>,
         subgraph_nodes: &[petgraph::graph::NodeIndex],
@@ -115,7 +129,7 @@ impl DependencyScheduler {
 
         for obj in &subgraph_objects {
             let idx = Self::object_id_24bit_index(obj);
-            if let Some(proxy_id) = object_last_proxy[idx] {
+            if let Some(proxy_id) = self.object_last_proxy[idx] {
                 locality_count[proxy_id] += 1;
             }
         }
@@ -140,7 +154,7 @@ impl DependencyScheduler {
 
     /// Update state for SDS policy
     pub(crate) fn update_state_for_sds<E>(
-        object_last_proxy: &mut [Option<ExecutorIndex>],
+        &mut self,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         subgraph_digests: &FxHashSet<TransactionDigest>,
         subgraph_objects: &Vec<ObjectID>,
@@ -163,14 +177,14 @@ impl DependencyScheduler {
             .or_insert(total_weight);
 
         for object_id in subgraph_objects {
-            object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
+            self.object_last_proxy[Self::object_id_24bit_index(&object_id)] = Some(proxy_id);
         }
     }
 
     /// Process a batch of transactions and return proxy assignments for large subgraphs
     pub(crate) fn process_transaction_batch<E>(
+        &self,
         transactions: &[RemoraTransaction<E>],
-        object_last_proxy: &[Option<ExecutorIndex>],
         num_proxies: usize,
     ) -> Vec<(ExecutorIndex, FxHashSet<TransactionDigest>, Vec<ObjectID>)>
     where
@@ -192,15 +206,14 @@ impl DependencyScheduler {
         large_subgraphs
             .iter()
             .map(|subgraph_nodes| {
-                Self::assign_large_subgraph_proxy::<E>(
-                    object_last_proxy,
-                    num_proxies,
-                    &graph,
-                    subgraph_nodes,
-                    &tx_map,
-                )
+                self.assign_large_subgraph_proxy::<E>(num_proxies, &graph, subgraph_nodes, &tx_map)
             })
             .collect()
+    }
+
+    /// Store batch index for pre-consensus scheduling
+    pub(crate) fn store_batch_idx(&self, batch_idx: usize) {
+        self.batch_idx.store(batch_idx, Ordering::Relaxed);
     }
 
     #[inline]
@@ -229,8 +242,7 @@ where
     pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub(crate) _phantom: PhantomData<E>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
-    pub(crate) batch_idx: Arc<AtomicUsize>,
+    pub(crate) dependency_scheduler: DependencyScheduler,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -252,8 +264,7 @@ where
             pre_consensus_routing_plan,
             _phantom: PhantomData,
             proxy_loads,
-            object_last_proxy: vec![None; 10000000],
-            batch_idx,
+            dependency_scheduler: DependencyScheduler::new(batch_idx),
         }
     }
 
@@ -289,7 +300,7 @@ where
         self.apply_sds_policy(&transactions, &graph);
         tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
 
-        self.batch_idx.store(batch_idx, Ordering::Relaxed);
+        self.dependency_scheduler.store_batch_idx(batch_idx);
     }
 
     fn apply_sds_policy(
@@ -308,11 +319,9 @@ where
 
     fn handle_large_subgraphs(&mut self, transactions: &[RemoraTransaction<E>]) {
         // Use shared dependency scheduler to get proxy assignments
-        let assignments = DependencyScheduler::process_transaction_batch::<E>(
-            transactions,
-            &self.object_last_proxy,
-            self.proxy_connections.len(),
-        );
+        let assignments = self
+            .dependency_scheduler
+            .process_transaction_batch::<E>(transactions, self.proxy_connections.len());
 
         let tx_map: FxHashMap<_, _> = transactions.iter().map(|tx| (tx.digest(), tx)).collect();
 
@@ -321,8 +330,7 @@ where
             for digest in &subgraph_digests {
                 self.pre_consensus_routing_plan.insert(*digest, proxy_id);
             }
-            DependencyScheduler::update_state_for_sds::<E>(
-                &mut self.object_last_proxy,
+            self.dependency_scheduler.update_state_for_sds::<E>(
                 self.proxy_loads.clone(),
                 &subgraph_digests,
                 &subgraph_objects,
@@ -453,9 +461,6 @@ where
     }
 }
 
-/// Processor for transactions that involve shared objects.
-/// Used only for load balancing policy selection.
-#[derive(Clone)]
 pub(crate) struct SharedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
@@ -472,9 +477,7 @@ where
     pub(crate) policy: PreConsensusSchedulingPolicy,
     pub(crate) counter: usize,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    /// Only used for post-consensus scheduling policy
-    pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
-    pub(crate) batch_idx: Arc<AtomicUsize>,
+    pub(crate) dependency_scheduler: DependencyScheduler,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -566,19 +569,16 @@ where
         required_versions_vec: &mut Vec<Vec<(ObjectID, SequenceNumber)>>,
     ) {
         // Use shared dependency scheduler to get proxy assignments
-        let assignments = DependencyScheduler::process_transaction_batch::<E>(
-            txns,
-            &self.object_last_proxy,
-            self.proxy_connections.len(),
-        );
+        let assignments = self
+            .dependency_scheduler
+            .process_transaction_batch::<E>(txns, self.proxy_connections.len());
 
         let tx_map: FxHashMap<_, _> = txns.iter().map(|tx| (tx.digest(), tx)).collect();
 
         // Create digest-to-proxy mapping from assignments
         let mut digest_to_proxy: FxHashMap<TransactionDigest, ExecutorIndex> = FxHashMap::default();
         for (proxy_id, subgraph_digests, subgraph_objects) in assignments {
-            DependencyScheduler::update_state_for_sds::<E>(
-                &mut self.object_last_proxy,
+            self.dependency_scheduler.update_state_for_sds::<E>(
                 self.proxy_loads.clone(),
                 &subgraph_digests,
                 &subgraph_objects,
@@ -625,10 +625,8 @@ where
         let states_to_proxy = self.states_to_proxy.clone();
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
         let separation_mode = self.separation_mode;
-        let counter = self.counter;
-        let policy = self.policy.clone();
         let proxy_loads = self.proxy_loads.clone();
-        let finished_batch_idx = self.batch_idx.clone();
+        let finished_batch_idx = self.dependency_scheduler.batch_idx.clone();
         self.counter += 1;
 
         tokio::spawn(async move {
@@ -663,30 +661,8 @@ where
                     .map(|(_, proxy_id)| proxy_id)
             }
             .unwrap_or_else(|| {
-                // FIXME
-                tracing::error!("should not be here");
-                // Policy fallback when no specific proxy is assigned
-                let fallback_proxy = match policy {
-                    PreConsensusSchedulingPolicy::LSDS => {
-                        Self::get_proxy_for_shared_objects_most_states(
-                            &proxy_connections,
-                            &states_to_proxy,
-                            &required_versions,
-                            counter,
-                        )
-                        .unwrap_or(counter % proxy_connections.len())
-                    }
-                    PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
-                };
-
-                let transaction_load =
-                    transaction_arc.expected_stateful_duration().as_micros() as usize;
-                proxy_loads
-                    .entry(fallback_proxy)
-                    .and_modify(|load| *load += transaction_load)
-                    .or_insert(transaction_load);
-
-                fallback_proxy
+                panic!("Transaction not found in pre-consensus routing plan and batch_idx {:?} is already finished",
+                    finished_batch_idx);
             });
 
             let stateful_missing_states = Self::get_missing_states_for_transaction(
@@ -752,6 +728,7 @@ where
     }
 
     /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.
+    #[allow(dead_code)]
     fn get_proxy_for_shared_objects_most_states(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
