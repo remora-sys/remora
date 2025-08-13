@@ -174,7 +174,11 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             // tracing::debug!("Received output: {:?}", result);
             assert!(result.success());
             let submit_timestamp = result.transaction_timestamp();
-            // TODO: Record transactions success and failure.
+
+            // Note: for tracing fine-grained latency only.
+            let passed = Metrics::now().as_secs_f64() - submit_timestamp;
+            tracing::info!("pass {:.2}", passed * 1000.0);
+
             self.metrics.update_metrics(submit_timestamp, "default");
         }
 
