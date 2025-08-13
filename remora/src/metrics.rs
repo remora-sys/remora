@@ -131,11 +131,13 @@ impl Metrics {
         self.update_benchmark_duration(now);
 
         // Update latency metrics.
-        let elapsed = now.as_secs_f64() - tx_submission_timestamp;
+        let elapsed = (now.as_secs_f64() - tx_submission_timestamp).max(0.0);
         self.latency_s
             .with_label_values(&[workload])
             .observe(elapsed);
-        self.latency_squared_sum.inc_by((elapsed * elapsed) as u64);
+        // Scale to microseconds to preserve precision
+        let elapsed_us = (elapsed * 1_000_000.0) as u64;
+        self.latency_squared_sum.inc_by(elapsed_us * elapsed_us);
     }
 
     /// Register the time since the last update. Must be called periodically. The parameter `now`

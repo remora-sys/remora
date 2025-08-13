@@ -620,7 +620,7 @@ where
         let dependency_controller = self.dependency_controller.clone();
         let proxy_connections = self.proxy_connections.clone();
         let pre_consensus_routing_plan = self.pre_consensus_routing_plan.clone();
-        let metrics = self.metrics.clone();
+        // let metrics = self.metrics.clone();
         let transaction_arc = Arc::new(transaction);
         let states_to_proxy = self.states_to_proxy.clone();
         let stateless_forwarding_table = self.stateless_forwarding_table.clone();
@@ -742,7 +742,7 @@ where
             };
 
             Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
-            metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
+            // metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
 
             // Notify any dependencies waiting on this transaction
             for notify in current_handles {
