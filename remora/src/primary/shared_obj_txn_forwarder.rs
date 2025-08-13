@@ -518,7 +518,7 @@ where
     ) {
         let mut txns = Vec::new();
         let mut required_versions_vec = Vec::new();
-        let batch_timeout = Duration::from_millis(15);
+        let batch_timeout = Duration::from_millis(10);
 
         let timer = tokio::time::sleep(batch_timeout);
         tokio::pin!(timer);
