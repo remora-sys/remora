@@ -268,30 +268,39 @@ mod tests {
         let dependency_controller = Arc::new(VersionedDependencyController::default());
 
         // Create shared processor
-        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor> {
-            proxy_connections: proxy_connections.clone(),
-            policy: LoadBalancingPolicy::RoundRobin,
-            txn_cnt: 0,
-            states_to_proxy: states_to_proxy.clone(),
-            dependency_controller: dependency_controller.clone(),
-            metrics: Arc::new(Metrics::new_for_tests()),
-            proxy_mode: ProxyMode::Separation,
-            proxy_loads: Arc::new(DashMap::new()),
-            proxy_access_histories: (0..proxy_connections.len())
+        let mut shared_processor = SharedObjTxnForwarder::<SuiExecutor>::new(
+            dependency_controller.clone(),
+            states_to_proxy.clone(),
+            LoadBalancingPolicy::RoundRobin,
+            proxy_connections.clone(),
+            ProxyMode::Separation,
+            Arc::new(Metrics::new_for_tests()),
+            Arc::new(DashMap::new()),
+            (0..proxy_connections.len())
                 .map(|_| Arc::new(DashMap::new()))
                 .collect(),
-        };
+        );
 
         // Generate transactions
         let remora_txns = generate_test_transactions(&config, 5).await;
         let required_versions = vec![(ObjectID::random(), SequenceNumber::new())];
 
-        // Manually forward transactions with required versions
+        // Create a channel to send transactions to the processor
+        let (tx_shared_txns, rx_shared_txns) = channel(100);
+
+        // Send transactions through the channel
         for txn in remora_txns {
-            shared_processor
-                .forward_shared_object_txn(txn, required_versions.clone())
-                .await;
+            tx_shared_txns
+                .send((txn, required_versions.clone()))
+                .await
+                .unwrap();
         }
+
+        // Drop the sender to close the channel
+        drop(tx_shared_txns);
+
+        // Process all transactions from the channel
+        shared_processor.process_shared_txns(rx_shared_txns).await;
 
         // Wait a bit for async processing
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

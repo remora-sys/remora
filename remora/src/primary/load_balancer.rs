@@ -96,19 +96,18 @@ where
             .reserve(10000000);
 
         // Initialize the SharedTxnProcessor
-        let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
-            proxy_connections: self.proxy_connections.clone(),
-            policy: self.policy.clone(),
-            txn_cnt: 0,
-            states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
-            dependency_controller: Arc::new(VersionedDependencyController::new()),
-            metrics: self.metrics.clone(),
-            proxy_mode: self.proxy_mode.clone(),
-            proxy_loads: Arc::new(DashMap::with_capacity(self.proxy_connections.len())),
-            proxy_access_histories: (0..self.proxy_connections.len())
+        let mut shared_txn_processor = SharedObjTxnForwarder::<E>::new(
+            Arc::new(VersionedDependencyController::new()),
+            Arc::new(DashMap::with_capacity(10000000)),
+            self.policy.clone(),
+            self.proxy_connections.clone(),
+            self.proxy_mode.clone(),
+            self.metrics.clone(),
+            Arc::new(DashMap::with_capacity(self.proxy_connections.len())),
+            (0..self.proxy_connections.len())
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))
                 .collect(),
-        };
+        );
 
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -136,7 +135,7 @@ where
 
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get() / 2)
+                .worker_threads(num_cpus::get())
                 .enable_all()
                 .build()
                 .unwrap();
