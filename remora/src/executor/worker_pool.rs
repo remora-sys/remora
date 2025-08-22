@@ -34,13 +34,13 @@ impl Default for WorkerPoolConfig {
 static NEXT_CORE_OFFSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Generic worker pool that can handle any task type
-pub struct GenericWorkerPool<T: WorkerTask> {
+pub struct WorkerPool<T: WorkerTask> {
     worker_txs: Vec<Sender<T>>,
     worker_handles: Vec<thread::JoinHandle<()>>,
     next_worker: usize,
 }
 
-impl<T: WorkerTask> GenericWorkerPool<T> {
+impl<T: WorkerTask> WorkerPool<T> {
     /// Create a generic worker pool
     pub fn new(context: T::Context, config: WorkerPoolConfig) -> Self {
         let num_workers = config.num_workers.unwrap_or_else(|| {
@@ -144,7 +144,7 @@ impl<T: WorkerTask> GenericWorkerPool<T> {
     }
 }
 
-impl<T: WorkerTask> Drop for GenericWorkerPool<T> {
+impl<T: WorkerTask> Drop for WorkerPool<T> {
     fn drop(&mut self) {
         // Wait for all worker threads to finish
         for handle in self.worker_handles.drain(..) {

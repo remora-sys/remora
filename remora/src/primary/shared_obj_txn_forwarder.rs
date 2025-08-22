@@ -6,7 +6,7 @@ use crate::{
             RemoraTransaction, RequiredStates,
         },
         versioned_dependency_controller::VersionedDependencyController,
-        worker_pool::{GenericWorkerPool, WorkerPoolConfig, WorkerTask},
+        worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
     proxy::core::ProxyId,
@@ -138,7 +138,7 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
-    pub(crate) worker_pool: GenericWorkerPool<ForwardingTask<E>>,
+    pub(crate) worker_pool: WorkerPool<ForwardingTask<E>>,
 }
 
 /// Task structure for worker threads
@@ -205,7 +205,7 @@ where
         };
 
         let config = WorkerPoolConfig::default();
-        let worker_pool = GenericWorkerPool::new(context, config);
+        let worker_pool = WorkerPool::new(context, config);
 
         Self { worker_pool }
     }
