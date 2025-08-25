@@ -10,7 +10,8 @@ tokio = { version = "1.28.1", features = ["full"] }
 anyhow = { version = "1.0.64", features = ["backtrace"] }
 git-version = "0.3.5"
 const-str = "0.5.3"
-futures = "0.3.23"
+futures = { version = "0.3.23", features = ["thread-pool"] }
+core_affinity = "0.8.3"
 bytes = "1.0.1"
 prometheus = "0.13"
 tracing = "0.1.36"
