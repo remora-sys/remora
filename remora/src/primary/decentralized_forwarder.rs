@@ -110,11 +110,6 @@ where
             send_tasks.push(task);
         }
 
-        // Wait for all sends to complete
-        for task in send_tasks {
-            let _ = task.await;
-        }
-
         tracing::debug!(
             "Broadcasted transaction batch {} to {} proxies",
             batch_sequence,
