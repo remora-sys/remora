@@ -6,6 +6,7 @@ use crate::{
             RemoraTransaction, RequiredStates,
         },
         versioned_dependency_controller::VersionedDependencyController,
+        worker_pool::{GenericWorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
     proxy::core::ProxyId,
@@ -17,6 +18,24 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber, TransactionDigest};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Context for forwarding tasks containing all necessary dependencies
+#[derive(Clone)]
+pub(crate) struct ForwardingContext<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub dependency_controller: Arc<VersionedDependencyController>,
+    pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
+    pub pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+    pub metrics: Arc<Metrics>,
+    pub states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+    pub stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+    pub separation_mode: SeparationMode,
+    pub policy: PreConsensusSchedulingPolicy,
+    pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PreConsensusSchedulingPolicy {
@@ -504,25 +523,49 @@ where
     }
 }
 
+/// Task structure for worker threads
+pub(crate) struct ForwardingTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub transaction: RemoraTransaction<E>,
+    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
+    pub counter: usize,
+}
+
+impl<E> WorkerTask for ForwardingTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    type Context = ForwardingContext<E>;
+
+    async fn process(self, context: &Self::Context) {
+        SharedObjTxnForwarder::<E>::process_forwarding_task(
+            self,
+            &context.dependency_controller,
+            &context.proxy_connections,
+            &context.pre_consensus_routing_plan,
+            &context.metrics,
+            &context.states_to_proxy,
+            &context.stateless_forwarding_table,
+            context.separation_mode,
+            &context.policy,
+            &context.proxy_loads,
+        )
+        .await;
+    }
+}
+
 /// Processor for transactions that involve shared objects.
 /// Used only for load balancing policy selection.
-#[derive(Clone)]
 pub(crate) struct SharedObjTxnForwarder<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
-    pub(crate) proxy_connections:
-        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) dependency_controller: Arc<VersionedDependencyController>,
-    pub(crate) metrics: Arc<Metrics>,
-    pub(crate) pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
-    pub(crate) states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
-    pub(crate) separation_mode: SeparationMode,
-    pub(crate) policy: PreConsensusSchedulingPolicy,
-    pub(crate) counter: usize,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub(crate) worker_pool: GenericWorkerPool<ForwardingTask<E>>,
 }
 
 impl<E> SharedObjTxnForwarder<E>
@@ -530,143 +573,173 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    /// Create a new SharedObjTxnForwarder with worker pool
+    pub(crate) fn new(
+        dependency_controller: Arc<VersionedDependencyController>,
+        proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
+        pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+        metrics: Arc<Metrics>,
+        states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+        separation_mode: SeparationMode,
+        policy: PreConsensusSchedulingPolicy,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    ) -> Self {
+        let context = ForwardingContext {
+            dependency_controller,
+            proxy_connections,
+            pre_consensus_routing_plan,
+            metrics,
+            states_to_proxy,
+            stateless_forwarding_table,
+            separation_mode,
+            policy,
+            proxy_loads,
+        };
+
+        let config = WorkerPoolConfig::default();
+        let worker_pool = GenericWorkerPool::new(context, config);
+
+        Self { worker_pool }
+    }
+    /// Main processing method that distributes transactions to worker threads
     pub(crate) async fn process_shared_txns(
         &mut self,
         mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
+        let mut counter = 0;
         while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
-            self.forward_shared_object_txn(transaction, required_versions)
-                .await;
+            let task = ForwardingTask {
+                transaction,
+                required_versions,
+                counter,
+            };
+
+            if let Err(e) = self.worker_pool.send_task(task).await {
+                tracing::error!("Failed to send forwarding task to worker pool: {}", e);
+            }
+
+            counter += 1;
         }
     }
 
-    /// Forwards transactions with shared objects to the appropriate proxy.
-    pub(crate) async fn forward_shared_object_txn(
-        &mut self,
-        transaction: RemoraTransaction<E>,
-        required_versions: Vec<(ObjectID, SequenceNumber)>,
+    /// Process a single forwarding task
+    async fn process_forwarding_task(
+        task: ForwardingTask<E>,
+        dependency_controller: &Arc<VersionedDependencyController>,
+        proxy_connections: &Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
+        pre_consensus_routing_plan: &Arc<DashMap<TransactionDigest, ProxyId>>,
+        metrics: &Arc<Metrics>,
+        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        stateless_forwarding_table: &Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+        separation_mode: SeparationMode,
+        policy: &PreConsensusSchedulingPolicy,
+        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
     ) {
-        // Clone all needed fields to move into the spawned task
-        let dependency_controller = self.dependency_controller.clone();
-        let proxy_connections = self.proxy_connections.clone();
-        let pre_consensus_routing_plan = self.pre_consensus_routing_plan.clone();
-        let metrics = self.metrics.clone();
-        let transaction_arc = Arc::new(transaction);
-        let states_to_proxy = self.states_to_proxy.clone();
-        let stateless_forwarding_table = self.stateless_forwarding_table.clone();
-        let separation_mode = self.separation_mode;
-        let counter = self.counter;
-        let policy = self.policy.clone();
-        let proxy_loads = self.proxy_loads.clone();
-        self.counter += 1;
+        let (prior_handles, current_handles) = match task.required_versions.is_empty() {
+            true => (Vec::new(), Vec::new()),
+            false => dependency_controller.get_prior_dependency_and_update(
+                0,
+                task.required_versions.clone(),
+                false,
+                false,
+            ),
+        };
 
-        tokio::spawn(async move {
-            let (prior_handles, current_handles) = match required_versions.is_empty() {
-                true => (Vec::new(), Vec::new()),
-                false => dependency_controller.get_prior_dependency_and_update(
-                    0,
-                    required_versions.clone(),
-                    false,
-                    false,
-                ),
-            };
-            // Wait for prior dependencies to complete
-            for prior_notify in prior_handles {
-                prior_notify.notified().await;
-            }
+        // Wait for prior dependencies to complete
+        for prior_notify in prior_handles {
+            prior_notify.notified().await;
+        }
 
-            // Remove the dependency when done
-            dependency_controller.remove_dependency(required_versions.clone());
+        // Remove the dependency when done
+        dependency_controller.remove_dependency(task.required_versions.clone());
 
-            let proxy_id = if let Some((_digest, proxy_id)) =
-                pre_consensus_routing_plan.remove(transaction_arc.digest())
-            {
-                proxy_id
-            } else {
-                let fallback_proxy_id = match policy {
-                    PreConsensusSchedulingPolicy::LSDS => {
-                        Self::get_proxy_for_shared_objects_most_states(
-                            &proxy_connections,
-                            &states_to_proxy,
-                            &required_versions,
-                            counter,
-                        )
-                        .unwrap_or(counter % proxy_connections.len())
-                    }
-                    PreConsensusSchedulingPolicy::RSDS => counter % proxy_connections.len(),
-                };
-
-                // Calculate the load for the transaction and update proxy_loads
-                let transaction_load =
-                    transaction_arc.expected_stateful_duration().as_micros() as usize;
-                proxy_loads
-                    .entry(fallback_proxy_id)
-                    .and_modify(|load| *load += transaction_load)
-                    .or_insert(transaction_load);
-
-                fallback_proxy_id
-            };
-
-            let stateful_missing_states = Self::get_missing_states_for_transaction(
-                &transaction_arc,
-                Some(required_versions),
-                proxy_id,
-                states_to_proxy,
-            )
-            .await;
-
-            let msg = if !separation_mode.is_primary_separation() {
-                PrimaryToProxyMessage::CombinedTxn(
-                    Arc::clone(&transaction_arc),
-                    proxy_id,
-                    stateful_missing_states,
-                )
-            } else {
-                let stateless_proxy_id = if separation_mode == SeparationMode::PrimaryPostSeparation
-                {
-                    let proxy = StatelessTxnForwarder::<E>::pick_stateless_proxy(
-                        &proxy_connections,
-                        &proxy_loads,
-                        transaction_arc.verification_duration(),
-                    );
-                    Self::send_to_proxy(
-                        &proxy_connections,
-                        proxy,
-                        PrimaryToProxyMessage::StatelessTxn(
-                            *transaction_arc.digest(),
-                            transaction_arc.verification_duration(),
-                        ),
+        let transaction_arc = Arc::new(task.transaction);
+        let proxy_id = if let Some((_digest, proxy_id)) =
+            pre_consensus_routing_plan.remove(transaction_arc.digest())
+        {
+            proxy_id
+        } else {
+            let fallback_proxy_id = match policy {
+                PreConsensusSchedulingPolicy::LSDS => {
+                    Self::get_proxy_for_shared_objects_most_states(
+                        proxy_connections,
+                        states_to_proxy,
+                        &task.required_versions,
+                        task.counter,
                     )
-                    .await;
-                    proxy
-                } else {
-                    // lookup from the stateless forwarding table
-                    stateless_forwarding_table
-                        .remove(&transaction_arc.digest())
-                        .map(|(_k, v)| v)
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "No stateless proxy found for transaction, defaulting to 0"
-                            );
-                            0
-                        })
-                };
-
-                PrimaryToProxyMessage::Txn(
-                    Arc::clone(&transaction_arc),
-                    stateless_proxy_id,
-                    stateful_missing_states,
-                )
+                    .unwrap_or(task.counter % proxy_connections.len())
+                }
+                PreConsensusSchedulingPolicy::RSDS => task.counter % proxy_connections.len(),
             };
 
-            Self::send_to_proxy(&proxy_connections, proxy_id, msg).await;
-            metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
+            // Calculate the load for the transaction and update proxy_loads
+            let transaction_load =
+                transaction_arc.expected_stateful_duration().as_micros() as usize;
+            proxy_loads
+                .entry(fallback_proxy_id)
+                .and_modify(|load| *load += transaction_load)
+                .or_insert(transaction_load);
 
-            // Notify any dependencies waiting on this transaction
-            for notify in current_handles {
-                notify.notify_one();
-            }
-        });
+            fallback_proxy_id
+        };
+
+        let stateful_missing_states = Self::get_missing_states_for_transaction(
+            &transaction_arc,
+            Some(task.required_versions),
+            proxy_id,
+            states_to_proxy.clone(),
+        )
+        .await;
+
+        let msg = if !separation_mode.is_primary_separation() {
+            PrimaryToProxyMessage::CombinedTxn(
+                Arc::clone(&transaction_arc),
+                proxy_id,
+                stateful_missing_states,
+            )
+        } else {
+            let stateless_proxy_id = if separation_mode == SeparationMode::PrimaryPostSeparation {
+                let proxy = StatelessTxnForwarder::<E>::pick_stateless_proxy(
+                    proxy_connections,
+                    proxy_loads,
+                    transaction_arc.verification_duration(),
+                );
+                Self::send_to_proxy(
+                    proxy_connections,
+                    proxy,
+                    PrimaryToProxyMessage::StatelessTxn(
+                        *transaction_arc.digest(),
+                        transaction_arc.verification_duration(),
+                    ),
+                )
+                .await;
+                proxy
+            } else {
+                // lookup from the stateless forwarding table
+                stateless_forwarding_table
+                    .remove(&transaction_arc.digest())
+                    .map(|(_k, v)| v)
+                    .unwrap_or_else(|| {
+                        tracing::warn!("No stateless proxy found for transaction, defaulting to 0");
+                        0
+                    })
+            };
+
+            PrimaryToProxyMessage::Txn(
+                Arc::clone(&transaction_arc),
+                stateless_proxy_id,
+                stateful_missing_states,
+            )
+        };
+
+        Self::send_to_proxy(proxy_connections, proxy_id, msg).await;
+        metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
+
+        // Notify any dependencies waiting on this transaction
+        for notify in current_handles {
+            notify.notify_one();
+        }
     }
 
     /// Get assigned proxy based on which proxy hosts the most states needed by this transaction.

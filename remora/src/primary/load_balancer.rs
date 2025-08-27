@@ -106,18 +106,17 @@ where
         let pre_consensus_routing_plan = Arc::new(DashMap::new());
 
         // Initialize the SharedTxnProcessor
-        let mut shared_txn_processor = SharedObjTxnForwarder::<E> {
-            proxy_connections: self.proxy_connections.clone(),
-            states_to_proxy: Arc::new(DashMap::with_capacity(10000000)),
-            dependency_controller: Arc::new(VersionedDependencyController::new()),
-            metrics: self.metrics.clone(),
-            pre_consensus_routing_plan: pre_consensus_routing_plan.clone(),
-            stateless_forwarding_table: stateless_forwarding_table.clone(),
-            separation_mode: self.separation_mode,
-            policy: self.policy.clone(),
-            counter: 0,
-            proxy_loads: proxy_loads.clone(),
-        };
+        let mut shared_txn_processor = SharedObjTxnForwarder::<E>::new(
+            Arc::new(VersionedDependencyController::new()),
+            self.proxy_connections.clone(),
+            pre_consensus_routing_plan.clone(),
+            self.metrics.clone(),
+            Arc::new(DashMap::with_capacity(10000000)),
+            stateless_forwarding_table.clone(),
+            self.separation_mode,
+            self.policy.clone(),
+            proxy_loads.clone(),
+        );
         let mut pre_consensus_sched_processor = PreConsensusSchedTask::<E>::new(
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
@@ -151,7 +150,7 @@ where
         // TODO: use more worker threads when not in primary separation mode
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get() / 2)
+                .worker_threads(num_cpus::get())
                 .enable_all()
                 .build()
                 .unwrap();

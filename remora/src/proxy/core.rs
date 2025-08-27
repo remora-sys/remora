@@ -755,7 +755,7 @@ where
 #[cfg(test)]
 mod tests {
     use dashmap::DashMap;
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::sync::Arc;
     use sui_types::base_types::{ObjectID, SequenceNumber};
     use tokio::sync::mpsc;
 
