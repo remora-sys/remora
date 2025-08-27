@@ -523,17 +523,6 @@ where
     }
 }
 
-/// Task structure for worker threads
-pub(crate) struct ForwardingTask<E>
-where
-    E: Executor + Clone + Send + Sync + 'static,
-    E::Transaction: Send + Sync + 'static,
-{
-    pub transaction: RemoraTransaction<E>,
-    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
-    pub counter: usize,
-}
-
 impl<E> WorkerTask for ForwardingTask<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
@@ -555,6 +544,67 @@ where
             &context.proxy_loads,
         )
         .await;
+    }
+}
+
+/// Task structure for worker threads
+pub(crate) struct ForwardingTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub transaction: RemoraTransaction<E>,
+    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
+    pub counter: usize,
+}
+
+/// Context for stateless forwarding tasks
+#[derive(Clone)]
+pub(crate) struct StatelessForwardingContext<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
+    pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+    pub stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+}
+
+/// Task structure for stateless forwarding
+pub(crate) struct StatelessForwardingTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    pub digest: TransactionDigest,
+    pub duration: Duration,
+    pub _phantom: PhantomData<E>,
+}
+
+impl<E> WorkerTask for StatelessForwardingTask<E>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    E::Transaction: Send + Sync + 'static,
+{
+    type Context = StatelessForwardingContext<E>;
+
+    async fn process(self, context: &Self::Context) {
+        let proxy = StatelessTxnForwarder::<E>::pick_stateless_proxy(
+            &context.proxy_connections,
+            &context.proxy_loads,
+            self.duration,
+        );
+
+        SharedObjTxnForwarder::<E>::send_to_proxy(
+            &context.proxy_connections,
+            proxy,
+            PrimaryToProxyMessage::StatelessTxn(self.digest, self.duration),
+        )
+        .await;
+
+        context
+            .stateless_forwarding_table
+            .insert(self.digest, proxy);
     }
 }
 
@@ -882,11 +932,7 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
-    pub(crate) proxy_connections:
-        Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
-    pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
-    pub(crate) stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
-    pub(crate) rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+    pub(crate) worker_pool: GenericWorkerPool<StatelessForwardingTask<E>>,
 }
 
 impl<E> StatelessTxnForwarder<E>
@@ -894,6 +940,24 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    /// Create a new StatelessTxnForwarder with worker pool
+    pub(crate) fn new(
+        proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
+    ) -> Self {
+        let context = StatelessForwardingContext {
+            proxy_connections,
+            proxy_loads,
+            stateless_forwarding_table,
+        };
+
+        let config = WorkerPoolConfig::default();
+        let worker_pool = GenericWorkerPool::new(context, config);
+
+        Self { worker_pool }
+    }
+
     pub(crate) fn pick_stateless_proxy(
         conn: &Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
@@ -913,21 +977,24 @@ where
         proxy
     }
 
-    pub(crate) async fn forward_stateless_txn(&mut self) {
-        while let Some((digest, duration)) = self.rx_stateless_txns.recv().await {
-            let conn = self.proxy_connections.clone();
-            let proxy_loads = self.proxy_loads.clone();
-            let stateless_forwarding_table = self.stateless_forwarding_table.clone();
-            tokio::spawn(async move {
-                let proxy = Self::pick_stateless_proxy(&conn, &proxy_loads, duration);
-                SharedObjTxnForwarder::<E>::send_to_proxy(
-                    &conn,
-                    proxy,
-                    PrimaryToProxyMessage::StatelessTxn(digest, duration),
-                )
-                .await;
-                stateless_forwarding_table.insert(digest, proxy);
-            });
+    /// Main processing method that distributes stateless transactions to worker threads
+    pub(crate) async fn forward_stateless_txn(
+        &mut self,
+        mut rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+    ) {
+        while let Some((digest, duration)) = rx_stateless_txns.recv().await {
+            let task = StatelessForwardingTask::<E> {
+                digest,
+                duration,
+                _phantom: PhantomData,
+            };
+
+            if let Err(e) = self.worker_pool.send_task(task).await {
+                tracing::error!(
+                    "Failed to send stateless forwarding task to worker pool: {}",
+                    e
+                );
+            }
         }
     }
 }

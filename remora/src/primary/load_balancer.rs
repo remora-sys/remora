@@ -175,12 +175,11 @@ where
         });
 
         if self.separation_mode == SeparationMode::PrimaryPreSeparation {
-            let mut stateless_txn_processor = StatelessTxnForwarder::<E> {
-                proxy_connections: self.proxy_connections.clone(),
-                proxy_loads: proxy_loads.clone(),
-                stateless_forwarding_table: stateless_forwarding_table.clone(),
-                rx_stateless_txns,
-            };
+            let mut stateless_txn_processor = StatelessTxnForwarder::<E>::new(
+                self.proxy_connections.clone(),
+                proxy_loads.clone(),
+                stateless_forwarding_table.clone(),
+            );
             thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(8)
@@ -188,7 +187,9 @@ where
                     .build()
                     .unwrap();
                 rt.block_on(async move {
-                    stateless_txn_processor.forward_stateless_txn().await;
+                    stateless_txn_processor
+                        .forward_stateless_txn(rx_stateless_txns)
+                        .await;
                 });
             });
         }
