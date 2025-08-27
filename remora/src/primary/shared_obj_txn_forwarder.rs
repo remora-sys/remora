@@ -647,7 +647,10 @@ where
             proxy_loads,
         };
 
-        let config = WorkerPoolConfig::default();
+        let config = WorkerPoolConfig {
+            num_workers: Some(16),
+            ..Default::default()
+        };
         let worker_pool = GenericWorkerPool::new(context, config);
 
         Self { worker_pool }
@@ -952,7 +955,10 @@ where
             stateless_forwarding_table,
         };
 
-        let config = WorkerPoolConfig::default();
+        let config = WorkerPoolConfig {
+            num_workers: Some(16),
+            ..Default::default()
+        };
         let worker_pool = GenericWorkerPool::new(context, config);
 
         Self { worker_pool }
