@@ -314,6 +314,7 @@ impl FakeExecutor {
             WorkloadType::FakeSolanaTransactions { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumTransfers { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumNftMint { execution_duration } => execution_duration,
+            WorkloadType::FakeEthereumBlock { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapNormal { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapPeak { execution_duration } => execution_duration,
             WorkloadType::FakeZipfian {
@@ -505,6 +506,10 @@ pub async fn generate_fake_transactions(
             let mut rng = StdRng::seed_from_u64(0);
             generate_fake_load_objects_and_transactions(&mut rng, pre_generation as usize, eth_mint)
         }
+        WorkloadType::FakeEthereumBlock { .. } => {
+            let mut rng = StdRng::seed_from_u64(0);
+            generate_fake_load_objects_and_transactions(&mut rng, pre_generation as usize, eth_block)
+        }
         WorkloadType::FakeUniswapNormal { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
             generate_fake_load_objects_and_transactions(
@@ -592,6 +597,10 @@ pub fn eth_transfers(rng: &mut StdRng) -> Vec<usize> {
 pub fn eth_mint(rng: &mut StdRng) -> Vec<usize> {
     let (nft, minter) = sui_single_node_benchmark::load_statistics::ethereum_nft_mint(rng);
     vec![nft, minter]
+}
+
+pub fn eth_block(rng: &mut StdRng) -> Vec<usize> {
+    sui_single_node_benchmark::load_statistics::ethereum_block_workload(rng)
 }
 
 pub fn uniswap_normal(rng: &mut StdRng) -> Vec<usize> {

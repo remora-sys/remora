@@ -245,6 +245,7 @@ pub enum WorkloadType {
     SolanaTransactions,
     EthereumTransfers,
     EthereumNftMint,
+    EthereumBlock,
     UniswapNormal,
     UniswapPeak,
     Zipfian {
@@ -262,6 +263,10 @@ pub enum WorkloadType {
         execution_duration: Duration,
     },
     FakeEthereumNftMint {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeEthereumBlock {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
     },
@@ -289,6 +294,7 @@ impl WorkloadType {
             WorkloadType::FakeSolanaTransactions { .. }
             | WorkloadType::FakeEthereumTransfers { .. }
             | WorkloadType::FakeEthereumNftMint { .. }
+            | WorkloadType::FakeEthereumBlock { .. }
             | WorkloadType::FakeUniswapNormal { .. }
             | WorkloadType::FakeUniswapPeak { .. }
             | WorkloadType::FakeZipfian { .. } => true,
@@ -321,12 +327,14 @@ impl Debug for WorkloadType {
             WorkloadType::SolanaTransactions => write!(f, "Solana transactions"),
             WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
+            WorkloadType::EthereumBlock => write!(f, "Ethereum block"),
             WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
             WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
             WorkloadType::Zipfian { .. } => write!(f, "Zipfian"),
             WorkloadType::FakeSolanaTransactions { .. } => write!(f, "Fake Solana transactions"),
             WorkloadType::FakeEthereumTransfers { .. } => write!(f, "Fake Ethereum transfers"),
             WorkloadType::FakeEthereumNftMint { .. } => write!(f, "Fake Ethereum NFT mint"),
+            WorkloadType::FakeEthereumBlock { .. } => write!(f, "Fake Ethereum block"),
             WorkloadType::FakeUniswapNormal { .. } => write!(f, "Fake Uniswap normal"),
             WorkloadType::FakeUniswapPeak { .. } => write!(f, "Fake Uniswap peak"),
             WorkloadType::FakeZipfian { .. } => write!(f, "Fake Zipfian"),

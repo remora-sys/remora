@@ -126,6 +126,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         WorkloadType::SolanaTransactions => Ok(WorkloadKind::SolanaTransactions),
         WorkloadType::EthereumTransfers => Ok(WorkloadKind::EthereumTransfers),
         WorkloadType::EthereumNftMint => Ok(WorkloadKind::EthereumNftMint),
+        WorkloadType::EthereumBlock => Ok(WorkloadKind::EthereumBlock),
         WorkloadType::UniswapNormal => Ok(WorkloadKind::UniswapNormal),
         WorkloadType::UniswapPeak => Ok(WorkloadKind::UniswapPeak),
         WorkloadType::Zipfian {
