@@ -127,6 +127,7 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         WorkloadType::EthereumTransfers => Ok(WorkloadKind::EthereumTransfers),
         WorkloadType::EthereumNftMint => Ok(WorkloadKind::EthereumNftMint),
         WorkloadType::EthereumBlock => Ok(WorkloadKind::EthereumBlock),
+        WorkloadType::DynamicEthereumBlock => Ok(WorkloadKind::DynamicEthereumBlock),
         WorkloadType::UniswapNormal => Ok(WorkloadKind::UniswapNormal),
         WorkloadType::UniswapPeak => Ok(WorkloadKind::UniswapPeak),
         WorkloadType::Zipfian {
@@ -149,6 +150,7 @@ pub async fn generate_sui_transactions(
     working_directory: Option<PathBuf>,
 ) -> Vec<Transaction> {
     tracing::debug!("Generating all transactions...");
+
     let workload = init_workload(config);
     let mut ctx = if let Some(path) = working_directory {
         BenchmarkContext::new_with_exportable_state(

@@ -1,0 +1,9 @@
+# Example configuration for Dynamic Ethereum Block workload
+# This workload cycles through different Ethereum blocks every 30 seconds
+# simulating dynamic hotspot changes over time
+load: 1000
+duration: 300s  # 5 minutes to see multiple block switches
+workload: DynamicEthereumBlock
+block_switch_interval: 30s  # Switch blocks every 30 seconds
+verification_duration: 100ms
+expected_stateful_duration: 100ms

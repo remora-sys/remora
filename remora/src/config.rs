@@ -246,6 +246,7 @@ pub enum WorkloadType {
     EthereumTransfers,
     EthereumNftMint,
     EthereumBlock,
+    DynamicEthereumBlock,
     UniswapNormal,
     UniswapPeak,
     Zipfian {
@@ -267,6 +268,10 @@ pub enum WorkloadType {
         execution_duration: Duration,
     },
     FakeEthereumBlock {
+        #[serde(default = "default_fake_execution_duration")]
+        execution_duration: Duration,
+    },
+    FakeDynamicEthereumBlock {
         #[serde(default = "default_fake_execution_duration")]
         execution_duration: Duration,
     },
@@ -295,6 +300,7 @@ impl WorkloadType {
             | WorkloadType::FakeEthereumTransfers { .. }
             | WorkloadType::FakeEthereumNftMint { .. }
             | WorkloadType::FakeEthereumBlock { .. }
+            | WorkloadType::FakeDynamicEthereumBlock { .. }
             | WorkloadType::FakeUniswapNormal { .. }
             | WorkloadType::FakeUniswapPeak { .. }
             | WorkloadType::FakeZipfian { .. } => true,
@@ -328,6 +334,7 @@ impl Debug for WorkloadType {
             WorkloadType::EthereumTransfers => write!(f, "Ethereum transfers"),
             WorkloadType::EthereumNftMint => write!(f, "Ethereum NFT mint"),
             WorkloadType::EthereumBlock => write!(f, "Ethereum block"),
+            WorkloadType::DynamicEthereumBlock => write!(f, "Dynamic Ethereum block"),
             WorkloadType::UniswapNormal => write!(f, "Uniswap normal"),
             WorkloadType::UniswapPeak => write!(f, "Uniswap peak"),
             WorkloadType::Zipfian { .. } => write!(f, "Zipfian"),
@@ -335,6 +342,9 @@ impl Debug for WorkloadType {
             WorkloadType::FakeEthereumTransfers { .. } => write!(f, "Fake Ethereum transfers"),
             WorkloadType::FakeEthereumNftMint { .. } => write!(f, "Fake Ethereum NFT mint"),
             WorkloadType::FakeEthereumBlock { .. } => write!(f, "Fake Ethereum block"),
+            WorkloadType::FakeDynamicEthereumBlock { .. } => {
+                write!(f, "Fake Dynamic Ethereum block")
+            }
             WorkloadType::FakeUniswapNormal { .. } => write!(f, "Fake Uniswap normal"),
             WorkloadType::FakeUniswapPeak { .. } => write!(f, "Fake Uniswap peak"),
             WorkloadType::FakeZipfian { .. } => write!(f, "Fake Zipfian"),
@@ -375,6 +385,9 @@ pub struct BenchmarkParameters {
     /// The expected stateful duration, used for LB.
     #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
     pub expected_stateful_duration: Duration,
+    /// The block switching interval for dynamic workloads (e.g., DynamicEthereumBlock).
+    #[serde(default = "default_benchmark_config::default_block_switch_interval")]
+    pub block_switch_interval: Duration,
 }
 
 impl BenchmarkParameters {
@@ -387,6 +400,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 
@@ -401,6 +415,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 
@@ -413,6 +428,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 
@@ -429,6 +445,7 @@ impl BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 
@@ -445,6 +462,7 @@ impl BenchmarkParameters {
             },
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 }
@@ -469,6 +487,10 @@ mod default_benchmark_config {
     pub fn default_fake_verification_duration() -> Duration {
         Duration::from_micros(2000)
     }
+
+    pub fn default_block_switch_interval() -> Duration {
+        Duration::from_secs(30)
+    }
 }
 
 impl Default for BenchmarkParameters {
@@ -480,6 +502,7 @@ impl Default for BenchmarkParameters {
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
+            block_switch_interval: default_benchmark_config::default_block_switch_interval(),
         }
     }
 }

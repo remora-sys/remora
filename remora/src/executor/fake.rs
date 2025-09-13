@@ -315,6 +315,7 @@ impl FakeExecutor {
             WorkloadType::FakeEthereumTransfers { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumNftMint { execution_duration } => execution_duration,
             WorkloadType::FakeEthereumBlock { execution_duration } => execution_duration,
+            WorkloadType::FakeDynamicEthereumBlock { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapNormal { execution_duration } => execution_duration,
             WorkloadType::FakeUniswapPeak { execution_duration } => execution_duration,
             WorkloadType::FakeZipfian {
@@ -508,7 +509,17 @@ pub async fn generate_fake_transactions(
         }
         WorkloadType::FakeEthereumBlock { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
-            generate_fake_load_objects_and_transactions(&mut rng, pre_generation as usize, eth_block)
+            generate_fake_load_objects_and_transactions(
+                &mut rng,
+                pre_generation as usize,
+                eth_block,
+            )
+        }
+        WorkloadType::FakeDynamicEthereumBlock { .. } => {
+            // For dynamic workloads, we don't pre-generate all transactions
+            // Instead, we generate them on-the-fly using the DynamicWorkloadManager
+            // This is handled by the client-side load generator
+            (HashSet::new(), Vec::new())
         }
         WorkloadType::FakeUniswapNormal { .. } => {
             let mut rng = StdRng::seed_from_u64(0);
