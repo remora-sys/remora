@@ -167,6 +167,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         });
 
         // Process results until core tasks complete
+        let mut sampled_results_count: u64 = 0;
         while let Some(result) = tokio::select! {
             result = self.rx_proxy_results.recv() => result,
             _ = &mut core_completion => None,
@@ -176,6 +177,14 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             let submit_timestamp = result.transaction_timestamp();
             // TODO: Record transactions success and failure.
             self.metrics.update_metrics(submit_timestamp, "default");
+
+            // Emit latency time-series every 10 results to reduce log volume
+            sampled_results_count += 1;
+            if sampled_results_count % 10 == 0 {
+                let now_secs = Metrics::now().as_secs_f64();
+                let latency_ms = (now_secs - submit_timestamp) * 1000.0;
+                tracing::info!("ts={:.6} latency_ms={:.2}", now_secs, latency_ms);
+            }
         }
 
         // Ensure core_completion task is done
