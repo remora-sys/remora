@@ -402,9 +402,11 @@ where
                 ExecutionResults::<E>::new(transaction.deref().clone(), None, None)
             };
 
-            // Record modified object versions into the per-epoch tracker
-            for (obj_id, seq) in execution_result.modified_at_versions() {
-                modified_tracker.record_version(obj_id, seq);
+            // Record modified objects into the per-epoch tracker
+            if let Some(new_state) = &execution_result.new_state {
+                for (obj_id, obj) in new_state.iter() {
+                    modified_tracker.record_object(*obj_id, obj.clone());
+                }
             }
 
             tracing::debug!(

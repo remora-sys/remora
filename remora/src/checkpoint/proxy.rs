@@ -1,7 +1,8 @@
-use crate::checkpoint::{EpochId, EpochObjectVersions};
+use crate::checkpoint::{EpochId, EpochObjectStates, EpochObjectVersions};
 use dashmap::DashMap;
 use std::sync::Arc;
 use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::object::Object;
 
 /// Tracks the current epoch on a proxy.
 #[derive(Clone)]
@@ -27,11 +28,11 @@ impl EpochTracker {
     }
 }
 
-/// Tracks modified objects in the current epoch. Phase 1: versions only.
+/// Tracks modified objects in the current epoch.
 #[derive(Clone)]
 pub struct ModifiedObjectTracker {
-    // map of object -> latest version in this epoch
-    modified: Arc<DashMap<ObjectID, SequenceNumber>>,
+    // map of object -> latest object state in this epoch
+    modified: Arc<DashMap<ObjectID, Object>>,
 }
 
 impl ModifiedObjectTracker {
@@ -41,16 +42,16 @@ impl ModifiedObjectTracker {
         }
     }
 
-    pub fn record_version(&self, object_id: ObjectID, version: SequenceNumber) {
-        self.modified.insert(object_id, version);
+    pub fn record_object(&self, object_id: ObjectID, object: Object) {
+        self.modified.insert(object_id, object);
     }
 
     /// Drain current epoch modifications and reset.
-    pub fn take_epoch_snapshot(&self) -> EpochObjectVersions {
-        let mut out = EpochObjectVersions::new();
+    pub fn take_epoch_snapshot(&self) -> EpochObjectStates {
+        let mut out = EpochObjectStates::new();
         // DashMap has no drain; iterate and then clear
         for entry in self.modified.iter() {
-            out.insert(*entry.key(), *entry.value());
+            out.insert(*entry.key(), entry.value().clone());
         }
         self.modified.clear();
         out

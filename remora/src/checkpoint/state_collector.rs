@@ -1,5 +1,7 @@
-use crate::checkpoint::{EpochId, EpochObjectVersions};
+use crate::checkpoint::storage::RocksSnapshotStore;
+use crate::checkpoint::{EpochId, EpochObjectStates};
 use std::collections::BTreeMap;
+use sui_types::object::Object;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 
@@ -14,9 +16,11 @@ pub struct StateCollector {
     /// Current epoch being collected
     current_epoch: Option<EpochId>,
     /// Snapshots received for current epoch (proxy_id -> snapshot)
-    pending_snapshots: BTreeMap<crate::proxy::core::ProxyId, EpochObjectVersions>,
+    pending_snapshots: BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>,
     /// Sender to notify when epoch is complete
     tx_epoch_complete: Option<Sender<EpochId>>,
+    /// Optional RocksDB store for persisting merged snapshots
+    snapshot_store: Option<RocksSnapshotStore>,
 }
 
 impl StateCollector {
@@ -26,7 +30,13 @@ impl StateCollector {
             current_epoch: None,
             pending_snapshots: BTreeMap::new(),
             tx_epoch_complete: None,
+            snapshot_store: None,
         }
+    }
+
+    pub fn with_store(mut self, store: RocksSnapshotStore) -> Self {
+        self.snapshot_store = Some(store);
+        self
     }
 
     /// Start collecting snapshots for a new epoch
@@ -42,7 +52,7 @@ impl StateCollector {
         &mut self,
         proxy_id: crate::proxy::core::ProxyId,
         epoch: EpochId,
-        snapshot: EpochObjectVersions,
+        snapshot: EpochObjectStates,
     ) {
         if let Some(current_epoch) = self.current_epoch {
             if current_epoch != epoch {
@@ -80,12 +90,12 @@ impl StateCollector {
         );
 
         // Merge all snapshots into a single state update
-        let mut merged_state = EpochObjectVersions::new();
+        let mut merged_state = BTreeMap::<sui_types::base_types::ObjectID, Object>::new();
         for (proxy_id, snapshot) in &self.pending_snapshots {
             debug!("Merging {} objects from proxy {}", snapshot.len(), proxy_id);
-            for (obj_id, version) in snapshot {
-                // Keep the latest version for each object
-                merged_state.insert(*obj_id, *version);
+            for (obj_id, obj) in snapshot {
+                // Keep the latest object for each object ID
+                merged_state.insert(*obj_id, obj.clone());
             }
         }
 
@@ -94,6 +104,15 @@ impl StateCollector {
             epoch.0,
             merged_state.len()
         );
+
+        if let Some(store) = &self.snapshot_store {
+            if let Err(e) = store.persist_objects(&merged_state) {
+                warn!(
+                    "Failed to persist merged objects for epoch {}: {:?}",
+                    epoch.0, e
+                );
+            }
+        }
 
         // Reset for next epoch
         self.current_epoch = None;
