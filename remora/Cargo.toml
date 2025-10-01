@@ -35,6 +35,7 @@ rand_mt = "4.2.2"
 serde_yaml = "0.9.21"
 thiserror = "1.0.63"
 parking_lot.workspace = true
+rocksdb = { version = "0.22", default-features = false, features = ["multi-threaded-cf"] }
 
 prometheus-parse = { git = "https://github.com/asonnino/prometheus-parser.git", rev = "75334db" }
 
@@ -63,6 +64,7 @@ petgraph.workspace = true
 
 [dev-dependencies]
 tracing-test = "0.2.5"
+tempfile = "3.8.0"
 
 [features]
 benchmark = []

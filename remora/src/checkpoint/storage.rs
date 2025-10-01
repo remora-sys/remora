@@ -82,4 +82,161 @@ impl RocksSnapshotStore {
         self.db.write(batch)?;
         Ok(())
     }
+
+    /// Retrieve an object by its ID.
+    ///
+    /// # Arguments
+    /// * `object_id` - The ID of the object to retrieve
+    ///
+    /// # Returns
+    /// * `Ok(Some(Object))` - Object found and deserialized
+    /// * `Ok(None)` - Object not found
+    /// * `Err(anyhow::Error)` - Deserialization error
+    pub fn get_object(&self, object_id: &ObjectID) -> anyhow::Result<Option<Object>> {
+        match self.db.get(object_id.as_ref())? {
+            Some(data) => {
+                let object = bincode::deserialize(&data)?;
+                Ok(Some(object))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all stored object IDs.
+    ///
+    /// # Returns
+    /// * `Vec<ObjectID>` - All stored object IDs
+    pub fn list_object_ids(&self) -> anyhow::Result<Vec<ObjectID>> {
+        let mut object_ids = Vec::new();
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+
+        for item in iter {
+            let (key, _) = item?;
+            if let Ok(object_id) = ObjectID::from_bytes(&key) {
+                object_ids.push(object_id);
+            }
+        }
+
+        Ok(object_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use sui_types::object::Object;
+    use tempfile::TempDir;
+
+    fn create_test_object(id: ObjectID) -> Object {
+        Object::immutable_with_id_for_testing(id)
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf());
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_persist_and_get() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf()).unwrap();
+
+        // Create test objects
+        let obj_id1 = ObjectID::random();
+        let obj_id2 = ObjectID::random();
+        let obj1 = create_test_object(obj_id1);
+        let obj2 = create_test_object(obj_id2);
+
+        // Persist objects
+        let mut objects = BTreeMap::new();
+        objects.insert(obj_id1, obj1.clone());
+        objects.insert(obj_id2, obj2.clone());
+
+        store.persist_objects(&objects).unwrap();
+
+        // Retrieve objects
+        let retrieved_obj1 = store.get_object(&obj_id1).unwrap();
+        let retrieved_obj2 = store.get_object(&obj_id2).unwrap();
+
+        assert_eq!(retrieved_obj1, Some(obj1));
+        assert_eq!(retrieved_obj2, Some(obj2));
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_get_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf()).unwrap();
+
+        let obj_id = ObjectID::random();
+        let retrieved = store.get_object(&obj_id).unwrap();
+        assert_eq!(retrieved, None);
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_list_object_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf()).unwrap();
+
+        // Create and persist test objects
+        let obj_id1 = ObjectID::random();
+        let obj_id2 = ObjectID::random();
+        let obj_id3 = ObjectID::random();
+
+        let mut objects = BTreeMap::new();
+        objects.insert(obj_id1, create_test_object(obj_id1));
+        objects.insert(obj_id2, create_test_object(obj_id2));
+        objects.insert(obj_id3, create_test_object(obj_id3));
+
+        store.persist_objects(&objects).unwrap();
+
+        // List object IDs
+        let mut object_ids = store.list_object_ids().unwrap();
+        object_ids.sort();
+
+        let mut expected_ids = vec![obj_id1, obj_id2, obj_id3];
+        expected_ids.sort();
+
+        assert_eq!(object_ids, expected_ids);
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf()).unwrap();
+
+        let obj_id = ObjectID::random();
+        let obj1 = create_test_object(obj_id);
+        let obj2 = create_test_object(obj_id); // Same ID, different object
+
+        // Persist first object
+        let mut objects1 = BTreeMap::new();
+        objects1.insert(obj_id, obj1.clone());
+        store.persist_objects(&objects1).unwrap();
+
+        // Overwrite with second object
+        let mut objects2 = BTreeMap::new();
+        objects2.insert(obj_id, obj2.clone());
+        store.persist_objects(&objects2).unwrap();
+
+        // Should retrieve the second object
+        let retrieved = store.get_object(&obj_id).unwrap();
+        assert_eq!(retrieved, Some(obj2));
+    }
+
+    #[test]
+    fn test_rocks_snapshot_store_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = RocksSnapshotStore::open(temp_dir.path().to_path_buf()).unwrap();
+
+        // Persist empty map
+        let objects = BTreeMap::new();
+        store.persist_objects(&objects).unwrap();
+
+        // Should have no objects
+        let object_ids = store.list_object_ids().unwrap();
+        assert!(object_ids.is_empty());
+    }
 }
