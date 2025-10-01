@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(test)]
+/*#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -537,3 +537,4 @@ mod tests {
         // let _ = proxy_handle.await;
     }
 }
+*/

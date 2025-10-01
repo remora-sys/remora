@@ -16,6 +16,7 @@ use sui_types::{
 };
 
 use crate::config::BenchmarkParameters;
+use crate::checkpoint::EpochId;
 use crate::proxy::core::ProxyId;
 
 /// A transaction that can be executed.
@@ -256,6 +257,9 @@ where
     StatelessTxn(Arc<TransactionWithTimestamp<T>>),
     /// Combined stateless+stateful
     CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
+    /// Primary requests checkpoint at epoch boundary: proxies finalize prior epoch
+    /// and prepare/report their snapshot for this epoch.
+    Checkpoint(EpochId),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

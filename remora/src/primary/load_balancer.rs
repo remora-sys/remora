@@ -15,6 +15,7 @@ use crate::{
         api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
         versioned_dependency_controller::VersionedDependencyController,
     },
+    checkpoint::EpochId,
     metrics::Metrics,
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
@@ -38,6 +39,8 @@ pub struct LoadBalancer<E: Executor> {
     proxy_mode: ProxyMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
+    /// Next epoch id to broadcast at consensus boundary (Phase 2 default: every batch)
+    next_epoch_id: u64,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -62,6 +65,7 @@ where
             policy,
             proxy_mode,
             metrics,
+            next_epoch_id: 1,
         }
     }
 
@@ -193,11 +197,28 @@ where
                             tracing::error!("Failed to send shared transactions: {:?}", e);
                         }
                     }
+
+                    // Phase 2: Broadcast checkpoint at consensus batch boundary
+                    let epoch = EpochId(self.next_epoch_id);
+                    self.broadcast_checkpoint(epoch).await;
+                    self.next_epoch_id += 1;
                 }
 
                 else => Err(NodeError::ShuttingDown)?,
             }
         }
+    }
+
+    async fn broadcast_checkpoint(&self, epoch: EpochId) {
+        for entry in self.proxy_connections.iter() {
+            let proxy_id = *entry.key();
+            let tx = entry.value();
+            let msg = PrimaryToProxyMessage::Checkpoint(epoch);
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!("Failed to send checkpoint to proxy {}: {:?}", proxy_id, e);
+            }
+        }
+        tracing::info!("Broadcasted checkpoint for epoch {}", epoch.0);
     }
 
     /// Spawn the load balancer in a new task.

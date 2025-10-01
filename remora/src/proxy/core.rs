@@ -110,6 +110,12 @@ where
                     )
                     .await;
                 }
+                PrimaryToProxyMessage::Checkpoint(epoch_id) => {
+                    tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
+                    self.epoch_tracker.update_epoch(epoch_id);
+                    let snapshot = self.modified_tracker.take_epoch_snapshot();
+                    tracing::info!("Proxy {} epoch {:?} snapshot objects: {}", self.id, epoch_id, snapshot.len());
+                }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
                 }
@@ -133,6 +139,12 @@ where
                         missing_states,
                     )
                     .await;
+                }
+                PrimaryToProxyMessage::Checkpoint(epoch_id) => {
+                    tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
+                    self.epoch_tracker.update_epoch(epoch_id);
+                    let snapshot = self.modified_tracker.take_epoch_snapshot();
+                    tracing::info!("Proxy {} epoch {:?} snapshot objects: {}", self.id, epoch_id, snapshot.len());
                 }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
