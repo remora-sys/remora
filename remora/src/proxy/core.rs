@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    checkpoint::proxy::{EpochTracker, ModifiedObjectTracker},
     config::ProxyMode,
     error::{NodeError, NodeResult},
     executor::{
@@ -44,6 +45,9 @@ struct PrimaryMessageProcessor<E: Executor> {
     stateless_controller: Arc<OneshotDependencyController>,
     mode: ProxyMode,
     metrics: Arc<Metrics>,
+    // Phase 1 checkpoint trackers
+    epoch_tracker: EpochTracker,
+    modified_tracker: ModifiedObjectTracker,
 }
 
 impl<E: Executor + Send + Sync + 'static> PrimaryMessageProcessor<E>
@@ -284,6 +288,7 @@ where
         let stateless_controller = self.stateless_controller.clone();
         let executor = self.executor.clone();
         let mode = self.mode.clone();
+        let modified_tracker = self.modified_tracker.clone();
 
         tokio::spawn(async move {
             // Assign shared objects version.
@@ -361,6 +366,11 @@ where
                 );
                 ExecutionResults::<E>::new(transaction.deref().clone(), None, None)
             };
+
+            // Record modified object versions into the per-epoch tracker
+            for (obj_id, seq) in execution_result.modified_at_versions() {
+                modified_tracker.record_version(obj_id, seq);
+            }
 
             tracing::debug!(
                 "Proxy {} completed execution for transaction {:?}, success: {}",
@@ -659,6 +669,9 @@ pub struct ProxyCore<E: Executor> {
     mode: ProxyMode,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
+    /// Phase 1 checkpoint trackers
+    epoch_tracker: EpochTracker,
+    modified_tracker: ModifiedObjectTracker,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
@@ -694,6 +707,8 @@ where
             stateless_controller: Arc::new(OneshotDependencyController::new()),
             mode,
             metrics,
+            epoch_tracker: EpochTracker::new(crate::checkpoint::EpochId(1)),
+            modified_tracker: ModifiedObjectTracker::new(),
         }
     }
 
@@ -712,6 +727,8 @@ where
             stateless_controller: self.stateless_controller.clone(),
             mode: self.mode.clone(),
             metrics: self.metrics.clone(),
+            epoch_tracker: self.epoch_tracker,
+            modified_tracker: self.modified_tracker,
         };
 
         let mut proxy_processor = ProxyMessageProcessor::<E> {

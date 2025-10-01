@@ -11,6 +11,7 @@ use tokio::{
 };
 
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
+use crate::checkpoint::primary::EpochManager;
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -32,6 +33,8 @@ pub struct PrimaryNode<E: Executor> {
     pub rx_client_connections: Receiver<Sender<()>>,
     /// The metrics for the validator.
     pub metrics: Arc<Metrics>,
+    /// Epoch manager (Phase 1: in-memory only)
+    pub epoch_manager: Arc<EpochManager>,
 }
 
 impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
@@ -52,6 +55,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         let mut primary_handles = Vec::new();
         let mut network_handles = Vec::new();
+
+        // Initialize epoch manager
+        let epoch_manager = Arc::new(EpochManager::new());
 
         // Connect to each proxy server
         for proxy_info in config.proxies.iter() {
@@ -110,6 +116,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             network_handles,
             rx_client_connections,
             metrics,
+            epoch_manager,
         }
     }
 
