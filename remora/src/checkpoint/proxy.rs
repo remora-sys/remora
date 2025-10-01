@@ -1,7 +1,7 @@
 use crate::checkpoint::{EpochId, EpochObjectVersions};
-use sui_types::base_types::{ObjectID, SequenceNumber};
 use dashmap::DashMap;
 use std::sync::Arc;
+use sui_types::base_types::{ObjectID, SequenceNumber};
 
 /// Tracks the current epoch on a proxy.
 #[derive(Clone)]
@@ -13,7 +13,9 @@ impl EpochTracker {
     pub fn new(initial: EpochId) -> Self {
         let map = DashMap::new();
         map.insert((), initial);
-        Self { current_epoch: Arc::new(map) }
+        Self {
+            current_epoch: Arc::new(map),
+        }
     }
 
     pub fn current(&self) -> EpochId {
@@ -33,7 +35,11 @@ pub struct ModifiedObjectTracker {
 }
 
 impl ModifiedObjectTracker {
-    pub fn new() -> Self { Self { modified: Arc::new(DashMap::new()) } }
+    pub fn new() -> Self {
+        Self {
+            modified: Arc::new(DashMap::new()),
+        }
+    }
 
     pub fn record_version(&self, object_id: ObjectID, version: SequenceNumber) {
         self.modified.insert(object_id, version);
@@ -50,5 +56,3 @@ impl ModifiedObjectTracker {
         out
     }
 }
-
-

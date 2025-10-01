@@ -24,8 +24,8 @@ use crate::{
     executor::{
         api::{
             ExecutableTransaction, ExecutionResults, Executor, ExecutorIndex, InterProxyReply,
-            InterProxyRequest, PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction,
-            RequiredStates, StateStore, Store,
+            InterProxyRequest, PrimaryToProxyMessage, ProxyToPrimaryMessage, ProxyToProxyMessage,
+            RemoraTransaction, RequiredStates, StateStore, Store,
         },
         oneshot_dependency_controller::OneshotDependencyController,
         versioned_dependency_controller::VersionedDependencyController,
@@ -41,6 +41,7 @@ struct PrimaryMessageProcessor<E: Executor> {
     store: Store<E>,
     tx_results: Sender<ExecutionResults<E>>,
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
+    tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
     mode: ProxyMode,
@@ -114,7 +115,18 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    tracing::info!("Proxy {} epoch {:?} snapshot objects: {}", self.id, epoch_id, snapshot.len());
+                    tracing::info!(
+                        "Proxy {} epoch {:?} snapshot objects: {}",
+                        self.id,
+                        epoch_id,
+                        snapshot.len()
+                    );
+
+                    // Send snapshot back to primary
+                    let reply = ProxyToPrimaryMessage::StateSnapshot(self.id, epoch_id, snapshot);
+                    if let Err(e) = self.tx_primary_replies.send(reply).await {
+                        tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
+                    }
                 }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
@@ -144,7 +156,18 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    tracing::info!("Proxy {} epoch {:?} snapshot objects: {}", self.id, epoch_id, snapshot.len());
+                    tracing::info!(
+                        "Proxy {} epoch {:?} snapshot objects: {}",
+                        self.id,
+                        epoch_id,
+                        snapshot.len()
+                    );
+
+                    // Send snapshot back to primary
+                    let reply = ProxyToPrimaryMessage::StateSnapshot(self.id, epoch_id, snapshot);
+                    if let Err(e) = self.tx_primary_replies.send(reply).await {
+                        tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
+                    }
                 }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
@@ -673,6 +696,8 @@ pub struct ProxyCore<E: Executor> {
     rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
     /// The sender for inter-proxy replies.
     tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
+    /// The sender for replies to primary.
+    tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     /// The dependency controller for multi-core tx execution.
     stateful_controller: Arc<VersionedDependencyController>,
     /// The dependency controller for stateless transactions.
@@ -704,6 +729,7 @@ where
         tx_results: Sender<ExecutionResults<E>>,
         rx_inter_proxy_requests: Receiver<ProxyToProxyMessage>,
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
+        tx_primary_replies: Sender<ProxyToPrimaryMessage>,
         mode: ProxyMode,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -715,6 +741,7 @@ where
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
+            tx_primary_replies,
             stateful_controller: Arc::new(VersionedDependencyController::new()),
             stateless_controller: Arc::new(OneshotDependencyController::new()),
             mode,
@@ -735,6 +762,7 @@ where
             store: self.store.clone(),
             tx_results: self.tx_results,
             tx_inter_proxy_replies: self.tx_inter_proxy_replies.clone(),
+            tx_primary_replies: self.tx_primary_replies,
             stateful_controller: self.stateful_controller.clone(),
             stateless_controller: self.stateless_controller.clone(),
             mode: self.mode.clone(),
@@ -808,6 +836,7 @@ mod tests {
         let (tx_to_proxy, rx_transactions) = mpsc::channel(100);
         let (tx_results, rx_results) = mpsc::channel(100);
         let (tx_inter_proxy_requests, rx_inter_proxy_requests) = mpsc::channel(100);
+        let (tx_primary_replies, _rx_primary_replies) = mpsc::channel(100);
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         // Initialize store
@@ -823,6 +852,7 @@ mod tests {
             tx_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies.clone(),
+            tx_primary_replies,
             ProxyMode::Separation,
             metrics,
         );

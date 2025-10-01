@@ -9,12 +9,16 @@ pub struct EpochManager {
 
 impl Default for EpochManager {
     fn default() -> Self {
-        Self { next_epoch_id: AtomicU64::new(1) }
+        Self {
+            next_epoch_id: AtomicU64::new(1),
+        }
     }
 }
 
 impl EpochManager {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Get a new epoch id and advance the counter.
     pub fn end_epoch_and_begin_next(&self) -> EpochId {
@@ -27,5 +31,3 @@ impl EpochManager {
         EpochId(self.next_epoch_id.load(Ordering::SeqCst))
     }
 }
-
-

@@ -11,7 +11,10 @@ use tokio::{
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
-    executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
+    executor::api::{
+        ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToPrimaryMessage,
+        ProxyToProxyMessage,
+    },
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
     proxy::core::{ProxyCore, ProxyId},
@@ -56,6 +59,10 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         let (tx_inter_proxy_requests, rx_inter_proxy_requests) =
             mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
+
+        // Create channel for replies to primary
+        let (tx_primary_replies, _rx_primary_replies) =
+            mpsc::channel::<ProxyToPrimaryMessage>(DEFAULT_CHANNEL_SIZE);
 
         // Find our proxy info from the config
         let our_proxy_info = config
@@ -137,6 +144,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_proxy_results,
             rx_inter_proxy_requests,
             tx_inter_proxy_replies,
+            tx_primary_replies,
             config.validator_parameters.proxy_mode,
             metrics.clone(),
         )

@@ -15,8 +15,8 @@ use sui_types::{
     transaction::InputObjectKind,
 };
 
+use crate::checkpoint::{EpochId, EpochObjectVersions};
 use crate::config::BenchmarkParameters;
-use crate::checkpoint::EpochId;
 use crate::proxy::core::ProxyId;
 
 /// A transaction that can be executed.
@@ -278,4 +278,11 @@ pub enum InterProxyReply {
 pub enum ProxyToProxyMessage {
     Request(InterProxyRequest),
     Reply(InterProxyReply),
+}
+
+/// Messages from proxies back to primary
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ProxyToPrimaryMessage {
+    /// Proxy reports its modified object versions snapshot for an epoch
+    StateSnapshot(ProxyId, EpochId, EpochObjectVersions),
 }

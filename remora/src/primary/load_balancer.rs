@@ -9,13 +9,13 @@ use tokio::{
 };
 
 use crate::{
+    checkpoint::EpochId,
     config::{LoadBalancingPolicy, ProxyMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
         api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
         versioned_dependency_controller::VersionedDependencyController,
     },
-    checkpoint::EpochId,
     metrics::Metrics,
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
