@@ -60,8 +60,8 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
-        // Create channel for replies to primary
-        let (tx_primary_replies, _rx_primary_replies) =
+        // Create a network client to send replies to the primary (snapshots)
+        let (tx_primary_replies, rx_primary_replies) =
             mpsc::channel::<ProxyToPrimaryMessage>(DEFAULT_CHANNEL_SIZE);
 
         // Find our proxy info from the config
@@ -75,13 +75,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         let (tx_connections, mut rx_connections) =
             mpsc::channel::<Sender<ProxyToProxyMessage>>(DEFAULT_CHANNEL_SIZE);
 
-        // Prepare listen addresses on localhost for proxy and primary
-        let proxy_port = our_proxy_info.listen_proxy_address.port();
-        let primary_port = our_proxy_info.listen_primary_address.port();
-        let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-
-        let listen_proxy_address = std::net::SocketAddr::new(localhost, proxy_port);
-        let listen_primary_address = std::net::SocketAddr::new(localhost, primary_port);
+        // Use configured addresses directly
+        let listen_proxy_address = our_proxy_info.listen_proxy_address;
+        let listen_primary_address = our_proxy_info.listen_primary_address;
 
         // Create a server that listens for connections from other proxies
         let inter_proxy_server_handle = NetworkServer::new(
@@ -114,6 +110,25 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         )
         .spawn();
         network_handles.push(primary_connection_handle);
+
+        // Outbound client from proxy to primary to send snapshots
+        let (tx_unused, _rx_unused) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);
+        let snapshot_client_handle =
+            NetworkClient::<Vec<u8>, Vec<u8>>::new(config.proxy_server_address, tx_unused, {
+                // Serialize messages to bytes for the network worker
+                let (tx_bytes, rx_bytes) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+                let mut rx_msgs = rx_primary_replies;
+                tokio::spawn(async move {
+                    while let Some(msg) = rx_msgs.recv().await {
+                        if let Ok(bytes) = bincode::serialize(&msg) {
+                            let _ = tx_bytes.send(bytes).await;
+                        }
+                    }
+                });
+                rx_bytes
+            })
+            .spawn();
+        network_handles.push(snapshot_client_handle);
 
         // Create connections to other proxies
         for proxy_info in &config.proxies {

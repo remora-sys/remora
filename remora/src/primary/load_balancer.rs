@@ -41,6 +41,10 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
     /// Next epoch id to broadcast at consensus boundary (Phase 2 default: every batch)
     next_epoch_id: u64,
+    /// Sender to notify the checkpoint collector of new epochs
+    epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
+    /// Cumulative transactions since last checkpoint
+    txns_since_last_epoch: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -56,6 +60,7 @@ where
         policy: LoadBalancingPolicy,
         proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
+        epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         Self {
@@ -66,6 +71,8 @@ where
             proxy_mode,
             metrics,
             next_epoch_id: 1,
+            epoch_tx,
+            txns_since_last_epoch: 0,
         }
     }
 
@@ -184,24 +191,39 @@ where
                         }
                     }
 
+                    // Count current batch size before moving vectors
+                    let batch_size = owned_txns.len() + shared_txns.len();
+
                     // Send owned-only transactions to the dedicated task
                     if !owned_txns.is_empty() {
-                        if let Err(e) = owned_txn_sender.send(owned_txns).await {
+                        let owned = owned_txns;
+                        if let Err(e) = owned_txn_sender.send(owned).await {
                             tracing::error!("Failed to send owned transactions: {:?}", e);
                         }
                     }
 
                     // Send shared-object transactions to the dedicated task
                     if !shared_txns.is_empty() {
-                        if let Err(e) = shared_txn_sender.send(shared_txns).await {
+                        let shared = shared_txns;
+                        if let Err(e) = shared_txn_sender.send(shared).await {
                             tracing::error!("Failed to send shared transactions: {:?}", e);
                         }
                     }
 
-                    // Phase 2: Broadcast checkpoint at consensus batch boundary
-                    let epoch = EpochId(self.next_epoch_id);
-                    self.broadcast_checkpoint(epoch).await;
-                    self.next_epoch_id += 1;
+                    // Phase 2+: Broadcast checkpoint when cumulative txns reach threshold
+                    self.txns_since_last_epoch = self.txns_since_last_epoch.saturating_add(batch_size);
+
+                    const EPOCH_TXN_THRESHOLD: usize = 10_000;
+                    if self.txns_since_last_epoch >= EPOCH_TXN_THRESHOLD {
+                        self.txns_since_last_epoch = 0;
+                        let epoch = EpochId(self.next_epoch_id);
+                        // Notify collector first; if channel is full, log and continue
+                        if let Err(e) = self.epoch_tx.try_send(epoch) {
+                            tracing::warn!("Failed to notify collector of epoch {:?}: {:?}", epoch, e);
+                        }
+                        self.broadcast_checkpoint(epoch).await;
+                        self.next_epoch_id += 1;
+                    }
                 }
 
                 else => Err(NodeError::ShuttingDown)?,

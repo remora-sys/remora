@@ -12,6 +12,9 @@ use tokio::{
 
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
+use crate::checkpoint::state_collector::StateCollector;
+use crate::checkpoint::storage::RocksSnapshotStore;
+use crate::executor::api::ProxyToPrimaryMessage;
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -75,6 +78,74 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             proxy_connections.insert(proxy_info.proxy_id, tx_proxy);
         }
 
+        // Create channels for checkpoint coordination and proxy->primary snapshots
+        let (tx_epoch_notify, mut rx_epoch_notify) =
+            mpsc::channel::<crate::checkpoint::EpochId>(DEFAULT_CHANNEL_SIZE);
+        let (tx_proxy_snapshots, rx_proxy_snapshots) =
+            mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);
+
+        // Spawn the state collector task
+        let expected_proxies = config.proxies.len();
+        let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
+        let snapshot_store = RocksSnapshotStore::open(snapshot_path)
+            .map(Some)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to open RocksSnapshotStore: {:?}. Continuing without persistence.",
+                    e
+                );
+                None
+            });
+
+        let mut collector = StateCollector::new(expected_proxies);
+        if let Some(store) = snapshot_store {
+            collector = collector.with_store(store);
+        }
+
+        // Start a server on the primary to accept proxy->primary snapshots
+        let (tx_unused_conn, _rx_unused_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let primary_listen_addr = config.proxy_server_address;
+        let snapshot_server_handle = crate::networking::server::NetworkServer::<Vec<u8>, ()>::new(
+            primary_listen_addr,
+            tx_unused_conn,
+            tx_proxy_snapshots.clone(),
+        )
+        .spawn();
+        network_handles.push(snapshot_server_handle);
+
+        // Collector task: receive epoch notifications and proxy snapshots
+        let collector_handle = tokio::spawn(async move {
+            let (tx_epoch_complete, mut rx_epoch_complete) =
+                mpsc::channel::<crate::checkpoint::EpochId>(DEFAULT_CHANNEL_SIZE);
+            let mut collector_inner = collector;
+            let mut rx_snapshots = rx_proxy_snapshots;
+
+            loop {
+                tokio::select! {
+                    Some(epoch) = rx_epoch_notify.recv() => {
+                        tracing::info!("Collector: starting epoch {:?}", epoch);
+                        collector_inner.start_epoch(epoch, tx_epoch_complete.clone());
+                    }
+                    Some(completed) = rx_epoch_complete.recv() => {
+                        tracing::info!("Collector: epoch {:?} complete", completed);
+                    }
+                    Some(bytes) = rx_snapshots.recv() => {
+                        match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
+                            Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                                collector_inner.process_snapshot(proxy_id, epoch, snapshot);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to deserialize snapshot: {:?}", e);
+                            }
+                        }
+                    }
+                    else => { break; }
+                }
+            }
+            crate::error::NodeResult::Ok(())
+        });
+        primary_handles.push(collector_handle);
+
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<E>::new(
             proxy_connections,
@@ -82,6 +153,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             config.validator_parameters.load_balancing_policy.clone(),
             config.validator_parameters.proxy_mode.clone(),
             metrics.clone(),
+            tx_epoch_notify,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
