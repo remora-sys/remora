@@ -1,8 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{io, marker::PhantomData, sync::Arc};
+use std::{
+    io,
+    marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -19,7 +25,6 @@ use crate::{
     networking::{client::NetworkClient, server::NetworkServer},
     proxy::core::{ProxyCore, ProxyId},
 };
-use dashmap::DashMap;
 
 pub struct ProxyNode<E: Executor> {
     pub phantom_data: PhantomData<E>,
@@ -79,9 +84,19 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         let listen_proxy_address = our_proxy_info.listen_proxy_address;
         let listen_primary_address = our_proxy_info.listen_primary_address;
 
+        // Bind servers to 0.0.0.0 to accept connections from external IPs
+        let bind_proxy_address = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            listen_proxy_address.port(),
+        );
+        let bind_primary_address = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            listen_primary_address.port(),
+        );
+
         // Create a server that listens for connections from other proxies
         let inter_proxy_server_handle = NetworkServer::new(
-            listen_proxy_address,
+            bind_proxy_address,
             tx_connections.clone(),
             tx_inter_proxy_requests.clone(),
         )
@@ -90,26 +105,33 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
 
         // Spawn a task to handle incoming proxy connections
         let connection_handle = tokio::spawn(async move {
-            while let Some(_new_connection) = rx_connections.recv().await {
+            let mut keepalive = Vec::new();
+            while let Some(new_connection) = rx_connections.recv().await {
                 tracing::info!("Received new proxy connection");
-                // Store the connection for future use
-                // You might want to store this in a shared state or handle it according to your needs
+                // Store the connection sender to keep the connection alive.
+                keepalive.push(new_connection);
             }
         });
-        let connection_listener_handles = vec![connection_handle];
+        let mut connection_listener_handles = vec![connection_handle];
 
-        let (tx_primary_connection, _) = mpsc::channel::<
+        let (tx_primary_connection, mut rx_primary_connection) = mpsc::channel::<
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         >(DEFAULT_CHANNEL_SIZE);
 
         // Create a server that listens for connections from the primary
-        let primary_connection_handle = NetworkServer::new(
-            listen_primary_address,
-            tx_primary_connection,
-            tx_transactions,
-        )
-        .spawn();
+        let primary_connection_handle =
+            NetworkServer::new(bind_primary_address, tx_primary_connection, tx_transactions)
+                .spawn();
         network_handles.push(primary_connection_handle);
+
+        // Drain primary connection notifications to keep the server alive
+        let primary_conn_drain_handle = tokio::spawn(async move {
+            let mut keepalive = Vec::new();
+            while let Some(new_connection) = rx_primary_connection.recv().await {
+                keepalive.push(new_connection);
+            }
+        });
+        connection_listener_handles.push(primary_conn_drain_handle);
 
         // Outbound client from proxy to primary to send snapshots
         let (tx_unused, _rx_unused) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);

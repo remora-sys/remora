@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{io, marker::PhantomData, sync::Arc};
-
 use serde::de::DeserializeOwned;
+use std::{
+    io,
+    marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
@@ -105,8 +109,12 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         // Start a server on the primary to accept proxy->primary snapshots
         let (tx_snapshot_conn, mut rx_snapshot_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let primary_listen_addr = config.proxy_server_address;
+        let snapshot_server_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            primary_listen_addr.port(),
+        );
         let snapshot_server_handle = crate::networking::server::NetworkServer::<Vec<u8>, ()>::new(
-            primary_listen_addr,
+            snapshot_server_addr,
             tx_snapshot_conn,
             tx_proxy_snapshots.clone(),
         )
