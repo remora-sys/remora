@@ -103,15 +103,22 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         }
 
         // Start a server on the primary to accept proxy->primary snapshots
-        let (tx_unused_conn, _rx_unused_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx_snapshot_conn, mut rx_snapshot_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let primary_listen_addr = config.proxy_server_address;
         let snapshot_server_handle = crate::networking::server::NetworkServer::<Vec<u8>, ()>::new(
             primary_listen_addr,
-            tx_unused_conn,
+            tx_snapshot_conn,
             tx_proxy_snapshots.clone(),
         )
         .spawn();
         network_handles.push(snapshot_server_handle);
+
+        // Drain snapshot connection notifications to keep the server alive
+        tokio::spawn(async move {
+            while (rx_snapshot_conn.recv().await).is_some() {
+                // Keep receiver alive
+            }
+        });
 
         // Collector task: receive epoch notifications and proxy snapshots
         let collector_handle = tokio::spawn(async move {

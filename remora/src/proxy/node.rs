@@ -96,9 +96,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
                 // You might want to store this in a shared state or handle it according to your needs
             }
         });
-        let mut connection_listener_handles = vec![connection_handle];
+        let connection_listener_handles = vec![connection_handle];
 
-        let (tx_primary_connection, mut rx_primary_connection) = mpsc::channel::<
+        let (tx_primary_connection, _) = mpsc::channel::<
             Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>,
         >(DEFAULT_CHANNEL_SIZE);
 
@@ -110,14 +110,6 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         )
         .spawn();
         network_handles.push(primary_connection_handle);
-
-        // Drain primary connection notifications to keep the server alive
-        let primary_conn_drain_handle = tokio::spawn(async move {
-            while let Some(_conn_tx) = rx_primary_connection.recv().await {
-                // Optionally store or process connection senders
-            }
-        });
-        connection_listener_handles.push(primary_conn_drain_handle);
 
         // Outbound client from proxy to primary to send snapshots
         let (tx_unused, _rx_unused) = mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);
