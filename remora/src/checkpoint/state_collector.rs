@@ -11,10 +11,10 @@ use crate::executor::api::ProxyToPrimaryMessage;
 pub struct StateCollector {
     /// Expected number of proxies
     expected_proxies: usize,
-    /// Current epoch being collected
-    current_epoch: Option<EpochId>,
-    /// Snapshots received for current epoch (proxy_id -> snapshot)
-    pending_snapshots: BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>,
+    /// Last epoch fully persisted by the collector (persistence epoch)
+    last_persisted_epoch: Option<EpochId>,
+    /// Snapshots grouped by epoch: epoch -> (proxy_id -> snapshot)
+    collecting_snapshots: BTreeMap<EpochId, BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>>,
     /// Sender to notify when epoch is complete
     tx_epoch_complete: Option<Sender<EpochId>>,
     /// Optional RocksDB store for persisting merged snapshots
@@ -25,8 +25,8 @@ impl StateCollector {
     pub fn new(expected_proxies: usize) -> Self {
         Self {
             expected_proxies,
-            current_epoch: None,
-            pending_snapshots: BTreeMap::new(),
+            last_persisted_epoch: None,
+            collecting_snapshots: BTreeMap::new(),
             tx_epoch_complete: None,
             snapshot_store: None,
         }
@@ -40,8 +40,8 @@ impl StateCollector {
     /// Start collecting snapshots for a new epoch
     pub fn start_epoch(&mut self, epoch: EpochId, tx_complete: Sender<EpochId>) {
         debug!("Starting epoch collection for epoch {}", epoch.0);
-        self.current_epoch = Some(epoch);
-        self.pending_snapshots.clear();
+        // Pre-create entry for the epoch; not strictly necessary due to on-demand insertion.
+        self.collecting_snapshots.entry(epoch).or_insert_with(BTreeMap::new);
         self.tx_epoch_complete = Some(tx_complete);
     }
 
@@ -52,31 +52,23 @@ impl StateCollector {
         epoch: EpochId,
         snapshot: EpochObjectStates,
     ) {
-        if let Some(current_epoch) = self.current_epoch {
-            if current_epoch != epoch {
-                warn!(
-                    "Received snapshot for epoch {} but current epoch is {}",
-                    epoch.0, current_epoch.0
-                );
-                return;
-            }
+        // Record snapshot for its epoch
+        let epoch_entry = self
+            .collecting_snapshots
+            .entry(epoch)
+            .or_insert_with(BTreeMap::new);
 
-            debug!(
-                "Received snapshot from proxy {} for epoch {}: {} objects",
-                proxy_id,
-                epoch.0,
-                snapshot.len()
-            );
+        debug!(
+            "Received snapshot from proxy {} for epoch {}: {} objects",
+            proxy_id,
+            epoch.0,
+            snapshot.len()
+        );
 
-            self.pending_snapshots.insert(proxy_id, snapshot);
+        epoch_entry.insert(proxy_id, snapshot);
 
-            // Check if we have all snapshots
-            if self.pending_snapshots.len() >= self.expected_proxies {
-                self.complete_epoch(epoch);
-            }
-        } else {
-            warn!("Received snapshot but no epoch is being collected");
-        }
+        // After updating, attempt to complete any ready epochs in order
+        self.try_complete_ready_epochs();
     }
 
     /// Complete the current epoch and merge all snapshots
@@ -84,16 +76,21 @@ impl StateCollector {
         info!(
             "Completing epoch {} with {} snapshots",
             epoch.0,
-            self.pending_snapshots.len()
+            self.collecting_snapshots
+                .get(&epoch)
+                .map(|m| m.len())
+                .unwrap_or(0)
         );
 
-        // Merge all snapshots into a single state update
+        // Merge all snapshots for the given epoch into a single state update
         let mut merged_state = BTreeMap::<sui_types::base_types::ObjectID, Object>::new();
-        for (proxy_id, snapshot) in &self.pending_snapshots {
-            debug!("Merging {} objects from proxy {}", snapshot.len(), proxy_id);
-            for (obj_id, obj) in snapshot {
-                // Keep the latest object for each object ID
-                merged_state.insert(*obj_id, obj.clone());
+        if let Some(per_proxy) = self.collecting_snapshots.get(&epoch) {
+            for (proxy_id, snapshot) in per_proxy {
+                debug!("Merging {} objects from proxy {}", snapshot.len(), proxy_id);
+                for (obj_id, obj) in snapshot {
+                    // Keep the latest object for each object ID
+                    merged_state.insert(*obj_id, obj.clone());
+                }
             }
         }
 
@@ -112,13 +109,44 @@ impl StateCollector {
             }
         }
 
-        // Reset for next epoch
-        self.current_epoch = None;
-        self.pending_snapshots.clear();
+        // Mark epoch as persisted and drop collected snapshots for this epoch
+        self.last_persisted_epoch = Some(epoch);
+        self.collecting_snapshots.remove(&epoch);
 
         // Notify completion
         if let Some(tx) = self.tx_epoch_complete.take() {
             let _ = tx.try_send(epoch);
+        }
+    }
+
+    /// Try to complete epochs in order starting from the next after last_persisted_epoch
+    fn try_complete_ready_epochs(&mut self) {
+        // Determine the next epoch we expect to persist
+        let next_epoch = match self.last_persisted_epoch {
+            Some(prev) => EpochId(prev.0 + 1),
+            None => {
+                // If we have never persisted, take the smallest epoch present
+                if let Some((&first_epoch, _)) = self.collecting_snapshots.iter().next() {
+                    first_epoch
+                } else {
+                    return;
+                }
+            }
+        };
+
+        // Keep completing epochs as long as the next in-order epoch is ready
+        let mut current = next_epoch;
+        loop {
+            let ready = self
+                .collecting_snapshots
+                .get(&current)
+                .map(|m| m.len() >= self.expected_proxies)
+                .unwrap_or(false);
+            if !ready {
+                break;
+            }
+            self.complete_epoch(current);
+            current = EpochId(current.0 + 1);
         }
     }
 
@@ -150,8 +178,8 @@ mod tests {
     fn test_state_collector_new() {
         let collector = StateCollector::new(3);
         assert_eq!(collector.expected_proxies, 3);
-        assert!(collector.current_epoch.is_none());
-        assert!(collector.pending_snapshots.is_empty());
+        assert!(collector.last_persisted_epoch.is_none());
+        assert!(collector.collecting_snapshots.is_empty());
     }
 
     #[test]
@@ -168,8 +196,12 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
 
         collector.start_epoch(EpochId(5), tx);
-        assert_eq!(collector.current_epoch, Some(EpochId(5)));
-        assert!(collector.pending_snapshots.is_empty());
+        assert!(collector.last_persisted_epoch.is_none());
+        assert!(collector
+            .collecting_snapshots
+            .get(&EpochId(5))
+            .map(|m| m.is_empty())
+            .unwrap_or(false));
     }
 
     #[test]
@@ -192,43 +224,60 @@ mod tests {
 
         // Process snapshot from proxy 1
         collector.process_snapshot(1, EpochId(5), snapshot.clone());
-        assert_eq!(collector.pending_snapshots.len(), 1);
-        assert_eq!(collector.pending_snapshots.get(&1).unwrap().len(), 2);
+        assert_eq!(
+            collector
+                .collecting_snapshots
+                .get(&EpochId(5))
+                .map(|m| m.len())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            collector
+                .collecting_snapshots
+                .get(&EpochId(5))
+                .unwrap()
+                .get(&1)
+                .unwrap()
+                .len(),
+            2
+        );
 
         // Process snapshot from proxy 2 - should trigger completion
         collector.process_snapshot(2, EpochId(5), snapshot);
-        assert!(collector.current_epoch.is_none());
-        assert!(collector.pending_snapshots.is_empty());
+        assert_eq!(collector.last_persisted_epoch, Some(EpochId(5)));
+        assert!(!collector.collecting_snapshots.contains_key(&EpochId(5)));
     }
 
     #[test]
-    fn test_state_collector_wrong_epoch() {
+    fn test_state_collector_multiple_epochs_buffering() {
         let mut collector = StateCollector::new(2);
         let (tx, _rx) = mpsc::channel(1);
 
         // Start epoch 5
         collector.start_epoch(EpochId(5), tx);
 
-        // Try to process snapshot for epoch 6 - should be ignored
+        // Process snapshot for epoch 6 as well (out of order is allowed, but completion is ordered)
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot(1, EpochId(6), snapshot);
 
-        // Should still be waiting for epoch 5
-        assert_eq!(collector.current_epoch, Some(EpochId(5)));
-        assert!(collector.pending_snapshots.is_empty());
+        // Epoch 6 should be buffered, not completed
+        assert!(collector.last_persisted_epoch.is_none());
+        assert!(collector.collecting_snapshots.contains_key(&EpochId(5)));
+        assert!(collector.collecting_snapshots.contains_key(&EpochId(6)));
     }
 
     #[test]
     fn test_state_collector_no_epoch() {
         let mut collector = StateCollector::new(2);
 
-        // Try to process snapshot without starting epoch - should be ignored
+        // Process snapshot without starting epoch - should create epoch entry
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot(1, EpochId(5), snapshot);
 
-        // Should still be in initial state
-        assert!(collector.current_epoch.is_none());
-        assert!(collector.pending_snapshots.is_empty());
+        // Should have buffered epoch 5, not persisted yet
+        assert!(collector.last_persisted_epoch.is_none());
+        assert!(collector.collecting_snapshots.contains_key(&EpochId(5)));
     }
 
     #[test]
@@ -263,8 +312,8 @@ mod tests {
         collector.process_snapshot(1, EpochId(5), snapshot1);
         collector.process_snapshot(2, EpochId(5), snapshot2);
 
-        // Should be completed and reset
-        assert!(collector.current_epoch.is_none());
-        assert!(collector.pending_snapshots.is_empty());
+        // Should be completed and cleared for epoch 5
+        assert_eq!(collector.last_persisted_epoch, Some(EpochId(5)));
+        assert!(!collector.collecting_snapshots.contains_key(&EpochId(5)));
     }
 }
