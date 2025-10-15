@@ -142,19 +142,19 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
                         collector_inner.ensure_epoch(epoch);
                     }
-                    Some(bytes) = rx_snapshots.recv() => {
-                        match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
-                            Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                                let collector_for_task = collector_inner.clone();
-                                tokio::spawn(async move {
-                                    collector_for_task.process_snapshot(proxy_id, epoch, snapshot);
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to deserialize snapshot: {:?}", e);
-                            }
-                        }
-                    }
+					Some(bytes) = rx_snapshots.recv() => {
+						let collector_for_task = collector_inner.clone();
+						tokio::spawn(async move {
+							match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
+								Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+									collector_for_task.process_snapshot(proxy_id, epoch, snapshot);
+								}
+								Err(e) => {
+									tracing::error!("Failed to deserialize snapshot: {:?}", e);
+								}
+							}
+						});
+					}
                     else => { break; }
                 }
             }
