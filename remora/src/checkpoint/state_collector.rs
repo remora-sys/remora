@@ -1,9 +1,10 @@
 use crate::checkpoint::storage::RocksSnapshotStore;
 use crate::checkpoint::{EpochId, EpochObjectStates};
 use std::collections::BTreeMap;
+use sui_types::base_types::ObjectID;
 use sui_types::object::Object;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::executor::api::ProxyToPrimaryMessage;
 
@@ -20,6 +21,8 @@ pub struct StateCollector {
     tx_epoch_complete: Option<Sender<EpochId>>,
     /// Optional RocksDB store for persisting merged snapshots
     snapshot_store: Option<RocksSnapshotStore>,
+    /// In-memory latest object states (no disk persistence)
+    merged_state: BTreeMap<ObjectID, Object>,
 }
 
 impl StateCollector {
@@ -30,6 +33,7 @@ impl StateCollector {
             collecting_snapshots: BTreeMap::new(),
             tx_epoch_complete: None,
             snapshot_store: None,
+            merged_state: BTreeMap::new(),
         }
     }
 
@@ -68,13 +72,19 @@ impl StateCollector {
             snapshot.len()
         );
 
+        // Write directly into the in-memory merged state (no per-epoch merge)
+        for (obj_id, obj) in snapshot.iter() {
+            self.merged_state.insert(*obj_id, obj.clone());
+        }
+
+        // Keep the snapshot for epoch-completion bookkeeping
         epoch_entry.insert(proxy_id, snapshot);
 
         // After updating, attempt to complete any ready epochs in order
         self.try_complete_ready_epochs();
     }
 
-    /// Complete the current epoch and merge all snapshots
+    /// Complete the current epoch (no merge/persist; state already updated on receipt)
     fn complete_epoch(&mut self, epoch: EpochId) {
         info!(
             "Completing epoch {} with {} snapshots",
@@ -85,32 +95,7 @@ impl StateCollector {
                 .unwrap_or(0)
         );
 
-        // Merge all snapshots for the given epoch into a single state update
-        let mut merged_state = BTreeMap::<sui_types::base_types::ObjectID, Object>::new();
-        if let Some(per_proxy) = self.collecting_snapshots.get(&epoch) {
-            for (proxy_id, snapshot) in per_proxy {
-                debug!("Merging {} objects from proxy {}", snapshot.len(), proxy_id);
-                for (obj_id, obj) in snapshot {
-                    // Keep the latest object for each object ID
-                    merged_state.insert(*obj_id, obj.clone());
-                }
-            }
-        }
-
-        info!(
-            "Epoch {} complete: {} unique objects in merged state",
-            epoch.0,
-            merged_state.len()
-        );
-
-        if let Some(store) = &self.snapshot_store {
-            if let Err(e) = store.persist_objects(&merged_state) {
-                warn!(
-                    "Failed to persist merged objects for epoch {}: {:?}",
-                    epoch.0, e
-                );
-            }
-        }
+        // The in-memory state is already updated incrementally in process_snapshot.
 
         // Mark epoch as persisted and drop collected snapshots for this epoch
         self.last_persisted_epoch = Some(epoch);
@@ -163,6 +148,16 @@ impl StateCollector {
             }
         }
         info!("State collector shutting down");
+    }
+
+    /// Get an object from the in-memory store.
+    pub fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
+        self.merged_state.get(object_id).cloned()
+    }
+
+    /// Current number of objects in memory.
+    pub fn merged_state_len(&self) -> usize {
+        self.merged_state.len()
     }
 }
 
