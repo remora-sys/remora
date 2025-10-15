@@ -17,7 +17,6 @@ use tokio::{
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
 use crate::checkpoint::state_collector::StateCollector;
-use crate::checkpoint::storage::RocksSnapshotStore;
 use crate::executor::api::ProxyToPrimaryMessage;
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
@@ -90,7 +89,10 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Spawn the state collector task
         let expected_proxies = config.proxies.len();
-        let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
+
+
+        // persistent storage
+        /*let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
         let snapshot_store = RocksSnapshotStore::open(snapshot_path)
             .map(Some)
             .unwrap_or_else(|e| {
@@ -104,7 +106,8 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let mut collector = StateCollector::new(expected_proxies);
         if let Some(store) = snapshot_store {
             collector = collector.with_store(store);
-        }
+        }*/
+        let collector = StateCollector::new(expected_proxies);
 
         // Start a server on the primary to accept proxy->primary snapshots
         let (tx_snapshot_conn, mut rx_snapshot_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);

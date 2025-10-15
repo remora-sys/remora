@@ -14,7 +14,8 @@ pub struct StateCollector {
     /// Last epoch fully persisted by the collector (persistence epoch)
     last_persisted_epoch: Option<EpochId>,
     /// Snapshots grouped by epoch: epoch -> (proxy_id -> snapshot)
-    collecting_snapshots: BTreeMap<EpochId, BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>>,
+    collecting_snapshots:
+        BTreeMap<EpochId, BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>>,
     /// Sender to notify when epoch is complete
     tx_epoch_complete: Option<Sender<EpochId>>,
     /// Optional RocksDB store for persisting merged snapshots
@@ -41,7 +42,9 @@ impl StateCollector {
     pub fn start_epoch(&mut self, epoch: EpochId, tx_complete: Sender<EpochId>) {
         debug!("Starting epoch collection for epoch {}", epoch.0);
         // Pre-create entry for the epoch; not strictly necessary due to on-demand insertion.
-        self.collecting_snapshots.entry(epoch).or_insert_with(BTreeMap::new);
+        self.collecting_snapshots
+            .entry(epoch)
+            .or_insert_with(BTreeMap::new);
         self.tx_epoch_complete = Some(tx_complete);
     }
 
