@@ -18,6 +18,7 @@ use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
 use crate::checkpoint::state_collector::StateCollector;
 use crate::executor::api::ProxyToPrimaryMessage;
+use crate::executor::worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -132,6 +133,35 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Single collector task: consume epoch notifications and snapshots directly
         let collector_for_worker = collector.clone();
+        // Initialize worker pool for deserialization + snapshot processing
+        #[derive(Clone)]
+        struct SnapshotTask {
+            bytes: Vec<u8>,
+        }
+        impl WorkerTask for SnapshotTask {
+            type Context = Arc<StateCollector>;
+            fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
+                let context = context.clone();
+                async move {
+                    match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
+                        Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                            context.process_snapshot(proxy_id, epoch, snapshot);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize snapshot: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+        let mut snapshot_pool: WorkerPool<SnapshotTask> = WorkerPool::new(
+            collector_for_worker.clone(),
+            WorkerPoolConfig {
+                num_workers: Some(4),
+                ..Default::default()
+            },
+        );
+
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
         let collector_handle = tokio::spawn(async move {
@@ -142,19 +172,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
                         collector_inner.ensure_epoch(epoch);
                     }
-					Some(bytes) = rx_snapshots.recv() => {
-						let collector_for_task = collector_inner.clone();
-						tokio::spawn(async move {
-							match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
-								Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-									collector_for_task.process_snapshot(proxy_id, epoch, snapshot);
-								}
-								Err(e) => {
-									tracing::error!("Failed to deserialize snapshot: {:?}", e);
-								}
-							}
-						});
-					}
+                    Some(bytes) = rx_snapshots.recv() => {
+                        let _ = snapshot_pool.send_task(SnapshotTask { bytes }).await;
+                    }
                     else => { break; }
                 }
             }

@@ -204,7 +204,10 @@ where
             proxy_access_histories: proxy_access_histories.clone(),
         };
 
-        let config = WorkerPoolConfig::default();
+        let config = WorkerPoolConfig {
+            num_workers: Some(num_cpus::get() - 4),
+            ..Default::default()
+        };
         let worker_pool = WorkerPool::new(context, config);
 
         Self { worker_pool }
