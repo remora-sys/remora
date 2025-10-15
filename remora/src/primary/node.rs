@@ -82,14 +82,13 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         }
 
         // Create channels for checkpoint coordination and proxy->primary snapshots
-        let (tx_epoch_notify, mut rx_epoch_notify) =
+        let (tx_epoch_notify, rx_epoch_notify) =
             mpsc::channel::<crate::checkpoint::EpochId>(DEFAULT_CHANNEL_SIZE);
         let (tx_proxy_snapshots, rx_proxy_snapshots) =
             mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);
 
         // Spawn the state collector task
         let expected_proxies = config.proxies.len();
-
 
         // persistent storage
         /*let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
@@ -107,7 +106,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         if let Some(store) = snapshot_store {
             collector = collector.with_store(store);
         }*/
-        let collector = StateCollector::new(expected_proxies);
+        let collector = Arc::new(StateCollector::new(expected_proxies));
 
         // Start a server on the primary to accept proxy->primary snapshots
         let (tx_snapshot_conn, mut rx_snapshot_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -131,26 +130,25 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             }
         });
 
-        // Collector task: receive epoch notifications and proxy snapshots
+        // Single collector task: consume epoch notifications and snapshots directly
+        let collector_for_worker = collector.clone();
+        let mut rx_epochs = rx_epoch_notify;
+        let mut rx_snapshots = rx_proxy_snapshots;
         let collector_handle = tokio::spawn(async move {
-            let (tx_epoch_complete, mut rx_epoch_complete) =
-                mpsc::channel::<crate::checkpoint::EpochId>(DEFAULT_CHANNEL_SIZE);
-            let mut collector_inner = collector;
-            let mut rx_snapshots = rx_proxy_snapshots;
-
+            let collector_inner = collector_for_worker;
             loop {
                 tokio::select! {
-                    Some(epoch) = rx_epoch_notify.recv() => {
+                    Some(epoch) = rx_epochs.recv() => {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
-                        collector_inner.start_epoch(epoch, tx_epoch_complete.clone());
-                    }
-                    Some(completed) = rx_epoch_complete.recv() => {
-                        tracing::info!("Collector: epoch {:?} complete", completed);
+                        collector_inner.ensure_epoch(epoch);
                     }
                     Some(bytes) = rx_snapshots.recv() => {
                         match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
                             Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                                collector_inner.process_snapshot(proxy_id, epoch, snapshot);
+                                let collector_for_task = collector_inner.clone();
+                                tokio::spawn(async move {
+                                    collector_for_task.process_snapshot(proxy_id, epoch, snapshot);
+                                });
                             }
                             Err(e) => {
                                 tracing::error!("Failed to deserialize snapshot: {:?}", e);

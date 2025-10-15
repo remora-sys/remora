@@ -1,69 +1,44 @@
-use crate::checkpoint::storage::RocksSnapshotStore;
 use crate::checkpoint::{EpochId, EpochObjectStates};
-use std::collections::BTreeMap;
+use dashmap::{DashMap, DashSet};
 use sui_types::base_types::ObjectID;
 use sui_types::object::Object;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tracing::{debug, info};
+use tracing::debug;
 
-use crate::executor::api::ProxyToPrimaryMessage;
-
-/// Collects state snapshots from all proxies and manages atomic state updates
+/// Concurrent in-memory state for snapshots and merged objects
 pub struct StateCollector {
-    /// Expected number of proxies
-    expected_proxies: usize,
-    /// Last epoch fully persisted by the collector (persistence epoch)
-    last_persisted_epoch: Option<EpochId>,
-    /// Snapshots grouped by epoch: epoch -> (proxy_id -> snapshot)
-    collecting_snapshots:
-        BTreeMap<EpochId, BTreeMap<crate::proxy::core::ProxyId, EpochObjectStates>>,
-    /// Sender to notify when epoch is complete
-    tx_epoch_complete: Option<Sender<EpochId>>,
-    /// Optional RocksDB store for persisting merged snapshots
-    snapshot_store: Option<RocksSnapshotStore>,
+    /// Proxies that have reported per-epoch: epoch -> set(proxy_id)
+    pub collecting_snapshots: DashMap<EpochId, DashSet<crate::proxy::core::ProxyId>>,
     /// In-memory latest object states (no disk persistence)
-    merged_state: BTreeMap<ObjectID, Object>,
+    pub merged_state: DashMap<ObjectID, Object>,
 }
 
 impl StateCollector {
-    pub fn new(expected_proxies: usize) -> Self {
+    pub fn new(_expected_proxies: usize) -> Self {
         Self {
-            expected_proxies,
-            last_persisted_epoch: None,
-            collecting_snapshots: BTreeMap::new(),
-            tx_epoch_complete: None,
-            snapshot_store: None,
-            merged_state: BTreeMap::new(),
+            collecting_snapshots: DashMap::new(),
+            merged_state: DashMap::new(),
         }
     }
 
-    pub fn with_store(mut self, store: RocksSnapshotStore) -> Self {
-        self.snapshot_store = Some(store);
-        self
-    }
-
-    /// Start collecting snapshots for a new epoch
-    pub fn start_epoch(&mut self, epoch: EpochId, tx_complete: Sender<EpochId>) {
-        debug!("Starting epoch collection for epoch {}", epoch.0);
-        // Pre-create entry for the epoch; not strictly necessary due to on-demand insertion.
+    /// Ensure an epoch entry exists
+    pub fn ensure_epoch(&self, epoch: EpochId) {
         self.collecting_snapshots
             .entry(epoch)
-            .or_insert_with(BTreeMap::new);
-        self.tx_epoch_complete = Some(tx_complete);
+            .or_insert_with(DashSet::new);
     }
 
     /// Process a state snapshot from a proxy
     pub fn process_snapshot(
-        &mut self,
+        &self,
         proxy_id: crate::proxy::core::ProxyId,
         epoch: EpochId,
         snapshot: EpochObjectStates,
     ) {
-        // Record snapshot for its epoch
+        // Upsert per-epoch snapshots and global merged state concurrently-safe
         let epoch_entry = self
             .collecting_snapshots
             .entry(epoch)
-            .or_insert_with(BTreeMap::new);
+            .or_insert_with(DashSet::new);
 
         debug!(
             "Received snapshot from proxy {} for epoch {}: {} objects",
@@ -72,87 +47,17 @@ impl StateCollector {
             snapshot.len()
         );
 
-        // Write directly into the in-memory merged state (no per-epoch merge)
-        for (obj_id, obj) in snapshot.iter() {
-            self.merged_state.insert(*obj_id, obj.clone());
+        // Move directly into the in-memory merged state (no per-epoch merge)
+        for (obj_id, obj) in snapshot.into_iter() {
+            self.merged_state.insert(obj_id, obj);
         }
 
-        // Keep the snapshot for epoch-completion bookkeeping
-        epoch_entry.insert(proxy_id, snapshot);
-
-        // After updating, attempt to complete any ready epochs in order
-        self.try_complete_ready_epochs();
-    }
-
-    /// Complete the current epoch (no merge/persist; state already updated on receipt)
-    fn complete_epoch(&mut self, epoch: EpochId) {
-        info!(
-            "Completing epoch {} with {} snapshots",
-            epoch.0,
-            self.collecting_snapshots
-                .get(&epoch)
-                .map(|m| m.len())
-                .unwrap_or(0)
-        );
-
-        // The in-memory state is already updated incrementally in process_snapshot.
-
-        // Mark epoch as persisted and drop collected snapshots for this epoch
-        self.last_persisted_epoch = Some(epoch);
-        self.collecting_snapshots.remove(&epoch);
-
-        // Notify completion
-        if let Some(tx) = self.tx_epoch_complete.take() {
-            let _ = tx.try_send(epoch);
-        }
-    }
-
-    /// Try to complete epochs in order starting from the next after last_persisted_epoch
-    fn try_complete_ready_epochs(&mut self) {
-        // Determine the next epoch we expect to persist
-        let next_epoch = match self.last_persisted_epoch {
-            Some(prev) => EpochId(prev.0 + 1),
-            None => {
-                // If we have never persisted, take the smallest epoch present
-                if let Some((&first_epoch, _)) = self.collecting_snapshots.iter().next() {
-                    first_epoch
-                } else {
-                    return;
-                }
-            }
-        };
-
-        // Keep completing epochs as long as the next in-order epoch is ready
-        let mut current = next_epoch;
-        loop {
-            let ready = self
-                .collecting_snapshots
-                .get(&current)
-                .map(|m| m.len() >= self.expected_proxies)
-                .unwrap_or(false);
-            if !ready {
-                break;
-            }
-            self.complete_epoch(current);
-            current = EpochId(current.0 + 1);
-        }
-    }
-
-    /// Run the state collector, processing messages from proxies
-    pub async fn run(&mut self, mut rx_snapshots: Receiver<ProxyToPrimaryMessage>) {
-        while let Some(message) = rx_snapshots.recv().await {
-            match message {
-                ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot) => {
-                    self.process_snapshot(proxy_id, epoch, snapshot);
-                }
-            }
-        }
-        info!("State collector shutting down");
+        epoch_entry.insert(proxy_id);
     }
 
     /// Get an object from the in-memory store.
     pub fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
-        self.merged_state.get(object_id).cloned()
+        self.merged_state.get(object_id).map(|e| e.clone())
     }
 
     /// Current number of objects in memory.
@@ -166,7 +71,6 @@ mod tests {
     use super::*;
     use sui_types::base_types::ObjectID;
     use sui_types::object::Object;
-    use tokio::sync::mpsc;
 
     fn create_test_object(id: ObjectID) -> Object {
         Object::immutable_with_id_for_testing(id)
@@ -175,40 +79,26 @@ mod tests {
     #[test]
     fn test_state_collector_new() {
         let collector = StateCollector::new(3);
-        assert_eq!(collector.expected_proxies, 3);
-        assert!(collector.last_persisted_epoch.is_none());
-        assert!(collector.collecting_snapshots.is_empty());
+        assert_eq!(collector.merged_state_len(), 0);
     }
 
     #[test]
     fn test_state_collector_with_store() {
-        let temp_dir = std::env::temp_dir().join("test_checkpoint");
-        let store = RocksSnapshotStore::open(temp_dir).unwrap();
-        let collector = StateCollector::new(2).with_store(store);
-        assert!(collector.snapshot_store.is_some());
+        let collector = StateCollector::new(2);
+        assert_eq!(collector.merged_state_len(), 0);
     }
 
     #[test]
     fn test_state_collector_start_epoch() {
-        let mut collector = StateCollector::new(2);
-        let (tx, _rx) = mpsc::channel(1);
-
-        collector.start_epoch(EpochId(5), tx);
-        assert!(collector.last_persisted_epoch.is_none());
-        assert!(collector
-            .collecting_snapshots
-            .get(&EpochId(5))
-            .map(|m| m.is_empty())
-            .unwrap_or(false));
+        let collector = StateCollector::new(2);
+        collector.ensure_epoch(EpochId(5));
+        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
     }
 
     #[test]
     fn test_state_collector_process_snapshot() {
-        let mut collector = StateCollector::new(2);
-        let (tx, _rx) = mpsc::channel(1);
-
-        // Start epoch
-        collector.start_epoch(EpochId(5), tx);
+        let collector = StateCollector::new(2);
+        collector.ensure_epoch(EpochId(5));
 
         // Create test objects
         let obj_id1 = ObjectID::random();
@@ -226,65 +116,55 @@ mod tests {
             collector
                 .collecting_snapshots
                 .get(&EpochId(5))
-                .map(|m| m.len())
-                .unwrap_or(0),
+                .unwrap()
+                .len(),
             1
         );
+        // merged_state should contain both objects after first snapshot
+        assert_eq!(collector.merged_state_len(), 2);
+
+        // Process snapshot from proxy 2
+        collector.process_snapshot(2, EpochId(5), snapshot);
         assert_eq!(
             collector
                 .collecting_snapshots
                 .get(&EpochId(5))
                 .unwrap()
-                .get(&1)
-                .unwrap()
                 .len(),
             2
         );
-
-        // Process snapshot from proxy 2 - should trigger completion
-        collector.process_snapshot(2, EpochId(5), snapshot);
-        assert_eq!(collector.last_persisted_epoch, Some(EpochId(5)));
-        assert!(!collector.collecting_snapshots.contains_key(&EpochId(5)));
     }
 
     #[test]
     fn test_state_collector_multiple_epochs_buffering() {
-        let mut collector = StateCollector::new(2);
-        let (tx, _rx) = mpsc::channel(1);
-
-        // Start epoch 5
-        collector.start_epoch(EpochId(5), tx);
+        let collector = StateCollector::new(2);
+        collector.ensure_epoch(EpochId(5));
 
         // Process snapshot for epoch 6 as well (out of order is allowed, but completion is ordered)
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot(1, EpochId(6), snapshot);
 
-        // Epoch 6 should be buffered, not completed
-        assert!(collector.last_persisted_epoch.is_none());
-        assert!(collector.collecting_snapshots.contains_key(&EpochId(5)));
-        assert!(collector.collecting_snapshots.contains_key(&EpochId(6)));
+        // Epochs should be present
+        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
+        assert!(collector.collecting_snapshots.get(&EpochId(6)).is_some());
     }
 
     #[test]
     fn test_state_collector_no_epoch() {
-        let mut collector = StateCollector::new(2);
+        let collector = StateCollector::new(2);
 
         // Process snapshot without starting epoch - should create epoch entry
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot(1, EpochId(5), snapshot);
 
-        // Should have buffered epoch 5, not persisted yet
-        assert!(collector.last_persisted_epoch.is_none());
-        assert!(collector.collecting_snapshots.contains_key(&EpochId(5)));
+        // Should have buffered epoch 5
+        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
     }
 
     #[test]
     fn test_state_collector_merge_snapshots() {
-        let mut collector = StateCollector::new(2);
-        let (tx, _rx) = mpsc::channel(1);
-
-        // Start epoch
-        collector.start_epoch(EpochId(5), tx);
+        let collector = StateCollector::new(2);
+        collector.ensure_epoch(EpochId(5));
 
         // Create snapshots with overlapping objects
         let obj_id1 = ObjectID::random();
@@ -310,8 +190,14 @@ mod tests {
         collector.process_snapshot(1, EpochId(5), snapshot1);
         collector.process_snapshot(2, EpochId(5), snapshot2);
 
-        // Should be completed and cleared for epoch 5
-        assert_eq!(collector.last_persisted_epoch, Some(EpochId(5)));
-        assert!(!collector.collecting_snapshots.contains_key(&EpochId(5)));
+        // Epoch should have two proxies recorded
+        assert_eq!(
+            collector
+                .collecting_snapshots
+                .get(&EpochId(5))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
