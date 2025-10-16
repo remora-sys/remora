@@ -15,6 +15,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -36,6 +37,7 @@ where
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
     pub epoch_logger: Option<Arc<EpochLogger>>,
     pub current_epoch: crate::checkpoint::EpochId,
+    pub standby_excluded: Arc<AtomicBool>,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -143,8 +145,6 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     pub(crate) worker_pool: WorkerPool<ForwardingTask<E>>,
-    /// When true, exclude the last proxy index from dispatch (reserved standby)
-    exclude_last_proxy: bool,
 }
 
 /// Task structure for worker threads
@@ -190,6 +190,7 @@ where
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
         epoch_logger: Option<Arc<EpochLogger>>,
         current_epoch: u64,
+        standby_excluded: Arc<AtomicBool>,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -202,6 +203,7 @@ where
             proxy_access_histories: proxy_access_histories.clone(),
             epoch_logger,
             current_epoch: crate::checkpoint::EpochId(current_epoch),
+            standby_excluded,
         };
 
         let config = WorkerPoolConfig {
@@ -210,10 +212,7 @@ where
         };
         let worker_pool = WorkerPool::new(context, config);
 
-        Self {
-            worker_pool,
-            exclude_last_proxy: true,
-        }
+        Self { worker_pool }
     }
 
     /// Process a single forwarding task
@@ -248,7 +247,7 @@ where
             + task.transaction.verification_duration();
         let transaction_arc = Arc::new(task.transaction);
 
-        if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
+        if let Some((mut proxy_index, mut stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
             policy,
             proxy_connections,
             states_to_proxy,
@@ -259,6 +258,25 @@ where
             proxy_access_histories,
             &txn_duration,
         ) {
+            // If standby is excluded, remap selection away from the last proxy index if chosen
+            if context.standby_excluded.load(Ordering::SeqCst) {
+                let proxy_count = proxy_connections.len();
+                if proxy_count > 0 {
+                    let last = proxy_count - 1;
+                    if proxy_index == last {
+                        if last == 0 {
+                            return;
+                        }
+                        proxy_index = last - 1;
+                    }
+                    if stateless_proxy_id == last {
+                        if last == 0 {
+                            return;
+                        }
+                        stateless_proxy_id = last - 1;
+                    }
+                }
+            }
             // Append per-epoch log record when context is available
             if let Some(logger) = &context.epoch_logger {
                 let epoch = context.current_epoch;

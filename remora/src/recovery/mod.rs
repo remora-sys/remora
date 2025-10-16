@@ -74,7 +74,10 @@ impl RecoveryCoordinator {
 
     /// Locate the replay cut for an epoch based on last applied index (best effort).
     pub fn locate_cut(&self, proxy: usize, default_cut: u64) -> u64 {
-        self.last_applied.get(&proxy).map(|v| *v.value()).unwrap_or(default_cut)
+        self.last_applied
+            .get(&proxy)
+            .map(|v| *v.value())
+            .unwrap_or(default_cut)
     }
 
     /// Collect replay items for a proxy from a given cut (inclusive) within an epoch.

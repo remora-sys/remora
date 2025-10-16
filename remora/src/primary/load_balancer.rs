@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc, thread};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::VecDeque, marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -22,8 +23,9 @@ use crate::{
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
-    recovery::{EpochLogger, RecoveryCoordinator},
+    recovery::EpochLogger,
 };
+use sui_types::base_types::{ObjectID, SequenceNumber};
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
@@ -48,8 +50,14 @@ pub struct LoadBalancer<E: Executor> {
     txns_since_last_epoch: usize,
     /// In-memory per-epoch transaction logger
     epoch_logger: Arc<EpochLogger>,
-    /// Minimal recovery coordinator (in-memory)
-    recovery: Arc<RecoveryCoordinator>,
+    /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
+    standby_excluded: Arc<AtomicBool>,
+    /// Failed proxy id (if any) for gating decisions
+    failed_proxy: Option<ProxyId>,
+    /// Grey-state ordered buffer per failed proxy
+    grey_queue: Arc<dashmap::DashMap<ProxyId, VecDeque<RemoraTransaction<E>>>>,
+    /// Shared mapping of (object, version) -> proxy index, for gating
+    states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -69,7 +77,7 @@ where
         epoch_logger: Arc<EpochLogger>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
-        let recovery = RecoveryCoordinator::new(epoch_logger.clone());
+        let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -81,7 +89,76 @@ where
             epoch_tx,
             txns_since_last_epoch: 0,
             epoch_logger,
-            recovery,
+            standby_excluded: Arc::new(AtomicBool::new(true)),
+            failed_proxy: None,
+            grey_queue: Arc::new(dashmap::DashMap::new()),
+            states_to_proxy,
+        }
+    }
+
+    /// Promote the reserved standby proxy to active dispatch.
+    pub fn promote_standby(&self) {
+        self.standby_excluded.store(false, Ordering::SeqCst);
+        tracing::info!("Standby proxy promoted to active; exclusion disabled");
+    }
+
+    /// Set the failed proxy id to enable grey gating decisions.
+    pub fn set_failed_proxy(&mut self, proxy: ProxyId) {
+        self.failed_proxy = Some(proxy);
+        self.grey_queue.entry(proxy).or_insert_with(VecDeque::new);
+        tracing::warn!("Failed proxy set to {} for grey gating", proxy);
+    }
+
+    /// Clear failed proxy and optionally flush queued transactions.
+    pub async fn clear_failed_proxy(
+        &mut self,
+        flush: bool,
+        shared_txn_sender: &Sender<(u64, RemoraTransaction<E>)>,
+        consensus_index: u64,
+    ) {
+        if let Some(proxy) = self.failed_proxy.take() {
+            if flush {
+                if let Some(mut q) = self.grey_queue.remove(&proxy).map(|(_, v)| v) {
+                    while let Some(tx) = q.pop_front() {
+                        let _ = shared_txn_sender.send((consensus_index, tx)).await;
+                    }
+                }
+            } else {
+                self.grey_queue.remove(&proxy);
+            }
+        }
+    }
+
+    /// Determine if a transaction should be buffered due to grey state (scaffold: returns false).
+    fn should_buffer_grey(&self, tx: &RemoraTransaction<E>) -> bool {
+        let failed = match self.failed_proxy {
+            Some(p) => p,
+            None => return false,
+        };
+        // If any required state maps to the failed proxy, buffer
+        for (obj, maybe_ver) in tx.shared_objects().iter() {
+            if let Some(ver) = maybe_ver {
+                if let Some(owner) = self.states_to_proxy.get(&(*obj, *ver)) {
+                    if *owner.value() == failed {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Enqueue a transaction into the per-failed-proxy ordered grey queue.
+    fn enqueue_grey(&self, tx: RemoraTransaction<E>) {
+        if let Some(proxy) = self.failed_proxy {
+            self.grey_queue
+                .entry(proxy)
+                .and_modify(|q| q.push_back(tx.clone()))
+                .or_insert_with(|| {
+                    let mut q = VecDeque::new();
+                    q.push_back(tx.clone());
+                    q
+                });
         }
     }
 
@@ -125,7 +202,7 @@ where
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E>::new(
             Arc::new(VersionedDependencyController::new()),
-            Arc::new(DashMap::with_capacity(10000000)),
+            self.states_to_proxy.clone(),
             self.policy.clone(),
             self.proxy_connections.clone(),
             self.proxy_mode.clone(),
@@ -136,6 +213,7 @@ where
                 .collect(),
             Some(self.epoch_logger.clone()),
             self.next_epoch_id,
+            self.standby_excluded.clone(),
         );
 
         thread::spawn(move || {
@@ -225,6 +303,11 @@ where
                         // Simulated consensus index (monotonic) per batch
                         let consensus_index = self.next_epoch_id /* placeholder */ * 1_000_000 + txn_cnt as u64;
                         for tx in shared_txns {
+                            // Optionally buffer grey-state transactions
+                            if self.should_buffer_grey(&tx) {
+                                self.enqueue_grey(tx);
+                                continue;
+                            }
                             if let Err(e) = shared_txn_sender.send((consensus_index, tx)).await {
                                 tracing::error!("Failed to send shared transactions: {:?}", e);
                             }
