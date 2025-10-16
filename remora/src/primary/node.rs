@@ -186,7 +186,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                 expected_proxies,
             });
 
-        let mut snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> =
+        let snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> =
             WorkerPool::new(
                 collector_ctx.clone(),
                 WorkerPoolConfig {
