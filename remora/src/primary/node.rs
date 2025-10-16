@@ -17,8 +17,8 @@ use tokio::{
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
 use crate::checkpoint::state_collector::StateCollector;
+use crate::executor::api::ExecutableTransaction;
 use crate::executor::api::ProxyToPrimaryMessage;
-use crate::executor::worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask};
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
@@ -27,6 +27,48 @@ use crate::{
     networking::{client::NetworkClient, server::NetworkServer},
     recovery::EpochLogger,
 };
+
+// WorkerPool context and task for processing proxy->primary snapshots
+use crate::executor::worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask};
+
+#[derive(Clone)]
+struct CollectorCtx<T: ExecutableTransaction + Clone> {
+    collector: Arc<StateCollector>,
+    logger: Arc<EpochLogger<T>>,
+    expected_proxies: usize,
+}
+
+#[derive(Clone)]
+struct SnapshotTask<T> {
+    bytes: Vec<u8>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> WorkerTask for SnapshotTask<T>
+where
+    T: ExecutableTransaction + Clone + Send + Sync + 'static,
+{
+    type Context = Arc<CollectorCtx<T>>;
+    fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
+        let ctx = context.clone();
+        async move {
+            match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
+                Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                    ctx.collector.process_snapshot(proxy_id, epoch, snapshot);
+                    if let Some(set) = ctx.collector.collecting_snapshots.get(&epoch) {
+                        if set.len() >= ctx.expected_proxies {
+                            ctx.logger.prune_epoch(epoch);
+                            tracing::info!("Pruned epoch {:?} after ack", epoch);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to deserialize snapshot: {:?}", e);
+                }
+            }
+        }
+    }
+}
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct PrimaryNode<E: Executor> {
@@ -132,54 +174,26 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             }
         });
 
-        // Single collector task: consume epoch notifications and snapshots directly
+        // Single collector task: consume epoch notifications and snapshots via a worker pool
         let collector_for_worker = collector.clone();
         let epoch_logger = EpochLogger::new();
-        // Initialize worker pool for deserialization + snapshot processing
-        #[derive(Clone)]
-        struct CollectorCtx {
-            collector: Arc<StateCollector>,
-            logger: Arc<EpochLogger>,
-            expected_proxies: usize,
-        }
-        #[derive(Clone)]
-        struct SnapshotTask {
-            bytes: Vec<u8>,
-        }
-        impl WorkerTask for SnapshotTask {
-            type Context = Arc<CollectorCtx>;
-            fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
-                let ctx = context.clone();
-                async move {
-                    match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
-                        Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                            ctx.collector.process_snapshot(proxy_id, epoch, snapshot);
-                            if let Some(set) = ctx.collector.collecting_snapshots.get(&epoch) {
-                                if set.len() >= ctx.expected_proxies {
-                                    ctx.logger.prune_epoch(epoch);
-                                    tracing::info!("Pruned epoch {:?} after ack", epoch);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to deserialize snapshot: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-        let collector_ctx = Arc::new(CollectorCtx {
-            collector: collector_for_worker.clone(),
-            logger: epoch_logger.clone(),
-            expected_proxies,
-        });
-        let mut snapshot_pool: WorkerPool<SnapshotTask> = WorkerPool::new(
-            collector_ctx.clone(),
-            WorkerPoolConfig {
-                num_workers: Some(4),
-                ..Default::default()
-            },
-        );
+
+        // Build worker pool context
+        let collector_ctx: Arc<CollectorCtx<<E as Executor>::Transaction>> =
+            Arc::new(CollectorCtx {
+                collector: collector_for_worker.clone(),
+                logger: epoch_logger.clone(),
+                expected_proxies,
+            });
+
+        let mut snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> =
+            WorkerPool::new(
+                collector_ctx.clone(),
+                WorkerPoolConfig {
+                    num_workers: Some(4),
+                    ..Default::default()
+                },
+            );
 
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
@@ -187,6 +201,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let collector_handle = tokio::spawn(async move {
             let collector_inner = collector_for_worker;
             let logger = collector_logger;
+            let mut pool = snapshot_pool;
             let mut last_epoch: Option<crate::checkpoint::EpochId> = None;
             loop {
                 tokio::select! {
@@ -200,7 +215,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         last_epoch = Some(epoch);
                     }
                     Some(bytes) = rx_snapshots.recv() => {
-                        let _ = snapshot_pool.send_task(SnapshotTask { bytes }).await;
+                        let _ = pool
+                            .send_task(SnapshotTask { bytes, _phantom: PhantomData })
+                            .await;
                     }
                     else => { break; }
                 }

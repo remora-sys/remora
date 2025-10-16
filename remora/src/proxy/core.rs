@@ -54,11 +54,11 @@ struct PrimaryMessageProcessor<E: Executor> {
 impl<E: Executor + Send + Sync + 'static> PrimaryMessageProcessor<E>
 where
     E: Send + 'static,
-    Store<E>: Send + Sync,
-    RemoraTransaction<E>: Send + Sync,
-    ExecutionResults<E>: Send + Sync,
-    <E as Executor>::ExecutionContext: Send + Sync,
-    <E as Executor>::Transaction: Send,
+    Store<E>: Send + Sync + 'static,
+    RemoraTransaction<E>: Send + Sync + 'static,
+    ExecutionResults<E>: Send + Sync + 'static,
+    <E as Executor>::ExecutionContext: Send + Sync + 'static,
+    <E as Executor>::Transaction: Send + Sync + 'static,
 {
     async fn run(
         &mut self,
@@ -128,6 +128,27 @@ where
                         tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
                     }
                 }
+                PrimaryToProxyMessage::Replay(batch) => {
+                    tracing::debug!(
+                        "Proxy {} received Replay batch for epoch {:?} ({} items)",
+                        self.id,
+                        batch.epoch,
+                        batch.items.len()
+                    );
+                    let items = batch
+                        .items
+                        .into_iter()
+                        .map(|m| crate::executor::api::ReplayItem {
+                            consensus_index: m.consensus_index,
+                            transaction: m.transaction,
+                            required_versions: m.required_versions,
+                            state_blobs: m.state_blobs,
+                        })
+                        .collect();
+                    let ctx = self.executor.context().clone();
+                    let store = self.store.clone();
+                    E::replay(ctx, store, items).await;
+                }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
                 }
@@ -169,6 +190,29 @@ where
                         tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
                     }
                 }
+                PrimaryToProxyMessage::Replay(batch) => {
+                    tracing::debug!(
+                        "Proxy {} received Replay batch for epoch {:?} ({} items)",
+                        self.id,
+                        batch.epoch,
+                        batch.items.len()
+                    );
+                    // Map ReplayMsg to ReplayItem and call Executor::replay
+                    let items = batch
+                        .items
+                        .into_iter()
+                        .map(|m| crate::executor::api::ReplayItem {
+                            consensus_index: m.consensus_index,
+                            transaction: m.transaction,
+                            required_versions: m.required_versions,
+                            state_blobs: m.state_blobs,
+                        })
+                        .collect();
+                    let ctx = self.executor.context().clone();
+                    let store = self.store.clone();
+                    let _ = E::replay(ctx, store, items).await;
+                }
+                // Replay handling already covered above in separation mode; no duplicate here.
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
                 }

@@ -50,9 +50,9 @@ pub struct LoadBalancer<E: Executor> {
     /// Cumulative transactions since last checkpoint
     txns_since_last_epoch: usize,
     /// In-memory per-epoch transaction logger
-    epoch_logger: Arc<EpochLogger>,
+    epoch_logger: Arc<EpochLogger<E::Transaction>>,
     /// Recovery coordinator for failure handling
-    recovery_coordinator: Arc<RecoveryCoordinator>,
+    recovery_coordinator: Arc<RecoveryCoordinator<E::Transaction>>,
     /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
     standby_excluded: Arc<AtomicBool>,
     /// Failed proxy id (if any) for gating decisions
@@ -81,7 +81,7 @@ where
         proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
         epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
-        epoch_logger: Arc<EpochLogger>,
+        epoch_logger: Arc<EpochLogger<E::Transaction>>,
         collector: Arc<StateCollector>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
@@ -148,6 +148,10 @@ where
                 failed_proxy,
                 standby_proxy
             );
+
+            // Start replay process for the replacement proxy
+            self.start_replay_process(failed_proxy, standby_proxy);
+
             Some(standby_proxy)
         } else {
             tracing::error!(
@@ -158,6 +162,100 @@ where
                 .register_error(crate::metrics::ErrorType::TransactionRateTooHigh);
             None
         }
+    }
+
+    /// Get the next batch of replay items for a failed proxy.
+    /// Returns None when all items have been replayed.
+    pub fn get_next_replay_batch(
+        &self,
+        failed_proxy: ProxyId,
+    ) -> Option<Vec<crate::recovery::LogRecord<E::Transaction>>> {
+        self.recovery_coordinator
+            .get_next_replay_batch(failed_proxy as usize)
+    }
+
+    /// Start the replay process for a replacement proxy.
+    /// This method spawns a task to send replay batches to the replacement proxy.
+    fn start_replay_process(&self, failed_proxy: ProxyId, replacement_proxy: ProxyId) {
+        let recovery_coordinator = self.recovery_coordinator.clone();
+        let proxy_connections = self.proxy_connections.clone();
+        let collector = self.collector.clone();
+
+        tokio::spawn(async move {
+            let mut batch_count = 0;
+            while let Some(batch) =
+                recovery_coordinator.get_next_replay_batch(failed_proxy as usize)
+            {
+                batch_count += 1;
+                tracing::info!(
+                    "Sending replay batch {} to replacement proxy {} ({} items)",
+                    batch_count,
+                    replacement_proxy,
+                    batch.len()
+                );
+
+                // Convert LogRecord to ReplayMsg and send to replacement proxy
+                if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
+                    // Get the epoch from the first record before consuming the batch
+                    let epoch = batch
+                        .first()
+                        .map(|record| record.epoch)
+                        .unwrap_or(crate::checkpoint::EpochId(0));
+
+                    let replay_items: Vec<crate::executor::api::ReplayMsg<E::Transaction>> = batch
+                        .into_iter()
+                        .map(|record| {
+                            // Hydrate transaction data from LogRecord
+                            let transaction = (*record.transaction).clone();
+
+                            // Fetch state blobs from StateCollector
+                            let mut state_blobs = std::collections::BTreeMap::new();
+                            for (object_id, _version) in record.required_states.keys() {
+                                if let Some(object) = collector.get_object(object_id) {
+                                    state_blobs.insert(*object_id, object);
+                                }
+                            }
+
+                            crate::executor::api::ReplayMsg {
+                                consensus_index: record.consensus_index.unwrap_or(0),
+                                transaction,
+                                required_versions: record.required_states.keys().cloned().collect(),
+                                state_blobs,
+                            }
+                        })
+                        .collect();
+
+                    let replay_batch = crate::executor::api::ReplayBatch {
+                        epoch,
+                        items: replay_items,
+                    };
+
+                    let msg = crate::executor::api::PrimaryToProxyMessage::Replay(replay_batch);
+                    if let Err(e) = proxy_tx.value().send(msg).await {
+                        tracing::error!(
+                            "Failed to send replay batch {} to replacement proxy {}: {:?}",
+                            batch_count,
+                            replacement_proxy,
+                            e
+                        );
+                        break;
+                    }
+                } else {
+                    tracing::error!(
+                        "Replacement proxy {} not found in connections",
+                        replacement_proxy
+                    );
+                    break;
+                }
+            }
+
+            tracing::info!(
+                "Completed replay process for failed proxy {} -> replacement proxy {} ({} batches)",
+                failed_proxy,
+                replacement_proxy,
+                batch_count
+            );
+        });
     }
 
     /// Mark an epoch as acknowledged and prune its log segment.

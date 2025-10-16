@@ -4,21 +4,61 @@
 #[cfg(test)]
 mod tests {
     use crate::checkpoint::EpochId;
+    use crate::executor::api::{ExecutableTransaction, TransactionWithTimestamp};
     use crate::recovery::{EpochLogger, LogRecord, RecoveryCoordinator};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use sui_types::base_types::ObjectID;
     use sui_types::digests::TransactionDigest;
+    use sui_types::transaction::InputObjectKind;
+
+    // Simple test transaction type
+    #[derive(Clone, Debug)]
+    #[allow(dead_code)]
+    struct TestTransaction {
+        id: u64,
+    }
+
+    impl ExecutableTransaction for TestTransaction {
+        fn digest(&self) -> &TransactionDigest {
+            // This is a test implementation - in real code this would be stored
+            static DIGEST: std::sync::OnceLock<TransactionDigest> = std::sync::OnceLock::new();
+            DIGEST.get_or_init(|| TransactionDigest::random())
+        }
+
+        fn input_objects(&self) -> Vec<InputObjectKind> {
+            vec![]
+        }
+
+        fn shared_object_ids(&self) -> Vec<ObjectID> {
+            vec![]
+        }
+    }
+
+    fn create_test_transaction(id: u64) -> Arc<TransactionWithTimestamp<TestTransaction>> {
+        Arc::new(TransactionWithTimestamp::new(
+            TestTransaction { id },
+            0.0,
+            vec![],
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_millis(0),
+            Some(0),
+        ))
+    }
 
     #[test]
     fn test_epoch_logger_basic_operations() {
-        let logger = EpochLogger::new();
+        let logger = EpochLogger::<TestTransaction>::new();
         let epoch = EpochId(1);
 
         // Test appending records
         let record = LogRecord {
             consensus_index: Some(100),
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(1),
             destination_proxy: 0,
             required_states: BTreeMap::new(),
+            epoch,
         };
 
         logger.append(epoch, record.clone());
@@ -35,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_recovery_coordinator_basic_operations() {
-        let logger = EpochLogger::new();
+        let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger);
 
         // Test begin recovery
@@ -54,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_recovery_coordinator_collect_replay_set() {
-        let logger = EpochLogger::new();
+        let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
         let epoch = EpochId(1);
 
@@ -62,22 +102,28 @@ mod tests {
         let record1 = LogRecord {
             consensus_index: Some(100),
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(1),
             destination_proxy: 0,
             required_states: BTreeMap::new(),
+            epoch,
         };
 
         let record2 = LogRecord {
             consensus_index: Some(150),
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(2),
             destination_proxy: 1, // Different proxy
             required_states: BTreeMap::new(),
+            epoch,
         };
 
         let record3 = LogRecord {
             consensus_index: Some(200),
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(3),
             destination_proxy: 0,
             required_states: BTreeMap::new(),
+            epoch,
         };
 
         logger.append(epoch, record1);
@@ -96,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_recovery_coordinator_drain_dirty_queue() {
-        let logger = EpochLogger::new();
+        let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
 
         // Set persist index to 120
@@ -109,22 +155,28 @@ mod tests {
         let record1 = LogRecord {
             consensus_index: Some(100), // Below persist index
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(1),
             destination_proxy: 0,
             required_states: BTreeMap::new(),
+            epoch: epoch1,
         };
 
         let record2 = LogRecord {
             consensus_index: Some(150), // Above persist index
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(2),
             destination_proxy: 0,
             required_states: BTreeMap::new(),
+            epoch: epoch1,
         };
 
         let record3 = LogRecord {
             consensus_index: Some(200), // Above persist index
             txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(3),
             destination_proxy: 1, // Different proxy
             required_states: BTreeMap::new(),
+            epoch: epoch2,
         };
 
         logger.append(epoch1, record1);
@@ -144,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_epoch_logger_multiple_epochs() {
-        let logger = EpochLogger::new();
+        let logger = EpochLogger::<TestTransaction>::new();
 
         // Add records to different epochs
         for epoch_num in 1..=3 {
@@ -152,8 +204,10 @@ mod tests {
             let record = LogRecord {
                 consensus_index: Some(epoch_num * 100),
                 txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(epoch_num),
                 destination_proxy: 0,
                 required_states: BTreeMap::new(),
+                epoch,
             };
             logger.append(epoch, record);
         }

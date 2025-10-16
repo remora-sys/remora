@@ -11,41 +11,44 @@ use sui_types::{
 };
 
 use crate::checkpoint::EpochId;
+use crate::executor::api::{ExecutableTransaction, TransactionWithTimestamp};
 
 #[cfg(test)]
 mod test_recovery;
 
 #[derive(Clone, Debug)]
-pub struct LogRecord {
+pub struct LogRecord<T: ExecutableTransaction + Clone> {
     pub consensus_index: Option<u64>,
     pub txn_digest: TransactionDigest,
+    pub transaction: Arc<TransactionWithTimestamp<T>>,
     pub destination_proxy: usize,
     pub required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>>,
+    pub epoch: EpochId,
 }
 
 /// In-memory per-epoch transaction logger.
 /// Epoch segments can be pruned (removed) atomically when acknowledged.
 #[derive(Default)]
-pub struct EpochLogger {
+pub struct EpochLogger<T: ExecutableTransaction + Clone> {
     /// epoch -> ordered log records
-    segments: DashMap<EpochId, Vec<LogRecord>>,
+    segments: DashMap<EpochId, Vec<LogRecord<T>>>,
 }
 
-impl EpochLogger {
+impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             segments: DashMap::new(),
         })
     }
 
-    pub fn append(&self, epoch: EpochId, record: LogRecord) {
+    pub fn append(&self, epoch: EpochId, record: LogRecord<T>) {
         self.segments
             .entry(epoch)
             .and_modify(|v| v.push(record.clone()))
             .or_insert_with(|| vec![record]);
     }
 
-    pub fn get_epoch(&self, epoch: EpochId) -> Option<Vec<LogRecord>> {
+    pub fn get_epoch(&self, epoch: EpochId) -> Option<Vec<LogRecord<T>>> {
         self.segments.get(&epoch).map(|r| r.clone())
     }
 
@@ -57,17 +60,28 @@ impl EpochLogger {
 
 /// Minimal recovery coordinator using the in-memory EpochLogger
 #[derive(Default)]
-pub struct RecoveryCoordinator {
-    logger: Arc<EpochLogger>,
+pub struct RecoveryCoordinator<T: ExecutableTransaction + Clone> {
+    logger: Arc<EpochLogger<T>>,
     /// Primary-level persist index: last fully acknowledged epoch's consensus index
     primary_persist_index: AtomicU64,
+    /// Default batch size for replay batches
+    batch_size: usize,
 }
 
-impl RecoveryCoordinator {
-    pub fn new(logger: Arc<EpochLogger>) -> Arc<Self> {
+impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
+    pub fn new(logger: Arc<EpochLogger<T>>) -> Arc<Self> {
         Arc::new(Self {
             logger,
             primary_persist_index: AtomicU64::new(0),
+            batch_size: 10, // Default batch size
+        })
+    }
+
+    pub fn new_with_batch_size(logger: Arc<EpochLogger<T>>, batch_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            logger,
+            primary_persist_index: AtomicU64::new(0),
+            batch_size,
         })
     }
 
@@ -75,6 +89,25 @@ impl RecoveryCoordinator {
     pub fn begin_recovery(&self, _failed_proxy: usize, standby_proxy: usize) -> usize {
         // Record failure; promotion is external policy. Return the standby for activation.
         standby_proxy
+    }
+
+    /// Get the next batch of replay items for a failed proxy.
+    /// Returns None when all items have been replayed.
+    pub fn get_next_replay_batch(&self, failed_proxy: usize) -> Option<Vec<LogRecord<T>>> {
+        let dirty_entries = self.drain_dirty_queue(failed_proxy);
+
+        if dirty_entries.is_empty() {
+            return None;
+        }
+
+        // Take up to batch_size items
+        let batch: Vec<LogRecord<T>> = dirty_entries.into_iter().take(self.batch_size).collect();
+
+        if batch.is_empty() {
+            None
+        } else {
+            Some(batch)
+        }
     }
 
     /// Get the current primary persist index (replay cut).
@@ -94,7 +127,7 @@ impl RecoveryCoordinator {
         epoch: EpochId,
         from_index: u64,
         failed_proxy: usize,
-    ) -> Vec<LogRecord> {
+    ) -> Vec<LogRecord<T>> {
         match self.logger.get_epoch(epoch) {
             Some(records) => records
                 .into_iter()
@@ -107,7 +140,7 @@ impl RecoveryCoordinator {
 
     /// Collect dirty queue entries for a failed proxy from all pending epochs.
     /// This implements the union described in the failure recovery plan.
-    pub fn drain_dirty_queue(&self, failed_proxy: usize) -> Vec<LogRecord> {
+    pub fn drain_dirty_queue(&self, failed_proxy: usize) -> Vec<LogRecord<T>> {
         let persist_index = self.get_persist_index();
         let mut dirty_entries = Vec::new();
 
@@ -117,7 +150,7 @@ impl RecoveryCoordinator {
             let records = epoch_entry.value();
 
             // Filter for failed proxy and consensus_index >= persist_index
-            let epoch_entries: Vec<LogRecord> = records
+            let epoch_entries: Vec<LogRecord<T>> = records
                 .iter()
                 .filter(|r| r.destination_proxy == failed_proxy)
                 .filter(|r| {

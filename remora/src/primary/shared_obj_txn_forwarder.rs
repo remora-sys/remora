@@ -35,7 +35,7 @@ where
     pub metrics: Arc<Metrics>,
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-    pub epoch_logger: Option<Arc<EpochLogger>>,
+    pub epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
     pub current_epoch: crate::checkpoint::EpochId,
     pub standby_excluded: Arc<AtomicBool>,
 }
@@ -188,7 +188,7 @@ where
         metrics: Arc<Metrics>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-        epoch_logger: Option<Arc<EpochLogger>>,
+        epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
         current_epoch: u64,
         standby_excluded: Arc<AtomicBool>,
     ) -> Self {
@@ -283,6 +283,7 @@ where
                 let rec = LogRecord {
                     consensus_index: Some(task.consensus_index),
                     txn_digest: *transaction_arc.digest(),
+                    transaction: transaction_arc.clone(),
                     destination_proxy: proxy_index,
                     required_states: Self::clone_required_states(
                         &task.required_versions,
@@ -290,6 +291,7 @@ where
                         proxy_index,
                     )
                     .await,
+                    epoch,
                 };
                 logger.append(epoch, rec);
             }

@@ -182,13 +182,19 @@ pub trait StateStore<U> {
 /// The executor is responsible for executing transactions and generating new transactions.
 pub trait Executor: Clone {
     /// The type of transaction to execute.
-    type Transaction: Clone + ExecutableTransaction + Serialize + DeserializeOwned;
+    type Transaction: Clone
+        + ExecutableTransaction
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static;
     /// The type of results from executing a transaction.
     type ExecutionResults: Clone + TransactionEffectsAPI + Debug;
     /// The type of store to store objects.
-    type Store: StateStore<Self::ExecutionResults>;
+    type Store: StateStore<Self::ExecutionResults> + Send + Sync + 'static;
     /// The benchmark context.
-    type ExecutionContext;
+    type ExecutionContext: Send + Sync + 'static;
 
     /// Get the context for the benchmark.
     fn context(&self) -> Arc<Self::ExecutionContext>;
@@ -227,6 +233,30 @@ pub trait Executor: Clone {
         ctx: Arc<Self::ExecutionContext>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = bool> + Send;
+
+    /// Replay API: commit provided states first, then execute the transaction using existing APIs.
+    /// Default implementation applies items sequentially.
+    fn replay(
+        ctx: Arc<Self::ExecutionContext>,
+        store: Arc<Self::Store>,
+        items: Vec<ReplayItem<Self::Transaction>>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        Self::Transaction: Send + Sync + 'static,
+        Self::Store: Send + Sync + 'static,
+        Self::ExecutionContext: Send + Sync + 'static,
+    {
+        async move {
+            for item in items {
+                if !item.state_blobs.is_empty() {
+                    // Commit required states first
+                    store.commit_new_objects(item.state_blobs);
+                }
+                // Execute using the existing execution path (ignore result here)
+                let _ = Self::execute(ctx.clone(), store.clone(), item.transaction).await;
+            }
+        }
+    }
 }
 
 /// Short for a transaction with a timestamp.
@@ -247,6 +277,37 @@ pub type RequiredStates = BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>>;
 pub type ExecutorIndex = usize;
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ReplayItem<T>
+where
+    T: ExecutableTransaction + Clone,
+{
+    pub consensus_index: u64,
+    pub transaction: TransactionWithTimestamp<T>,
+    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
+    pub state_blobs: BTreeMap<ObjectID, Object>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReplayMsg<T>
+where
+    T: ExecutableTransaction + Clone,
+{
+    pub consensus_index: u64,
+    pub transaction: TransactionWithTimestamp<T>,
+    pub required_versions: Vec<(ObjectID, SequenceNumber)>,
+    pub state_blobs: BTreeMap<ObjectID, Object>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReplayBatch<T>
+where
+    T: ExecutableTransaction + Clone,
+{
+    pub epoch: EpochId,
+    pub items: Vec<ReplayMsg<T>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PrimaryToProxyMessage<T>
 where
     T: ExecutableTransaction + Clone,
@@ -260,6 +321,8 @@ where
     /// Primary requests checkpoint at epoch boundary: proxies finalize prior epoch
     /// and prepare/report their snapshot for this epoch.
     Checkpoint(EpochId),
+    /// Replay batch: primary sends transactions with required states to commit-then-execute
+    Replay(ReplayBatch<T>),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
