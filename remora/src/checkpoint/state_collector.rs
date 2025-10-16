@@ -1,6 +1,6 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
 use dashmap::{DashMap, DashSet};
-use sui_types::base_types::ObjectID;
+use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
 use tracing::debug;
 
@@ -58,6 +58,11 @@ impl StateCollector {
     /// Get an object from the in-memory store.
     pub fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
         self.merged_state.get(object_id).map(|e| e.clone())
+    }
+
+    /// Get the persisted version for an object without cloning the entire object.
+    pub fn get_persisted_version(&self, object_id: &ObjectID) -> Option<SequenceNumber> {
+        self.merged_state.get(object_id).map(|e| e.version())
     }
 
     /// Current number of objects in memory.

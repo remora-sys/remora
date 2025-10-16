@@ -793,9 +793,11 @@ where
                 tracing::debug!("Sent transaction to proxy {}", dest_proxy);
             } else {
                 tracing::warn!(
-                    "Failed to send transaction to proxy {}, removing connection",
+                    "Failed to send to proxy {}. Marking as failed and removing.",
                     dest_proxy
                 );
+                // Stop routing to this proxy by removing its connection entry
+                proxy_connections.remove(&dest_proxy);
             }
         } else {
             tracing::warn!("Proxy connection {} not found", dest_proxy);

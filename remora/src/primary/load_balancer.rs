@@ -10,6 +10,7 @@ use tokio::{
 };
 
 use crate::{
+    checkpoint::state_collector::StateCollector,
     checkpoint::EpochId,
     config::{LoadBalancingPolicy, ProxyMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
@@ -58,6 +59,8 @@ pub struct LoadBalancer<E: Executor> {
     grey_queue: Arc<dashmap::DashMap<ProxyId, VecDeque<RemoraTransaction<E>>>>,
     /// Shared mapping of (object, version) -> proxy index, for gating
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
+    /// Reference to the collector for persisted version checks
+    collector: Arc<StateCollector>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -75,6 +78,7 @@ where
         metrics: Arc<Metrics>,
         epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
         epoch_logger: Arc<EpochLogger>,
+        collector: Arc<StateCollector>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
@@ -93,6 +97,7 @@ where
             failed_proxy: None,
             grey_queue: Arc::new(dashmap::DashMap::new()),
             states_to_proxy,
+            collector,
         }
     }
 
@@ -131,16 +136,17 @@ where
 
     /// Determine if a transaction should be buffered due to grey state (scaffold: returns false).
     fn should_buffer_grey(&self, tx: &RemoraTransaction<E>) -> bool {
-        let failed = match self.failed_proxy {
-            Some(p) => p,
-            None => return false,
-        };
-        // If any required state maps to the failed proxy, buffer
+        // If any required state maps to a currently unavailable proxy, buffer
         for (obj, maybe_ver) in tx.shared_objects().iter() {
             if let Some(ver) = maybe_ver {
-                if let Some(owner) = self.states_to_proxy.get(&(*obj, *ver)) {
-                    if *owner.value() == failed {
-                        return true;
+                // persisted version in primary (from merged_state)
+                let persisted_ver = self.collector.get_persisted_version(obj);
+                if persisted_ver.map_or(true, |pv| pv < *ver) {
+                    if let Some(owner) = self.states_to_proxy.get(&(*obj, *ver)) {
+                        let owner_id = *owner.value();
+                        if !self.proxy_connections.contains_key(&owner_id) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -335,13 +341,22 @@ where
         }
     }
 
-    async fn broadcast_checkpoint(&self, epoch: EpochId) {
-        for entry in self.proxy_connections.iter() {
-            let proxy_id = *entry.key();
-            let tx = entry.value();
-            let msg = PrimaryToProxyMessage::Checkpoint(epoch);
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!("Failed to send checkpoint to proxy {}: {:?}", proxy_id, e);
+    async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
+        // Clone keys to avoid holding references while mutating map
+        let proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        for proxy_id in proxy_ids {
+            let tx_opt = self
+                .proxy_connections
+                .get(&proxy_id)
+                .map(|e| e.value().clone());
+            if let Some(tx) = tx_opt {
+                let msg = PrimaryToProxyMessage::Checkpoint(epoch);
+                if let Err(_e) = tx.send(msg).await {
+                    tracing::warn!("Proxy {} send failed; designating as failed", proxy_id);
+                    // Designate failed: enable grey gating and remove connection
+                    self.set_failed_proxy(proxy_id);
+                    self.proxy_connections.remove(&proxy_id);
+                }
             }
         }
         tracing::info!("Broadcasted checkpoint for epoch {}", epoch.0);

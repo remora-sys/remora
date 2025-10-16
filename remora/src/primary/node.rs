@@ -137,17 +137,29 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let epoch_logger = EpochLogger::new();
         // Initialize worker pool for deserialization + snapshot processing
         #[derive(Clone)]
+        struct CollectorCtx {
+            collector: Arc<StateCollector>,
+            logger: Arc<EpochLogger>,
+            expected_proxies: usize,
+        }
+        #[derive(Clone)]
         struct SnapshotTask {
             bytes: Vec<u8>,
         }
         impl WorkerTask for SnapshotTask {
-            type Context = Arc<StateCollector>;
+            type Context = Arc<CollectorCtx>;
             fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
-                let context = context.clone();
+                let ctx = context.clone();
                 async move {
                     match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
                         Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                            context.process_snapshot(proxy_id, epoch, snapshot);
+                            ctx.collector.process_snapshot(proxy_id, epoch, snapshot);
+                            if let Some(set) = ctx.collector.collecting_snapshots.get(&epoch) {
+                                if set.len() >= ctx.expected_proxies {
+                                    ctx.logger.prune_epoch(epoch);
+                                    tracing::info!("Pruned epoch {:?} after ack", epoch);
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!("Failed to deserialize snapshot: {:?}", e);
@@ -156,8 +168,13 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                 }
             }
         }
+        let collector_ctx = Arc::new(CollectorCtx {
+            collector: collector_for_worker.clone(),
+            logger: epoch_logger.clone(),
+            expected_proxies,
+        });
         let mut snapshot_pool: WorkerPool<SnapshotTask> = WorkerPool::new(
-            collector_for_worker.clone(),
+            collector_ctx.clone(),
             WorkerPoolConfig {
                 num_workers: Some(4),
                 ..Default::default()
@@ -201,6 +218,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             metrics.clone(),
             tx_epoch_notify,
             epoch_logger.clone(),
+            collector.clone(),
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
