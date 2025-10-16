@@ -22,7 +22,7 @@ use crate::{
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
-    recovery::EpochLogger,
+    recovery::{EpochLogger, RecoveryCoordinator},
 };
 
 /// A load balancer is responsible for distributing transactions to proxies.
@@ -48,6 +48,8 @@ pub struct LoadBalancer<E: Executor> {
     txns_since_last_epoch: usize,
     /// In-memory per-epoch transaction logger
     epoch_logger: Arc<EpochLogger>,
+    /// Minimal recovery coordinator (in-memory)
+    recovery: Arc<RecoveryCoordinator>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -67,6 +69,7 @@ where
         epoch_logger: Arc<EpochLogger>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
+        let recovery = RecoveryCoordinator::new(epoch_logger.clone());
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -78,6 +81,7 @@ where
             epoch_tx,
             txns_since_last_epoch: 0,
             epoch_logger,
+            recovery,
         }
     }
 
