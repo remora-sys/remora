@@ -3,11 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::checkpoint::EpochId;
     use crate::recovery::{EpochLogger, LogRecord, RecoveryCoordinator};
     use std::collections::BTreeMap;
-    use sui_types::base_types::ObjectID;
     use sui_types::digests::TransactionDigest;
 
     #[test]
@@ -44,14 +42,14 @@ mod tests {
         let replacement = coordinator.begin_recovery(0, 1);
         assert_eq!(replacement, 1);
 
-        // Test locate cut
-        let cut = coordinator.locate_cut(0, 50);
-        assert_eq!(cut, 50); // Should return default when no last applied
+        // Test persist index (starts at 0)
+        let persist_index = coordinator.get_persist_index();
+        assert_eq!(persist_index, 0);
 
-        // Test update last applied
-        coordinator.update_last_applied(0, 100);
-        let cut_after_update = coordinator.locate_cut(0, 50);
-        assert_eq!(cut_after_update, 100);
+        // Test update persist index
+        coordinator.update_persist_index(100);
+        let updated_persist_index = coordinator.get_persist_index();
+        assert_eq!(updated_persist_index, 100);
     }
 
     #[test]
@@ -94,6 +92,54 @@ mod tests {
         // Test collecting from index 50 (should get both records for proxy 0)
         let replay_set_all = coordinator.collect_replay_set(epoch, 50, 0);
         assert_eq!(replay_set_all.len(), 2);
+    }
+
+    #[test]
+    fn test_recovery_coordinator_drain_dirty_queue() {
+        let logger = EpochLogger::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        // Set persist index to 120
+        coordinator.update_persist_index(120);
+
+        // Add records to different epochs
+        let epoch1 = EpochId(1);
+        let epoch2 = EpochId(2);
+
+        let record1 = LogRecord {
+            consensus_index: Some(100), // Below persist index
+            txn_digest: TransactionDigest::random(),
+            destination_proxy: 0,
+            required_states: BTreeMap::new(),
+        };
+
+        let record2 = LogRecord {
+            consensus_index: Some(150), // Above persist index
+            txn_digest: TransactionDigest::random(),
+            destination_proxy: 0,
+            required_states: BTreeMap::new(),
+        };
+
+        let record3 = LogRecord {
+            consensus_index: Some(200), // Above persist index
+            txn_digest: TransactionDigest::random(),
+            destination_proxy: 1, // Different proxy
+            required_states: BTreeMap::new(),
+        };
+
+        logger.append(epoch1, record1);
+        logger.append(epoch1, record2);
+        logger.append(epoch2, record3);
+
+        // Test draining dirty queue for proxy 0
+        let dirty_queue = coordinator.drain_dirty_queue(0);
+        assert_eq!(dirty_queue.len(), 1); // Only record2 should match (proxy 0, index >= 120)
+        assert_eq!(dirty_queue[0].consensus_index, Some(150));
+
+        // Test draining for proxy 1
+        let dirty_queue_1 = coordinator.drain_dirty_queue(1);
+        assert_eq!(dirty_queue_1.len(), 1); // Only record3 should match (proxy 1, index >= 120)
+        assert_eq!(dirty_queue_1[0].consensus_index, Some(200));
     }
 
     #[test]

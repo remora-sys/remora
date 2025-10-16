@@ -161,17 +161,29 @@ where
     }
 
     /// Mark an epoch as acknowledged and prune its log segment.
-    pub fn acknowledge_epoch(&self, epoch: EpochId) {
+    pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
         self.epoch_ack_state.insert(epoch, true);
         self.epoch_logger.prune_epoch(epoch);
         self.collector.acknowledge_epoch(epoch);
-        tracing::debug!("Epoch {} acknowledged and pruned", epoch.0);
+        // Update primary persist index
+        self.recovery_coordinator
+            .update_persist_index(consensus_index);
+        tracing::debug!(
+            "Epoch {} acknowledged and pruned, persist index updated to {}",
+            epoch.0,
+            consensus_index
+        );
     }
 
     /// Check for epoch completion and trigger acknowledgment if ready.
-    pub fn check_epoch_completion(&self, epoch: EpochId, expected_proxies: usize) {
+    pub fn check_epoch_completion(
+        &self,
+        epoch: EpochId,
+        expected_proxies: usize,
+        consensus_index: u64,
+    ) {
         if self.collector.is_epoch_complete(epoch, expected_proxies) {
-            self.acknowledge_epoch(epoch);
+            self.acknowledge_epoch(epoch, consensus_index);
         }
     }
 

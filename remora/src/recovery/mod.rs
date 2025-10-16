@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use dashmap::DashMap;
 use sui_types::{
@@ -56,31 +59,33 @@ impl EpochLogger {
 #[derive(Default)]
 pub struct RecoveryCoordinator {
     logger: Arc<EpochLogger>,
-    /// Per-proxy last applied consensus index (best effort)
-    last_applied: DashMap<usize, u64>,
+    /// Primary-level persist index: last fully acknowledged epoch's consensus index
+    primary_persist_index: AtomicU64,
 }
 
 impl RecoveryCoordinator {
     pub fn new(logger: Arc<EpochLogger>) -> Arc<Self> {
         Arc::new(Self {
             logger,
-            last_applied: DashMap::new(),
+            primary_persist_index: AtomicU64::new(0),
         })
     }
 
     /// Begin recovery for a failed proxy. Returns the replacement proxy id to use.
-    pub fn begin_recovery(&self, failed_proxy: usize, standby_proxy: usize) -> usize {
+    pub fn begin_recovery(&self, _failed_proxy: usize, standby_proxy: usize) -> usize {
         // Record failure; promotion is external policy. Return the standby for activation.
-        let _ = self.last_applied.remove(&failed_proxy);
         standby_proxy
     }
 
-    /// Locate the replay cut for an epoch based on last applied index (best effort).
-    pub fn locate_cut(&self, proxy: usize, default_cut: u64) -> u64 {
-        self.last_applied
-            .get(&proxy)
-            .map(|v| *v.value())
-            .unwrap_or(default_cut)
+    /// Get the current primary persist index (replay cut).
+    pub fn get_persist_index(&self) -> u64 {
+        self.primary_persist_index.load(Ordering::SeqCst)
+    }
+
+    /// Update the primary persist index when an epoch is acknowledged.
+    pub fn update_persist_index(&self, consensus_index: u64) {
+        self.primary_persist_index
+            .store(consensus_index, Ordering::SeqCst);
     }
 
     /// Collect replay items for a proxy from a given cut (inclusive) within an epoch.
@@ -100,8 +105,32 @@ impl RecoveryCoordinator {
         }
     }
 
-    /// Update last applied index for a proxy (call on successful dispatch/ack if needed).
-    pub fn update_last_applied(&self, proxy: usize, index: u64) {
-        self.last_applied.insert(proxy, index);
+    /// Collect dirty queue entries for a failed proxy from all pending epochs.
+    /// This implements the union described in the failure recovery plan.
+    pub fn drain_dirty_queue(&self, failed_proxy: usize) -> Vec<LogRecord> {
+        let persist_index = self.get_persist_index();
+        let mut dirty_entries = Vec::new();
+
+        // Collect from all epochs in the logger
+        for epoch_entry in self.logger.segments.iter() {
+            let _epoch = *epoch_entry.key();
+            let records = epoch_entry.value();
+
+            // Filter for failed proxy and consensus_index >= persist_index
+            let epoch_entries: Vec<LogRecord> = records
+                .iter()
+                .filter(|r| r.destination_proxy == failed_proxy)
+                .filter(|r| {
+                    r.consensus_index
+                        .map(|i| i >= persist_index)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            dirty_entries.extend(epoch_entries);
+        }
+
+        dirty_entries
     }
 }
