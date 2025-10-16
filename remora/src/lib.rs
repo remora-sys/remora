@@ -10,3 +10,4 @@ pub mod metrics;
 pub mod networking;
 pub mod primary;
 pub mod proxy;
+pub mod recovery;

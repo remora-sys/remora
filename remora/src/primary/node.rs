@@ -25,6 +25,7 @@ use crate::{
     executor::api::{Executor, PrimaryToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
+    recovery::EpochLogger,
 };
 
 /// The single machine validator is a simple validator that runs all components.
@@ -133,6 +134,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Single collector task: consume epoch notifications and snapshots directly
         let collector_for_worker = collector.clone();
+        let epoch_logger = EpochLogger::new();
         // Initialize worker pool for deserialization + snapshot processing
         #[derive(Clone)]
         struct SnapshotTask {
@@ -164,13 +166,21 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
+        let collector_logger = epoch_logger.clone();
         let collector_handle = tokio::spawn(async move {
             let collector_inner = collector_for_worker;
+            let logger = collector_logger;
+            let mut last_epoch: Option<crate::checkpoint::EpochId> = None;
             loop {
                 tokio::select! {
                     Some(epoch) = rx_epochs.recv() => {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
                         collector_inner.ensure_epoch(epoch);
+                        if let Some(prev) = last_epoch.take() {
+                            // Prune previous epoch segment upon moving to a new epoch
+                            logger.prune_epoch(prev);
+                        }
+                        last_epoch = Some(epoch);
                     }
                     Some(bytes) = rx_snapshots.recv() => {
                         let _ = snapshot_pool.send_task(SnapshotTask { bytes }).await;
@@ -190,6 +200,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             config.validator_parameters.proxy_mode.clone(),
             metrics.clone(),
             tx_epoch_notify,
+            epoch_logger.clone(),
         )
         .spawn();
         primary_handles.push(load_balancer_handle);

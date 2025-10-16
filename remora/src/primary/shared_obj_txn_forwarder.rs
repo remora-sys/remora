@@ -10,6 +10,7 @@ use crate::{
     },
     metrics::Metrics,
     proxy::core::ProxyId,
+    recovery::{EpochLogger, LogRecord},
 };
 use dashmap::DashMap;
 use rand::Rng;
@@ -33,6 +34,8 @@ where
     pub metrics: Arc<Metrics>,
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
+    pub epoch_logger: Option<Arc<EpochLogger>>,
+    pub current_epoch: crate::checkpoint::EpochId,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -53,20 +56,21 @@ where
 {
     pub(crate) async fn process_version_assignments(
         &mut self,
-        mut shared_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
-        sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(u64, RemoraTransaction<E>)>,
+        sender: Sender<(u64, RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
-        while let Some(transactions) = shared_txn_receiver.recv().await {
-            for mut transaction in transactions {
-                let required_versions = self.assign_shared_object_versions(&mut transaction);
+        while let Some((consensus_index, mut transaction)) = shared_txn_receiver.recv().await {
+            let required_versions = self.assign_shared_object_versions(&mut transaction);
 
-                tracing::debug!(
-                    "Version assignment task received transaction {:?}",
-                    transaction.digest()
-                );
+            tracing::debug!(
+                "Version assignment task received transaction {:?}",
+                transaction.digest()
+            );
 
-                sender.send((transaction, required_versions)).await.unwrap();
-            }
+            sender
+                .send((consensus_index, transaction, required_versions))
+                .await
+                .unwrap();
         }
     }
 
@@ -139,6 +143,8 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     pub(crate) worker_pool: WorkerPool<ForwardingTask<E>>,
+    /// When true, exclude the last proxy index from dispatch (reserved standby)
+    exclude_last_proxy: bool,
 }
 
 /// Task structure for worker threads
@@ -150,6 +156,7 @@ where
     pub transaction: RemoraTransaction<E>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub txn_cnt: usize,
+    pub consensus_index: u64,
 }
 
 impl<E> WorkerTask for ForwardingTask<E>
@@ -160,18 +167,7 @@ where
     type Context = ForwardingContext<E>;
 
     async fn process(self, context: &Self::Context) {
-        SharedObjTxnForwarder::<E>::process_forwarding_task(
-            self,
-            &context.dependency_controller,
-            &context.states_to_proxy,
-            &context.policy,
-            &context.proxy_connections,
-            context.proxy_mode.clone(),
-            &context.metrics,
-            &context.proxy_loads,
-            &context.proxy_access_histories,
-        )
-        .await;
+        SharedObjTxnForwarder::<E>::process_forwarding_task(self, context).await;
     }
 }
 
@@ -192,6 +188,8 @@ where
         metrics: Arc<Metrics>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
+        epoch_logger: Option<Arc<EpochLogger>>,
+        current_epoch: u64,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -202,6 +200,8 @@ where
             metrics: metrics.clone(),
             proxy_loads: proxy_loads.clone(),
             proxy_access_histories: proxy_access_histories.clone(),
+            epoch_logger,
+            current_epoch: crate::checkpoint::EpochId(current_epoch),
         };
 
         let config = WorkerPoolConfig {
@@ -210,23 +210,22 @@ where
         };
         let worker_pool = WorkerPool::new(context, config);
 
-        Self { worker_pool }
+        Self {
+            worker_pool,
+            exclude_last_proxy: true,
+        }
     }
 
     /// Process a single forwarding task
-    async fn process_forwarding_task(
-        task: ForwardingTask<E>,
-        dependency_controller: &Arc<VersionedDependencyController>,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
-        policy: &LoadBalancingPolicy,
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        proxy_mode: ProxyMode,
-        metrics: &Arc<Metrics>,
-        proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
-        proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
-    ) {
+    async fn process_forwarding_task(task: ForwardingTask<E>, context: &ForwardingContext<E>) {
+        let dependency_controller = &context.dependency_controller;
+        let states_to_proxy = &context.states_to_proxy;
+        let policy = &context.policy;
+        let proxy_connections = &context.proxy_connections;
+        let proxy_mode = context.proxy_mode.clone();
+        let metrics = &context.metrics;
+        let proxy_loads = &context.proxy_loads;
+        let proxy_access_histories = &context.proxy_access_histories;
         let (prior_handles, current_handles) = match task.required_versions.is_empty() {
             true => (Vec::new(), Vec::new()),
             false => dependency_controller.get_prior_dependency_and_update(
@@ -260,6 +259,22 @@ where
             proxy_access_histories,
             &txn_duration,
         ) {
+            // Append per-epoch log record when context is available
+            if let Some(logger) = &context.epoch_logger {
+                let epoch = context.current_epoch;
+                let rec = LogRecord {
+                    consensus_index: Some(task.consensus_index),
+                    txn_digest: *transaction_arc.digest(),
+                    destination_proxy: proxy_index,
+                    required_states: Self::clone_required_states(
+                        &task.required_versions,
+                        states_to_proxy.clone(),
+                        proxy_index,
+                    )
+                    .await,
+                };
+                logger.append(epoch, rec);
+            }
             let stateful_missing_states = Self::get_missing_states_for_transaction(
                 &transaction_arc,
                 Some(task.required_versions),
@@ -299,17 +314,38 @@ where
         }
     }
 
+    async fn clone_required_states(
+        required_versions: &[(ObjectID, SequenceNumber)],
+        states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        proxy_index: ExecutorIndex,
+    ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ExecutorIndex>> {
+        let mut required_states = BTreeMap::new();
+        for (object_id, seq_num) in required_versions.iter().cloned() {
+            let previous_owner = states_to_proxy.get(&(object_id, seq_num)).map(|o| *o);
+            let prev = previous_owner.filter(|owner| *owner != proxy_index);
+            required_states.insert((object_id, seq_num), prev);
+        }
+        required_states
+    }
+
     /// Main processing method that distributes transactions to worker threads
     pub(crate) async fn process_shared_txns(
         &mut self,
-        mut shared_txn_receiver: Receiver<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(
+            u64,
+            RemoraTransaction<E>,
+            Vec<(ObjectID, SequenceNumber)>,
+        )>,
     ) {
         let mut txn_cnt = 0;
-        while let Some((transaction, required_versions)) = shared_txn_receiver.recv().await {
+        while let Some((consensus_index, transaction, required_versions)) =
+            shared_txn_receiver.recv().await
+        {
             let task = ForwardingTask {
                 transaction,
                 required_versions,
                 txn_cnt,
+                consensus_index,
             };
 
             if let Err(e) = self.worker_pool.send_task(task).await {
@@ -371,6 +407,20 @@ where
         }
     }
 
+    #[inline]
+    fn effective_proxy_count(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+    ) -> usize {
+        let count = proxy_connections.len();
+        if count > 0 {
+            count - 1
+        } else {
+            0
+        }
+    }
+
     /// Get assigned proxy for shared objects using round-robin.
     fn get_proxy_for_shared_objects_round_robin(
         proxy_connections: &Arc<
@@ -378,7 +428,7 @@ where
         >,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
+        let proxy_count = Self::effective_proxy_count(proxy_connections);
         if proxy_count == 0 {
             return None;
         }
@@ -393,7 +443,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
+        let proxy_count = Self::effective_proxy_count(proxy_connections);
         if proxy_count == 0 {
             return None;
         }
@@ -411,7 +461,7 @@ where
         required_versions: &[(ObjectID, SequenceNumber)],
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
+        let proxy_count = Self::effective_proxy_count(proxy_connections);
         if proxy_count == 0 {
             return None;
         }
@@ -469,7 +519,7 @@ where
         txn_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
+        let proxy_count = Self::effective_proxy_count(proxy_connections);
         if proxy_count == 0 {
             return None;
         }
@@ -507,7 +557,7 @@ where
         txn_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = proxy_connections.len();
+        let proxy_count = Self::effective_proxy_count(proxy_connections);
         if proxy_count == 0 {
             return None;
         }

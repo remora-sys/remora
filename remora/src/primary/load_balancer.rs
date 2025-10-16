@@ -22,6 +22,7 @@ use crate::{
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
+    recovery::EpochLogger,
 };
 
 /// A load balancer is responsible for distributing transactions to proxies.
@@ -45,6 +46,8 @@ pub struct LoadBalancer<E: Executor> {
     epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
     /// Cumulative transactions since last checkpoint
     txns_since_last_epoch: usize,
+    /// In-memory per-epoch transaction logger
+    epoch_logger: Arc<EpochLogger>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -61,6 +64,7 @@ where
         proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
         epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
+        epoch_logger: Arc<EpochLogger>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         Self {
@@ -73,6 +77,7 @@ where
             next_epoch_id: 1,
             epoch_tx,
             txns_since_last_epoch: 0,
+            epoch_logger,
         }
     }
 
@@ -80,16 +85,23 @@ where
     fn initialize_processors(
         &self,
     ) -> (
-        Sender<Vec<RemoraTransaction<E>>>, // owned_txn_sender
-        Sender<Vec<RemoraTransaction<E>>>, // shared_txn_sender
+        Sender<Vec<RemoraTransaction<E>>>,   // owned_txn_sender
+        Sender<(u64, RemoraTransaction<E>)>, // shared_txn_sender with consensus index
     ) {
         // Create channels for transactions
         let (owned_txn_sender, owned_txn_receiver) =
             tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (shared_txn_sender, shared_txn_receiver) =
-            tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
+            tokio::sync::mpsc::channel::<(u64, RemoraTransaction<E>)>(DEFAULT_CHANNEL_SIZE);
         let (version_assignment_sender, version_assignment_receiver) =
-            tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
+            tokio::sync::mpsc::channel::<(
+                u64,
+                RemoraTransaction<E>,
+                Vec<(
+                    sui_types::base_types::ObjectID,
+                    sui_types::base_types::SequenceNumber,
+                )>,
+            )>(DEFAULT_CHANNEL_SIZE);
 
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
@@ -118,6 +130,8 @@ where
             (0..self.proxy_connections.len())
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))
                 .collect(),
+            Some(self.epoch_logger.clone()),
+            self.next_epoch_id,
         );
 
         thread::spawn(move || {
@@ -204,9 +218,12 @@ where
 
                     // Send shared-object transactions to the dedicated task
                     if !shared_txns.is_empty() {
-                        let shared = shared_txns;
-                        if let Err(e) = shared_txn_sender.send(shared).await {
-                            tracing::error!("Failed to send shared transactions: {:?}", e);
+                        // Simulated consensus index (monotonic) per batch
+                        let consensus_index = self.next_epoch_id /* placeholder */ * 1_000_000 + txn_cnt as u64;
+                        for tx in shared_txns {
+                            if let Err(e) = shared_txn_sender.send((consensus_index, tx)).await {
+                                tracing::error!("Failed to send shared transactions: {:?}", e);
+                            }
                         }
                     }
 
