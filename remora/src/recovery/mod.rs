@@ -9,6 +9,9 @@ use sui_types::{
 
 use crate::checkpoint::EpochId;
 
+#[cfg(test)]
+mod test_recovery;
+
 #[derive(Clone, Debug)]
 pub struct LogRecord {
     pub consensus_index: Option<u64>,

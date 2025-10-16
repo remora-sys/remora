@@ -69,6 +69,21 @@ impl StateCollector {
     pub fn merged_state_len(&self) -> usize {
         self.merged_state.len()
     }
+
+    /// Check if an epoch is complete (all proxies have reported snapshots).
+    /// Returns true if the epoch can be acknowledged and pruned.
+    pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
+        self.collecting_snapshots
+            .get(&epoch)
+            .map(|proxies| proxies.len() >= expected_proxies)
+            .unwrap_or(false)
+    }
+
+    /// Mark an epoch as acknowledged and remove it from tracking.
+    pub fn acknowledge_epoch(&self, epoch: EpochId) {
+        self.collecting_snapshots.remove(&epoch);
+        tracing::debug!("Epoch {} acknowledged and removed from tracking", epoch.0);
+    }
 }
 
 #[cfg(test)]

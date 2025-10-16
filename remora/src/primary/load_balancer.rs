@@ -24,7 +24,7 @@ use crate::{
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
-    recovery::EpochLogger,
+    recovery::{EpochLogger, RecoveryCoordinator},
 };
 use sui_types::base_types::{ObjectID, SequenceNumber};
 
@@ -51,6 +51,8 @@ pub struct LoadBalancer<E: Executor> {
     txns_since_last_epoch: usize,
     /// In-memory per-epoch transaction logger
     epoch_logger: Arc<EpochLogger>,
+    /// Recovery coordinator for failure handling
+    recovery_coordinator: Arc<RecoveryCoordinator>,
     /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
     standby_excluded: Arc<AtomicBool>,
     /// Failed proxy id (if any) for gating decisions
@@ -61,6 +63,8 @@ pub struct LoadBalancer<E: Executor> {
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
     /// Reference to the collector for persisted version checks
     collector: Arc<StateCollector>,
+    /// Per-epoch acknowledgment state: Acknowledged | Pending
+    epoch_ack_state: Arc<DashMap<EpochId, bool>>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -82,6 +86,7 @@ where
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
+        let recovery_coordinator = RecoveryCoordinator::new(epoch_logger.clone());
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -93,11 +98,13 @@ where
             epoch_tx,
             txns_since_last_epoch: 0,
             epoch_logger,
+            recovery_coordinator,
             standby_excluded: Arc::new(AtomicBool::new(true)),
             failed_proxy: None,
             grey_queue: Arc::new(dashmap::DashMap::new()),
             states_to_proxy,
             collector,
+            epoch_ack_state: Arc::new(DashMap::new()),
         }
     }
 
@@ -112,6 +119,60 @@ where
         self.failed_proxy = Some(proxy);
         self.grey_queue.entry(proxy).or_insert_with(VecDeque::new);
         tracing::warn!("Failed proxy set to {} for grey gating", proxy);
+    }
+
+    /// Begin recovery for a failed proxy and promote standby.
+    pub fn begin_recovery(&mut self, failed_proxy: ProxyId) -> Option<ProxyId> {
+        // Find the standby proxy (last proxy in connections)
+        let standby_proxy = self
+            .proxy_connections
+            .iter()
+            .map(|entry| *entry.key())
+            .max()
+            .unwrap_or(failed_proxy);
+
+        if standby_proxy != failed_proxy {
+            // Begin recovery process
+            let _replacement = self
+                .recovery_coordinator
+                .begin_recovery(failed_proxy as usize, standby_proxy as usize);
+
+            // Promote standby to active
+            self.promote_standby();
+
+            // Remove failed proxy from connections
+            self.proxy_connections.remove(&failed_proxy);
+
+            tracing::info!(
+                "Recovery begun: failed proxy {} replaced by standby {}",
+                failed_proxy,
+                standby_proxy
+            );
+            Some(standby_proxy)
+        } else {
+            tracing::error!(
+                "No standby proxy available for recovery of proxy {}",
+                failed_proxy
+            );
+            self.metrics
+                .register_error(crate::metrics::ErrorType::TransactionRateTooHigh);
+            None
+        }
+    }
+
+    /// Mark an epoch as acknowledged and prune its log segment.
+    pub fn acknowledge_epoch(&self, epoch: EpochId) {
+        self.epoch_ack_state.insert(epoch, true);
+        self.epoch_logger.prune_epoch(epoch);
+        self.collector.acknowledge_epoch(epoch);
+        tracing::debug!("Epoch {} acknowledged and pruned", epoch.0);
+    }
+
+    /// Check for epoch completion and trigger acknowledgment if ready.
+    pub fn check_epoch_completion(&self, epoch: EpochId, expected_proxies: usize) {
+        if self.collector.is_epoch_complete(epoch, expected_proxies) {
+            self.acknowledge_epoch(epoch);
+        }
     }
 
     /// Clear failed proxy and optionally flush queued transactions.
@@ -134,7 +195,7 @@ where
         }
     }
 
-    /// Determine if a transaction should be buffered due to grey state (scaffold: returns false).
+    /// Determine if a transaction should be buffered due to grey state.
     fn should_buffer_grey(&self, tx: &RemoraTransaction<E>) -> bool {
         // If any required state maps to a currently unavailable proxy, buffer
         for (obj, maybe_ver) in tx.shared_objects().iter() {
@@ -152,6 +213,38 @@ where
             }
         }
         false
+    }
+
+    // Grey unblocking readiness is determined externally when replacement is healthy.
+
+    /// Unblock grey transactions for a proxy that has caught up.
+    pub async fn unblock_grey_transactions(
+        &mut self,
+        proxy: ProxyId,
+        shared_txn_sender: &Sender<(u64, RemoraTransaction<E>)>,
+        consensus_index: u64,
+    ) {
+        if let Some(mut queue) = self.grey_queue.remove(&proxy).map(|(_, v)| v) {
+            let queue_size = queue.len();
+            tracing::info!(
+                "Unblocking {} grey transactions for proxy {}",
+                queue_size,
+                proxy
+            );
+
+            // Update metrics - log unblocking activity
+            tracing::info!(
+                "Unblocked {} grey transactions, queue now empty",
+                queue_size
+            );
+
+            while let Some(tx) = queue.pop_front() {
+                if let Err(e) = shared_txn_sender.send((consensus_index, tx)).await {
+                    tracing::error!("Failed to send unblocked transaction: {:?}", e);
+                    break;
+                }
+            }
+        }
     }
 
     /// Enqueue a transaction into the per-failed-proxy ordered grey queue.
@@ -353,9 +446,15 @@ where
                 let msg = PrimaryToProxyMessage::Checkpoint(epoch);
                 if let Err(_e) = tx.send(msg).await {
                     tracing::warn!("Proxy {} send failed; designating as failed", proxy_id);
-                    // Designate failed: enable grey gating and remove connection
+                    // Designate failed: enable grey gating and begin recovery
                     self.set_failed_proxy(proxy_id);
-                    self.proxy_connections.remove(&proxy_id);
+                    if let Some(replacement) = self.begin_recovery(proxy_id) {
+                        tracing::info!(
+                            "Proxy {} replaced by {} during recovery",
+                            proxy_id,
+                            replacement
+                        );
+                    }
                 }
             }
         }
