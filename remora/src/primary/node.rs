@@ -135,7 +135,8 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             mpsc::channel::<Vec<u8>>(DEFAULT_CHANNEL_SIZE);
 
         // Spawn the state collector task
-        let expected_proxies = config.proxies.len();
+        // Exclude the standby proxy from snapshot collection (same as transaction dispatch)
+        let expected_proxies = config.proxies.len() - 1;
 
         // persistent storage
         /*let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
