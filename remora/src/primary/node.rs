@@ -54,6 +54,12 @@ where
         async move {
             match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
                 Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                    tracing::info!(
+                        "Received snapshot from proxy {} for epoch {}: {} objects",
+                        proxy_id,
+                        epoch.0,
+                        snapshot.len()
+                    );
                     ctx.collector
                         .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
                     // The state collector now handles epoch completion and persist index advancement internally
@@ -206,6 +212,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             let logger = collector_logger;
             let mut pool = snapshot_pool;
             let mut last_epoch: Option<crate::checkpoint::EpochId> = None;
+            tracing::info!("State collector started, waiting for snapshots...");
             loop {
                 tokio::select! {
                     Some(epoch) = rx_epochs.recv() => {
@@ -243,11 +250,15 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         last_epoch = Some(epoch);
                     }
                     Some(bytes) = rx_snapshots.recv() => {
+                        tracing::info!("Received snapshot bytes: {} bytes", bytes.len());
                         let _ = pool
                             .send_task(SnapshotTask { bytes, _phantom: PhantomData })
                             .await;
                     }
-                    else => { break; }
+                    else => {
+                        tracing::warn!("No snapshots received - proxies may not be running!");
+                        break;
+                    }
                 }
             }
             crate::error::NodeResult::Ok(())

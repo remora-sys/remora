@@ -641,7 +641,17 @@ where
     async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
         // Clone keys to avoid holding references while mutating map
         let proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        let proxy_count = proxy_ids.len();
+
         for proxy_id in proxy_ids {
+            // Exclude standby proxy if standby_excluded is true
+            if self.standby_excluded.load(Ordering::SeqCst) && proxy_count > 0 {
+                let last_proxy_index = proxy_count - 1;
+                if proxy_id == last_proxy_index {
+                    continue; // Skip the standby proxy
+                }
+            }
+
             let tx_opt = self
                 .proxy_connections
                 .get(&proxy_id)
