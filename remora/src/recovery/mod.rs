@@ -95,6 +95,30 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// Returns None when all items have been replayed.
     pub fn get_next_replay_batch(&self, failed_proxy: usize) -> Option<Vec<LogRecord<T>>> {
         let dirty_entries = self.drain_dirty_queue(failed_proxy);
+        if dirty_entries.is_empty() {
+            let persist_index = self.get_persist_index();
+            // Emit a brief diagnostic to help understand why replay may stall
+            let mut epoch_counts: Vec<(EpochId, usize)> = Vec::new();
+            for seg in self.logger.segments.iter() {
+                let epoch = *seg.key();
+                let count = seg
+                    .value()
+                    .iter()
+                    .filter(|r| r.destination_proxy == failed_proxy)
+                    .filter(|r| r.consensus_index.map(|i| i >= persist_index).unwrap_or(false))
+                    .count();
+                if count > 0 {
+                    epoch_counts.push((epoch, count));
+                }
+            }
+            tracing::debug!(
+                failed_proxy,
+                persist_index,
+                epochs_with_entries = epoch_counts.len(),
+                ?epoch_counts,
+                "Dirty queue empty for failed proxy; no replay candidates"
+            );
+        }
 
         if dirty_entries.is_empty() {
             return None;

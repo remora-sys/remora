@@ -132,6 +132,19 @@ where
             .unwrap_or(failed_proxy);
 
         if standby_proxy != failed_proxy {
+            // Log dirty queue size and persist index for diagnostics
+            let dq_len = self
+                .recovery_coordinator
+                .drain_dirty_queue(failed_proxy as usize)
+                .len();
+            let persist_index = self.recovery_coordinator.get_persist_index();
+            tracing::info!(
+                failed_proxy,
+                standby_proxy,
+                dirty_queue = dq_len,
+                persist_index,
+                "Beginning recovery: diagnostics before replay"
+            );
             // Begin recovery process
             let _replacement = self
                 .recovery_coordinator
@@ -183,9 +196,19 @@ where
 
         tokio::spawn(async move {
             let mut batch_count = 0;
-            while let Some(batch) =
-                recovery_coordinator.get_next_replay_batch(failed_proxy as usize)
-            {
+            loop {
+                let next = recovery_coordinator.get_next_replay_batch(failed_proxy as usize);
+                if next.is_none() {
+                    let persist_index = recovery_coordinator.get_persist_index();
+                    // Best-effort epoch/segment stats
+                    tracing::info!(
+                        failed_proxy,
+                        persist_index,
+                        "No replay batch available; replay loop exiting"
+                    );
+                    break;
+                }
+                let batch = next.unwrap();
                 batch_count += 1;
                 tracing::info!(
                     "Sending replay batch {} to replacement proxy {} ({} items)",

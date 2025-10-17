@@ -294,6 +294,14 @@ where
                     epoch,
                 };
                 logger.append(epoch, rec);
+                tracing::debug!(
+                    epoch = epoch.0,
+                    consensus_index = task.consensus_index,
+                    proxy_index,
+                    stateless_proxy_id,
+                    txn = ?transaction_arc.digest(),
+                    "Appended LogRecord for txn to epoch log"
+                );
             }
             let stateful_missing_states = Self::get_missing_states_for_transaction(
                 &transaction_arc,
@@ -800,6 +808,10 @@ where
                 );
                 // Stop routing to this proxy by removing its connection entry
                 proxy_connections.remove(&dest_proxy);
+                tracing::warn!(
+                    proxy = dest_proxy,
+                    "Proxy removed from connections due to send failure (no recovery trigger here)"
+                );
             }
         } else {
             tracing::warn!("Proxy connection {} not found", dest_proxy);
