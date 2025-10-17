@@ -108,7 +108,7 @@ impl StateCollector {
             .map(|proxies| {
                 let proxy_count = proxies.len();
                 let complete = proxy_count >= expected_proxies;
-                tracing::debug!(
+                tracing::info!(
                     "Epoch {} completion check: {}/{} proxies, complete: {}",
                     epoch.0,
                     proxy_count,
@@ -118,7 +118,7 @@ impl StateCollector {
                 complete
             })
             .unwrap_or_else(|| {
-                tracing::debug!("Epoch {} not found in collecting_snapshots", epoch.0);
+                tracing::info!("Epoch {} not found in collecting_snapshots", epoch.0);
                 false
             });
         is_complete
