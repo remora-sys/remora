@@ -15,7 +15,7 @@ use crate::{
     config::{LoadBalancingPolicy, ProxyMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
+        api::{ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -120,6 +120,7 @@ where
         self.grey_queue.entry(proxy).or_insert_with(VecDeque::new);
         tracing::warn!("Failed proxy set to {} for grey gating", proxy);
     }
+
 
     /// Begin recovery for a failed proxy and promote standby.
     pub fn begin_recovery(&mut self, failed_proxy: ProxyId) -> Option<ProxyId> {
@@ -356,8 +357,25 @@ where
                 let persisted_ver = self.collector.get_persisted_version(obj);
                 if persisted_ver.map_or(true, |pv| pv < *ver) {
                     if let Some(owner) = self.states_to_proxy.get(&(*obj, *ver)) {
-                        let owner_id = *owner.value();
-                        if !self.proxy_connections.contains_key(&owner_id) {
+                        let owner_index = *owner.value();
+                        // Resolve ExecutorIndex to actual ProxyId
+                        let resolved_proxy_id = self.resolve_executor_index_to_proxy_id(owner_index);
+                        if let Some(proxy_id) = resolved_proxy_id {
+                            if !self.proxy_connections.contains_key(&proxy_id) {
+                                tracing::debug!(
+                                    "Buffering transaction {:?} - state owner proxy {} not available",
+                                    tx.transaction.digest(),
+                                    proxy_id
+                                );
+                                return true;
+                            }
+                        } else {
+                            // ExecutorIndex doesn't resolve to any current proxy - buffer
+                            tracing::debug!(
+                                "Buffering transaction {:?} - state owner index {} not resolvable",
+                                tx.transaction.digest(),
+                                owner_index
+                            );
                             return true;
                         }
                     }
@@ -365,6 +383,13 @@ where
             }
         }
         false
+    }
+
+    /// Resolve ExecutorIndex to ProxyId using the same logic as SharedObjTxnForwarder
+    fn resolve_executor_index_to_proxy_id(&self, idx: usize) -> Option<ProxyId> {
+        let mut keys: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+        keys.get(idx).copied()
     }
 
     // Grey unblocking readiness is determined externally when replacement is healthy.

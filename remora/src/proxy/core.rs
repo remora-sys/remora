@@ -297,7 +297,14 @@ where
 
         for (states, proxy_id) in &required_states {
             if let Some(proxy_id) = proxy_id {
-                assert_ne!(*proxy_id, self.id);
+                if *proxy_id == self.id {
+                    tracing::warn!(
+                        "Proxy {} attempting to request states from itself, skipping request for states: {:?}",
+                        self.id,
+                        states
+                    );
+                    continue;
+                }
                 tracing::debug!(
                     "Proxy {} requesting {} missing states from proxy {}: {:?}",
                     self.id,
