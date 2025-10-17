@@ -53,6 +53,11 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
     pub fn prune_epoch(&self, epoch: EpochId) {
         self.segments.remove(&epoch);
     }
+
+    /// Get all epoch segments for pruning logic.
+    pub fn get_segments(&self) -> &DashMap<EpochId, Vec<LogRecord<T>>> {
+        &self.segments
+    }
 }
 
 /// Minimal recovery coordinator using the in-memory EpochLogger
@@ -72,10 +77,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     }
 
     pub fn new_with_batch_size(logger: Arc<EpochLogger<T>>, batch_size: usize) -> Arc<Self> {
-        Arc::new(Self {
-            logger,
-            batch_size,
-        })
+        Arc::new(Self { logger, batch_size })
     }
 
     /// Begin recovery for a failed proxy. Returns the replacement proxy id to use.
@@ -86,7 +88,11 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
     /// Get the next batch of replay items for a failed proxy.
     /// Returns None when all items have been replayed.
-    pub fn get_next_replay_batch(&self, failed_proxy: usize, persist_index: u64) -> Option<Vec<LogRecord<T>>> {
+    pub fn get_next_replay_batch(
+        &self,
+        failed_proxy: usize,
+        persist_index: u64,
+    ) -> Option<Vec<LogRecord<T>>> {
         let dirty_entries = self.drain_dirty_queue(failed_proxy, persist_index);
         if dirty_entries.is_empty() {
             // Emit a brief diagnostic to help understand why replay may stall
@@ -97,7 +103,11 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                     .value()
                     .iter()
                     .filter(|r| r.destination_proxy == failed_proxy)
-                    .filter(|r| r.consensus_index.map(|i| i >= persist_index).unwrap_or(false))
+                    .filter(|r| {
+                        r.consensus_index
+                            .map(|i| i >= persist_index)
+                            .unwrap_or(false)
+                    })
                     .count();
                 if count > 0 {
                     epoch_counts.push((epoch, count));
@@ -127,7 +137,10 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     }
 
     /// Get the current primary persist index (replay cut) from the state collector.
-    pub fn get_persist_index(&self, state_collector: &crate::checkpoint::state_collector::StateCollector) -> u64 {
+    pub fn get_persist_index(
+        &self,
+        state_collector: &crate::checkpoint::state_collector::StateCollector,
+    ) -> u64 {
         state_collector.get_persist_index()
     }
 
@@ -159,6 +172,8 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             let records = epoch_entry.value();
 
             // Filter for failed proxy and consensus_index >= persist_index
+            // Note: We use >= because persist_index represents the last fully acknowledged index,
+            // so we need to replay transactions at and after that point
             let epoch_entries: Vec<LogRecord<T>> = records
                 .iter()
                 .filter(|r| r.destination_proxy == failed_proxy)

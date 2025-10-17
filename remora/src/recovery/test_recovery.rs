@@ -3,8 +3,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::checkpoint::EpochId;
     use crate::checkpoint::state_collector::StateCollector;
+    use crate::checkpoint::EpochId;
     use crate::executor::api::{ExecutableTransaction, TransactionWithTimestamp};
     use crate::recovery::{EpochLogger, LogRecord, RecoveryCoordinator};
     use std::collections::BTreeMap;

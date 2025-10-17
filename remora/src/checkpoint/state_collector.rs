@@ -37,6 +37,7 @@ impl StateCollector {
         proxy_id: crate::proxy::core::ProxyId,
         epoch: EpochId,
         snapshot: EpochObjectStates,
+        expected_proxies: usize,
     ) {
         // Upsert per-epoch snapshots and global merged state concurrently-safe
         let epoch_entry = self
@@ -57,6 +58,19 @@ impl StateCollector {
         }
 
         epoch_entry.insert(proxy_id);
+
+        // Check if epoch is complete and advance persist index if so
+        if self.is_epoch_complete(epoch, expected_proxies) {
+            // The consensus index should be the current persist index + 1
+            let current_persist_index = self.get_persist_index();
+            let consensus_index = current_persist_index + 1;
+            self.acknowledge_epoch(epoch, consensus_index);
+            tracing::info!(
+                "Epoch {} completed and acknowledged, persist index updated to {}",
+                epoch.0,
+                consensus_index
+            );
+        }
     }
 
     /// Get an object from the in-memory store.
@@ -145,7 +159,7 @@ mod tests {
         snapshot.insert(obj_id2, obj2);
 
         // Process snapshot from proxy 1
-        collector.process_snapshot(1, EpochId(5), snapshot.clone());
+        collector.process_snapshot(1, EpochId(5), snapshot.clone(), 2);
         assert_eq!(
             collector
                 .collecting_snapshots
@@ -158,7 +172,7 @@ mod tests {
         assert_eq!(collector.merged_state_len(), 2);
 
         // Process snapshot from proxy 2
-        collector.process_snapshot(2, EpochId(5), snapshot);
+        collector.process_snapshot(2, EpochId(5), snapshot, 2);
         assert_eq!(
             collector
                 .collecting_snapshots
@@ -176,7 +190,7 @@ mod tests {
 
         // Process snapshot for epoch 6 as well (out of order is allowed, but completion is ordered)
         let snapshot = EpochObjectStates::new();
-        collector.process_snapshot(1, EpochId(6), snapshot);
+        collector.process_snapshot(1, EpochId(6), snapshot, 2);
 
         // Epochs should be present
         assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
@@ -189,7 +203,7 @@ mod tests {
 
         // Process snapshot without starting epoch - should create epoch entry
         let snapshot = EpochObjectStates::new();
-        collector.process_snapshot(1, EpochId(5), snapshot);
+        collector.process_snapshot(1, EpochId(5), snapshot, 2);
 
         // Should have buffered epoch 5
         assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
@@ -221,8 +235,8 @@ mod tests {
         snapshot2.insert(obj_id3, obj3);
 
         // Process both snapshots
-        collector.process_snapshot(1, EpochId(5), snapshot1);
-        collector.process_snapshot(2, EpochId(5), snapshot2);
+        collector.process_snapshot(1, EpochId(5), snapshot1, 2);
+        collector.process_snapshot(2, EpochId(5), snapshot2, 2);
 
         // Epoch should have two proxies recorded
         assert_eq!(

@@ -54,7 +54,10 @@ where
         async move {
             match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
                 Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                    ctx.collector.process_snapshot(proxy_id, epoch, snapshot);
+                    ctx.collector
+                        .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
+                    // The state collector now handles epoch completion and persist index advancement internally
+                    // We still need to prune the epoch logger
                     if let Some(set) = ctx.collector.collecting_snapshots.get(&epoch) {
                         if set.len() >= ctx.expected_proxies {
                             ctx.logger.prune_epoch(epoch);
@@ -186,14 +189,13 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                 expected_proxies,
             });
 
-        let snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> =
-            WorkerPool::new(
-                collector_ctx.clone(),
-                WorkerPoolConfig {
-                    num_workers: Some(4),
-                    ..Default::default()
-                },
-            );
+        let snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> = WorkerPool::new(
+            collector_ctx.clone(),
+            WorkerPoolConfig {
+                num_workers: Some(4),
+                ..Default::default()
+            },
+        );
 
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
@@ -209,8 +211,33 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
                         collector_inner.ensure_epoch(epoch);
                         if let Some(prev) = last_epoch.take() {
-                            // Prune previous epoch segment upon moving to a new epoch
-                            logger.prune_epoch(prev);
+                            // Only prune previous epoch if it's been fully persisted
+                            // Check if the previous epoch's records are all below the current persist_index
+                            let current_persist_index = collector_inner.get_persist_index();
+                            let should_prune = logger.get_epoch(prev)
+                                .map(|records| {
+                                    records.iter().all(|record| {
+                                        record.consensus_index
+                                            .map(|idx| idx < current_persist_index)
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(true); // If epoch doesn't exist, it's safe to prune
+
+                            if should_prune {
+                                logger.prune_epoch(prev);
+                                tracing::debug!(
+                                    "Pruned epoch {} (all records below persist_index {})",
+                                    prev.0,
+                                    current_persist_index
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Skipped pruning epoch {} (some records >= persist_index {})",
+                                    prev.0,
+                                    current_persist_index
+                                );
+                            }
                         }
                         last_epoch = Some(epoch);
                     }

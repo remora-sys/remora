@@ -15,7 +15,10 @@ use crate::{
     config::{LoadBalancingPolicy, ProxyMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
+        api::{
+            ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
+            RemoraTransaction, Store,
+        },
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -63,8 +66,6 @@ pub struct LoadBalancer<E: Executor> {
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
     /// Reference to the collector for persisted version checks
     collector: Arc<StateCollector>,
-    /// Per-epoch acknowledgment state: Acknowledged | Pending
-    epoch_ack_state: Arc<DashMap<EpochId, bool>>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -104,7 +105,6 @@ where
             grey_queue: Arc::new(dashmap::DashMap::new()),
             states_to_proxy,
             collector,
-            epoch_ack_state: Arc::new(DashMap::new()),
         }
     }
 
@@ -120,7 +120,6 @@ where
         self.grey_queue.entry(proxy).or_insert_with(VecDeque::new);
         tracing::warn!("Failed proxy set to {} for grey gating", proxy);
     }
-
 
     /// Begin recovery for a failed proxy and promote standby.
     pub fn begin_recovery(&mut self, failed_proxy: ProxyId) -> Option<ProxyId> {
@@ -219,8 +218,10 @@ where
             );
             let mut batch_count = 0;
             loop {
+                // Always get the latest persist_index to ensure we don't miss newer transactions
                 let persist_index = collector.get_persist_index();
-                let next = recovery_coordinator.get_next_replay_batch(failed_proxy as usize, persist_index);
+                let next = recovery_coordinator
+                    .get_next_replay_batch(failed_proxy as usize, persist_index);
                 if next.is_none() {
                     // Best-effort epoch/segment stats
                     tracing::info!(
@@ -303,29 +304,52 @@ where
         });
     }
 
-    /// Mark an epoch as acknowledged and prune its log segment.
-    pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
-        self.epoch_ack_state.insert(epoch, true);
-        self.epoch_logger.prune_epoch(epoch);
-        // Advance persist index in the collector
-        self.collector.acknowledge_epoch(epoch, consensus_index);
-        tracing::debug!(
-            "Epoch {} acknowledged and pruned, persist index updated to {}",
-            epoch.0,
-            consensus_index
-        );
-    }
+    /// Prune epoch logger based on current persist index from state collector.
+    /// This should be called periodically to clean up old epoch logs.
+    pub fn prune_epoch_logger(&self) {
+        let current_persist_index = self.collector.get_persist_index();
 
-    /// Check for epoch completion and trigger acknowledgment if ready.
-    pub fn check_epoch_completion(
-        &self,
-        epoch: EpochId,
-        expected_proxies: usize,
-        consensus_index: u64,
-    ) {
-        if self.collector.is_epoch_complete(epoch, expected_proxies) {
-            self.acknowledge_epoch(epoch, consensus_index);
+        // Collect epochs to prune - only prune epochs where all records have consensus_index < persist_index
+        let epochs_to_prune: Vec<crate::checkpoint::EpochId> = self
+            .epoch_logger
+            .get_segments()
+            .iter()
+            .filter_map(|entry| {
+                let epoch = *entry.key();
+                let records = entry.value();
+
+                // Check if all records in this epoch are below the persist_index
+                let all_below_persist = records.iter().all(|record| {
+                    record
+                        .consensus_index
+                        .map(|idx| idx < current_persist_index)
+                        .unwrap_or(false) // If no consensus_index, don't prune
+                });
+
+                if all_below_persist && !records.is_empty() {
+                    Some(epoch)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Prune the identified epochs
+        let pruned_count = epochs_to_prune.len();
+        for epoch in epochs_to_prune {
+            self.epoch_logger.prune_epoch(epoch);
+            tracing::debug!(
+                "Pruned epoch {} (all records below persist_index {})",
+                epoch.0,
+                current_persist_index
+            );
         }
+
+        tracing::debug!(
+            "Epoch logger pruning completed. Persist index: {}, pruned {} epochs",
+            current_persist_index,
+            pruned_count
+        );
     }
 
     /// Clear failed proxy and optionally flush queued transactions.
@@ -359,7 +383,8 @@ where
                     if let Some(owner) = self.states_to_proxy.get(&(*obj, *ver)) {
                         let owner_index = *owner.value();
                         // Resolve ExecutorIndex to actual ProxyId
-                        let resolved_proxy_id = self.resolve_executor_index_to_proxy_id(owner_index);
+                        let resolved_proxy_id =
+                            self.resolve_executor_index_to_proxy_id(owner_index);
                         if let Some(proxy_id) = resolved_proxy_id {
                             if !self.proxy_connections.contains_key(&proxy_id) {
                                 tracing::debug!(
