@@ -154,7 +154,9 @@ where
             self.promote_standby();
 
             // Remove failed proxy from connections
-            self.proxy_connections.remove(&failed_proxy);
+            tracing::info!(failed_proxy, "Attempting to remove failed proxy connection");
+            let removed = self.proxy_connections.remove(&failed_proxy).is_some();
+            tracing::info!(failed_proxy, removed, "Failed proxy removal result");
 
             tracing::info!(
                 "Recovery begun: failed proxy {} replaced by standby {}",
@@ -163,7 +165,16 @@ where
             );
 
             // Start replay process for the replacement proxy
+            let replacement_present = self.proxy_connections.contains_key(&standby_proxy);
+            let conn_count = self.proxy_connections.len();
+            tracing::info!(
+                standby_proxy,
+                replacement_present,
+                conn_count,
+                "Replay initiation precheck: replacement presence and connection count"
+            );
             self.start_replay_process(failed_proxy, standby_proxy);
+            tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
         } else {
@@ -195,6 +206,11 @@ where
         let collector = self.collector.clone();
 
         tokio::spawn(async move {
+            tracing::info!(
+                failed_proxy,
+                replacement_proxy,
+                "Replay task spawned for failed proxy"
+            );
             let mut batch_count = 0;
             loop {
                 let next = recovery_coordinator.get_next_replay_batch(failed_proxy as usize);
