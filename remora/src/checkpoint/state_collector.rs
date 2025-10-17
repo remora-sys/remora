@@ -1,5 +1,6 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
 use dashmap::{DashMap, DashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
 use tracing::debug;
@@ -10,6 +11,8 @@ pub struct StateCollector {
     pub collecting_snapshots: DashMap<EpochId, DashSet<crate::proxy::core::ProxyId>>,
     /// In-memory latest object states (no disk persistence)
     pub merged_state: DashMap<ObjectID, Object>,
+    /// Primary-level persist index: last fully acknowledged epoch's consensus index
+    persist_index: AtomicU64,
 }
 
 impl StateCollector {
@@ -17,6 +20,7 @@ impl StateCollector {
         Self {
             collecting_snapshots: DashMap::new(),
             merged_state: DashMap::new(),
+            persist_index: AtomicU64::new(0),
         }
     }
 
@@ -79,10 +83,20 @@ impl StateCollector {
             .unwrap_or(false)
     }
 
-    /// Mark an epoch as acknowledged and remove it from tracking.
-    pub fn acknowledge_epoch(&self, epoch: EpochId) {
+    /// Mark an epoch as acknowledged, advance persist index, and remove it from tracking.
+    pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
+        self.persist_index.store(consensus_index, Ordering::SeqCst);
         self.collecting_snapshots.remove(&epoch);
-        tracing::debug!("Epoch {} acknowledged and removed from tracking", epoch.0);
+        tracing::debug!(
+            "Epoch {} acknowledged; persist index advanced to {}",
+            epoch.0,
+            consensus_index
+        );
+    }
+
+    /// Get the current primary persist index (replay cut).
+    pub fn get_persist_index(&self) -> u64 {
+        self.persist_index.load(Ordering::SeqCst)
     }
 }
 

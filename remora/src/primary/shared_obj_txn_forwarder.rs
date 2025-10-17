@@ -176,6 +176,18 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    #[inline]
+    fn resolve_proxy_id(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        idx: ExecutorIndex,
+    ) -> Option<ProxyId> {
+        // Map positional index to the nth key in the current connections snapshot
+        let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+        keys.get(idx).copied()
+    }
     /// Create a new SharedObjTxnForwarder with worker pool
     pub(crate) fn new(
         dependency_controller: Arc<VersionedDependencyController>,
@@ -277,18 +289,22 @@ where
                     }
                 }
             }
+            // Resolve proxy ids to actual connection keys
+            let resolved_stateful = Self::resolve_proxy_id(proxy_connections, proxy_index);
+            let resolved_stateless = Self::resolve_proxy_id(proxy_connections, stateless_proxy_id);
+
             // Append per-epoch log record when context is available
-            if let Some(logger) = &context.epoch_logger {
+            if let (Some(logger), Some(dest_pid)) = (&context.epoch_logger, resolved_stateful) {
                 let epoch = context.current_epoch;
                 let rec = LogRecord {
                     consensus_index: Some(task.consensus_index),
                     txn_digest: *transaction_arc.digest(),
                     transaction: transaction_arc.clone(),
-                    destination_proxy: proxy_index,
+                    destination_proxy: dest_pid,
                     required_states: Self::clone_required_states(
                         &task.required_versions,
                         states_to_proxy.clone(),
-                        proxy_index,
+                        dest_pid,
                     )
                     .await,
                     epoch,
@@ -297,8 +313,8 @@ where
                 tracing::debug!(
                     epoch = epoch.0,
                     consensus_index = task.consensus_index,
-                    proxy_index,
-                    stateless_proxy_id,
+                    dest_proxy = dest_pid,
+                    stateless = resolved_stateless.unwrap_or(usize::MAX),
                     txn = ?transaction_arc.digest(),
                     "Appended LogRecord for txn to epoch log"
                 );
@@ -314,21 +330,42 @@ where
             if proxy_mode == ProxyMode::Separation {
                 let stateless_msg =
                     PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
-                Self::send_to_proxy(proxy_connections, stateless_proxy_id, stateless_msg).await;
+                if let Some(stateless_pid) = resolved_stateless {
+                    Self::send_to_proxy(proxy_connections, stateless_pid, stateless_msg).await;
+                } else {
+                    tracing::warn!(
+                        idx = stateless_proxy_id,
+                        "Stateless proxy index did not resolve to a live proxy"
+                    );
+                }
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
                     Arc::clone(&transaction_arc),
-                    stateless_proxy_id,
+                    resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states,
                 );
-                Self::send_to_proxy(proxy_connections, proxy_index, stateful_msg).await;
+                if let Some(stateful_pid) = resolved_stateful {
+                    Self::send_to_proxy(proxy_connections, stateful_pid, stateful_msg).await;
+                } else {
+                    tracing::warn!(
+                        idx = proxy_index,
+                        "Stateful proxy index did not resolve to a live proxy"
+                    );
+                }
             } else {
                 let stateful_msg = PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
-                    stateless_proxy_id,
+                    resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states,
                 );
-                Self::send_to_proxy(proxy_connections, proxy_index, stateful_msg).await;
+                if let Some(stateful_pid) = resolved_stateful {
+                    Self::send_to_proxy(proxy_connections, stateful_pid, stateful_msg).await;
+                } else {
+                    tracing::warn!(
+                        idx = proxy_index,
+                        "Combined proxy index did not resolve to a live proxy"
+                    );
+                }
             }
 
             metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");

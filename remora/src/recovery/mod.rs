@@ -1,8 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use sui_types::{
@@ -62,8 +59,6 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
 #[derive(Default)]
 pub struct RecoveryCoordinator<T: ExecutableTransaction + Clone> {
     logger: Arc<EpochLogger<T>>,
-    /// Primary-level persist index: last fully acknowledged epoch's consensus index
-    primary_persist_index: AtomicU64,
     /// Default batch size for replay batches
     batch_size: usize,
 }
@@ -72,7 +67,6 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     pub fn new(logger: Arc<EpochLogger<T>>) -> Arc<Self> {
         Arc::new(Self {
             logger,
-            primary_persist_index: AtomicU64::new(0),
             batch_size: 10, // Default batch size
         })
     }
@@ -80,7 +74,6 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     pub fn new_with_batch_size(logger: Arc<EpochLogger<T>>, batch_size: usize) -> Arc<Self> {
         Arc::new(Self {
             logger,
-            primary_persist_index: AtomicU64::new(0),
             batch_size,
         })
     }
@@ -93,10 +86,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
     /// Get the next batch of replay items for a failed proxy.
     /// Returns None when all items have been replayed.
-    pub fn get_next_replay_batch(&self, failed_proxy: usize) -> Option<Vec<LogRecord<T>>> {
-        let dirty_entries = self.drain_dirty_queue(failed_proxy);
+    pub fn get_next_replay_batch(&self, failed_proxy: usize, persist_index: u64) -> Option<Vec<LogRecord<T>>> {
+        let dirty_entries = self.drain_dirty_queue(failed_proxy, persist_index);
         if dirty_entries.is_empty() {
-            let persist_index = self.get_persist_index();
             // Emit a brief diagnostic to help understand why replay may stall
             let mut epoch_counts: Vec<(EpochId, usize)> = Vec::new();
             for seg in self.logger.segments.iter() {
@@ -134,15 +126,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         }
     }
 
-    /// Get the current primary persist index (replay cut).
-    pub fn get_persist_index(&self) -> u64 {
-        self.primary_persist_index.load(Ordering::SeqCst)
-    }
-
-    /// Update the primary persist index when an epoch is acknowledged.
-    pub fn update_persist_index(&self, consensus_index: u64) {
-        self.primary_persist_index
-            .store(consensus_index, Ordering::SeqCst);
+    /// Get the current primary persist index (replay cut) from the state collector.
+    pub fn get_persist_index(&self, state_collector: &crate::checkpoint::state_collector::StateCollector) -> u64 {
+        state_collector.get_persist_index()
     }
 
     /// Collect replay items for a proxy from a given cut (inclusive) within an epoch.
@@ -164,8 +150,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
     /// Collect dirty queue entries for a failed proxy from all pending epochs.
     /// This implements the union described in the failure recovery plan.
-    pub fn drain_dirty_queue(&self, failed_proxy: usize) -> Vec<LogRecord<T>> {
-        let persist_index = self.get_persist_index();
+    pub fn drain_dirty_queue(&self, failed_proxy: usize, persist_index: u64) -> Vec<LogRecord<T>> {
         let mut dirty_entries = Vec::new();
 
         // Collect from all epochs in the logger

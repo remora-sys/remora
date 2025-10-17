@@ -133,11 +133,11 @@ where
 
         if standby_proxy != failed_proxy {
             // Log dirty queue size and persist index for diagnostics
+            let persist_index = self.collector.get_persist_index();
             let dq_len = self
                 .recovery_coordinator
-                .drain_dirty_queue(failed_proxy as usize)
+                .drain_dirty_queue(failed_proxy as usize, persist_index)
                 .len();
-            let persist_index = self.recovery_coordinator.get_persist_index();
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
@@ -198,8 +198,9 @@ where
         &self,
         failed_proxy: ProxyId,
     ) -> Option<Vec<crate::recovery::LogRecord<E::Transaction>>> {
+        let persist_index = self.collector.get_persist_index();
         self.recovery_coordinator
-            .get_next_replay_batch(failed_proxy as usize)
+            .get_next_replay_batch(failed_proxy as usize, persist_index)
     }
 
     /// Start the replay process for a replacement proxy.
@@ -217,9 +218,9 @@ where
             );
             let mut batch_count = 0;
             loop {
-                let next = recovery_coordinator.get_next_replay_batch(failed_proxy as usize);
+                let persist_index = collector.get_persist_index();
+                let next = recovery_coordinator.get_next_replay_batch(failed_proxy as usize, persist_index);
                 if next.is_none() {
-                    let persist_index = recovery_coordinator.get_persist_index();
                     // Best-effort epoch/segment stats
                     tracing::info!(
                         failed_proxy,
@@ -305,10 +306,8 @@ where
     pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
         self.epoch_ack_state.insert(epoch, true);
         self.epoch_logger.prune_epoch(epoch);
-        self.collector.acknowledge_epoch(epoch);
-        // Update primary persist index
-        self.recovery_coordinator
-            .update_persist_index(consensus_index);
+        // Advance persist index in the collector
+        self.collector.acknowledge_epoch(epoch, consensus_index);
         tracing::debug!(
             "Epoch {} acknowledged and pruned, persist index updated to {}",
             epoch.0,
@@ -517,6 +516,7 @@ where
         let (owned_txn_sender, shared_txn_sender) = self.initialize_processors();
 
         let mut txn_cnt = 0;
+        let mut _last_consensus_index: u64 = 0;
         loop {
             tokio::select! {
                 Some(transactions) = self.rx_committed_txns.recv() => {
@@ -554,6 +554,7 @@ where
                     if !shared_txns.is_empty() {
                         // Simulated consensus index (monotonic) per batch
                         let consensus_index = self.next_epoch_id /* placeholder */ * 1_000_000 + txn_cnt as u64;
+                        _last_consensus_index = consensus_index;
                         for tx in shared_txns {
                             // Optionally buffer grey-state transactions
                             if self.should_buffer_grey(&tx) {

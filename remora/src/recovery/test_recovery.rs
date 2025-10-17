@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod tests {
     use crate::checkpoint::EpochId;
+    use crate::checkpoint::state_collector::StateCollector;
     use crate::executor::api::{ExecutableTransaction, TransactionWithTimestamp};
     use crate::recovery::{EpochLogger, LogRecord, RecoveryCoordinator};
     use std::collections::BTreeMap;
@@ -77,18 +78,19 @@ mod tests {
     fn test_recovery_coordinator_basic_operations() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger);
+        let state_collector = StateCollector::new(3);
 
         // Test begin recovery
         let replacement = coordinator.begin_recovery(0, 1);
         assert_eq!(replacement, 1);
 
         // Test persist index (starts at 0)
-        let persist_index = coordinator.get_persist_index();
+        let persist_index = coordinator.get_persist_index(&state_collector);
         assert_eq!(persist_index, 0);
 
         // Test update persist index
-        coordinator.update_persist_index(100);
-        let updated_persist_index = coordinator.get_persist_index();
+        state_collector.acknowledge_epoch(EpochId(1), 100);
+        let updated_persist_index = coordinator.get_persist_index(&state_collector);
         assert_eq!(updated_persist_index, 100);
     }
 
@@ -144,9 +146,10 @@ mod tests {
     fn test_recovery_coordinator_drain_dirty_queue() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
 
         // Set persist index to 120
-        coordinator.update_persist_index(120);
+        state_collector.acknowledge_epoch(EpochId(1), 120);
 
         // Add records to different epochs
         let epoch1 = EpochId(1);
@@ -184,12 +187,13 @@ mod tests {
         logger.append(epoch2, record3);
 
         // Test draining dirty queue for proxy 0
-        let dirty_queue = coordinator.drain_dirty_queue(0);
+        let persist_index = state_collector.get_persist_index();
+        let dirty_queue = coordinator.drain_dirty_queue(0, persist_index);
         assert_eq!(dirty_queue.len(), 1); // Only record2 should match (proxy 0, index >= 120)
         assert_eq!(dirty_queue[0].consensus_index, Some(150));
 
         // Test draining for proxy 1
-        let dirty_queue_1 = coordinator.drain_dirty_queue(1);
+        let dirty_queue_1 = coordinator.drain_dirty_queue(1, persist_index);
         assert_eq!(dirty_queue_1.len(), 1); // Only record3 should match (proxy 1, index >= 120)
         assert_eq!(dirty_queue_1[0].consensus_index, Some(200));
     }
@@ -233,6 +237,7 @@ mod tests {
     fn test_recovery_coordinator_batch_processing() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new_with_batch_size(logger.clone(), 3);
+        let state_collector = StateCollector::new(3);
         let epoch = EpochId(1);
 
         // Add more records than batch size
@@ -249,22 +254,23 @@ mod tests {
         }
 
         // Set persist index to 100
-        coordinator.update_persist_index(100);
+        state_collector.acknowledge_epoch(EpochId(1), 100);
 
         // Test that get_next_replay_batch returns batches
-        let batch1 = coordinator.get_next_replay_batch(0);
+        let persist_index = state_collector.get_persist_index();
+        let batch1 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch1.is_some());
         assert!(batch1.unwrap().len() <= 3); // Should be limited by batch_size
 
-        let batch2 = coordinator.get_next_replay_batch(0);
+        let batch2 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch2.is_some());
         assert!(batch2.unwrap().len() <= 3); // Should be limited by batch_size
 
-        let batch3 = coordinator.get_next_replay_batch(0);
+        let batch3 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch3.is_some());
         assert!(batch3.unwrap().len() <= 3); // Should be limited by batch_size
 
-        let batch4 = coordinator.get_next_replay_batch(0);
+        let batch4 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch4.is_some());
         assert!(batch4.unwrap().len() <= 3); // Should be limited by batch_size
     }
@@ -273,9 +279,10 @@ mod tests {
     fn test_recovery_coordinator_empty_dirty_queue() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
 
         // Set persist index high
-        coordinator.update_persist_index(1000);
+        state_collector.acknowledge_epoch(EpochId(1), 1000);
 
         // Add records below persist index
         let epoch = EpochId(1);
@@ -290,7 +297,8 @@ mod tests {
         logger.append(epoch, record);
 
         // Should return empty dirty queue
-        let dirty_queue = coordinator.drain_dirty_queue(0);
+        let persist_index = state_collector.get_persist_index();
+        let dirty_queue = coordinator.drain_dirty_queue(0, persist_index);
         assert!(dirty_queue.is_empty());
     }
 
@@ -298,9 +306,10 @@ mod tests {
     fn test_recovery_coordinator_mixed_proxy_epochs() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
 
         // Set persist index
-        coordinator.update_persist_index(150);
+        state_collector.acknowledge_epoch(EpochId(1), 150);
 
         // Add records to different epochs and proxies
         let epoch1 = EpochId(1);
@@ -341,14 +350,15 @@ mod tests {
         logger.append(epoch2, record3);
 
         // Test draining for proxy 0 (should get records from both epochs)
-        let dirty_queue_0 = coordinator.drain_dirty_queue(0);
+        let persist_index = state_collector.get_persist_index();
+        let dirty_queue_0 = coordinator.drain_dirty_queue(0, persist_index);
         assert_eq!(dirty_queue_0.len(), 2);
         // Order may vary, so check both possible orders
         let indices: Vec<Option<u64>> = dirty_queue_0.iter().map(|r| r.consensus_index).collect();
         assert!(indices.contains(&Some(200)) && indices.contains(&Some(300)));
 
         // Test draining for proxy 1 (should get record from epoch 1 only)
-        let dirty_queue_1 = coordinator.drain_dirty_queue(1);
+        let dirty_queue_1 = coordinator.drain_dirty_queue(1, persist_index);
         assert_eq!(dirty_queue_1.len(), 1);
         assert_eq!(dirty_queue_1[0].consensus_index, Some(250));
     }
@@ -357,6 +367,7 @@ mod tests {
     fn test_recovery_coordinator_consensus_index_filtering() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
         let epoch = EpochId(1);
 
         // Add records with different consensus indices
@@ -380,7 +391,7 @@ mod tests {
         }
 
         // Set persist index to 100
-        coordinator.update_persist_index(100);
+        state_collector.acknowledge_epoch(EpochId(1), 100);
 
         // Test collect_replay_set with different from_index values
         let replay_set_50 = coordinator.collect_replay_set(epoch, 50, 0);
@@ -393,14 +404,15 @@ mod tests {
         assert_eq!(replay_set_200.len(), 0); // no records
 
         // Test drain_dirty_queue for proxy 0
-        let dirty_queue_0 = coordinator.drain_dirty_queue(0);
+        let persist_index = state_collector.get_persist_index();
+        let dirty_queue_0 = coordinator.drain_dirty_queue(0, persist_index);
         assert_eq!(dirty_queue_0.len(), 2); // indices 100 and 150
                                             // Verify the indices are correct (order may vary)
         let indices_0: Vec<Option<u64>> = dirty_queue_0.iter().map(|r| r.consensus_index).collect();
         assert!(indices_0.contains(&Some(100)) && indices_0.contains(&Some(150)));
 
         // Test drain_dirty_queue for proxy 1
-        let dirty_queue_1 = coordinator.drain_dirty_queue(1);
+        let dirty_queue_1 = coordinator.drain_dirty_queue(1, persist_index);
         assert_eq!(dirty_queue_1.len(), 1); // index 200
     }
 
@@ -408,6 +420,7 @@ mod tests {
     fn test_recovery_coordinator_none_consensus_index() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
         let epoch = EpochId(1);
 
         // Add records with None consensus_index
@@ -425,7 +438,8 @@ mod tests {
         let replay_set = coordinator.collect_replay_set(epoch, 0, 0);
         assert!(replay_set.is_empty());
 
-        let dirty_queue = coordinator.drain_dirty_queue(0);
+        let persist_index = state_collector.get_persist_index();
+        let dirty_queue = coordinator.drain_dirty_queue(0, persist_index);
         assert!(dirty_queue.is_empty());
     }
 
@@ -461,17 +475,18 @@ mod tests {
     fn test_recovery_coordinator_persist_index_updates() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
+        let state_collector = StateCollector::new(3);
 
         // Initial persist index should be 0
-        assert_eq!(coordinator.get_persist_index(), 0);
+        assert_eq!(coordinator.get_persist_index(&state_collector), 0);
 
         // Update persist index
-        coordinator.update_persist_index(500);
-        assert_eq!(coordinator.get_persist_index(), 500);
+        state_collector.acknowledge_epoch(EpochId(1), 500);
+        assert_eq!(coordinator.get_persist_index(&state_collector), 500);
 
         // Update again
-        coordinator.update_persist_index(1000);
-        assert_eq!(coordinator.get_persist_index(), 1000);
+        state_collector.acknowledge_epoch(EpochId(2), 1000);
+        assert_eq!(coordinator.get_persist_index(&state_collector), 1000);
     }
 
     #[test]
@@ -503,6 +518,7 @@ mod tests {
     fn test_recovery_coordinator_custom_batch_size() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new_with_batch_size(logger.clone(), 5);
+        let state_collector = StateCollector::new(3);
         let epoch = EpochId(1);
 
         // Add 12 records
@@ -518,22 +534,23 @@ mod tests {
             logger.append(epoch, record);
         }
 
-        coordinator.update_persist_index(100);
+        state_collector.acknowledge_epoch(EpochId(1), 100);
 
         // Test that get_next_replay_batch returns batches
-        let batch1 = coordinator.get_next_replay_batch(0);
+        let persist_index = state_collector.get_persist_index();
+        let batch1 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch1.is_some());
         assert!(batch1.unwrap().len() <= 5); // Should be limited by batch_size
 
-        let batch2 = coordinator.get_next_replay_batch(0);
+        let batch2 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch2.is_some());
         assert!(batch2.unwrap().len() <= 5); // Should be limited by batch_size
 
-        let batch3 = coordinator.get_next_replay_batch(0);
+        let batch3 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch3.is_some());
         assert!(batch3.unwrap().len() <= 5); // Should be limited by batch_size
 
-        let batch4 = coordinator.get_next_replay_batch(0);
+        let batch4 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch4.is_some());
         assert!(batch4.unwrap().len() <= 5); // Should be limited by batch_size
     }
