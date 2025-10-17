@@ -803,15 +803,11 @@ where
                 tracing::debug!("Sent transaction to proxy {}", dest_proxy);
             } else {
                 tracing::warn!(
-                    "Failed to send to proxy {}. Marking as failed and removing.",
+                    "Failed to send to proxy {}. Not removing here; load balancer will handle recovery.",
                     dest_proxy
                 );
-                // Stop routing to this proxy by removing its connection entry
-                proxy_connections.remove(&dest_proxy);
-                tracing::warn!(
-                    proxy = dest_proxy,
-                    "Proxy removed from connections due to send failure (no recovery trigger here)"
-                );
+                // Do not remove here to avoid races with load balancer coordinated recovery.
+                // Load balancer will handle designation and removal during checkpoint/recovery.
             }
         } else {
             tracing::warn!("Proxy connection {} not found", dest_proxy);

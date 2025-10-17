@@ -156,7 +156,11 @@ where
             // Remove failed proxy from connections
             tracing::info!(failed_proxy, "Attempting to remove failed proxy connection");
             let removed = self.proxy_connections.remove(&failed_proxy).is_some();
-            tracing::info!(failed_proxy, removed, "Failed proxy removal result");
+            tracing::info!(
+                "Failed proxy removal result failed_proxy={} removed={}",
+                failed_proxy,
+                removed
+            );
 
             tracing::info!(
                 "Recovery begun: failed proxy {} replaced by standby {}",
