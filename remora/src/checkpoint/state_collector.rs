@@ -60,16 +60,28 @@ impl StateCollector {
         epoch_entry.insert(proxy_id);
 
         // Check if epoch is complete and advance persist index if so
+        let current_persist_index = self.get_persist_index();
+        let epoch_proxy_count = epoch_entry.len();
+        tracing::debug!(
+            "Epoch {} progress: {}/{} proxies reported, current persist index: {}",
+            epoch.0,
+            epoch_proxy_count,
+            expected_proxies,
+            current_persist_index
+        );
+        
         if self.is_epoch_complete(epoch, expected_proxies) {
             // The consensus index should be the current persist index + 1
-            let current_persist_index = self.get_persist_index();
             let consensus_index = current_persist_index + 1;
-            self.acknowledge_epoch(epoch, consensus_index);
             tracing::info!(
-                "Epoch {} completed and acknowledged, persist index updated to {}",
+                "Epoch {} completed with {}/{} proxies, advancing persist index from {} to {}",
                 epoch.0,
+                epoch_proxy_count,
+                expected_proxies,
+                current_persist_index,
                 consensus_index
             );
+            self.acknowledge_epoch(epoch, consensus_index);
         }
     }
 
@@ -91,20 +103,38 @@ impl StateCollector {
     /// Check if an epoch is complete (all proxies have reported snapshots).
     /// Returns true if the epoch can be acknowledged and pruned.
     pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
-        self.collecting_snapshots
+        let is_complete = self.collecting_snapshots
             .get(&epoch)
-            .map(|proxies| proxies.len() >= expected_proxies)
-            .unwrap_or(false)
+            .map(|proxies| {
+                let proxy_count = proxies.len();
+                let complete = proxy_count >= expected_proxies;
+                tracing::debug!(
+                    "Epoch {} completion check: {}/{} proxies, complete: {}",
+                    epoch.0,
+                    proxy_count,
+                    expected_proxies,
+                    complete
+                );
+                complete
+            })
+            .unwrap_or_else(|| {
+                tracing::debug!("Epoch {} not found in collecting_snapshots", epoch.0);
+                false
+            });
+        is_complete
     }
 
     /// Mark an epoch as acknowledged, advance persist index, and remove it from tracking.
     pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
+        let old_persist_index = self.persist_index.load(Ordering::SeqCst);
         self.persist_index.store(consensus_index, Ordering::SeqCst);
-        self.collecting_snapshots.remove(&epoch);
-        tracing::debug!(
-            "Epoch {} acknowledged; persist index advanced to {}",
+        let removed_epoch = self.collecting_snapshots.remove(&epoch);
+        tracing::info!(
+            "Epoch {} acknowledged; persist index advanced from {} to {}, removed {} tracking entries",
             epoch.0,
-            consensus_index
+            old_persist_index,
+            consensus_index,
+            removed_epoch.map(|(_, proxies)| proxies.len()).unwrap_or(0)
         );
     }
 
