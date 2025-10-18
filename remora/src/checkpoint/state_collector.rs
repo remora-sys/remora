@@ -85,15 +85,37 @@ impl StateCollector {
         if epoch_proxy_count >= expected_proxies {
             // The consensus index should be the current persist index + 1
             let consensus_index = current_persist_index + 1;
-            tracing::info!(
-                "Epoch {} completed with {}/{} proxies, advancing persist index from {} to {}",
-                epoch.0,
-                epoch_proxy_count,
-                expected_proxies,
+
+            // Use a compare-and-swap to ensure only one worker advances the persist index
+            let old_persist_index = self.persist_index.compare_exchange(
                 current_persist_index,
-                consensus_index
+                consensus_index,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             );
-            self.acknowledge_epoch(epoch, consensus_index);
+
+            match old_persist_index {
+                Ok(_) => {
+                    // We successfully advanced the persist index
+                    tracing::info!(
+                        "Epoch {} completed with {}/{} proxies, advancing persist index from {} to {}",
+                        epoch.0,
+                        epoch_proxy_count,
+                        expected_proxies,
+                        current_persist_index,
+                        consensus_index
+                    );
+                    // Remove the epoch from tracking
+                    self.collecting_snapshots.remove(&epoch);
+                }
+                Err(_) => {
+                    // Another worker already advanced the persist index
+                    tracing::debug!(
+                        "Epoch {} completion detected but persist index already advanced by another worker",
+                        epoch.0
+                    );
+                }
+            }
         }
     }
 
@@ -138,6 +160,8 @@ impl StateCollector {
     }
 
     /// Mark an epoch as acknowledged, advance persist index, and remove it from tracking.
+    /// This function is now handled inline in process_snapshot to avoid race conditions.
+    #[deprecated(note = "Use atomic operations in process_snapshot instead")]
     pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
         let old_persist_index = self.persist_index.load(Ordering::SeqCst);
         self.persist_index.store(consensus_index, Ordering::SeqCst);

@@ -61,14 +61,13 @@ where
                     );
                     ctx.collector
                         .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
-                    tracing::debug!(
-                        "Completed processing snapshot from proxy {} for epoch {}",
-                        proxy_id,
-                        epoch.0
-                    );
                 }
                 Err(e) => {
-                    tracing::error!("Failed to deserialize snapshot: {:?}", e);
+                    tracing::error!(
+                        "Failed to deserialize snapshot ({} bytes): {:?}",
+                        self.bytes.len(),
+                        e
+                    );
                 }
             }
         }
