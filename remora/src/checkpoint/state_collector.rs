@@ -3,7 +3,6 @@ use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
-use tracing::debug;
 
 /// Concurrent in-memory state for snapshots and merged objects
 pub struct StateCollector {
@@ -45,8 +44,14 @@ impl StateCollector {
             .entry(epoch)
             .or_insert_with(DashSet::new);
 
-        debug!(
-            "Received snapshot from proxy {} for epoch {}: {} objects",
+        tracing::debug!(
+            "Epoch {} entry created/retrieved, current proxy count: {}",
+            epoch.0,
+            epoch_entry.len()
+        );
+
+        tracing::info!(
+            "Process_snapshot: Received snapshot from proxy {} for epoch {}: {} objects",
             proxy_id,
             epoch.0,
             snapshot.len()
@@ -59,18 +64,25 @@ impl StateCollector {
 
         epoch_entry.insert(proxy_id);
 
+        tracing::debug!(
+            "Proxy {} inserted into epoch {}, new proxy count: {}",
+            proxy_id,
+            epoch.0,
+            epoch_entry.len()
+        );
+
         // Check if epoch is complete and advance persist index if so
         let current_persist_index = self.get_persist_index();
         let epoch_proxy_count = epoch_entry.len();
-        tracing::debug!(
+        tracing::info!(
             "Epoch {} progress: {}/{} proxies reported, current persist index: {}",
             epoch.0,
             epoch_proxy_count,
             expected_proxies,
             current_persist_index
         );
-        
-        if self.is_epoch_complete(epoch, expected_proxies) {
+
+        if epoch_proxy_count >= expected_proxies {
             // The consensus index should be the current persist index + 1
             let consensus_index = current_persist_index + 1;
             tracing::info!(
@@ -103,7 +115,8 @@ impl StateCollector {
     /// Check if an epoch is complete (all proxies have reported snapshots).
     /// Returns true if the epoch can be acknowledged and pruned.
     pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
-        let is_complete = self.collecting_snapshots
+        let is_complete = self
+            .collecting_snapshots
             .get(&epoch)
             .map(|proxies| {
                 let proxy_count = proxies.len();

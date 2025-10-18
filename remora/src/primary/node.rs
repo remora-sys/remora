@@ -32,9 +32,8 @@ use crate::{
 use crate::executor::worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask};
 
 #[derive(Clone)]
-struct CollectorCtx<T: ExecutableTransaction + Clone> {
+struct CollectorCtx {
     collector: Arc<StateCollector>,
-    logger: Arc<EpochLogger<T>>,
     expected_proxies: usize,
 }
 
@@ -48,7 +47,7 @@ impl<T> WorkerTask for SnapshotTask<T>
 where
     T: ExecutableTransaction + Clone + Send + Sync + 'static,
 {
-    type Context = Arc<CollectorCtx<T>>;
+    type Context = Arc<CollectorCtx>;
     fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
         let ctx = context.clone();
         async move {
@@ -62,14 +61,6 @@ where
                     );
                     ctx.collector
                         .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
-                    // The state collector now handles epoch completion and persist index advancement internally
-                    // We still need to prune the epoch logger
-                    if let Some(set) = ctx.collector.collecting_snapshots.get(&epoch) {
-                        if set.len() >= ctx.expected_proxies {
-                            ctx.logger.prune_epoch(epoch);
-                            tracing::info!("Pruned epoch {:?} after ack", epoch);
-                        }
-                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to deserialize snapshot: {:?}", e);
@@ -189,12 +180,10 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let epoch_logger = EpochLogger::new();
 
         // Build worker pool context
-        let collector_ctx: Arc<CollectorCtx<<E as Executor>::Transaction>> =
-            Arc::new(CollectorCtx {
-                collector: collector_for_worker.clone(),
-                logger: epoch_logger.clone(),
-                expected_proxies,
-            });
+        let collector_ctx: Arc<CollectorCtx> = Arc::new(CollectorCtx {
+            collector: collector_for_worker.clone(),
+            expected_proxies,
+        });
 
         let snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> = WorkerPool::new(
             collector_ctx.clone(),
