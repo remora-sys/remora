@@ -17,7 +17,7 @@ use tokio::{
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
 use crate::checkpoint::state_collector::StateCollector;
-use crate::executor::api::ExecutableTransaction;
+// Removed unused import
 use crate::executor::api::ProxyToPrimaryMessage;
 use crate::{
     config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
@@ -28,8 +28,7 @@ use crate::{
     recovery::EpochLogger,
 };
 
-// WorkerPool context and task for processing proxy->primary snapshots
-use crate::executor::worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask};
+// Snapshot processing using tokio::spawn
 
 #[derive(Clone)]
 struct CollectorCtx {
@@ -37,42 +36,7 @@ struct CollectorCtx {
     expected_proxies: usize,
 }
 
-#[derive(Clone)]
-struct SnapshotTask<T> {
-    bytes: Vec<u8>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T> WorkerTask for SnapshotTask<T>
-where
-    T: ExecutableTransaction + Clone + Send + Sync + 'static,
-{
-    type Context = Arc<CollectorCtx>;
-    fn process(self, context: &Self::Context) -> impl futures::Future<Output = ()> + Send {
-        let ctx = context.clone();
-        async move {
-            match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
-                Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
-                    tracing::info!(
-                        "Processing snapshot from proxy {} for epoch {}: {} objects",
-                        proxy_id,
-                        epoch.0,
-                        snapshot.len()
-                    );
-                    ctx.collector
-                        .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to deserialize snapshot ({} bytes): {:?}",
-                        self.bytes.len(),
-                        e
-                    );
-                }
-            }
-        }
-    }
-}
+// Snapshot processing moved to tokio::spawn
 
 /// The single machine validator is a simple validator that runs all components.
 pub struct PrimaryNode<E: Executor> {
@@ -189,13 +153,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             expected_proxies,
         });
 
-        let snapshot_pool: WorkerPool<SnapshotTask<<E as Executor>::Transaction>> = WorkerPool::new(
-            collector_ctx.clone(),
-            WorkerPoolConfig {
-                num_workers: Some(4),
-                ..Default::default()
-            },
-        );
+        // Using tokio::spawn instead of worker pool for snapshot processing
 
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
@@ -203,7 +161,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let collector_handle = tokio::spawn(async move {
             let collector_inner = collector_for_worker;
             let logger = collector_logger;
-            let mut pool = snapshot_pool;
             let mut last_epoch: Option<crate::checkpoint::EpochId> = None;
             tracing::info!("State collector started, waiting for snapshots...");
             loop {
@@ -244,17 +201,28 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                     }
                     Some(bytes) = rx_snapshots.recv() => {
                         tracing::info!("Received snapshot bytes: {} bytes", bytes.len());
-                        match pool
-                            .send_task(SnapshotTask { bytes, _phantom: PhantomData })
-                            .await
-                        {
-                            Ok(_) => {
-                                tracing::debug!("Successfully queued snapshot for processing");
+                        let collector_ctx = collector_ctx.clone();
+                        tokio::spawn(async move {
+                            match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
+                                Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                                    tracing::info!(
+                                        "Processing snapshot from proxy {} for epoch {}: {} objects",
+                                        proxy_id,
+                                        epoch.0,
+                                        snapshot.len()
+                                    );
+                                    collector_ctx.collector
+                                        .process_snapshot(proxy_id, epoch, snapshot, collector_ctx.expected_proxies);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to deserialize snapshot ({} bytes): {:?}",
+                                        bytes.len(),
+                                        e
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to queue snapshot for processing: {:?}", e);
-                            }
-                        }
+                        });
                     }
                     else => {
                         tracing::warn!("No snapshots received - proxies may not be running!");
