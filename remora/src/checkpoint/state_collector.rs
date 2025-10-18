@@ -129,13 +129,13 @@ impl StateCollector {
 
                         if should_prune {
                             logger.prune_epoch(prev_epoch);
-                            tracing::debug!(
+                            tracing::info!(
                                 "Pruned epoch {} (all records below persist_index {})",
                                 prev_epoch.0,
                                 current_persist_index
                             );
                         } else {
-                            tracing::debug!(
+                            tracing::info!(
                                 "Skipped pruning epoch {} (some records >= persist_index {})",
                                 prev_epoch.0,
                                 current_persist_index
