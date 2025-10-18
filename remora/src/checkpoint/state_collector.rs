@@ -31,13 +31,16 @@ impl StateCollector {
     }
 
     /// Process a state snapshot from a proxy
-    pub fn process_snapshot(
+    pub fn process_snapshot<T>(
         &self,
         proxy_id: crate::proxy::core::ProxyId,
         epoch: EpochId,
         snapshot: EpochObjectStates,
         expected_proxies: usize,
-    ) {
+        epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
+    ) where
+        T: crate::executor::api::ExecutableTransaction + Clone,
+    {
         // Upsert per-epoch snapshots and global merged state concurrently-safe
         let epoch_entry = self
             .collecting_snapshots
@@ -107,6 +110,38 @@ impl StateCollector {
                     );
                     // Remove the epoch from tracking
                     self.collecting_snapshots.remove(&epoch);
+
+                    // Prune the previous epoch if it exists and is safe to prune
+                    if let Some(logger) = epoch_logger {
+                        let prev_epoch = EpochId(epoch.0 - 1);
+                        let current_persist_index = self.get_persist_index();
+                        let should_prune = logger
+                            .get_epoch(prev_epoch)
+                            .map(|records| {
+                                records.iter().all(|record| {
+                                    record
+                                        .consensus_index
+                                        .map(|idx| idx < current_persist_index)
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(true); // If epoch doesn't exist, it's safe to prune
+
+                        if should_prune {
+                            logger.prune_epoch(prev_epoch);
+                            tracing::debug!(
+                                "Pruned epoch {} (all records below persist_index {})",
+                                prev_epoch.0,
+                                current_persist_index
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Skipped pruning epoch {} (some records >= persist_index {})",
+                                prev_epoch.0,
+                                current_persist_index
+                            );
+                        }
+                    }
                 }
                 Err(_) => {
                     // Another worker already advanced the persist index
@@ -226,7 +261,13 @@ mod tests {
         snapshot.insert(obj_id2, obj2);
 
         // Process snapshot from proxy 1
-        collector.process_snapshot(1, EpochId(5), snapshot.clone(), 2);
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(5),
+            snapshot.clone(),
+            2,
+            None,
+        );
         assert_eq!(
             collector
                 .collecting_snapshots
@@ -239,7 +280,13 @@ mod tests {
         assert_eq!(collector.merged_state_len(), 2);
 
         // Process snapshot from proxy 2
-        collector.process_snapshot(2, EpochId(5), snapshot, 2);
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            2,
+            EpochId(5),
+            snapshot,
+            2,
+            None,
+        );
         assert_eq!(
             collector
                 .collecting_snapshots
@@ -257,7 +304,13 @@ mod tests {
 
         // Process snapshot for epoch 6 as well (out of order is allowed, but completion is ordered)
         let snapshot = EpochObjectStates::new();
-        collector.process_snapshot(1, EpochId(6), snapshot, 2);
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(6),
+            snapshot,
+            2,
+            None,
+        );
 
         // Epochs should be present
         assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
@@ -270,7 +323,13 @@ mod tests {
 
         // Process snapshot without starting epoch - should create epoch entry
         let snapshot = EpochObjectStates::new();
-        collector.process_snapshot(1, EpochId(5), snapshot, 2);
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(5),
+            snapshot,
+            2,
+            None,
+        );
 
         // Should have buffered epoch 5
         assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
@@ -302,8 +361,20 @@ mod tests {
         snapshot2.insert(obj_id3, obj3);
 
         // Process both snapshots
-        collector.process_snapshot(1, EpochId(5), snapshot1, 2);
-        collector.process_snapshot(2, EpochId(5), snapshot2, 2);
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(5),
+            snapshot1,
+            2,
+            None,
+        );
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            2,
+            EpochId(5),
+            snapshot2,
+            2,
+            None,
+        );
 
         // Epoch should have two proxies recorded
         assert_eq!(

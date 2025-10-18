@@ -159,49 +159,20 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let mut rx_snapshots = rx_proxy_snapshots;
         let collector_logger = epoch_logger.clone();
         let collector_handle = tokio::spawn(async move {
-            let collector_inner = collector_for_worker;
+            let _collector_inner = collector_for_worker;
             let logger = collector_logger;
-            let mut last_epoch: Option<crate::checkpoint::EpochId> = None;
+            let mut _last_epoch: Option<crate::checkpoint::EpochId> = None;
             tracing::info!("State collector started, waiting for snapshots...");
             loop {
                 tokio::select! {
                     Some(epoch) = rx_epochs.recv() => {
                         tracing::info!("Collector: starting epoch {:?}", epoch);
-                        collector_inner.ensure_epoch(epoch);
-                        if let Some(prev) = last_epoch.take() {
-                            // Only prune previous epoch if it's been fully persisted
-                            // Check if the previous epoch's records are all below the current persist_index
-                            let current_persist_index = collector_inner.get_persist_index();
-                            let should_prune = logger.get_epoch(prev)
-                                .map(|records| {
-                                    records.iter().all(|record| {
-                                        record.consensus_index
-                                            .map(|idx| idx < current_persist_index)
-                                            .unwrap_or(false)
-                                    })
-                                })
-                                .unwrap_or(true); // If epoch doesn't exist, it's safe to prune
-
-                            if should_prune {
-                                logger.prune_epoch(prev);
-                                tracing::debug!(
-                                    "Pruned epoch {} (all records below persist_index {})",
-                                    prev.0,
-                                    current_persist_index
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "Skipped pruning epoch {} (some records >= persist_index {})",
-                                    prev.0,
-                                    current_persist_index
-                                );
-                            }
-                        }
-                        last_epoch = Some(epoch);
+                        _last_epoch = Some(epoch);
                     }
                     Some(bytes) = rx_snapshots.recv() => {
                         tracing::info!("Received snapshot bytes: {} bytes", bytes.len());
                         let collector_ctx = collector_ctx.clone();
+                        let logger = logger.clone();
                         tokio::spawn(async move {
                             match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
                                 Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
@@ -212,7 +183,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                                         snapshot.len()
                                     );
                                     collector_ctx.collector
-                                        .process_snapshot(proxy_id, epoch, snapshot, collector_ctx.expected_proxies);
+                                        .process_snapshot(proxy_id, epoch, snapshot, collector_ctx.expected_proxies, Some(&logger));
                                 }
                                 Err(e) => {
                                     tracing::error!(
