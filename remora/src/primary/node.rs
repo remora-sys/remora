@@ -54,13 +54,18 @@ where
             match bincode::deserialize::<ProxyToPrimaryMessage>(&self.bytes) {
                 Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
                     tracing::info!(
-                        "Received snapshot from proxy {} for epoch {}: {} objects",
+                        "Processing snapshot from proxy {} for epoch {}: {} objects",
                         proxy_id,
                         epoch.0,
                         snapshot.len()
                     );
                     ctx.collector
                         .process_snapshot(proxy_id, epoch, snapshot, ctx.expected_proxies);
+                    tracing::debug!(
+                        "Completed processing snapshot from proxy {} for epoch {}",
+                        proxy_id,
+                        epoch.0
+                    );
                 }
                 Err(e) => {
                     tracing::error!("Failed to deserialize snapshot: {:?}", e);
@@ -240,9 +245,17 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                     }
                     Some(bytes) = rx_snapshots.recv() => {
                         tracing::info!("Received snapshot bytes: {} bytes", bytes.len());
-                        let _ = pool
+                        match pool
                             .send_task(SnapshotTask { bytes, _phantom: PhantomData })
-                            .await;
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::debug!("Successfully queued snapshot for processing");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to queue snapshot for processing: {:?}", e);
+                            }
+                        }
                     }
                     else => {
                         tracing::warn!("No snapshots received - proxies may not be running!");
