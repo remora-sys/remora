@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::VecDeque, marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -48,6 +48,8 @@ pub struct LoadBalancer<E: Executor> {
     metrics: Arc<Metrics>,
     /// Next epoch id to broadcast at consensus boundary (Phase 2 default: every batch)
     next_epoch_id: u64,
+    /// Atomic current epoch id shared with forwarders for logging
+    current_epoch_atomic: Arc<AtomicU64>,
     /// Sender to notify the checkpoint collector of new epochs
     epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
     /// Cumulative transactions since last checkpoint
@@ -96,6 +98,7 @@ where
             proxy_mode,
             metrics,
             next_epoch_id: 1,
+            current_epoch_atomic: Arc::new(AtomicU64::new(0)),
             epoch_tx,
             txns_since_last_epoch: 0,
             epoch_logger,
@@ -133,7 +136,8 @@ where
 
         if standby_proxy != failed_proxy {
             // Log dirty queue size and persist index for diagnostics
-            let persist_index = self.collector.get_persist_index();
+            // Use the failed proxy's own persist_index
+            let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
             let dq_len = self
                 .recovery_coordinator
                 .drain_dirty_queue(failed_proxy as usize, persist_index)
@@ -198,13 +202,15 @@ where
         &self,
         failed_proxy: ProxyId,
     ) -> Option<Vec<crate::recovery::LogRecord<E::Transaction>>> {
-        let persist_index = self.collector.get_persist_index();
+        // Use the failed proxy's own persist_index to find dirty transactions
+        // in epochs after its last reported epoch
+        let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
         self.recovery_coordinator
             .get_next_replay_batch(failed_proxy as usize, persist_index)
     }
 
     /// Start the replay process for a replacement proxy.
-    /// This method spawns a task to send replay batches to the replacement proxy.
+    /// This method spawns a task to send all dirty transactions to the replacement proxy.
     fn start_replay_process(&self, failed_proxy: ProxyId, replacement_proxy: ProxyId) {
         let recovery_coordinator = self.recovery_coordinator.clone();
         let proxy_connections = self.proxy_connections.clone();
@@ -216,91 +222,116 @@ where
                 replacement_proxy,
                 "Replay task spawned for failed proxy"
             );
-            let mut batch_count = 0;
-            loop {
-                // Always get the latest persist_index to ensure we don't miss newer transactions
-                let persist_index = collector.get_persist_index();
-                let next = recovery_coordinator
-                    .get_next_replay_batch(failed_proxy as usize, persist_index);
-                if next.is_none() {
-                    // Best-effort epoch/segment stats
-                    tracing::info!(
-                        failed_proxy,
-                        persist_index,
-                        "No replay batch available; replay loop exiting"
-                    );
-                    break;
-                }
-                let batch = next.unwrap();
-                batch_count += 1;
+
+            // Use the failed proxy's own persist_index to find dirty transactions
+            // in epochs after its last reported epoch
+            let persist_index = collector.get_proxy_persist_index(failed_proxy);
+
+            // Get ALL dirty transactions at once (not in a loop, since drain_dirty_queue
+            // doesn't remove items and would return the same transactions repeatedly)
+            let dirty_txns =
+                recovery_coordinator.drain_dirty_queue(failed_proxy as usize, persist_index);
+
+            if dirty_txns.is_empty() {
                 tracing::info!(
-                    "Sending replay batch {} to replacement proxy {} ({} items)",
-                    batch_count,
-                    replacement_proxy,
-                    batch.len()
+                    failed_proxy,
+                    persist_index,
+                    "No dirty transactions to replay"
                 );
+                return;
+            }
 
-                // Convert LogRecord to ReplayMsg and send to replacement proxy
-                if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
-                    // Get the epoch from the first record before consuming the batch
-                    let epoch = batch
-                        .first()
-                        .map(|record| record.epoch)
-                        .unwrap_or(crate::checkpoint::EpochId(0));
+            tracing::info!(
+                failed_proxy,
+                replacement_proxy,
+                dirty_txn_count = dirty_txns.len(),
+                persist_index,
+                "Sending all dirty transactions to replacement proxy"
+            );
 
-                    let replay_items: Vec<crate::executor::api::ReplayMsg<E::Transaction>> = batch
-                        .into_iter()
-                        .map(|record| {
-                            // Hydrate transaction data from LogRecord
-                            let transaction = (*record.transaction).clone();
+            // Convert LogRecord to ReplayMsg and send to replacement proxy
+            if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
+                // Group transactions by epoch and send one batch per epoch
+                let mut txns_by_epoch: std::collections::BTreeMap<
+                    crate::checkpoint::EpochId,
+                    Vec<_>,
+                > = std::collections::BTreeMap::new();
 
-                            // Fetch state blobs from StateCollector
-                            let mut state_blobs = std::collections::BTreeMap::new();
-                            for (object_id, _version) in record.required_states.keys() {
-                                if let Some(object) = collector.get_object(object_id) {
-                                    state_blobs.insert(*object_id, object);
+                for record in dirty_txns {
+                    txns_by_epoch.entry(record.epoch).or_default().push(record);
+                }
+
+                let total_epochs = txns_by_epoch.len();
+                let mut sent_count = 0;
+
+                for (epoch, epoch_records) in txns_by_epoch {
+                    let replay_items: Vec<crate::executor::api::ReplayMsg<E::Transaction>> =
+                        epoch_records
+                            .into_iter()
+                            .map(|record| {
+                                // Hydrate transaction data from LogRecord
+                                let transaction = (*record.transaction).clone();
+
+                                // Fetch state blobs from StateCollector
+                                let mut state_blobs = std::collections::BTreeMap::new();
+                                for (object_id, _version) in record.required_states.keys() {
+                                    if let Some(object) = collector.get_object(object_id) {
+                                        state_blobs.insert(*object_id, object);
+                                    }
                                 }
-                            }
 
-                            crate::executor::api::ReplayMsg {
-                                consensus_index: record.consensus_index.unwrap_or(0),
-                                transaction,
-                                required_versions: record.required_states.keys().cloned().collect(),
-                                state_blobs,
-                            }
-                        })
-                        .collect();
+                                crate::executor::api::ReplayMsg {
+                                    consensus_index: record.consensus_index.unwrap_or(0),
+                                    transaction,
+                                    required_versions: record
+                                        .required_states
+                                        .keys()
+                                        .cloned()
+                                        .collect(),
+                                    state_blobs,
+                                }
+                            })
+                            .collect();
+
+                    let batch_size = replay_items.len();
+                    sent_count += batch_size;
 
                     let replay_batch = crate::executor::api::ReplayBatch {
                         epoch,
                         items: replay_items,
                     };
 
+                    tracing::info!(
+                        epoch = epoch.0,
+                        batch_size,
+                        sent_count,
+                        "Sending replay batch for epoch"
+                    );
+
                     let msg = crate::executor::api::PrimaryToProxyMessage::Replay(replay_batch);
                     if let Err(e) = proxy_tx.value().send(msg).await {
                         tracing::error!(
-                            "Failed to send replay batch {} to replacement proxy {}: {:?}",
-                            batch_count,
+                            "Failed to send replay batch for epoch {} to replacement proxy {}: {:?}",
+                            epoch.0,
                             replacement_proxy,
                             e
                         );
-                        break;
+                        return;
                     }
-                } else {
-                    tracing::error!(
-                        "Replacement proxy {} not found in connections",
-                        replacement_proxy
-                    );
-                    break;
                 }
-            }
 
-            tracing::info!(
-                "Completed replay process for failed proxy {} -> replacement proxy {} ({} batches)",
-                failed_proxy,
-                replacement_proxy,
-                batch_count
-            );
+                tracing::info!(
+                    "Completed replay: sent {} transactions across {} epochs to replacement proxy {}",
+                    sent_count,
+                    total_epochs,
+                    replacement_proxy
+                );
+            } else {
+                tracing::error!(
+                    "Replacement proxy {} not found in connections",
+                    replacement_proxy
+                );
+            }
         });
     }
 
@@ -512,7 +543,7 @@ where
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))
                 .collect(),
             Some(self.epoch_logger.clone()),
-            self.next_epoch_id,
+            self.current_epoch_atomic.clone(),
             self.standby_excluded.clone(),
         );
 
@@ -629,6 +660,8 @@ where
                         }
                         self.broadcast_checkpoint(epoch).await;
                         self.next_epoch_id += 1;
+                        // Update the atomic epoch for forwarders to use
+                        self.current_epoch_atomic.store(self.next_epoch_id, Ordering::SeqCst);
 
                         // Periodically prune old epochs from the logger
                         self.prune_epoch_logger();

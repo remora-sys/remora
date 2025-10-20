@@ -125,6 +125,23 @@ impl StateCollector {
             .map(|atomic| atomic.load(Ordering::SeqCst))
             .unwrap_or(0)
     }
+
+    /// Get the persist index excluding a specific proxy.
+    /// This is used during recovery to calculate the persist_index without
+    /// including the failed proxy, which would otherwise prevent finding
+    /// dirty transactions for that proxy.
+    pub fn get_persist_index_excluding(&self, excluded_proxy: crate::proxy::core::ProxyId) -> u64 {
+        if self.per_proxy_persist_index.is_empty() {
+            return 0;
+        }
+
+        self.per_proxy_persist_index
+            .iter()
+            .filter(|entry| *entry.key() != excluded_proxy)
+            .map(|entry| entry.value().load(Ordering::SeqCst))
+            .min()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

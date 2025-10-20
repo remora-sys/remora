@@ -42,7 +42,15 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
         self.segments
             .entry(epoch)
             .and_modify(|v| v.push(record.clone()))
-            .or_insert_with(|| vec![record]);
+            .or_insert_with(|| vec![record.clone()]);
+
+        tracing::debug!(
+            epoch = epoch.0,
+            destination_proxy = record.destination_proxy,
+            consensus_index = record.consensus_index,
+            txn_digest = ?record.txn_digest,
+            "EpochLogger: appended transaction"
+        );
     }
 
     pub fn get_epoch(&self, epoch: EpochId) -> Option<Vec<LogRecord<T>>> {
@@ -64,20 +72,17 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
 #[derive(Default)]
 pub struct RecoveryCoordinator<T: ExecutableTransaction + Clone> {
     logger: Arc<EpochLogger<T>>,
-    /// Default batch size for replay batches
-    batch_size: usize,
 }
 
 impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     pub fn new(logger: Arc<EpochLogger<T>>) -> Arc<Self> {
-        Arc::new(Self {
-            logger,
-            batch_size: 10, // Default batch size
-        })
+        Arc::new(Self { logger })
     }
 
-    pub fn new_with_batch_size(logger: Arc<EpochLogger<T>>, batch_size: usize) -> Arc<Self> {
-        Arc::new(Self { logger, batch_size })
+    /// Deprecated: batch_size is no longer used since recovery sends all dirty
+    /// transactions at once. Use new() instead.
+    pub fn new_with_batch_size(logger: Arc<EpochLogger<T>>, _batch_size: usize) -> Arc<Self> {
+        Self::new(logger)
     }
 
     /// Begin recovery for a failed proxy. Returns the replacement proxy id to use.
@@ -94,44 +99,72 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         persist_index: u64,
     ) -> Option<Vec<LogRecord<T>>> {
         let dirty_entries = self.drain_dirty_queue(failed_proxy, persist_index);
+
+        // Always log comprehensive diagnostics for debugging
+        tracing::info!(
+            failed_proxy,
+            persist_index,
+            dirty_entries_count = dirty_entries.len(),
+            "get_next_replay_batch called"
+        );
+
         if dirty_entries.is_empty() {
-            // Emit a brief diagnostic to help understand why replay may stall
-            let mut epoch_counts: Vec<(EpochId, usize)> = Vec::new();
+            // Detailed diagnostics: show ALL epochs and their transaction counts
+            let mut all_epochs_info: Vec<(u64, usize, usize)> = Vec::new(); // (epoch, total_txns, matching_txns)
             for seg in self.logger.segments.iter() {
                 let epoch = *seg.key();
-                let count = seg
+                let total_count = seg.value().len();
+                let proxy_count = seg
                     .value()
                     .iter()
                     .filter(|r| r.destination_proxy == failed_proxy)
-                    .filter(|r| {
-                        r.consensus_index
-                            .map(|i| i >= persist_index)
-                            .unwrap_or(false)
-                    })
                     .count();
-                if count > 0 {
-                    epoch_counts.push((epoch, count));
+                let matching_count = seg
+                    .value()
+                    .iter()
+                    .filter(|r| r.destination_proxy == failed_proxy)
+                    .filter(|r| r.epoch.0 >= persist_index)
+                    .count();
+                all_epochs_info.push((epoch.0, total_count, proxy_count));
+
+                if proxy_count > 0 {
+                    tracing::info!(
+                        epoch = epoch.0,
+                        total_txns = total_count,
+                        failed_proxy_txns = proxy_count,
+                        matching_txns_after_persist = matching_count,
+                        persist_index,
+                        comparison = format!(
+                            "epoch {} > persist_index {}? {}",
+                            epoch.0,
+                            persist_index,
+                            epoch.0 > persist_index
+                        ),
+                        "Epoch details for failed proxy"
+                    );
                 }
             }
-            tracing::debug!(
+            tracing::warn!(
                 failed_proxy,
                 persist_index,
-                epochs_with_entries = epoch_counts.len(),
-                ?epoch_counts,
-                "Dirty queue empty for failed proxy; no replay candidates"
+                total_epochs = all_epochs_info.len(),
+                ?all_epochs_info,
+                "No dirty transactions found - detailed epoch breakdown"
             );
-        }
-
-        if dirty_entries.is_empty() {
             return None;
         }
 
-        // Take up to batch_size items
-        let batch: Vec<LogRecord<T>> = dirty_entries.into_iter().take(self.batch_size).collect();
+        // Return all dirty entries at once (batch_size no longer used)
+        let batch: Vec<LogRecord<T>> = dirty_entries.into_iter().collect();
 
         if batch.is_empty() {
             None
         } else {
+            tracing::info!(
+                failed_proxy,
+                batch_size = batch.len(),
+                "Returning replay batch"
+            );
             Some(batch)
         }
     }
@@ -171,17 +204,15 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             let _epoch = *epoch_entry.key();
             let records = epoch_entry.value();
 
-            // Filter for failed proxy and consensus_index >= persist_index
-            // Note: We use >= because persist_index represents the last fully acknowledged index,
-            // so we need to replay transactions at and after that point
+            // Filter for failed proxy and epoch > persist_index
+            // Note: persist_index represents the last fully acknowledged epoch,
+            // so we need to replay transactions from epochs AFTER that point.
+            // We use > (not >=) because transactions in the persist_index epoch
+            // have already been completed and acknowledged by the proxy.
             let epoch_entries: Vec<LogRecord<T>> = records
                 .iter()
                 .filter(|r| r.destination_proxy == failed_proxy)
-                .filter(|r| {
-                    r.consensus_index
-                        .map(|i| i >= persist_index)
-                        .unwrap_or(false)
-                })
+                .filter(|r| r.epoch.0 > persist_index)
                 .cloned()
                 .collect();
 

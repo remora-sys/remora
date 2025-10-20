@@ -15,7 +15,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -36,7 +36,7 @@ where
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
     pub epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
-    pub current_epoch: crate::checkpoint::EpochId,
+    pub current_epoch: Arc<AtomicU64>,
     pub standby_excluded: Arc<AtomicBool>,
 }
 
@@ -201,7 +201,7 @@ where
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
         epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
-        current_epoch: u64,
+        current_epoch: Arc<AtomicU64>,
         standby_excluded: Arc<AtomicBool>,
     ) -> Self {
         let context = ForwardingContext {
@@ -214,7 +214,7 @@ where
             proxy_loads: proxy_loads.clone(),
             proxy_access_histories: proxy_access_histories.clone(),
             epoch_logger,
-            current_epoch: crate::checkpoint::EpochId(current_epoch),
+            current_epoch,
             standby_excluded,
         };
 
@@ -295,7 +295,8 @@ where
 
             // Append per-epoch log record when context is available
             if let (Some(logger), Some(dest_pid)) = (&context.epoch_logger, resolved_stateful) {
-                let epoch = context.current_epoch;
+                let epoch =
+                    crate::checkpoint::EpochId(context.current_epoch.load(Ordering::SeqCst));
                 let rec = LogRecord {
                     consensus_index: Some(task.consensus_index),
                     txn_digest: *transaction_arc.digest(),
@@ -839,7 +840,7 @@ where
             if proxy_connection.send(message).await.is_ok() {
                 tracing::debug!("Sent transaction to proxy {}", dest_proxy);
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     "Failed to send to proxy {}. Not removing here; load balancer will handle recovery.",
                     dest_proxy
                 );
@@ -847,7 +848,7 @@ where
                 // Load balancer will handle designation and removal during checkpoint/recovery.
             }
         } else {
-            tracing::warn!("Proxy connection {} not found", dest_proxy);
+            tracing::debug!("Proxy connection {} not found", dest_proxy);
         }
     }
 }
