@@ -84,12 +84,15 @@ mod tests {
         let replacement = coordinator.begin_recovery(0, 1);
         assert_eq!(replacement, 1);
 
-        // Test persist index (starts at 0)
+        // Test persist index (starts at 0 when no proxies have reported)
         let persist_index = coordinator.get_persist_index(&state_collector);
         assert_eq!(persist_index, 0);
 
-        // Test update persist index
-        state_collector.acknowledge_epoch(EpochId(1), 100);
+        // Simulate proxy 0 reporting epoch 100 via process_snapshot
+        use std::collections::BTreeMap;
+        let snapshot = BTreeMap::new();
+        state_collector.process_snapshot::<TestTransaction>(0, EpochId(100), snapshot, 3, None);
+
         let updated_persist_index = coordinator.get_persist_index(&state_collector);
         assert_eq!(updated_persist_index, 100);
     }
@@ -148,8 +151,18 @@ mod tests {
         let coordinator = RecoveryCoordinator::new(logger.clone());
         let state_collector = StateCollector::new(3);
 
-        // Set persist index to 120
-        state_collector.acknowledge_epoch(EpochId(1), 120);
+        // Simulate all 3 proxies reporting epoch 120
+        use std::collections::BTreeMap;
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(120),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Add records to different epochs
         let epoch1 = EpochId(1);
@@ -253,8 +266,17 @@ mod tests {
             logger.append(epoch, record);
         }
 
-        // Set persist index to 100
-        state_collector.acknowledge_epoch(EpochId(1), 100);
+        // Simulate all proxies reporting epoch 100
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(100),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Test that get_next_replay_batch returns batches
         let persist_index = state_collector.get_persist_index();
@@ -281,8 +303,17 @@ mod tests {
         let coordinator = RecoveryCoordinator::new(logger.clone());
         let state_collector = StateCollector::new(3);
 
-        // Set persist index high
-        state_collector.acknowledge_epoch(EpochId(1), 1000);
+        // Simulate all proxies reporting high epoch 1000
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(1000),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Add records below persist index
         let epoch = EpochId(1);
@@ -308,8 +339,17 @@ mod tests {
         let coordinator = RecoveryCoordinator::new(logger.clone());
         let state_collector = StateCollector::new(3);
 
-        // Set persist index
-        state_collector.acknowledge_epoch(EpochId(1), 150);
+        // Simulate all proxies reporting epoch 150
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(150),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Add records to different epochs and proxies
         let epoch1 = EpochId(1);
@@ -390,8 +430,17 @@ mod tests {
             logger.append(epoch, record);
         }
 
-        // Set persist index to 100
-        state_collector.acknowledge_epoch(EpochId(1), 100);
+        // Simulate all proxies reporting epoch 100
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(100),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Test collect_replay_set with different from_index values
         let replay_set_50 = coordinator.collect_replay_set(epoch, 50, 0);
@@ -480,12 +529,30 @@ mod tests {
         // Initial persist index should be 0
         assert_eq!(coordinator.get_persist_index(&state_collector), 0);
 
-        // Update persist index
-        state_collector.acknowledge_epoch(EpochId(1), 500);
+        // Simulate all proxies reporting epoch 500
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(500),
+                snapshot,
+                3,
+                None,
+            );
+        }
         assert_eq!(coordinator.get_persist_index(&state_collector), 500);
 
-        // Update again
-        state_collector.acknowledge_epoch(EpochId(2), 1000);
+        // Simulate all proxies reporting epoch 1000
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(1000),
+                snapshot,
+                3,
+                None,
+            );
+        }
         assert_eq!(coordinator.get_persist_index(&state_collector), 1000);
     }
 
@@ -534,7 +601,17 @@ mod tests {
             logger.append(epoch, record);
         }
 
-        state_collector.acknowledge_epoch(EpochId(1), 100);
+        // Simulate all proxies reporting epoch 100
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector.process_snapshot::<TestTransaction>(
+                proxy_id,
+                EpochId(100),
+                snapshot,
+                3,
+                None,
+            );
+        }
 
         // Test that get_next_replay_batch returns batches
         let persist_index = state_collector.get_persist_index();

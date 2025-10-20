@@ -1,58 +1,44 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
 
 /// Concurrent in-memory state for snapshots and merged objects
 pub struct StateCollector {
-    /// Proxies that have reported per-epoch: epoch -> set(proxy_id)
-    pub collecting_snapshots: DashMap<EpochId, DashSet<crate::proxy::core::ProxyId>>,
     /// In-memory latest object states (no disk persistence)
     pub merged_state: DashMap<ObjectID, Object>,
-    /// Primary-level persist index: last fully acknowledged epoch's consensus index
-    persist_index: AtomicU64,
+    /// Per-proxy persist index: tracks the last acknowledged epoch for each proxy
+    /// Key: ProxyId, Value: last acknowledged epoch ID
+    per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
 }
 
 impl StateCollector {
     pub fn new(_expected_proxies: usize) -> Self {
         Self {
-            collecting_snapshots: DashMap::new(),
             merged_state: DashMap::new(),
-            persist_index: AtomicU64::new(0),
+            per_proxy_persist_index: DashMap::new(),
         }
     }
 
-    /// Ensure an epoch entry exists
-    pub fn ensure_epoch(&self, epoch: EpochId) {
-        self.collecting_snapshots
-            .entry(epoch)
-            .or_insert_with(DashSet::new);
-    }
-
     /// Process a state snapshot from a proxy
+    ///
+    /// This updates the per-proxy persist index for the proxy that reported the snapshot.
+    /// Since each proxy reports snapshots in order, we can simply update that proxy's
+    /// persist index without complex buffering logic.
+    ///
+    /// Note: Pruning is handled separately by the caller (e.g., LoadBalancer::prune_epoch_logger)
+    /// to avoid inefficient per-snapshot pruning.
     pub fn process_snapshot<T>(
         &self,
         proxy_id: crate::proxy::core::ProxyId,
         epoch: EpochId,
         snapshot: EpochObjectStates,
-        expected_proxies: usize,
-        epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
+        _expected_proxies: usize,
+        _epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
     ) where
         T: crate::executor::api::ExecutableTransaction + Clone,
     {
-        // Upsert per-epoch snapshots and global merged state concurrently-safe
-        let epoch_entry = self
-            .collecting_snapshots
-            .entry(epoch)
-            .or_insert_with(DashSet::new);
-
-        tracing::debug!(
-            "Epoch {} entry created/retrieved, current proxy count: {}",
-            epoch.0,
-            epoch_entry.len()
-        );
-
         tracing::info!(
             "Process_snapshot: Received snapshot from proxy {} for epoch {}: {} objects",
             proxy_id,
@@ -65,93 +51,22 @@ impl StateCollector {
             self.merged_state.insert(obj_id, obj);
         }
 
-        epoch_entry.insert(proxy_id);
+        // Update this proxy's persist index to the epoch just completed
+        // Since proxies report epochs in order, we can directly update without checks
+        let consensus_index = epoch.0;
 
-        tracing::debug!(
-            "Proxy {} inserted into epoch {}, new proxy count: {}",
-            proxy_id,
-            epoch.0,
-            epoch_entry.len()
-        );
+        // Initialize or update the proxy's persist index
+        self.per_proxy_persist_index
+            .entry(proxy_id)
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(consensus_index, Ordering::SeqCst);
 
-        // Check if epoch is complete and advance persist index if so
-        let current_persist_index = self.get_persist_index();
-        let epoch_proxy_count = epoch_entry.len();
         tracing::info!(
-            "Epoch {} progress: {}/{} proxies reported, current persist index: {}",
-            epoch.0,
-            epoch_proxy_count,
-            expected_proxies,
-            current_persist_index
+            "Updated persist_index for proxy {} to {} (epoch {})",
+            proxy_id,
+            consensus_index,
+            epoch.0
         );
-
-        if epoch_proxy_count >= expected_proxies {
-            // The consensus index should be the current persist index + 1
-            let consensus_index = current_persist_index + 1;
-
-            // Use a compare-and-swap to ensure only one worker advances the persist index
-            let old_persist_index = self.persist_index.compare_exchange(
-                current_persist_index,
-                consensus_index,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-
-            match old_persist_index {
-                Ok(_) => {
-                    // We successfully advanced the persist index
-                    tracing::info!(
-                        "Epoch {} completed with {}/{} proxies, advancing persist index from {} to {}",
-                        epoch.0,
-                        epoch_proxy_count,
-                        expected_proxies,
-                        current_persist_index,
-                        consensus_index
-                    );
-                    // Remove the epoch from tracking
-                    self.collecting_snapshots.remove(&epoch);
-
-                    // Prune the previous epoch if it exists and is safe to prune
-                    if let Some(logger) = epoch_logger {
-                        let prev_epoch = EpochId(epoch.0 - 1);
-                        let current_persist_index = self.get_persist_index();
-                        let should_prune = logger
-                            .get_epoch(prev_epoch)
-                            .map(|records| {
-                                records.iter().all(|record| {
-                                    record
-                                        .consensus_index
-                                        .map(|idx| idx < current_persist_index)
-                                        .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(true); // If epoch doesn't exist, it's safe to prune
-
-                        if should_prune {
-                            logger.prune_epoch(prev_epoch);
-                            tracing::info!(
-                                "Pruned epoch {} (all records below persist_index {})",
-                                prev_epoch.0,
-                                current_persist_index
-                            );
-                        } else {
-                            tracing::info!(
-                                "Skipped pruning epoch {} (some records >= persist_index {})",
-                                prev_epoch.0,
-                                current_persist_index
-                            );
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Another worker already advanced the persist index
-                    tracing::debug!(
-                        "Epoch {} completion detected but persist index already advanced by another worker",
-                        epoch.0
-                    );
-                }
-            }
-        }
     }
 
     /// Get an object from the in-memory store.
@@ -169,50 +84,46 @@ impl StateCollector {
         self.merged_state.len()
     }
 
-    /// Check if an epoch is complete (all proxies have reported snapshots).
-    /// Returns true if the epoch can be acknowledged and pruned.
+    /// Check if an epoch is complete (all proxies have reported at least this epoch).
+    /// Returns true if all proxies have a persist_index >= the epoch.
     pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
-        let is_complete = self
-            .collecting_snapshots
-            .get(&epoch)
-            .map(|proxies| {
-                let proxy_count = proxies.len();
-                let complete = proxy_count >= expected_proxies;
-                tracing::info!(
-                    "Epoch {} completion check: {}/{} proxies, complete: {}",
-                    epoch.0,
-                    proxy_count,
-                    expected_proxies,
-                    complete
-                );
-                complete
-            })
-            .unwrap_or_else(|| {
-                tracing::info!("Epoch {} not found in collecting_snapshots", epoch.0);
-                false
-            });
-        is_complete
-    }
+        if self.per_proxy_persist_index.len() < expected_proxies {
+            return false;
+        }
 
-    /// Mark an epoch as acknowledged, advance persist index, and remove it from tracking.
-    /// This function is now handled inline in process_snapshot to avoid race conditions.
-    #[deprecated(note = "Use atomic operations in process_snapshot instead")]
-    pub fn acknowledge_epoch(&self, epoch: EpochId, consensus_index: u64) {
-        let old_persist_index = self.persist_index.load(Ordering::SeqCst);
-        self.persist_index.store(consensus_index, Ordering::SeqCst);
-        let removed_epoch = self.collecting_snapshots.remove(&epoch);
-        tracing::info!(
-            "Epoch {} acknowledged; persist index advanced from {} to {}, removed {} tracking entries",
-            epoch.0,
-            old_persist_index,
-            consensus_index,
-            removed_epoch.map(|(_, proxies)| proxies.len()).unwrap_or(0)
-        );
+        let complete = self
+            .per_proxy_persist_index
+            .iter()
+            .take(expected_proxies)
+            .all(|entry| entry.value().load(Ordering::SeqCst) >= epoch.0);
+
+        tracing::info!("Epoch {} completion check: complete: {}", epoch.0, complete);
+        complete
     }
 
     /// Get the current primary persist index (replay cut).
+    ///
+    /// This returns the minimum persist_index across all proxies, which is
+    /// the safe point for pruning - we can only prune transactions that all
+    /// proxies have completed and acknowledged.
     pub fn get_persist_index(&self) -> u64 {
-        self.persist_index.load(Ordering::SeqCst)
+        if self.per_proxy_persist_index.is_empty() {
+            return 0;
+        }
+
+        self.per_proxy_persist_index
+            .iter()
+            .map(|entry| entry.value().load(Ordering::SeqCst))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Get the persist index for a specific proxy (for debugging/diagnostics).
+    pub fn get_proxy_persist_index(&self, proxy_id: crate::proxy::core::ProxyId) -> u64 {
+        self.per_proxy_persist_index
+            .get(&proxy_id)
+            .map(|atomic| atomic.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 }
 
@@ -239,16 +150,8 @@ mod tests {
     }
 
     #[test]
-    fn test_state_collector_start_epoch() {
-        let collector = StateCollector::new(2);
-        collector.ensure_epoch(EpochId(5));
-        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
-    }
-
-    #[test]
     fn test_state_collector_process_snapshot() {
         let collector = StateCollector::new(2);
-        collector.ensure_epoch(EpochId(5));
 
         // Create test objects
         let obj_id1 = ObjectID::random();
@@ -268,14 +171,8 @@ mod tests {
             2,
             None,
         );
-        assert_eq!(
-            collector
-                .collecting_snapshots
-                .get(&EpochId(5))
-                .unwrap()
-                .len(),
-            1
-        );
+        // Check proxy 1's persist index
+        assert_eq!(collector.get_proxy_persist_index(1), 5);
         // merged_state should contain both objects after first snapshot
         assert_eq!(collector.merged_state_len(), 2);
 
@@ -287,58 +184,85 @@ mod tests {
             2,
             None,
         );
-        assert_eq!(
-            collector
-                .collecting_snapshots
-                .get(&EpochId(5))
-                .unwrap()
-                .len(),
-            2
-        );
+        // Check proxy 2's persist index
+        assert_eq!(collector.get_proxy_persist_index(2), 5);
+        // Minimum should be 5
+        assert_eq!(collector.get_persist_index(), 5);
     }
 
     #[test]
-    fn test_state_collector_multiple_epochs_buffering() {
+    fn test_state_collector_multiple_epochs() {
         let collector = StateCollector::new(2);
-        collector.ensure_epoch(EpochId(5));
 
-        // Process snapshot for epoch 6 as well (out of order is allowed, but completion is ordered)
+        // Process snapshots for different epochs - no ordering required
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             1,
             EpochId(6),
-            snapshot,
+            snapshot.clone(),
             2,
             None,
         );
 
-        // Epochs should be present
-        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
-        assert!(collector.collecting_snapshots.get(&EpochId(6)).is_some());
-    }
+        // Proxy 1 should be at epoch 6
+        assert_eq!(collector.get_proxy_persist_index(1), 6);
 
-    #[test]
-    fn test_state_collector_no_epoch() {
-        let collector = StateCollector::new(2);
-
-        // Process snapshot without starting epoch - should create epoch entry
-        let snapshot = EpochObjectStates::new();
+        // Process snapshot for epoch 5 from proxy 2 - out of order is fine
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            1,
+            2,
             EpochId(5),
             snapshot,
             2,
             None,
         );
 
-        // Should have buffered epoch 5
-        assert!(collector.collecting_snapshots.get(&EpochId(5)).is_some());
+        // Proxy 2 should be at epoch 5
+        assert_eq!(collector.get_proxy_persist_index(2), 5);
+        // Minimum should be 5
+        assert_eq!(collector.get_persist_index(), 5);
+    }
+
+    #[test]
+    fn test_state_collector_per_proxy_tracking() {
+        let collector = StateCollector::new(3);
+
+        // Process snapshots from different proxies at different epochs
+        let snapshot = EpochObjectStates::new();
+
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            EpochId(10),
+            snapshot.clone(),
+            3,
+            None,
+        );
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(5),
+            snapshot.clone(),
+            3,
+            None,
+        );
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            2,
+            EpochId(7),
+            snapshot,
+            3,
+            None,
+        );
+
+        // Check individual persist indices
+        assert_eq!(collector.get_proxy_persist_index(0), 10);
+        assert_eq!(collector.get_proxy_persist_index(1), 5);
+        assert_eq!(collector.get_proxy_persist_index(2), 7);
+
+        // Global persist index should be minimum (5)
+        assert_eq!(collector.get_persist_index(), 5);
     }
 
     #[test]
     fn test_state_collector_merge_snapshots() {
         let collector = StateCollector::new(2);
-        collector.ensure_epoch(EpochId(5));
 
         // Create snapshots with overlapping objects
         let obj_id1 = ObjectID::random();
@@ -376,14 +300,52 @@ mod tests {
             None,
         );
 
-        // Epoch should have two proxies recorded
-        assert_eq!(
-            collector
-                .collecting_snapshots
-                .get(&EpochId(5))
-                .unwrap()
-                .len(),
-            2
+        // Both proxies should be at epoch 5
+        assert_eq!(collector.get_proxy_persist_index(1), 5);
+        assert_eq!(collector.get_proxy_persist_index(2), 5);
+        // All 3 objects should be in merged state (last-writer-wins for obj_id1)
+        assert_eq!(collector.merged_state_len(), 3);
+    }
+
+    #[test]
+    fn test_per_proxy_independent_progress() {
+        // Test that each proxy can progress independently through epochs
+        let collector = StateCollector::new(3);
+        let snapshot = EpochObjectStates::new();
+
+        // Proxy 0 reports up to epoch 10
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            EpochId(10),
+            snapshot.clone(),
+            3,
+            None,
         );
+
+        // Proxy 1 reports up to epoch 5
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            EpochId(5),
+            snapshot.clone(),
+            3,
+            None,
+        );
+
+        // Proxy 2 reports up to epoch 7
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            2,
+            EpochId(7),
+            snapshot,
+            3,
+            None,
+        );
+
+        // Each proxy should track its own progress
+        assert_eq!(collector.get_proxy_persist_index(0), 10);
+        assert_eq!(collector.get_proxy_persist_index(1), 5);
+        assert_eq!(collector.get_proxy_persist_index(2), 7);
+
+        // Global persist index is the minimum (safe point for pruning)
+        assert_eq!(collector.get_persist_index(), 5);
     }
 }

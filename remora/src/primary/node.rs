@@ -154,7 +154,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         });
 
         // Using tokio::spawn instead of worker pool for snapshot processing
-
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
         let collector_logger = epoch_logger.clone();

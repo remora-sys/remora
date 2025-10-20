@@ -306,27 +306,24 @@ where
 
     /// Prune epoch logger based on current persist index from state collector.
     /// This should be called periodically to clean up old epoch logs.
+    ///
+    /// With per-proxy persist_index, we can safely prune any epoch where the epoch ID
+    /// is less than the minimum persist_index across all proxies, since that means
+    /// all proxies have moved past that epoch.
     pub fn prune_epoch_logger(&self) {
-        let current_persist_index = self.collector.get_persist_index();
+        let min_persist_index = self.collector.get_persist_index();
 
-        // Collect epochs to prune - only prune epochs where all records have consensus_index < persist_index
+        // Simply prune all epochs below the minimum persist index
+        // Since persist_index represents epoch IDs, and all proxies report in order,
+        // any epoch with ID < min_persist_index has been completed by all proxies
         let epochs_to_prune: Vec<crate::checkpoint::EpochId> = self
             .epoch_logger
             .get_segments()
             .iter()
             .filter_map(|entry| {
                 let epoch = *entry.key();
-                let records = entry.value();
-
-                // Check if all records in this epoch are below the persist_index
-                let all_below_persist = records.iter().all(|record| {
-                    record
-                        .consensus_index
-                        .map(|idx| idx < current_persist_index)
-                        .unwrap_or(false) // If no consensus_index, don't prune
-                });
-
-                if all_below_persist && !records.is_empty() {
+                // Prune if epoch ID is less than the minimum persist index
+                if epoch.0 < min_persist_index {
                     Some(epoch)
                 } else {
                     None
@@ -339,17 +336,19 @@ where
         for epoch in epochs_to_prune {
             self.epoch_logger.prune_epoch(epoch);
             tracing::debug!(
-                "Pruned epoch {} (all records below persist_index {})",
+                "Pruned epoch {} (epoch < min_persist_index {})",
                 epoch.0,
-                current_persist_index
+                min_persist_index
             );
         }
 
-        tracing::debug!(
-            "Epoch logger pruning completed. Persist index: {}, pruned {} epochs",
-            current_persist_index,
-            pruned_count
-        );
+        if pruned_count > 0 {
+            tracing::info!(
+                "Epoch logger pruning completed. Min persist index: {}, pruned {} epochs",
+                min_persist_index,
+                pruned_count
+            );
+        }
     }
 
     /// Clear failed proxy and optionally flush queued transactions.
@@ -630,6 +629,9 @@ where
                         }
                         self.broadcast_checkpoint(epoch).await;
                         self.next_epoch_id += 1;
+
+                        // Periodically prune old epochs from the logger
+                        self.prune_epoch_logger();
                     }
                 }
 
