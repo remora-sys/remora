@@ -723,7 +723,8 @@ where
         if let Some(tx) = tx_inter_proxy_replies.get(&proxy_id) {
             if tx.send(message).await.is_err() {
                 tracing::warn!(
-                    "Failed to send reply to proxy {}, connection may be lost",
+                    "Failed to send {} to proxy {}, connection may be lost",
+                    message_type,
                     proxy_id
                 );
             }
