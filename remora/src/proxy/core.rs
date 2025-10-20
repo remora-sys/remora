@@ -721,15 +721,128 @@ where
         tracing::debug!("Sending {} to proxy {}", message_type, proxy_id);
 
         if let Some(tx) = tx_inter_proxy_replies.get(&proxy_id) {
-            if tx.send(message).await.is_err() {
+            if let Err(e) = tx.send(message.clone()).await {
                 tracing::warn!(
-                    "Failed to send {} to proxy {}, connection may be lost",
+                    "Failed to send {} to proxy {}, connection may be lost: {:?}",
                     message_type,
-                    proxy_id
+                    proxy_id,
+                    e
                 );
+
+                // If this is a stateful request and send failed, redirect to standby proxy
+                if let ProxyToProxyMessage::Request(InterProxyRequest::Stateful(
+                    requester_id,
+                    states,
+                )) = &message
+                {
+                    // Find the standby proxy (highest ProxyId in connections)
+                    let standby_proxy = tx_inter_proxy_replies
+                        .iter()
+                        .map(|entry| *entry.key())
+                        .max();
+
+                    if let Some(standby_id) = standby_proxy {
+                        if standby_id != proxy_id {
+                            tracing::info!(
+                                "Redirecting stateful request from proxy {} to standby proxy {} (failed proxy: {})",
+                                requester_id,
+                                standby_id,
+                                proxy_id
+                            );
+
+                            // Send the request to the standby proxy instead
+                            if let Some(standby_tx) = tx_inter_proxy_replies.get(&standby_id) {
+                                let redirect_request =
+                                    InterProxyRequest::Stateful(*requester_id, states.clone());
+                                if let Err(e) = standby_tx
+                                    .send(ProxyToProxyMessage::Request(redirect_request))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to send redirected stateful request to standby proxy {}: {:?}",
+                                        standby_id,
+                                        e
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "Successfully redirected stateful request to standby proxy {}",
+                                        standby_id
+                                    );
+                                }
+                            } else {
+                                tracing::error!(
+                                    "Standby proxy {} not found in connections",
+                                    standby_id
+                                );
+                            }
+                        } else {
+                            tracing::error!(
+                                "Cannot redirect to standby - failed proxy {} is the standby",
+                                proxy_id
+                            );
+                        }
+                    } else {
+                        tracing::error!("No standby proxy available for redirection");
+                    }
+                }
             }
         } else {
             tracing::warn!("No connection found for proxy {}", proxy_id);
+
+            // If this is a stateful request and no connection exists, redirect to standby proxy
+            if let ProxyToProxyMessage::Request(InterProxyRequest::Stateful(requester_id, states)) =
+                &message
+            {
+                // Find the standby proxy (highest ProxyId in connections)
+                let standby_proxy = tx_inter_proxy_replies
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .max();
+
+                if let Some(standby_id) = standby_proxy {
+                    if standby_id != proxy_id {
+                        tracing::info!(
+                            "Redirecting stateful request from proxy {} to standby proxy {} (no connection to proxy: {})",
+                            requester_id,
+                            standby_id,
+                            proxy_id
+                        );
+
+                        // Send the request to the standby proxy instead
+                        if let Some(standby_tx) = tx_inter_proxy_replies.get(&standby_id) {
+                            let redirect_request =
+                                InterProxyRequest::Stateful(*requester_id, states.clone());
+                            if let Err(e) = standby_tx
+                                .send(ProxyToProxyMessage::Request(redirect_request))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to send redirected stateful request to standby proxy {}: {:?}",
+                                    standby_id,
+                                    e
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Successfully redirected stateful request to standby proxy {}",
+                                    standby_id
+                                );
+                            }
+                        } else {
+                            tracing::error!(
+                                "Standby proxy {} not found in connections",
+                                standby_id
+                            );
+                        }
+                    } else {
+                        tracing::error!(
+                            "Cannot redirect to standby - failed proxy {} is the standby",
+                            proxy_id
+                        );
+                    }
+                } else {
+                    tracing::error!("No standby proxy available for redirection");
+                }
+            }
         }
     }
 }
