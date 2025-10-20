@@ -188,6 +188,19 @@ where
         keys.sort_unstable();
         keys.get(idx).copied()
     }
+
+    #[inline]
+    fn proxy_id_to_index(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        proxy_id: ProxyId,
+    ) -> Option<ExecutorIndex> {
+        // Map ProxyId to its positional index in sorted keys
+        let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+        keys.iter().position(|&id| id == proxy_id)
+    }
     /// Create a new SharedObjTxnForwarder with worker pool
     pub(crate) fn new(
         dependency_controller: Arc<VersionedDependencyController>,
@@ -297,6 +310,9 @@ where
             if let (Some(logger), Some(dest_pid)) = (&context.epoch_logger, resolved_stateful) {
                 let epoch =
                     crate::checkpoint::EpochId(context.current_epoch.load(Ordering::SeqCst));
+                // Convert ProxyId to positional index for clone_required_states
+                let dest_index =
+                    Self::proxy_id_to_index(proxy_connections, dest_pid).unwrap_or(dest_pid);
                 let rec = LogRecord {
                     consensus_index: Some(task.consensus_index),
                     txn_digest: *transaction_arc.digest(),
@@ -305,7 +321,7 @@ where
                     required_states: Self::clone_required_states(
                         &task.required_versions,
                         states_to_proxy.clone(),
-                        dest_pid,
+                        dest_index,
                     )
                     .await,
                     epoch,
@@ -327,6 +343,13 @@ where
                 states_to_proxy.clone(),
             )
             .await;
+
+            // CRITICAL: Resolve positional indices to ProxyIds before sending to proxies
+            // Proxies use these values to look up peer connections, so they must be actual ProxyIds
+            let stateful_missing_states = Self::resolve_required_states_to_proxy_ids(
+                stateful_missing_states,
+                proxy_connections,
+            );
 
             if proxy_mode == ProxyMode::Separation {
                 let stateless_msg =
@@ -392,6 +415,23 @@ where
             required_states.insert((object_id, seq_num), prev);
         }
         required_states
+    }
+
+    /// Convert required_states from positional indices to ProxyIds
+    /// This is critical for proxies to correctly resolve peer proxy connections
+    fn resolve_required_states_to_proxy_ids(
+        required_states: BTreeMap<(ObjectID, SequenceNumber), Option<ExecutorIndex>>,
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+    ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
+        let mut resolved = BTreeMap::new();
+        for ((obj_id, seq_num), maybe_idx) in required_states {
+            let resolved_proxy_id =
+                maybe_idx.and_then(|idx| Self::resolve_proxy_id(proxy_connections, idx));
+            resolved.insert((obj_id, seq_num), resolved_proxy_id);
+        }
+        resolved
     }
 
     /// Main processing method that distributes transactions to worker threads
@@ -833,7 +873,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        dest_proxy: ExecutorIndex,
+        dest_proxy: ProxyId,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
         if let Some(proxy_connection) = proxy_connections.get(&dest_proxy) {

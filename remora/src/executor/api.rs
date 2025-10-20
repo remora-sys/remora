@@ -240,25 +240,26 @@ pub trait Executor: Clone {
         ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         items: Vec<ReplayItem<Self::Transaction>>,
-    ) -> impl Future<Output = ()> + Send
-    where
+    ) where
         Self::Transaction: Send + Sync + 'static,
         Self::Store: Send + Sync + 'static,
         Self::ExecutionContext: Send + Sync + 'static,
     {
-        async move {
-            for item in items {
+        for item in items {
+            let ctx = ctx.clone();
+            let store = store.clone();
+            tokio::spawn(async move {
                 if !item.state_blobs.is_empty() {
                     // Commit required states first
                     store.commit_new_objects(item.state_blobs);
                 }
                 // Execute using the existing execution path (ignore result here)
-                let _ = Self::execute(ctx.clone(), store.clone(), item.transaction).await;
-            }
+                let _ = Self::execute(ctx, store, item.transaction).await;
+            });
         }
+        tracing::info!("Dirty transactions all spawned");
     }
 }
-
 /// Short for a transaction with a timestamp.
 pub type RemoraTransaction<E> = TransactionWithTimestamp<<E as Executor>::Transaction>;
 

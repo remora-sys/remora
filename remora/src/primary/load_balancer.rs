@@ -166,6 +166,28 @@ where
                 removed
             );
 
+            // CRITICAL FIX: After removing a proxy, the resolve_proxy_id mapping changes.
+            // Positional indices in states_to_proxy need to be adjusted to account for
+            // the removed proxy. All indices > failed_proxy must be decremented by 1.
+            //
+            // Example: Before removal: connections = {0, 1, 2}, index 1 maps to ProxyId 1
+            //          After removing 0: connections = {1, 2}, index 0 maps to ProxyId 1 (shifted!)
+            //
+            // So we need to decrement all state ownership indices > removed proxy index.
+            let mut remapped_count = 0;
+            for mut entry in self.states_to_proxy.iter_mut() {
+                let current_idx = *entry.value();
+                if current_idx > failed_proxy {
+                    *entry.value_mut() = current_idx - 1;
+                    remapped_count += 1;
+                }
+            }
+            tracing::info!(
+                failed_proxy,
+                remapped_count,
+                "Adjusted state ownership indices after proxy removal"
+            );
+
             tracing::info!(
                 "Recovery begun: failed proxy {} replaced by standby {}",
                 failed_proxy,

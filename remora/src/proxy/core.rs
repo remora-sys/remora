@@ -147,7 +147,7 @@ where
                         .collect();
                     let ctx = self.executor.context().clone();
                     let store = self.store.clone();
-                    E::replay(ctx, store, items).await;
+                    E::replay(ctx, store, items);
                 }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
@@ -210,7 +210,7 @@ where
                         .collect();
                     let ctx = self.executor.context().clone();
                     let store = self.store.clone();
-                    let _ = E::replay(ctx, store, items).await;
+                    E::replay(ctx, store, items);
                 }
                 // Replay handling already covered above in separation mode; no duplicate here.
                 _ => {
