@@ -135,19 +135,32 @@ where
                         batch.epoch,
                         batch.items.len()
                     );
-                    let items = batch
-                        .items
-                        .into_iter()
-                        .map(|m| crate::executor::api::ReplayItem {
-                            consensus_index: m.consensus_index,
-                            transaction: m.transaction,
-                            required_versions: m.required_versions,
-                            state_blobs: m.state_blobs,
-                        })
-                        .collect();
-                    let ctx = self.executor.context().clone();
-                    let store = self.store.clone();
-                    E::replay(ctx, store, items);
+                    for msg in batch.items {
+                        // Commit state_blobs using spawn_state_updates
+                        if !msg.state_blobs.is_empty() {
+                            self.spawn_state_updates(msg.state_blobs.clone());
+                        }
+
+                        // Build required_states from required_versions
+                        let required_states: RequiredStates = msg
+                            .required_versions
+                            .into_iter()
+                            .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
+                            .collect();
+
+                        tracing::debug!(
+                            "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                            msg.transaction.digest(),
+                            required_states.keys(),
+                            msg.state_blobs.keys()
+                        );
+
+                        // Spawn stateful transaction
+                        let transaction = Arc::new(msg.transaction);
+                        self.spawn_stateful_txn(transaction, None, required_states)
+                            .await
+                            .expect("Failed to spawn replay transaction");
+                    }
                 }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
@@ -197,20 +210,32 @@ where
                         batch.epoch,
                         batch.items.len()
                     );
-                    // Map ReplayMsg to ReplayItem and call Executor::replay
-                    let items = batch
-                        .items
-                        .into_iter()
-                        .map(|m| crate::executor::api::ReplayItem {
-                            consensus_index: m.consensus_index,
-                            transaction: m.transaction,
-                            required_versions: m.required_versions,
-                            state_blobs: m.state_blobs,
-                        })
-                        .collect();
-                    let ctx = self.executor.context().clone();
-                    let store = self.store.clone();
-                    E::replay(ctx, store, items);
+                    for msg in batch.items {
+                        // Commit state_blobs using spawn_state_updates
+                        if !msg.state_blobs.is_empty() {
+                            self.spawn_state_updates(msg.state_blobs.clone());
+                        }
+
+                        // Build required_states from required_versions
+                        let required_states: RequiredStates = msg
+                            .required_versions
+                            .into_iter()
+                            .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
+                            .collect();
+
+                        tracing::debug!(
+                            "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                            msg.transaction.digest(),
+                            required_states.keys(),
+                            msg.state_blobs.keys()
+                        );
+
+                        // Spawn stateful transaction
+                        let transaction = Arc::new(msg.transaction);
+                        self.spawn_stateful_txn(transaction, None, required_states)
+                            .await
+                            .expect("Failed to spawn replay transaction");
+                    }
                 }
                 // Replay handling already covered above in separation mode; no duplicate here.
                 _ => {
@@ -351,6 +376,25 @@ where
             stateful_controller.get_prior_dependency_and_update(0, obj_ids.clone(), false, false);
 
         (obj_ids, prior_handles, current_handles)
+    }
+
+    /// Spawn a task to commit state updates and notify dependencies
+    fn spawn_state_updates(&self, state_blobs: BTreeMap<ObjectID, Object>) {
+        let objs: Vec<_> = state_blobs
+            .iter()
+            .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
+            .collect();
+        let (_, current_handles) = self
+            .stateful_controller
+            .get_prior_dependency_and_update(0, objs, true, false);
+
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            store.commit_new_objects(state_blobs);
+            for notify in current_handles {
+                notify.notify_one();
+            }
+        });
     }
 
     pub async fn spawn_stateful_txn(

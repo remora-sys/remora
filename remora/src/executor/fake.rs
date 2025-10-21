@@ -434,7 +434,14 @@ impl Executor for FakeExecutor {
                             object.version()
                         );
                         if object.version() != version.unwrap() {
-                            tracing::debug!("Version mismatch for object {:?}", id);
+                            tracing::info!(
+                                "Version mismatch for object {:?} - transaction {:?}
+                                actual version is {:?} while expected is {:?}",
+                                id,
+                                transaction.digest(),
+                                object.version(),
+                                version.unwrap()
+                            );
                             return false;
                         }
                     }

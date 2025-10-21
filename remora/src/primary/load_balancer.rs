@@ -269,35 +269,37 @@ where
 
                 let total_epochs = txns_by_epoch.len();
                 let mut sent_count = 0;
+                let mut sent_blobs = std::collections::HashSet::new();
 
                 for (epoch, epoch_records) in txns_by_epoch {
-                    let replay_items: Vec<crate::executor::api::ReplayMsg<E::Transaction>> =
-                        epoch_records
-                            .into_iter()
-                            .map(|record| {
-                                // Hydrate transaction data from LogRecord
-                                let transaction = (*record.transaction).clone();
+                    let mut replay_items = Vec::new();
+                    for record in epoch_records {
+                        // Hydrate transaction data from LogRecord
+                        let transaction = (*record.transaction).clone();
 
-                                // Fetch state blobs from StateCollector
-                                let mut state_blobs = std::collections::BTreeMap::new();
-                                for (object_id, _version) in record.required_states.keys() {
-                                    if let Some(object) = collector.get_object(object_id) {
-                                        state_blobs.insert(*object_id, object);
-                                    }
-                                }
+                        // Fetch state blobs from StateCollector, avoiding duplicates
+                        let mut state_blobs = std::collections::BTreeMap::new();
+                        for (object_id, version) in record.required_states.keys() {
+                            // Skip blobs that have already been sent in this replay session
+                            if sent_blobs.contains(object_id) {
+                                continue;
+                            }
+                            if *version == SequenceNumber::from(2) {
+                                continue;
+                            }
+                            if let Some(object) = collector.get_object(object_id) {
+                                state_blobs.insert(*object_id, object);
+                                sent_blobs.insert(*object_id);
+                            }
+                        }
 
-                                crate::executor::api::ReplayMsg {
-                                    consensus_index: record.consensus_index.unwrap_or(0),
-                                    transaction,
-                                    required_versions: record
-                                        .required_states
-                                        .keys()
-                                        .cloned()
-                                        .collect(),
-                                    state_blobs,
-                                }
-                            })
-                            .collect();
+                        replay_items.push(crate::executor::api::ReplayMsg {
+                            consensus_index: record.consensus_index.unwrap_or(0),
+                            transaction,
+                            required_versions: record.required_states.keys().cloned().collect(),
+                            state_blobs,
+                        });
+                    }
 
                     let batch_size = replay_items.len();
                     sent_count += batch_size;
