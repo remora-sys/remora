@@ -148,7 +148,7 @@ where
                             .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                             .collect();
 
-                        tracing::debug!(
+                        tracing::info!(
                             "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                             msg.transaction.digest(),
                             required_states.keys(),
@@ -223,11 +223,11 @@ where
                             .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                             .collect();
 
-                        tracing::debug!(
+                        tracing::info!(
                             "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                             msg.transaction.digest(),
                             required_states.keys(),
-                            msg.state_blobs.keys()
+                            msg.state_blobs
                         );
 
                         // Spawn stateful transaction

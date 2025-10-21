@@ -278,17 +278,18 @@ mod tests {
             );
         }
 
-        // Test that get_next_replay_batch returns batches
+        // Test that get_next_replay_batch returns all dirty transactions
         // Note: drain_dirty_queue doesn't actually remove items, so each call returns the same items
+        // The batch_size parameter is deprecated and ignored - all transactions are returned
         let persist_index = state_collector.get_persist_index();
         let batch1 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch1.is_some());
-        assert_eq!(batch1.unwrap().len(), 3); // Should be limited by batch_size (7 items, batch size 3)
+        assert_eq!(batch1.unwrap().len(), 7); // Returns all 7 items (batch_size is ignored)
 
         // Subsequent calls return the same batch (items aren't removed)
         let batch2 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch2.is_some());
-        assert_eq!(batch2.unwrap().len(), 3);
+        assert_eq!(batch2.unwrap().len(), 7);
     }
 
     #[test]
@@ -620,17 +621,18 @@ mod tests {
             );
         }
 
-        // Test that get_next_replay_batch returns batches
+        // Test that get_next_replay_batch returns all dirty transactions
         // Note: drain_dirty_queue doesn't actually remove items, so each call returns the same items
+        // The batch_size parameter is deprecated and ignored - all transactions are returned
         let persist_index = state_collector.get_persist_index();
         let batch1 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch1.is_some());
-        assert_eq!(batch1.unwrap().len(), 5); // Should be limited by batch_size
+        assert_eq!(batch1.unwrap().len(), 12); // Returns all 12 items (batch_size is ignored)
 
         // Subsequent calls return the same batch (items aren't removed)
         let batch2 = coordinator.get_next_replay_batch(0, persist_index);
         assert!(batch2.is_some());
-        assert_eq!(batch2.unwrap().len(), 5);
+        assert_eq!(batch2.unwrap().len(), 12);
     }
 
     /// This test validates that dirty transactions can be retrieved after a failure.

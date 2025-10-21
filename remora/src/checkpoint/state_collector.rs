@@ -6,29 +6,42 @@ use sui_types::object::Object;
 
 /// Concurrent in-memory state for snapshots and merged objects
 pub struct StateCollector {
-    /// In-memory latest object states (no disk persistence)
+    /// Persisted state: Objects acknowledged by ALL proxies (stable, safe for recovery)
+    /// This is the "commit point" - all proxies have reached consensus on these versions
     pub merged_state: DashMap<ObjectID, Object>,
+
+    /// Temporary per-proxy state: Snapshots received but not yet fully acknowledged
+    /// Key: (ProxyId, ObjectID) -> Object
+    /// Once all proxies report for an epoch, temp states are promoted to merged_state
+    temp_state_by_proxy: DashMap<(crate::proxy::core::ProxyId, ObjectID), Object>,
+
     /// Per-proxy persist index: tracks the last acknowledged epoch for each proxy
     /// Key: ProxyId, Value: last acknowledged epoch ID
-    per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
+    pub(crate) per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
+
+    /// Number of expected proxies (for determining when all have acknowledged)
+    expected_proxies: usize,
 }
 
 impl StateCollector {
-    pub fn new(_expected_proxies: usize) -> Self {
+    pub fn new(expected_proxies: usize) -> Self {
         Self {
             merged_state: DashMap::new(),
+            temp_state_by_proxy: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
+            expected_proxies,
         }
     }
 
     /// Process a state snapshot from a proxy
     ///
-    /// This updates the per-proxy persist index for the proxy that reported the snapshot.
-    /// Since each proxy reports snapshots in order, we can simply update that proxy's
-    /// persist index without complex buffering logic.
+    /// Two-phase commit protocol:
+    /// 1. Store snapshot in temp_state_by_proxy (per-proxy temporary storage)
+    /// 2. Check if ALL proxies have reported for this epoch
+    /// 3. If yes, promote temp states to merged_state (persisted, stable)
     ///
-    /// Note: Pruning is handled separately by the caller (e.g., LoadBalancer::prune_epoch_logger)
-    /// to avoid inefficient per-snapshot pruning.
+    /// This ensures merged_state only contains versions acknowledged by all proxies,
+    /// eliminating version gaps during recovery.
     pub fn process_snapshot<T>(
         &self,
         proxy_id: crate::proxy::core::ProxyId,
@@ -46,32 +59,95 @@ impl StateCollector {
             snapshot.len()
         );
 
-        // Move directly into the in-memory merged state (no per-epoch merge)
+        // Phase 1: Store in temporary per-proxy state
         for (obj_id, obj) in snapshot.into_iter() {
-            self.merged_state.insert(obj_id, obj);
+            self.temp_state_by_proxy.insert((proxy_id, obj_id), obj);
         }
 
         // Update this proxy's persist index to the epoch just completed
-        // Since proxies report epochs in order, we can directly update without checks
         let consensus_index = epoch.0;
-
-        // Initialize or update the proxy's persist index
         self.per_proxy_persist_index
             .entry(proxy_id)
             .or_insert_with(|| AtomicU64::new(0))
             .store(consensus_index, Ordering::SeqCst);
 
         tracing::info!(
-            "Updated persist_index for proxy {} to {} (epoch {})",
+            "Stored temp snapshot for proxy {} at epoch {}",
             proxy_id,
-            consensus_index,
             epoch.0
+        );
+
+        // Phase 2: Check if all proxies have reached this epoch
+        // If yes, promote temp states to merged_state (commit point)
+        if self.is_epoch_complete(epoch, self.expected_proxies) {
+            self.commit_epoch(epoch);
+        }
+    }
+
+    /// Commit an epoch: promote all temp states to merged_state
+    /// This happens when ALL proxies have acknowledged the epoch
+    fn commit_epoch(&self, epoch: EpochId) {
+        let mut committed_count = 0;
+
+        // Collect all object IDs and their latest versions from temp state
+        let mut objects_by_id: std::collections::HashMap<ObjectID, (SequenceNumber, Object)> =
+            std::collections::HashMap::new();
+
+        // Scan all temp states to find latest version of each object
+        for entry in self.temp_state_by_proxy.iter() {
+            let ((_proxy_id, obj_id), obj) = entry.pair();
+            let version = obj.version();
+
+            // Keep the latest version for each object
+            objects_by_id
+                .entry(*obj_id)
+                .and_modify(|(current_version, current_obj)| {
+                    if version > *current_version {
+                        *current_version = version;
+                        *current_obj = obj.clone();
+                    }
+                })
+                .or_insert((version, obj.clone()));
+        }
+
+        // Commit all latest versions to merged_state
+        for (obj_id, (_version, obj)) in objects_by_id {
+            self.merged_state.insert(obj_id, obj);
+            committed_count += 1;
+        }
+
+        // Clear temp states for committed objects (optional optimization)
+        // Keep temp states for now to support partial epochs during recovery
+
+        tracing::info!(
+            "Committed epoch {} to merged_state: {} objects promoted",
+            epoch.0,
+            committed_count
         );
     }
 
-    /// Get an object from the in-memory store.
+    /// Get an object from the in-memory store (persisted state only).
     pub fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
         self.merged_state.get(object_id).map(|e| e.clone())
+    }
+
+    /// Get an object for a specific proxy, checking both persisted and that proxy's temp state.
+    /// First checks merged_state (fully acknowledged), then falls back to the proxy's temp state.
+    /// This is useful during recovery to access objects from the failed proxy's incomplete epochs.
+    pub fn get_object_for_proxy(
+        &self,
+        object_id: &ObjectID,
+        proxy_id: crate::proxy::core::ProxyId,
+    ) -> Option<Object> {
+        // First try persisted state (ground truth)
+        if let Some(obj) = self.merged_state.get(object_id) {
+            return Some(obj.clone());
+        }
+
+        // Fall back to this specific proxy's temp state
+        self.temp_state_by_proxy
+            .get(&(proxy_id, *object_id))
+            .map(|obj| obj.clone())
     }
 
     /// Get the persisted version for an object without cloning the entire object.
@@ -190,8 +266,8 @@ mod tests {
         );
         // Check proxy 1's persist index
         assert_eq!(collector.get_proxy_persist_index(1), 5);
-        // merged_state should contain both objects after first snapshot
-        assert_eq!(collector.merged_state_len(), 2);
+        // merged_state should be EMPTY until all proxies report (two-phase commit)
+        assert_eq!(collector.merged_state_len(), 0);
 
         // Process snapshot from proxy 2
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
@@ -205,6 +281,8 @@ mod tests {
         assert_eq!(collector.get_proxy_persist_index(2), 5);
         // Minimum should be 5
         assert_eq!(collector.get_persist_index(), 5);
+        // NOW merged_state should contain both objects (all proxies reported)
+        assert_eq!(collector.merged_state_len(), 2);
     }
 
     #[test]

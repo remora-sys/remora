@@ -119,21 +119,27 @@ where
             .unwrap_or(failed_proxy);
 
         if standby_proxy != failed_proxy {
-            // Log dirty queue size and persist index for diagnostics
             // Use the failed proxy's own persist_index
             let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
-            let dq_len = self
-                .recovery_coordinator
-                .drain_dirty_queue(failed_proxy as usize, persist_index)
-                .len();
+
+            // NEW: Compute recovery plan with bridging transactions
+            let (bridging_txns, dirty_txns) =
+                self.recovery_coordinator.begin_recovery_with_bridging(
+                    failed_proxy as usize,
+                    persist_index,
+                    &self.collector,
+                );
+
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
-                dirty_queue = dq_len,
+                bridging_count = bridging_txns.len(),
+                dirty_count = dirty_txns.len(),
                 persist_index,
-                "Beginning recovery: diagnostics before replay"
+                "Beginning recovery with bridging transactions"
             );
-            // Begin recovery process
+
+            // Begin recovery process (old API for compatibility)
             let _replacement = self
                 .recovery_coordinator
                 .begin_recovery(failed_proxy as usize, standby_proxy as usize);
@@ -216,7 +222,8 @@ where
     }
 
     /// Start the replay process for a replacement proxy.
-    /// This method spawns a task to send all dirty transactions to the replacement proxy.
+    /// This method spawns a task to send bridging transactions (from healthy proxies) first,
+    /// then dirty transactions (from failed proxy) to the replacement proxy.
     fn start_replay_process(&self, failed_proxy: ProxyId, replacement_proxy: ProxyId) {
         let recovery_coordinator = self.recovery_coordinator.clone();
         let proxy_connections = self.proxy_connections.clone();
@@ -229,41 +236,44 @@ where
                 "Replay task spawned for failed proxy"
             );
 
-            // Use the failed proxy's own persist_index to find dirty transactions
-            // in epochs after its last reported epoch
+            // Use the failed proxy's own persist_index
             let persist_index = collector.get_proxy_persist_index(failed_proxy);
+            let failed_proxy_id = failed_proxy; // Capture for use in closure
 
-            // Get ALL dirty transactions at once (not in a loop, since drain_dirty_queue
-            // doesn't remove items and would return the same transactions repeatedly)
-            let dirty_txns =
-                recovery_coordinator.drain_dirty_queue(failed_proxy as usize, persist_index);
+            // NEW: Get complete recovery plan with bridging transactions
+            let (bridging_txns, dirty_txns) = recovery_coordinator.begin_recovery_with_bridging(
+                failed_proxy as usize,
+                persist_index,
+                &collector,
+            );
 
-            if dirty_txns.is_empty() {
-                tracing::info!(
-                    failed_proxy,
-                    persist_index,
-                    "No dirty transactions to replay"
-                );
+            if bridging_txns.is_empty() && dirty_txns.is_empty() {
+                tracing::info!(failed_proxy, persist_index, "No transactions to replay");
                 return;
             }
 
             tracing::info!(
                 failed_proxy,
                 replacement_proxy,
-                dirty_txn_count = dirty_txns.len(),
+                bridging_count = bridging_txns.len(),
+                dirty_count = dirty_txns.len(),
                 persist_index,
-                "Sending all dirty transactions to replacement proxy"
+                "Sending bridging + dirty transactions to replacement proxy"
             );
 
             // Convert LogRecord to ReplayMsg and send to replacement proxy
             if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
+                // Combine bridging and dirty transactions in order
+                // Bridging transactions must be replayed FIRST to regenerate missing versions
+                let all_txns = bridging_txns.into_iter().chain(dirty_txns.into_iter());
+
                 // Group transactions by epoch and send one batch per epoch
                 let mut txns_by_epoch: std::collections::BTreeMap<
                     crate::checkpoint::EpochId,
                     Vec<_>,
                 > = std::collections::BTreeMap::new();
 
-                for record in dirty_txns {
+                for record in all_txns {
                     txns_by_epoch.entry(record.epoch).or_default().push(record);
                 }
 
@@ -277,8 +287,13 @@ where
                         // Hydrate transaction data from LogRecord
                         let transaction = (*record.transaction).clone();
 
-                        // Fetch state blobs from StateCollector, avoiding duplicates
+                        // Fetch state blobs from StateCollector when available
+                        // NOTE: For bridging transactions, missing blobs are OK - they will be
+                        // regenerated by executing the transaction on the standby proxy.
                         let mut state_blobs = std::collections::BTreeMap::new();
+                        let is_from_failed_proxy =
+                            record.destination_proxy == failed_proxy_id as usize;
+
                         for (object_id, version) in record.required_states.keys() {
                             // Skip blobs that have already been sent in this replay session
                             if sent_blobs.contains(object_id) {
@@ -287,9 +302,33 @@ where
                             if *version == SequenceNumber::from(2) {
                                 continue;
                             }
-                            if let Some(object) = collector.get_object(object_id) {
-                                state_blobs.insert(*object_id, object);
-                                sent_blobs.insert(*object_id);
+
+                            // Try to fetch the object:
+                            // - For failed proxy txns: check persisted + failed proxy's temp state
+                            // - For healthy proxy txns (bridging): check persisted state only
+                            let object_opt = if is_from_failed_proxy {
+                                collector.get_object_for_proxy(object_id, failed_proxy_id)
+                            } else {
+                                collector.get_object(object_id)
+                            };
+
+                            if let Some(object) = object_opt {
+                                // Verify version matches
+                                if object.version() == *version {
+                                    state_blobs.insert(*object_id, object);
+                                    sent_blobs.insert(*object_id);
+                                } else {
+                                    tracing::warn!(
+                                        "Version mismatch for object {:?} - expected {:?}, got {:?}. \
+                                        This is OK for bridging txns - will be regenerated",
+                                        object_id, version, object.version()
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "Object {:?} v{:?} not in collector - will be regenerated by replay",
+                                    object_id, version
+                                );
                             }
                         }
 
