@@ -181,11 +181,17 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         idx: ExecutorIndex,
     ) -> Option<ProxyId> {
-        // Map positional index to the nth key in the current connections snapshot
+        // This is the core fix: always resolve the index against the *current* set of active proxies.
         let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
+
+        if standby_excluded.load(Ordering::SeqCst) && keys.len() > 1 {
+            keys.pop();
+        }
+
         keys.get(idx).copied()
     }
 
@@ -272,9 +278,10 @@ where
             + task.transaction.verification_duration();
         let transaction_arc = Arc::new(task.transaction);
 
-        if let Some((mut proxy_index, mut stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
+        if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
             policy,
             proxy_connections,
+            &context.standby_excluded,
             states_to_proxy,
             task.txn_cnt,
             &task.required_versions,
@@ -283,28 +290,14 @@ where
             proxy_access_histories,
             &txn_duration,
         ) {
-            // If standby is excluded, remap selection away from the last proxy index if chosen
-            if context.standby_excluded.load(Ordering::SeqCst) {
-                let proxy_count = proxy_connections.len();
-                if proxy_count > 0 {
-                    let last = proxy_count - 1;
-                    if proxy_index == last {
-                        if last == 0 {
-                            return;
-                        }
-                        proxy_index = last - 1;
-                    }
-                    if stateless_proxy_id == last {
-                        if last == 0 {
-                            return;
-                        }
-                        stateless_proxy_id = last - 1;
-                    }
-                }
-            }
             // Resolve proxy ids to actual connection keys
-            let resolved_stateful = Self::resolve_proxy_id(proxy_connections, proxy_index);
-            let resolved_stateless = Self::resolve_proxy_id(proxy_connections, stateless_proxy_id);
+            let resolved_stateful =
+                Self::resolve_proxy_id(proxy_connections, &context.standby_excluded, proxy_index);
+            let resolved_stateless = Self::resolve_proxy_id(
+                proxy_connections,
+                &context.standby_excluded,
+                stateless_proxy_id,
+            );
 
             // Append per-epoch log record when context is available
             if let (Some(logger), Some(dest_pid)) = (&context.epoch_logger, resolved_stateful) {
@@ -349,6 +342,7 @@ where
             let stateful_missing_states = Self::resolve_required_states_to_proxy_ids(
                 stateful_missing_states,
                 proxy_connections,
+                &context.standby_excluded,
             );
 
             if proxy_mode == ProxyMode::Separation {
@@ -424,11 +418,12 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
         let mut resolved = BTreeMap::new();
         for ((obj_id, seq_num), maybe_idx) in required_states {
-            let resolved_proxy_id =
-                maybe_idx.and_then(|idx| Self::resolve_proxy_id(proxy_connections, idx));
+            let resolved_proxy_id = maybe_idx
+                .and_then(|idx| Self::resolve_proxy_id(proxy_connections, standby_excluded, idx));
             resolved.insert((obj_id, seq_num), resolved_proxy_id);
         }
         resolved
@@ -469,6 +464,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
@@ -478,21 +474,27 @@ where
         txn_duration: &Duration,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
-            LoadBalancingPolicy::RoundRobin => {
-                Self::get_proxy_for_shared_objects_round_robin(proxy_connections, txn_cnt)
-            }
+            LoadBalancingPolicy::RoundRobin => Self::get_proxy_for_shared_objects_round_robin(
+                proxy_connections,
+                standby_excluded,
+                txn_cnt,
+            ),
             LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
                 proxy_connections,
+                standby_excluded,
                 states_to_proxy,
                 required_versions,
                 txn_cnt,
             ),
             LoadBalancingPolicy::Random => {
-                Self::get_proxy_for_shared_objects_random(proxy_connections)
+                Self::get_proxy_for_shared_objects_random(proxy_connections, standby_excluded)
             }
-            LoadBalancingPolicy::Hermes => destination.map(|dest| (dest, dest)),
+            LoadBalancingPolicy::Hermes => {
+                destination.map(|dest| (dest, dest)) // Note: Hermes still returns ProxyId, must be converted to index
+            }
             LoadBalancingPolicy::LocalityLoad => Self::get_proxy_for_shared_objects_locality_load(
                 proxy_connections,
+                standby_excluded,
                 states_to_proxy,
                 required_versions,
                 proxy_loads,
@@ -502,6 +504,7 @@ where
             LoadBalancingPolicy::AffinityAware => {
                 Self::get_proxy_for_shared_objects_affinity_aware(
                     proxy_connections,
+                    standby_excluded,
                     states_to_proxy,
                     required_versions,
                     proxy_loads,
@@ -518,12 +521,13 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
     ) -> usize {
         let count = proxy_connections.len();
-        if count > 0 {
+        if standby_excluded.load(Ordering::SeqCst) && count > 1 {
             count - 1
         } else {
-            0
+            count
         }
     }
 
@@ -532,9 +536,10 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections);
+        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
         if proxy_count == 0 {
             return None;
         }
@@ -548,8 +553,9 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections);
+        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
         if proxy_count == 0 {
             return None;
         }
@@ -563,11 +569,12 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         required_versions: &[(ObjectID, SequenceNumber)],
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections);
+        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
         if proxy_count == 0 {
             return None;
         }
@@ -619,13 +626,14 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         txn_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections);
+        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
         if proxy_count == 0 {
             return None;
         }
@@ -656,6 +664,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
+        standby_excluded: &Arc<AtomicBool>,
         _states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
@@ -663,7 +672,7 @@ where
         txn_duration: &Duration,
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections);
+        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
         if proxy_count == 0 {
             return None;
         }
