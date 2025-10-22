@@ -348,21 +348,33 @@ where
                 );
 
                 // Fetch state blobs for all states owned by the failed proxy
+                // Note: get_object_for_proxy will return the requested version if available,
+                // or a newer version from merged_state if the old version was superseded
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
+                let mut missing_states = Vec::new();
                 for (object_id, version) in &failed_proxy_states {
                     if let Some(object) =
                         collector.get_object_for_proxy(object_id, *version, failed_proxy as usize)
                     {
-                        // Version is guaranteed to match now - get_object_for_proxy verifies it
                         initial_state_blobs.insert(*object_id, object);
                     } else {
-                        tracing::info!(
+                        tracing::warn!(
                             "Failed to fetch state {:?} @ {:?} from collector for failed proxy {}",
                             object_id,
                             version,
                             failed_proxy
                         );
+                        missing_states.push((*object_id, *version));
                     }
+                }
+
+                if !missing_states.is_empty() {
+                    tracing::warn!(
+                        "Failed to fetch {} state blobs for failed proxy {}: {:?}",
+                        missing_states.len(),
+                        failed_proxy,
+                        missing_states
+                    );
                 }
 
                 tracing::info!(

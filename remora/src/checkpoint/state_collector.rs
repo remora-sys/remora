@@ -123,6 +123,27 @@ impl StateCollector {
 
         // Commit all latest versions to merged_state and update version_ownership
         for (obj_id, (version, obj, writer_proxy)) in objects_by_id {
+            // Check if there's an existing version ownership entry for this object
+            // Remove old entries to keep version_ownership clean (one entry per object)
+            let old_entries: Vec<_> = self
+                .version_ownership
+                .iter()
+                .filter_map(|entry| {
+                    let ((oid, ver), _proxy) = entry.pair();
+                    if *oid == obj_id {
+                        Some((*oid, *ver))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Remove old version entries for this object
+            for (old_obj_id, old_version) in old_entries {
+                self.version_ownership.remove(&(old_obj_id, old_version));
+            }
+
+            // Insert the new latest version
             self.merged_state.insert(obj_id, obj);
             // Record which proxy wrote this version
             self.version_ownership
@@ -147,8 +168,15 @@ impl StateCollector {
 
     /// Get an object for a specific proxy at a specific version.
     /// Checks both persisted state (merged_state) and that proxy's temp state.
-    /// Returns the object only if its version matches the requested version.
-    /// This is useful during recovery to access exact versions owned by the failed proxy.
+    ///
+    /// Fallback logic:
+    /// 1. If exact version found in proxy's temp_state: return it
+    /// 2. If exact version found in merged_state: return it
+    /// 3. If newer version found in merged_state: return it (supersedes old version)
+    /// 4. Otherwise: return None
+    ///
+    /// This is useful during recovery to access versions owned by the failed proxy,
+    /// with graceful handling when older versions have been superseded.
     pub fn get_object_for_proxy(
         &self,
         object_id: &ObjectID,
@@ -160,16 +188,30 @@ impl StateCollector {
             if obj.version() == version {
                 return Some(obj.clone());
             }
+            // Don't fallback to newer temp_state version - could be divergent
         }
 
         // Then try persisted state (for committed versions)
         if let Some(obj) = self.merged_state.get(object_id) {
             if obj.version() == version {
+                // Exact match
+                return Some(obj.clone());
+            } else if obj.version() > version {
+                // Newer version available in merged_state - this is OK!
+                // The object was updated by healthy proxies after the failed proxy's version.
+                // Return the newer version as it supersedes the old one.
+                tracing::debug!(
+                    "Returning newer version for object {:?}: requested {:?}, found {:?}",
+                    object_id,
+                    version,
+                    obj.version()
+                );
                 return Some(obj.clone());
             }
+            // If merged_state has older version, don't return it (shouldn't happen)
         }
 
-        // Version mismatch or object not found
+        // Version not found
         None
     }
 
@@ -180,21 +222,53 @@ impl StateCollector {
 
     /// Get all (ObjectID, SequenceNumber) pairs owned by a specific proxy.
     /// Used during recovery to identify all versions that need to be transferred to standby.
+    ///
+    /// Returns versions from both:
+    /// 1. version_ownership (committed versions)
+    /// 2. temp_state_by_proxy (uncommitted versions from incomplete epochs)
     pub fn get_versions_by_proxy(
         &self,
         proxy_id: crate::proxy::core::ProxyId,
     ) -> Vec<(ObjectID, SequenceNumber)> {
-        self.version_ownership
-            .iter()
-            .filter_map(|entry| {
-                let ((obj_id, version), writer) = entry.pair();
-                if *writer == proxy_id {
-                    Some((*obj_id, *version))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        use std::collections::HashMap;
+
+        // Use HashMap to keep only the LATEST version per object
+        // Key: ObjectID, Value: SequenceNumber
+        let mut versions: HashMap<ObjectID, SequenceNumber> = HashMap::new();
+
+        // Collect from version_ownership (committed versions)
+        for entry in self.version_ownership.iter() {
+            let ((obj_id, version), writer) = entry.pair();
+            if *writer == proxy_id {
+                versions
+                    .entry(*obj_id)
+                    .and_modify(|v| {
+                        if *version > *v {
+                            *v = *version;
+                        }
+                    })
+                    .or_insert(*version);
+            }
+        }
+
+        // Also collect from temp_state_by_proxy (uncommitted versions)
+        // These are important for incomplete epochs that never committed
+        for entry in self.temp_state_by_proxy.iter() {
+            let ((pid, obj_id), obj) = entry.pair();
+            if *pid == proxy_id {
+                let version = obj.version();
+                versions
+                    .entry(*obj_id)
+                    .and_modify(|v| {
+                        if version > *v {
+                            *v = version;
+                        }
+                    })
+                    .or_insert(version);
+            }
+        }
+
+        versions.into_iter().collect()
     }
 
     /// Current number of objects in memory.
