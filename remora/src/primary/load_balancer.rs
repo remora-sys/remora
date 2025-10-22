@@ -385,7 +385,7 @@ where
                         state_blobs: initial_state_blobs.clone(),
                     };
 
-                    tracing::info!(
+                    tracing::debug!(
                         "Sending initial state transfer batch to replacement proxy: {:?}",
                         initial_state_blobs.clone()
                     );
