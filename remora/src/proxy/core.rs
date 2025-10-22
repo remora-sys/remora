@@ -104,6 +104,7 @@ where
                         transaction.digest(),
                         stateless_res_proxy_id
                     );
+
                     self.process_stateful_transaction(
                         transaction,
                         stateless_res_proxy_id,
@@ -398,19 +399,36 @@ where
 
     /// Spawn a task to commit state updates and notify dependencies
     fn spawn_state_updates(&self, state_blobs: BTreeMap<ObjectID, Object>) {
-        let objs: Vec<_> = state_blobs
-            .iter()
-            .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
-            .collect();
-        let (_, current_handles) = self
-            .stateful_controller
-            .get_prior_dependency_and_update(0, objs, true, false);
+        // CRITICAL FIX: Process each object individually to maintain correct version notifications
+        // When committing multiple objects at different versions (e.g., obj1@v8, obj2@v11),
+        // using get_prior_dependency_and_update with all objects batched causes incorrect wakeups
+        // because calculate_next_version uses MAX across all versions.
+        //
+        // Example bug scenario:
+        // - Committing {obj1@v8, obj2@v11}
+        // - After one_before(): {obj1@v7, obj2@v10}
+        // - calculate_next_version computes max(v7, v10) + 1 = v11
+        // - Creates entries for (obj1, v11) and (obj2, v11) ← WRONG for obj1!
+        // - Transaction waiting for obj1@v8 never wakes up
+        //
+        // Solution: Process each object separately so obj1@v8 creates entry at v8, not v11
+        let mut all_handles = Vec::new();
+        for (oid, obj) in state_blobs.iter() {
+            let version = obj.compute_object_reference().1.one_before().unwrap();
+            let (_, handles) = self.stateful_controller.get_prior_dependency_and_update(
+                0,
+                vec![(*oid, version)],
+                true,
+                false,
+            );
+            all_handles.extend(handles);
+        }
 
         let store = self.store.clone();
         tokio::spawn(async move {
             store.commit_new_objects(state_blobs.clone());
             tracing::info!("Committed new objects: {:?}", state_blobs);
-            for notify in current_handles {
+            for notify in all_handles {
                 notify.notify_one();
             }
         });
@@ -422,10 +440,11 @@ where
         stateless_handle: Option<oneshot::Receiver<bool>>,
         required_states: RequiredStates,
     ) -> NodeResult<()> {
-        tracing::debug!(
-            "Proxy {} spawning stateful transaction {:?}",
+        tracing::info!(
+            "Proxy {} spawning stateful transaction {:?} and required states {:?}",
             self.id,
-            transaction.digest()
+            transaction.digest(),
+            required_states
         );
 
         let store = self.store.clone();
