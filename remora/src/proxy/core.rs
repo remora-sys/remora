@@ -173,7 +173,7 @@ where
                     stateless_res_proxy_id,
                     missing_states,
                 ) => {
-                    tracing::debug!(
+                    tracing::info!(
                         "Proxy {} received combined transaction {:?}, stateless proxy: {}",
                         self.id,
                         transaction.digest(),
@@ -606,10 +606,10 @@ where
     }
 
     async fn handle_stateful_reply(&mut self, objects: BTreeMap<ObjectID, Object>) {
-        tracing::debug!(
-            "Proxy {} handling stateful reply with {} objects",
+        tracing::info!(
+            "Proxy {} handling stateful reply with objects: {:?}",
             self.id,
-            objects.len()
+            objects
         );
 
         // Mock the states update (oid, v) as a txn from (oid, v - 1) to (oid, v)
@@ -652,7 +652,7 @@ where
         proxy_id: ProxyId,
         requested_states: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        tracing::debug!(
+        tracing::info!(
             "Proxy {} handling stateful request from proxy {} for states: {:?}",
             self.id,
             proxy_id,
@@ -675,7 +675,10 @@ where
                 prior_notify.notified().await;
             }
             stateful_controller.remove_dependency(requested_states.clone());
-            tracing::debug!("Ready to get objects for stateful request");
+            tracing::info!(
+                "Ready to get objects for stateful request {:?}",
+                requested_states
+            );
             let mut objects = BTreeMap::new();
             for state in requested_states {
                 let object = match store.read_object(&state.0) {
@@ -788,10 +791,11 @@ where
                     if let Some(standby_id) = standby_proxy {
                         if standby_id != proxy_id {
                             tracing::info!(
-                                "Redirecting stateful request from proxy {} to standby proxy {} (failed proxy: {})",
+                                "Redirecting stateful request from proxy {} to standby proxy {} (failed proxy: {}) with states: {:?}",
                                 requester_id,
                                 standby_id,
-                                proxy_id
+                                proxy_id,
+                                states.clone(),
                             );
 
                             // Send the request to the standby proxy instead

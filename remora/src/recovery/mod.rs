@@ -432,10 +432,19 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// Uses the prebuilt healthy_txns_by_object graph for efficient lookup.
     /// Returns transactions ordered by consensus to maintain causality.
     ///
+    /// IMPORTANT: Only includes transactions whose inputs are available from either:
+    /// 1. Persisted state, OR
+    /// 2. Will be produced by dirty transaction replay
+    ///
+    /// This prevents including transitive chains of healthy transactions where one
+    /// bridging transaction depends on another bridging transaction's output.
+    ///
     /// # Arguments
     /// * `missing_versions` - Set of (ObjectID, SequenceNumber) that need regeneration
     /// * `persist_index` - Starting epoch (snapshot point)
     /// * `failed_proxy` - The failed proxy ID
+    /// * `collector` - StateCollector to check persisted versions
+    /// * `dirty_txns` - Dirty transactions that will be replayed
     ///
     /// # Returns
     /// Ordered list of transactions that must be replayed to regenerate missing versions
@@ -444,11 +453,22 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         missing_versions: &std::collections::HashSet<(ObjectID, SequenceNumber)>,
         persist_index: u64,
         failed_proxy: usize,
+        collector: &crate::checkpoint::state_collector::StateCollector,
+        dirty_txns: &[LogRecord<T>],
     ) -> Vec<LogRecord<T>> {
         use std::collections::HashSet;
 
         let mut bridging_txns = Vec::new();
         let mut seen_digests = HashSet::new();
+
+        // Build set of versions that will be produced by dirty transaction replay
+        let mut dirty_productions: HashSet<(ObjectID, SequenceNumber)> = HashSet::new();
+        for record in dirty_txns {
+            for ((obj_id, req_version), _) in &record.required_states {
+                let produced_version = SequenceNumber::from_u64(req_version.value() + 1);
+                dirty_productions.insert((*obj_id, produced_version));
+            }
+        }
 
         // Scan all epochs from persist_index onward
         for epoch_entry in self.logger.segments.iter() {
@@ -481,7 +501,41 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                             missing_versions.contains(&(*obj_id, produced_version))
                         });
 
-                if produces_needed_version {
+                if !produces_needed_version {
+                    continue;
+                }
+
+                // CRITICAL FIX: Check if this transaction's inputs are available.
+                // Only include bridging transactions whose required states are either:
+                // 1. Available in persisted state, OR
+                // 2. Will be produced by dirty transaction replay
+                //
+                // This prevents including transitive chains like:
+                //   H1: requires v3, produces v4 (needed by dirty txn)
+                //   H2: requires v4, produces v5 (v4 comes from H1, not persisted!)
+                // We should only include H1, not H2.
+                let inputs_available =
+                    record
+                        .required_states
+                        .iter()
+                        .all(|((obj_id, req_version), _)| {
+                            // Check if version is in persisted state
+                            if let Some(persisted_version) = collector.get_persisted_version(obj_id)
+                            {
+                                if persisted_version == *req_version {
+                                    return true; // Available in persisted state
+                                }
+                            }
+
+                            // Check if version will be produced by dirty transaction replay
+                            if dirty_productions.contains(&(*obj_id, *req_version)) {
+                                return true; // Will be available after dirty replay
+                            }
+
+                            false // Not available - this transaction shouldn't be in bridging set
+                        });
+
+                if inputs_available {
                     bridging_txns.push(record.clone());
                     seen_digests.insert(record.txn_digest);
 
@@ -490,6 +544,13 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                         from_proxy = record.destination_proxy,
                         epoch = epoch.0,
                         "Included bridging transaction from healthy proxy"
+                    );
+                } else {
+                    tracing::debug!(
+                        txn_digest = ?record.txn_digest,
+                        from_proxy = record.destination_proxy,
+                        epoch = epoch.0,
+                        "Skipped bridging transaction - inputs not available from persisted state or dirty replay"
                     );
                 }
             }
@@ -559,8 +620,13 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         }
 
         // Step 3: Collect bridging transactions
-        let bridging_txns =
-            self.collect_bridging_transactions(&missing_versions, persist_index, failed_proxy);
+        let bridging_txns = self.collect_bridging_transactions(
+            &missing_versions,
+            persist_index,
+            failed_proxy,
+            collector,
+            &dirty_txns,
+        );
 
         tracing::info!(
             bridging_count = bridging_txns.len(),

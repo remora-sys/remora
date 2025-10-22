@@ -109,7 +109,7 @@ where
     }
 
     /// Begin recovery for a failed proxy and promote standby.
-    pub fn begin_recovery(&mut self, failed_proxy: ProxyId) -> Option<ProxyId> {
+    pub async fn begin_recovery(&mut self, failed_proxy: ProxyId) -> Option<ProxyId> {
         // Find the standby proxy (last proxy in connections)
         let standby_proxy = self
             .proxy_connections
@@ -121,6 +121,29 @@ where
         if standby_proxy != failed_proxy {
             // Use the failed proxy's own persist_index
             let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
+
+            // CRITICAL FIX: Wait for in-flight forwarding tasks to complete their epoch logger appends.
+            //
+            // Race condition: Forwarding tasks run in parallel worker threads and append to the epoch
+            // logger asynchronously. When we detect proxy failure and call begin_recovery(), some
+            // forwarding tasks may still be in-flight - they've sent (or tried to send) to the failed
+            // proxy but haven't yet appended to the epoch logger. If we collect dirty transactions
+            // immediately, we'll miss these late-arriving transactions.
+            //
+            // Solution: Add a small delay after detecting failure to allow in-flight tasks to complete.
+            // This gives worker threads time to finish their logger.append() calls (line 322 in
+            // shared_obj_txn_forwarder.rs) before we snapshot the dirty transaction set.
+            //
+            // TODO: Replace with proper synchronization (e.g., worker pool flush or epoch barrier).
+            tracing::info!(
+                failed_proxy,
+                "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tracing::info!(
+                failed_proxy,
+                "Delay complete, proceeding with dirty transaction collection"
+            );
 
             // NEW: Compute recovery plan with bridging transactions
             let (bridging_txns, dirty_txns) =
@@ -144,8 +167,9 @@ where
                 .recovery_coordinator
                 .begin_recovery(failed_proxy as usize, standby_proxy as usize);
 
-            // Promote standby to active
-            self.promote_standby();
+            // NOTE: Do NOT promote standby here! Promotion happens AFTER replay completes
+            // in start_replay_process() to prevent duplicate transactions.
+            // The standby_excluded flag remains true during recovery.
 
             // Remove failed proxy from connections
             tracing::info!(failed_proxy, "Attempting to remove failed proxy connection");
@@ -224,10 +248,12 @@ where
     /// Start the replay process for a replacement proxy.
     /// This method spawns a task to send bridging transactions (from healthy proxies) first,
     /// then dirty transactions (from failed proxy) to the replacement proxy.
+    /// After all replay messages are sent, it promotes the standby to active.
     fn start_replay_process(&self, failed_proxy: ProxyId, replacement_proxy: ProxyId) {
         let recovery_coordinator = self.recovery_coordinator.clone();
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
+        let standby_excluded = self.standby_excluded.clone();
 
         tokio::spawn(async move {
             tracing::info!(
@@ -249,6 +275,13 @@ where
 
             if bridging_txns.is_empty() && dirty_txns.is_empty() {
                 tracing::info!(failed_proxy, persist_index, "No transactions to replay");
+
+                // No replay needed, but still promote standby to active
+                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    replacement_proxy,
+                    "Standby proxy promoted to active (no replay needed)"
+                );
                 return;
             }
 
@@ -373,10 +406,32 @@ where
                     total_epochs,
                     replacement_proxy
                 );
+
+                // CRITICAL FIX: Promote standby AFTER all replay messages are sent.
+                //
+                // Bug: If we promote the standby before replay completes, new transactions can be
+                // forwarded to the standby while it's still processing replay messages. This causes
+                // duplicates: the same transaction appears both as a normal CombinedTxn (from new
+                // forwarding) and as a Replay message (from recovery).
+                //
+                // Solution: Keep standby_excluded=true during replay, then promote after sending
+                // all replay messages. This ensures the standby only receives replay traffic until
+                // it's fully caught up.
+                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    replacement_proxy,
+                    "Standby proxy promoted to active after replay completion"
+                );
             } else {
                 tracing::error!(
                     "Replacement proxy {} not found in connections",
                     replacement_proxy
+                );
+                // Promote standby anyway to avoid system deadlock
+                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!(
+                    replacement_proxy,
+                    "Standby promoted despite replay failure to avoid deadlock"
                 );
             }
         });
@@ -589,10 +644,20 @@ where
                         if let Err(e) = self.epoch_tx.try_send(epoch) {
                             tracing::warn!("Failed to notify collector of epoch {:?}: {:?}", epoch, e);
                         }
-                        self.broadcast_checkpoint(epoch).await;
+
+                        // CRITICAL FIX: Update epoch counter BEFORE broadcast to prevent transaction spillover.
+                        //
+                        // Bug: If we update current_epoch_atomic AFTER broadcast_checkpoint completes,
+                        // transactions forwarded during the broadcast window will be tagged with the OLD
+                        // epoch ID. This causes epoch logs to grow unboundedly - later epochs accumulate
+                        // spillover from all previous broadcasts.
+                        //
+                        // Solution: Increment and store the next epoch ID immediately, so any transactions
+                        // forwarded during broadcast are correctly tagged with the new epoch.
                         self.next_epoch_id += 1;
-                        // Update the atomic epoch for forwarders to use
                         self.current_epoch_atomic.store(self.next_epoch_id, Ordering::SeqCst);
+
+                        self.broadcast_checkpoint(epoch).await;
 
                         // Periodically prune old epochs from the logger
                         self.prune_epoch_logger();
@@ -626,7 +691,7 @@ where
                 let msg = PrimaryToProxyMessage::Checkpoint(epoch);
                 if let Err(_e) = tx.send(msg).await {
                     tracing::warn!("Proxy {} send failed; beginning recovery", proxy_id);
-                    if let Some(replacement) = self.begin_recovery(proxy_id) {
+                    if let Some(replacement) = self.begin_recovery(proxy_id).await {
                         tracing::info!(
                             "Proxy {} replaced by {} during recovery",
                             proxy_id,
