@@ -151,7 +151,7 @@ where
                                 .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                                 .collect();
 
-                            tracing::info!(
+                            tracing::debug!(
                                 "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
                                 required_states.keys(),
@@ -164,7 +164,7 @@ where
                                 .await
                                 .expect("Failed to spawn replay transaction");
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Proxy {} received pure state transfer with {} state blobs (no transaction)",
                                 self.id,
                                 msg.state_blobs.len()
@@ -183,7 +183,7 @@ where
                     stateless_res_proxy_id,
                     missing_states,
                 ) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Proxy {} received combined transaction {:?}, stateless proxy: {}",
                         self.id,
                         transaction.digest(),
@@ -200,7 +200,7 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    tracing::info!(
+                    tracing::debug!(
                         "Proxy {} epoch {:?} snapshot objects: {}",
                         self.id,
                         epoch_id,
@@ -235,7 +235,7 @@ where
                                 .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                                 .collect();
 
-                            tracing::info!(
+                            tracing::debug!(
                                 "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
                                 required_states.keys(),
@@ -248,7 +248,7 @@ where
                                 .await
                                 .expect("Failed to spawn replay transaction");
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Proxy {} received pure state transfer with {} state blobs (no transaction)",
                                 self.id,
                                 msg.state_blobs.len()
@@ -426,8 +426,7 @@ where
 
         let store = self.store.clone();
         tokio::spawn(async move {
-            store.commit_new_objects(state_blobs.clone());
-            tracing::info!("Committed new objects: {:?}", state_blobs);
+            store.commit_new_objects(state_blobs);
             for notify in all_handles {
                 notify.notify_one();
             }
@@ -440,7 +439,7 @@ where
         stateless_handle: Option<oneshot::Receiver<bool>>,
         required_states: RequiredStates,
     ) -> NodeResult<()> {
-        tracing::info!(
+        tracing::debug!(
             "Proxy {} spawning stateful transaction {:?} and required states {:?}",
             self.id,
             transaction.digest(),
@@ -644,7 +643,7 @@ where
     }
 
     async fn handle_stateful_reply(&mut self, objects: BTreeMap<ObjectID, Object>) {
-        tracing::info!(
+        tracing::debug!(
             "Proxy {} handling stateful reply with objects: {:?}",
             self.id,
             objects
@@ -690,7 +689,7 @@ where
         proxy_id: ProxyId,
         requested_states: Vec<(ObjectID, SequenceNumber)>,
     ) {
-        tracing::info!(
+        tracing::debug!(
             "Proxy {} handling stateful request from proxy {} for states: {:?}",
             self.id,
             proxy_id,
@@ -713,7 +712,7 @@ where
                 prior_notify.notified().await;
             }
             stateful_controller.remove_dependency(requested_states.clone());
-            tracing::info!(
+            tracing::debug!(
                 "Ready to get objects for stateful request {:?}",
                 requested_states
             );
@@ -828,7 +827,7 @@ where
 
                     if let Some(standby_id) = standby_proxy {
                         if standby_id != proxy_id {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Redirecting stateful request from proxy {} to standby proxy {} (failed proxy: {}) with states: {:?}",
                                 requester_id,
                                 standby_id,
@@ -887,7 +886,7 @@ where
 
                 if let Some(standby_id) = standby_proxy {
                     if standby_id != proxy_id {
-                        tracing::info!(
+                        tracing::debug!(
                             "Redirecting stateful request from proxy {} to standby proxy {} (no connection to proxy: {})",
                             requester_id,
                             standby_id,
