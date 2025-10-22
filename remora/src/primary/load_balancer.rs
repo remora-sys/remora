@@ -187,8 +187,32 @@ where
             // Example: Before removal: connections = {0, 1, 2}, index 1 maps to ProxyId 1
             //          After removing 0: connections = {1, 2}, index 0 maps to ProxyId 1 (shifted!)
             //
-            // So we need to decrement all state ownership indices > removed proxy index.
+            // States owned by the failed proxy need special handling:
+            // - They will be replayed to the replacement proxy
+            // - We clear them from the map so they'll be re-established during replay
+            // - When replay transactions execute, they'll update states_to_proxy naturally
             let mut remapped_count = 0;
+            let mut cleared_count = 0;
+
+            // CRITICAL: Capture ALL state versions owned by failed proxy BEFORE clearing.
+            // These will be transferred to the standby even if not referenced by dirty/bridging txns.
+            // Use StateCollector's version_ownership tracking (comprehensive, not rotating like states_to_proxy)
+            let failed_proxy_states = self.collector.get_versions_by_proxy(failed_proxy);
+
+            tracing::info!(
+                failed_proxy,
+                state_count = failed_proxy_states.len(),
+                "Captured {} state versions owned by failed proxy for transfer to standby",
+                failed_proxy_states.len()
+            );
+
+            // Remove states that were owned by the failed proxy
+            for key in &failed_proxy_states {
+                self.states_to_proxy.remove(key);
+                cleared_count += 1;
+            }
+
+            // Decrement indices for proxies that came after the failed proxy
             for mut entry in self.states_to_proxy.iter_mut() {
                 let current_idx = *entry.value();
                 if current_idx > failed_proxy {
@@ -199,7 +223,10 @@ where
             tracing::info!(
                 failed_proxy,
                 remapped_count,
-                "Adjusted state ownership indices after proxy removal"
+                cleared_count,
+                "Adjusted state ownership indices after proxy removal: remapped {}, cleared {}",
+                remapped_count,
+                cleared_count
             );
 
             tracing::info!(
@@ -217,7 +244,7 @@ where
                 conn_count,
                 "Replay initiation precheck: replacement presence and connection count"
             );
-            self.start_replay_process(failed_proxy, standby_proxy);
+            self.start_replay_process(failed_proxy, standby_proxy, failed_proxy_states);
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
@@ -248,8 +275,14 @@ where
     /// Start the replay process for a replacement proxy.
     /// This method spawns a task to send bridging transactions (from healthy proxies) first,
     /// then dirty transactions (from failed proxy) to the replacement proxy.
+    /// Also transfers all state versions owned by the failed proxy.
     /// After all replay messages are sent, it promotes the standby to active.
-    fn start_replay_process(&self, failed_proxy: ProxyId, replacement_proxy: ProxyId) {
+    fn start_replay_process(
+        &self,
+        failed_proxy: ProxyId,
+        replacement_proxy: ProxyId,
+        failed_proxy_states: Vec<(ObjectID, SequenceNumber)>,
+    ) {
         let recovery_coordinator = self.recovery_coordinator.clone();
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
@@ -291,14 +324,105 @@ where
                 bridging_count = bridging_txns.len(),
                 dirty_count = dirty_txns.len(),
                 persist_index,
-                "Sending bridging + dirty transactions to replacement proxy"
+                state_transfer_count = failed_proxy_states.len(),
+                "Sending state transfer + bridging + dirty transactions to replacement proxy"
             );
 
             // Convert LogRecord to ReplayMsg and send to replacement proxy
             if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
+                // CRITICAL: First, transfer ALL states owned by failed proxy as initial snapshot.
+                //
+                // Problem: Dirty + bridging transactions only cover states actually used by those
+                // transactions. But the failed proxy may own many other state versions that aren't
+                // referenced. When healthy proxies redirect state requests to the standby, it won't
+                // have those states!
+                //
+                // Solution: Send an initial batch containing all state blobs owned by the failed proxy.
+                // This ensures standby can respond to any state request that might be redirected to it.
+
+                tracing::info!(
+                    replacement_proxy,
+                    state_count = failed_proxy_states.len(),
+                    "Fetching {} state blobs owned by failed proxy for initial transfer",
+                    failed_proxy_states.len()
+                );
+
+                // Fetch state blobs for all states owned by the failed proxy
+                let mut initial_state_blobs = std::collections::BTreeMap::new();
+                for (object_id, version) in &failed_proxy_states {
+                    if let Some(object) =
+                        collector.get_object_for_proxy(object_id, failed_proxy as usize)
+                    {
+                        if object.version() == *version {
+                            initial_state_blobs.insert(*object_id, object);
+                        } else {
+                            tracing::warn!(
+                                "Version mismatch for failed proxy state {:?}: expected {:?}, got {:?}",
+                                object_id, version, object.version()
+                            );
+                        }
+                    } else {
+                        tracing::info!(
+                            "Failed to fetch state {:?} @ {:?} from collector for failed proxy {}",
+                            object_id,
+                            version,
+                            failed_proxy
+                        );
+                    }
+                }
+
+                tracing::info!(
+                    replacement_proxy,
+                    fetched_count = initial_state_blobs.len(),
+                    requested_count = failed_proxy_states.len(),
+                    "Fetched {} / {} state blobs for initial transfer",
+                    initial_state_blobs.len(),
+                    failed_proxy_states.len()
+                );
+
+                // Send initial state transfer as a special replay batch with epoch 0
+                if !initial_state_blobs.is_empty() {
+                    // Create a pure state transfer message (transaction = None)
+                    // The proxy will only commit the state blobs without executing any transaction
+                    let state_transfer_msg = crate::executor::api::ReplayMsg {
+                        consensus_index: 0,
+                        transaction: None, // No transaction - pure state transfer
+                        required_versions: vec![],
+                        state_blobs: initial_state_blobs.clone(),
+                    };
+
+                    tracing::info!(
+                        "Sending initial state transfer batch to replacement proxy: {:?}",
+                        initial_state_blobs.clone()
+                    );
+
+                    let state_transfer_batch = crate::executor::api::ReplayBatch {
+                        epoch: crate::checkpoint::EpochId(0), // Special epoch for state transfer
+                        items: vec![state_transfer_msg],
+                    };
+
+                    let msg =
+                        crate::executor::api::PrimaryToProxyMessage::Replay(state_transfer_batch);
+                    if let Err(e) = proxy_tx.value().send(msg).await {
+                        tracing::error!(
+                            "Failed to send initial state transfer to replacement proxy {}: {:?}",
+                            replacement_proxy,
+                            e
+                        );
+                        return;
+                    }
+
+                    tracing::info!(
+                        replacement_proxy,
+                        state_count = initial_state_blobs.len(),
+                        "Sent initial state transfer batch to replacement proxy"
+                    );
+                }
+
                 // Combine bridging and dirty transactions in order
                 // Bridging transactions must be replayed FIRST to regenerate missing versions
-                let all_txns = bridging_txns.into_iter().chain(dirty_txns.into_iter());
+                // Clone the transactions so we can use them later to update states_to_proxy
+                let all_txns = bridging_txns.iter().chain(dirty_txns.iter()).cloned();
 
                 // Group transactions by epoch and send one batch per epoch
                 let mut txns_by_epoch: std::collections::BTreeMap<
@@ -312,7 +436,14 @@ where
 
                 let total_epochs = txns_by_epoch.len();
                 let mut sent_count = 0;
+                // CRITICAL FIX: Track (object_id, version) pairs, not just object_id!
+                // Multiple transactions may need different versions of the same object.
                 let mut sent_blobs = std::collections::HashSet::new();
+
+                // Build set of all states already sent in initial transfer
+                // These are ALL versions owned by the failed proxy
+                let initial_transfer_states: std::collections::HashSet<(ObjectID, SequenceNumber)> =
+                    failed_proxy_states.iter().cloned().collect();
 
                 for (epoch, epoch_records) in txns_by_epoch {
                     let mut replay_items = Vec::new();
@@ -321,53 +452,56 @@ where
                         let transaction = (*record.transaction).clone();
 
                         // Fetch state blobs from StateCollector when available
-                        // NOTE: For bridging transactions, missing blobs are OK - they will be
-                        // regenerated by executing the transaction on the standby proxy.
+                        // OPTIMIZATION: Skip state blobs for dirty transactions (from failed proxy)
+                        // since they're already in the initial transfer. Only fetch for bridging
+                        // transactions (from healthy proxies).
                         let mut state_blobs = std::collections::BTreeMap::new();
                         let is_from_failed_proxy =
                             record.destination_proxy == failed_proxy_id as usize;
 
-                        for (object_id, version) in record.required_states.keys() {
-                            // Skip blobs that have already been sent in this replay session
-                            if sent_blobs.contains(object_id) {
-                                continue;
-                            }
-                            if *version == SequenceNumber::from(2) {
-                                continue;
-                            }
+                        // Only fetch state blobs for bridging transactions
+                        // Dirty transaction states are already in initial transfer
+                        if !is_from_failed_proxy {
+                            for (object_id, version) in record.required_states.keys() {
+                                // Skip if already sent in this replay batch
+                                if sent_blobs.contains(&(*object_id, *version)) {
+                                    continue;
+                                }
+                                // Skip if already in initial transfer
+                                if initial_transfer_states.contains(&(*object_id, *version)) {
+                                    continue;
+                                }
+                                if *version == SequenceNumber::from(2) {
+                                    continue;
+                                }
 
-                            // Try to fetch the object:
-                            // - For failed proxy txns: check persisted + failed proxy's temp state
-                            // - For healthy proxy txns (bridging): check persisted state only
-                            let object_opt = if is_from_failed_proxy {
-                                collector.get_object_for_proxy(object_id, failed_proxy_id)
-                            } else {
-                                collector.get_object(object_id)
-                            };
+                                // Fetch from persisted state only (bridging txns were on healthy proxies)
+                                let object_opt = collector.get_object(object_id);
 
-                            if let Some(object) = object_opt {
-                                // Verify version matches
-                                if object.version() == *version {
-                                    state_blobs.insert(*object_id, object);
-                                    sent_blobs.insert(*object_id);
+                                if let Some(object) = object_opt {
+                                    // Verify version matches
+                                    if object.version() == *version {
+                                        state_blobs.insert(*object_id, object);
+                                        sent_blobs.insert((*object_id, *version));
+                                    } else {
+                                        tracing::warn!(
+                                            "Version mismatch for object {:?} - expected {:?}, got {:?}. \
+                                            This is OK for bridging txns - will be regenerated",
+                                            object_id, version, object.version()
+                                        );
+                                    }
                                 } else {
-                                    tracing::warn!(
-                                        "Version mismatch for object {:?} - expected {:?}, got {:?}. \
-                                        This is OK for bridging txns - will be regenerated",
-                                        object_id, version, object.version()
+                                    tracing::debug!(
+                                        "Object {:?} v{:?} not in collector - will be regenerated by replay",
+                                        object_id, version
                                     );
                                 }
-                            } else {
-                                tracing::debug!(
-                                    "Object {:?} v{:?} not in collector - will be regenerated by replay",
-                                    object_id, version
-                                );
                             }
                         }
 
                         replay_items.push(crate::executor::api::ReplayMsg {
                             consensus_index: record.consensus_index.unwrap_or(0),
-                            transaction,
+                            transaction: Some(transaction),
                             required_versions: record.required_states.keys().cloned().collect(),
                             state_blobs,
                         });
@@ -422,6 +556,22 @@ where
                     replacement_proxy,
                     "Standby proxy promoted to active after replay completion"
                 );
+
+                // IMPORTANT: Update states_to_proxy ONLY for dirty transactions (from failed proxy).
+                //
+                // Bridging transactions are from healthy proxies - they already executed there and
+                // those proxies own the states. We're just replaying them on standby to regenerate
+                // intermediate versions, but ownership remains with the original healthy proxies.
+                //
+                // Dirty transactions are from the failed proxy - after replay on standby, the standby
+                // now owns those state versions. We need to update states_to_proxy to reflect this.
+                //
+                // Note: We do NOT pass states_to_proxy to this task because updating it from a spawned
+                // task would be unsafe. Instead, we accept that future transactions will naturally
+                // update the map through normal forwarding when they access these objects.
+                //
+                // The cleared states from the failed proxy (line 196-212 in begin_recovery) will be
+                // re-established organically as new transactions touch those objects.
             } else {
                 tracing::error!(
                     "Replacement proxy {} not found in connections",

@@ -141,25 +141,34 @@ where
                             self.spawn_state_updates(msg.state_blobs.clone());
                         }
 
-                        // Build required_states from required_versions
-                        let required_states: RequiredStates = msg
-                            .required_versions
-                            .into_iter()
-                            .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
-                            .collect();
+                        // If transaction is Some, execute it; otherwise this is pure state transfer
+                        if let Some(transaction) = msg.transaction {
+                            // Build required_states from required_versions
+                            let required_states: RequiredStates = msg
+                                .required_versions
+                                .into_iter()
+                                .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
+                                .collect();
 
-                        tracing::info!(
-                            "Replaying txn {:?} with required states {:?} and state blobs {:?}",
-                            msg.transaction.digest(),
-                            required_states.keys(),
-                            msg.state_blobs.keys()
-                        );
+                            tracing::info!(
+                                "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                                transaction.digest(),
+                                required_states.keys(),
+                                msg.state_blobs.keys()
+                            );
 
-                        // Spawn stateful transaction
-                        let transaction = Arc::new(msg.transaction);
-                        self.spawn_stateful_txn(transaction, None, required_states)
-                            .await
-                            .expect("Failed to spawn replay transaction");
+                            // Spawn stateful transaction
+                            let transaction = Arc::new(transaction);
+                            self.spawn_stateful_txn(transaction, None, required_states)
+                                .await
+                                .expect("Failed to spawn replay transaction");
+                        } else {
+                            tracing::info!(
+                                "Proxy {} received pure state transfer with {} state blobs (no transaction)",
+                                self.id,
+                                msg.state_blobs.len()
+                            );
+                        }
                     }
                 }
                 _ => {
@@ -216,25 +225,34 @@ where
                             self.spawn_state_updates(msg.state_blobs.clone());
                         }
 
-                        // Build required_states from required_versions
-                        let required_states: RequiredStates = msg
-                            .required_versions
-                            .into_iter()
-                            .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
-                            .collect();
+                        // If transaction is Some, execute it; otherwise this is pure state transfer
+                        if let Some(transaction) = msg.transaction {
+                            // Build required_states from required_versions
+                            let required_states: RequiredStates = msg
+                                .required_versions
+                                .into_iter()
+                                .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
+                                .collect();
 
-                        tracing::info!(
-                            "Replaying txn {:?} with required states {:?} and state blobs {:?}",
-                            msg.transaction.digest(),
-                            required_states.keys(),
-                            msg.state_blobs
-                        );
+                            tracing::info!(
+                                "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                                transaction.digest(),
+                                required_states.keys(),
+                                msg.state_blobs
+                            );
 
-                        // Spawn stateful transaction
-                        let transaction = Arc::new(msg.transaction);
-                        self.spawn_stateful_txn(transaction, None, required_states)
-                            .await
-                            .expect("Failed to spawn replay transaction");
+                            // Spawn stateful transaction
+                            let transaction = Arc::new(transaction);
+                            self.spawn_stateful_txn(transaction, None, required_states)
+                                .await
+                                .expect("Failed to spawn replay transaction");
+                        } else {
+                            tracing::info!(
+                                "Proxy {} received pure state transfer with {} state blobs (no transaction)",
+                                self.id,
+                                msg.state_blobs.len()
+                            );
+                        }
                     }
                 }
                 // Replay handling already covered above in separation mode; no duplicate here.
@@ -390,7 +408,8 @@ where
 
         let store = self.store.clone();
         tokio::spawn(async move {
-            store.commit_new_objects(state_blobs);
+            store.commit_new_objects(state_blobs.clone());
+            tracing::info!("Committed new objects: {:?}", state_blobs);
             for notify in current_handles {
                 notify.notify_one();
             }

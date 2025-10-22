@@ -19,6 +19,12 @@ pub struct StateCollector {
     /// Key: ProxyId, Value: last acknowledged epoch ID
     pub(crate) per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
 
+    /// Version ownership: tracks which proxy wrote each persisted version
+    /// Key: (ObjectID, SequenceNumber) -> ProxyId
+    /// Updated when promoting temp state to merged_state during snapshot merging
+    /// Used during recovery to identify all versions owned by a failed proxy
+    version_ownership: DashMap<(ObjectID, SequenceNumber), crate::proxy::core::ProxyId>,
+
     /// Number of expected proxies (for determining when all have acknowledged)
     expected_proxies: usize,
 }
@@ -29,6 +35,7 @@ impl StateCollector {
             merged_state: DashMap::new(),
             temp_state_by_proxy: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
+            version_ownership: DashMap::new(),
             expected_proxies,
         }
     }
@@ -90,29 +97,36 @@ impl StateCollector {
         let mut committed_count = 0;
 
         // Collect all object IDs and their latest versions from temp state
-        let mut objects_by_id: std::collections::HashMap<ObjectID, (SequenceNumber, Object)> =
-            std::collections::HashMap::new();
+        // Track which proxy wrote each latest version for recovery
+        let mut objects_by_id: std::collections::HashMap<
+            ObjectID,
+            (SequenceNumber, Object, crate::proxy::core::ProxyId),
+        > = std::collections::HashMap::new();
 
         // Scan all temp states to find latest version of each object
         for entry in self.temp_state_by_proxy.iter() {
-            let ((_proxy_id, obj_id), obj) = entry.pair();
+            let ((proxy_id, obj_id), obj) = entry.pair();
             let version = obj.version();
 
-            // Keep the latest version for each object
+            // Keep the latest version for each object, and track which proxy wrote it
             objects_by_id
                 .entry(*obj_id)
-                .and_modify(|(current_version, current_obj)| {
+                .and_modify(|(current_version, current_obj, writer_proxy)| {
                     if version > *current_version {
                         *current_version = version;
                         *current_obj = obj.clone();
+                        *writer_proxy = *proxy_id;
                     }
                 })
-                .or_insert((version, obj.clone()));
+                .or_insert((version, obj.clone(), *proxy_id));
         }
 
-        // Commit all latest versions to merged_state
-        for (obj_id, (_version, obj)) in objects_by_id {
+        // Commit all latest versions to merged_state and update version_ownership
+        for (obj_id, (version, obj, writer_proxy)) in objects_by_id {
             self.merged_state.insert(obj_id, obj);
+            // Record which proxy wrote this version
+            self.version_ownership
+                .insert((obj_id, version), writer_proxy);
             committed_count += 1;
         }
 
@@ -153,6 +167,25 @@ impl StateCollector {
     /// Get the persisted version for an object without cloning the entire object.
     pub fn get_persisted_version(&self, object_id: &ObjectID) -> Option<SequenceNumber> {
         self.merged_state.get(object_id).map(|e| e.version())
+    }
+
+    /// Get all (ObjectID, SequenceNumber) pairs owned by a specific proxy.
+    /// Used during recovery to identify all versions that need to be transferred to standby.
+    pub fn get_versions_by_proxy(
+        &self,
+        proxy_id: crate::proxy::core::ProxyId,
+    ) -> Vec<(ObjectID, SequenceNumber)> {
+        self.version_ownership
+            .iter()
+            .filter_map(|entry| {
+                let ((obj_id, version), writer) = entry.pair();
+                if *writer == proxy_id {
+                    Some((*obj_id, *version))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Current number of objects in memory.

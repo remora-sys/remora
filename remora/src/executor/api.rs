@@ -268,7 +268,8 @@ where
     T: ExecutableTransaction + Clone,
 {
     pub consensus_index: u64,
-    pub transaction: TransactionWithTimestamp<T>,
+    /// Transaction to replay. If None, this is a pure state transfer (only commit state_blobs).
+    pub transaction: Option<TransactionWithTimestamp<T>>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub state_blobs: BTreeMap<ObjectID, Object>,
 }

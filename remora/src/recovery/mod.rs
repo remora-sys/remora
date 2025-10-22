@@ -429,15 +429,17 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
     /// Collect bridging transactions needed to regenerate missing state versions.
     ///
-    /// Uses the prebuilt healthy_txns_by_object graph for efficient lookup.
+    /// Uses iterative expansion to include chains of bridging transactions.
     /// Returns transactions ordered by consensus to maintain causality.
     ///
-    /// IMPORTANT: Only includes transactions whose inputs are available from either:
-    /// 1. Persisted state, OR
-    /// 2. Will be produced by dirty transaction replay
+    /// IMPORTANT: This uses a fixed-point algorithm to handle transitive dependencies:
+    /// - Start with versions needed by dirty transactions
+    /// - Find healthy transactions that produce those versions
+    /// - Check if those transactions need versions not in persisted state or dirty productions
+    /// - If so, add those missing versions to the needed set and repeat
+    /// - Continue until no new versions are needed
     ///
-    /// This prevents including transitive chains of healthy transactions where one
-    /// bridging transaction depends on another bridging transaction's output.
+    /// This ensures we include complete chains like: H1 → H2 → dirty, where H2 depends on H1.
     ///
     /// # Arguments
     /// * `missing_versions` - Set of (ObjectID, SequenceNumber) that need regeneration
@@ -470,72 +472,58 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             }
         }
 
-        // Scan all epochs from persist_index onward
-        for epoch_entry in self.logger.segments.iter() {
-            let epoch = *epoch_entry.key();
+        // Start with the initially missing versions
+        let mut needed_versions = missing_versions.clone();
+        let mut iterations = 0;
+        const MAX_ITERATIONS: usize = 100; // Prevent infinite loops
 
-            // Only look at epochs after the persisted snapshot
-            if epoch.0 <= persist_index {
-                continue;
+        // Fixed-point iteration: keep finding transactions until no new versions are needed
+        loop {
+            iterations += 1;
+            if iterations > MAX_ITERATIONS {
+                tracing::warn!("Bridging transaction collection exceeded max iterations, stopping");
+                break;
             }
 
-            for record in epoch_entry.value() {
-                // ONLY consider transactions from HEALTHY proxies
-                if record.destination_proxy == failed_proxy {
+            let mut new_versions_needed = HashSet::new();
+            let prev_bridging_count = bridging_txns.len();
+
+            // Scan all epochs from persist_index onward
+            for epoch_entry in self.logger.segments.iter() {
+                let epoch = *epoch_entry.key();
+
+                // Only look at epochs after the persisted snapshot
+                if epoch.0 <= persist_index {
                     continue;
                 }
 
-                // Skip if we've already included this transaction
-                if seen_digests.contains(&record.txn_digest) {
-                    continue;
-                }
+                for record in epoch_entry.value() {
+                    // ONLY consider transactions from HEALTHY proxies
+                    if record.destination_proxy == failed_proxy {
+                        continue;
+                    }
 
-                // Check if this transaction produces any of the missing versions
-                let produces_needed_version =
-                    record
-                        .required_states
-                        .iter()
-                        .any(|((obj_id, req_version), _)| {
-                            let produced_version =
-                                SequenceNumber::from_u64(req_version.value() + 1);
-                            missing_versions.contains(&(*obj_id, produced_version))
-                        });
+                    // Skip if we've already included this transaction
+                    if seen_digests.contains(&record.txn_digest) {
+                        continue;
+                    }
 
-                if !produces_needed_version {
-                    continue;
-                }
+                    // Check if this transaction produces any of the needed versions
+                    let produces_needed_version =
+                        record
+                            .required_states
+                            .iter()
+                            .any(|((obj_id, req_version), _)| {
+                                let produced_version =
+                                    SequenceNumber::from_u64(req_version.value() + 1);
+                                needed_versions.contains(&(*obj_id, produced_version))
+                            });
 
-                // CRITICAL FIX: Check if this transaction's inputs are available.
-                // Only include bridging transactions whose required states are either:
-                // 1. Available in persisted state, OR
-                // 2. Will be produced by dirty transaction replay
-                //
-                // This prevents including transitive chains like:
-                //   H1: requires v3, produces v4 (needed by dirty txn)
-                //   H2: requires v4, produces v5 (v4 comes from H1, not persisted!)
-                // We should only include H1, not H2.
-                let inputs_available =
-                    record
-                        .required_states
-                        .iter()
-                        .all(|((obj_id, req_version), _)| {
-                            // Check if version is in persisted state
-                            if let Some(persisted_version) = collector.get_persisted_version(obj_id)
-                            {
-                                if persisted_version == *req_version {
-                                    return true; // Available in persisted state
-                                }
-                            }
+                    if !produces_needed_version {
+                        continue;
+                    }
 
-                            // Check if version will be produced by dirty transaction replay
-                            if dirty_productions.contains(&(*obj_id, *req_version)) {
-                                return true; // Will be available after dirty replay
-                            }
-
-                            false // Not available - this transaction shouldn't be in bridging set
-                        });
-
-                if inputs_available {
+                    // Include this transaction in the bridging set
                     bridging_txns.push(record.clone());
                     seen_digests.insert(record.txn_digest);
 
@@ -545,15 +533,35 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                         epoch = epoch.0,
                         "Included bridging transaction from healthy proxy"
                     );
-                } else {
-                    tracing::debug!(
-                        txn_digest = ?record.txn_digest,
-                        from_proxy = record.destination_proxy,
-                        epoch = epoch.0,
-                        "Skipped bridging transaction - inputs not available from persisted state or dirty replay"
-                    );
+
+                    // Check what versions THIS transaction needs
+                    // If any are missing, we'll need to include more transactions
+                    for ((obj_id, req_version), _) in &record.required_states {
+                        // Check if this required version is available
+                        let available_in_persisted = collector
+                            .get_persisted_version(obj_id)
+                            .map(|v| v == *req_version)
+                            .unwrap_or(false);
+
+                        let produced_by_dirty =
+                            dirty_productions.contains(&(*obj_id, *req_version));
+
+                        if !available_in_persisted && !produced_by_dirty {
+                            // This version is missing - need to find the transaction that produces it
+                            new_versions_needed.insert((*obj_id, *req_version));
+                        }
+                    }
                 }
             }
+
+            // If no new transactions were added this iteration, we're done
+            if bridging_txns.len() == prev_bridging_count {
+                tracing::debug!(iterations, "Bridging transaction collection converged");
+                break;
+            }
+
+            // Add the newly identified missing versions to the needed set for next iteration
+            needed_versions.extend(new_versions_needed);
         }
 
         // CRITICAL: Sort by consensus order to maintain causality
@@ -562,9 +570,10 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         tracing::info!(
             bridging_count = bridging_txns.len(),
             missing_versions_count = missing_versions.len(),
+            iterations,
             failed_proxy,
             persist_index,
-            "Collected bridging transactions from healthy proxies"
+            "Collected bridging transactions from healthy proxies (iterative)"
         );
 
         bridging_txns

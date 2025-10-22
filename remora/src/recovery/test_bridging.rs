@@ -132,7 +132,8 @@ mod tests {
         );
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
         // Assert: Should include the healthy proxy transaction
         assert_eq!(bridging.len(), 1, "Should find bridging transaction");
@@ -240,7 +241,8 @@ mod tests {
         assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(5))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
         // Assert: Should include the healthy proxy transaction
         assert_eq!(bridging.len(), 1, "Should find bridging transaction");
@@ -300,7 +302,8 @@ mod tests {
         assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(2))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
         // Assert: Should find the transaction that produces v2
         assert_eq!(bridging.len(), 1, "Should find txn that produces v2");
@@ -379,20 +382,24 @@ mod tests {
         assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(7))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
-        // Assert: Should return transactions in consensus order
+        // Assert: Should include ALL three transactions (chain: txn1→txn2→txn3)
+        // because txn3 needs v6 (from txn2), and txn2 needs v5 (from txn1)
         assert_eq!(
             bridging.len(),
-            1,
-            "Should find the transaction producing v7"
+            3,
+            "Should find all transactions in the chain (v4→v5→v6→v7)"
         );
-        assert_eq!(bridging[0].txn_digest, txn3_digest);
-        assert_eq!(
-            bridging[0].consensus_index,
-            Some(103),
-            "Should maintain consensus order"
-        );
+
+        // Assert: Transactions are sorted in consensus order
+        assert_eq!(bridging[0].txn_digest, txn1_digest);
+        assert_eq!(bridging[0].consensus_index, Some(101));
+        assert_eq!(bridging[1].txn_digest, txn2_digest);
+        assert_eq!(bridging[1].consensus_index, Some(102));
+        assert_eq!(bridging[2].txn_digest, txn3_digest);
+        assert_eq!(bridging[2].consensus_index, Some(103));
     }
 
     #[test]
@@ -475,7 +482,8 @@ mod tests {
         assert!(!missing.contains(&(obj_b, SequenceNumber::from_u64(3))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
         // Assert: Should include both bridging transactions
         assert_eq!(bridging.len(), 2, "Should find both bridging transactions");
@@ -576,12 +584,29 @@ mod tests {
         assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(6))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
-        // Assert: Should include txn2 (produces v6), not txn3 (from failed proxy)
-        assert_eq!(bridging.len(), 1, "Should find txn2 as bridging");
-        assert_eq!(bridging[0].txn_digest, txn2_digest);
-        assert_eq!(bridging[0].destination_proxy, 2);
+        // Assert: Should include txn1 AND txn2 (chain: v4→v5→v6)
+        // txn2 produces v6 (needed), but txn2 requires v5 (from txn1)
+        // NOT txn3 (from failed proxy) or txn4 (not in the dependency chain)
+        assert_eq!(bridging.len(), 2, "Should find txn1 and txn2 as bridging");
+
+        let digests: Vec<_> = bridging.iter().map(|r| r.txn_digest).collect();
+        assert!(digests.contains(&txn1_digest), "Should include txn1");
+        assert!(digests.contains(&txn2_digest), "Should include txn2");
+        assert!(
+            !digests.contains(&txn3_digest),
+            "Should NOT include txn3 (failed proxy)"
+        );
+        assert!(
+            !digests.contains(&txn4_digest),
+            "Should NOT include txn4 (not needed)"
+        );
+
+        // Verify order
+        assert_eq!(bridging[0].txn_digest, txn1_digest);
+        assert_eq!(bridging[1].txn_digest, txn2_digest);
     }
 
     #[test]
@@ -807,7 +832,8 @@ mod tests {
         assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(5))));
 
         // Test: Collect bridging transactions
-        let bridging = coordinator.collect_bridging_transactions(&missing, 10, 0);
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
 
         // Assert: Only the healthy txn producing v5
         assert_eq!(bridging.len(), 1);
@@ -864,5 +890,392 @@ mod tests {
             0,
             "v5 produced by dirty txn, not a missing version"
         );
+    }
+
+    #[test]
+    fn test_transitive_chain_two_healthy_txns() {
+        // Test that the iterative algorithm correctly includes chains of healthy transactions
+        // Snapshot: A=v3
+        // Healthy H1: v3→v4
+        // Healthy H2: v4→v5 (depends on H1's output!)
+        // Dirty D1: needs v5
+        //
+        // Both H1 and H2 should be in bridging set
+
+        let logger = EpochLogger::<FakeTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+        let collector = StateCollector::new(3);
+
+        let obj_a = ObjectID::random();
+
+        // Setup: Snapshot has A at v3
+        let obj_a_v3 = Object::immutable_with_id_for_testing(obj_a);
+        collector.merged_state.insert(obj_a, obj_a_v3);
+
+        // Healthy H1: requires v3, produces v4
+        let h1_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                100,
+                1, // healthy proxy
+                h1_digest,
+                vec![(obj_a, SequenceNumber::from_u64(3), None)],
+            ),
+        );
+
+        // Healthy H2: requires v4, produces v5
+        let h2_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                101,
+                1, // healthy proxy
+                h2_digest,
+                vec![(obj_a, SequenceNumber::from_u64(4), None)],
+            ),
+        );
+
+        // Dirty transaction needs v5
+        let dirty_txn = create_log_record(
+            11,
+            102,
+            0, // failed proxy
+            TransactionDigest::random(),
+            vec![(obj_a, SequenceNumber::from_u64(5), None)],
+        );
+
+        let dirty_txns = vec![dirty_txn];
+
+        // Test: Identify missing versions
+        let missing = coordinator.identify_missing_versions(&dirty_txns, &collector, 10);
+
+        // Assert: v5 is missing
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(5))));
+
+        // Test: Collect bridging transactions
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
+
+        // Assert: BOTH H1 and H2 should be included (iterative expansion)
+        assert_eq!(
+            bridging.len(),
+            2,
+            "Should include both H1 and H2 in the chain"
+        );
+
+        let digests: Vec<_> = bridging.iter().map(|r| r.txn_digest).collect();
+        assert!(digests.contains(&h1_digest), "Should include H1");
+        assert!(digests.contains(&h2_digest), "Should include H2");
+
+        // Assert: Transactions are in consensus order (H1 before H2)
+        assert_eq!(bridging[0].txn_digest, h1_digest);
+        assert_eq!(bridging[1].txn_digest, h2_digest);
+    }
+
+    #[test]
+    fn test_transitive_chain_three_healthy_txns() {
+        // Test longer chain: H1 → H2 → H3 → dirty
+        // All three should be included
+
+        let logger = EpochLogger::<FakeTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+        let collector = StateCollector::new(3);
+
+        let obj_a = ObjectID::random();
+
+        // Setup: Snapshot has A at v2
+        let obj_a_v2 = Object::immutable_with_id_for_testing(obj_a);
+        collector.merged_state.insert(obj_a, obj_a_v2);
+
+        // Healthy H1: v2→v3
+        let h1_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                100,
+                1,
+                h1_digest,
+                vec![(obj_a, SequenceNumber::from_u64(2), None)],
+            ),
+        );
+
+        // Healthy H2: v3→v4
+        let h2_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                101,
+                1,
+                h2_digest,
+                vec![(obj_a, SequenceNumber::from_u64(3), None)],
+            ),
+        );
+
+        // Healthy H3: v4→v5
+        let h3_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                102,
+                2,
+                h3_digest,
+                vec![(obj_a, SequenceNumber::from_u64(4), None)],
+            ),
+        );
+
+        // Dirty: needs v5
+        let dirty_txn = create_log_record(
+            11,
+            103,
+            0,
+            TransactionDigest::random(),
+            vec![(obj_a, SequenceNumber::from_u64(5), None)],
+        );
+
+        let dirty_txns = vec![dirty_txn];
+
+        // Test
+        let missing = coordinator.identify_missing_versions(&dirty_txns, &collector, 10);
+        assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(5))));
+
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
+
+        // Assert: All three should be included
+        assert_eq!(bridging.len(), 3, "Should include H1, H2, and H3");
+        assert_eq!(bridging[0].txn_digest, h1_digest);
+        assert_eq!(bridging[1].txn_digest, h2_digest);
+        assert_eq!(bridging[2].txn_digest, h3_digest);
+    }
+
+    #[test]
+    fn test_partial_chain_with_dirty_intersection() {
+        // Test: H1 → H2 → dirty1 → dirty2
+        // Only H1 and H2 should be in bridging (dirty1 produces version needed by dirty2)
+
+        let logger = EpochLogger::<FakeTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+        let collector = StateCollector::new(3);
+
+        let obj_a = ObjectID::random();
+
+        // Setup: Snapshot has A at v2
+        let obj_a_v2 = Object::immutable_with_id_for_testing(obj_a);
+        collector.merged_state.insert(obj_a, obj_a_v2);
+
+        // Healthy H1: v2→v3
+        let h1_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                100,
+                1,
+                h1_digest,
+                vec![(obj_a, SequenceNumber::from_u64(2), None)],
+            ),
+        );
+
+        // Healthy H2: v3→v4
+        let h2_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                101,
+                1,
+                h2_digest,
+                vec![(obj_a, SequenceNumber::from_u64(3), None)],
+            ),
+        );
+
+        // Dirty1: v4→v5
+        let dirty1 = create_log_record(
+            11,
+            102,
+            0,
+            TransactionDigest::random(),
+            vec![(obj_a, SequenceNumber::from_u64(4), None)],
+        );
+
+        // Dirty2: needs v5
+        let dirty2 = create_log_record(
+            11,
+            103,
+            0,
+            TransactionDigest::random(),
+            vec![(obj_a, SequenceNumber::from_u64(5), None)],
+        );
+
+        let dirty_txns = vec![dirty1, dirty2];
+
+        // Test
+        let missing = coordinator.identify_missing_versions(&dirty_txns, &collector, 10);
+
+        // Assert: Only v4 is missing (v5 will be produced by dirty1)
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(4))));
+
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
+
+        // Assert: Both H1 and H2 are needed
+        assert_eq!(bridging.len(), 2);
+        assert_eq!(bridging[0].txn_digest, h1_digest);
+        assert_eq!(bridging[1].txn_digest, h2_digest);
+    }
+
+    #[test]
+    fn test_branching_dependencies() {
+        // Test multiple objects with independent chains
+        // Object A: H1(v1→v2) → dirty needs v2
+        // Object B: H2(v1→v2) → H3(v2→v3) → dirty needs v3
+        // Should include H1, H2, H3
+
+        let logger = EpochLogger::<FakeTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+        let collector = StateCollector::new(3);
+
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+
+        // Setup: Both objects at v1 in snapshot
+        let obj_a_v1 = Object::immutable_with_id_for_testing(obj_a);
+        collector.merged_state.insert(obj_a, obj_a_v1);
+        let obj_b_v1 = Object::immutable_with_id_for_testing(obj_b);
+        collector.merged_state.insert(obj_b, obj_b_v1);
+
+        // H1: A:v1→v2
+        let h1_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                100,
+                1,
+                h1_digest,
+                vec![(obj_a, SequenceNumber::from_u64(1), None)],
+            ),
+        );
+
+        // H2: B:v1→v2
+        let h2_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                101,
+                1,
+                h2_digest,
+                vec![(obj_b, SequenceNumber::from_u64(1), None)],
+            ),
+        );
+
+        // H3: B:v2→v3
+        let h3_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                102,
+                2,
+                h3_digest,
+                vec![(obj_b, SequenceNumber::from_u64(2), None)],
+            ),
+        );
+
+        // Dirty: needs A:v2 and B:v3
+        let dirty_txn = create_log_record(
+            11,
+            103,
+            0,
+            TransactionDigest::random(),
+            vec![
+                (obj_a, SequenceNumber::from_u64(2), None),
+                (obj_b, SequenceNumber::from_u64(3), None),
+            ],
+        );
+
+        let dirty_txns = vec![dirty_txn];
+
+        // Test
+        let missing = coordinator.identify_missing_versions(&dirty_txns, &collector, 10);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(2))));
+        assert!(missing.contains(&(obj_b, SequenceNumber::from_u64(3))));
+
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
+
+        // Assert: All three transactions included
+        assert_eq!(bridging.len(), 3);
+        let digests: Vec<_> = bridging.iter().map(|r| r.txn_digest).collect();
+        assert!(digests.contains(&h1_digest));
+        assert!(digests.contains(&h2_digest));
+        assert!(digests.contains(&h3_digest));
+    }
+
+    #[test]
+    fn test_no_infinite_loop_on_missing_dependency() {
+        // Test that algorithm doesn't loop infinitely when a dependency can't be satisfied
+        // Snapshot: A=v3
+        // Healthy H1: needs v5→v6 (but v5 doesn't exist anywhere!)
+        // Dirty: needs v6
+        //
+        // Should stop after MAX_ITERATIONS and include H1 anyway
+
+        let logger = EpochLogger::<FakeTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+        let collector = StateCollector::new(3);
+
+        let obj_a = ObjectID::random();
+
+        // Setup: Snapshot has A at v3
+        let obj_a_v3 = Object::immutable_with_id_for_testing(obj_a);
+        collector.merged_state.insert(obj_a, obj_a_v3);
+
+        // Healthy H1: requires v5 (MISSING!), produces v6
+        let h1_digest = TransactionDigest::random();
+        logger.append(
+            EpochId(11),
+            create_log_record(
+                11,
+                100,
+                1,
+                h1_digest,
+                vec![(obj_a, SequenceNumber::from_u64(5), None)],
+            ),
+        );
+
+        // Dirty: needs v6
+        let dirty_txn = create_log_record(
+            11,
+            101,
+            0,
+            TransactionDigest::random(),
+            vec![(obj_a, SequenceNumber::from_u64(6), None)],
+        );
+
+        let dirty_txns = vec![dirty_txn];
+
+        // Test
+        let missing = coordinator.identify_missing_versions(&dirty_txns, &collector, 10);
+        assert!(missing.contains(&(obj_a, SequenceNumber::from_u64(6))));
+
+        // This should not hang - it should stop after finding H1 and realizing v5 is unsatisfiable
+        let bridging =
+            coordinator.collect_bridging_transactions(&missing, 10, 0, &collector, &dirty_txns);
+
+        // Should include H1 even though its dependency can't be satisfied
+        // (The proxy will have to deal with the missing v5 at replay time)
+        assert_eq!(bridging.len(), 1);
+        assert_eq!(bridging[0].txn_digest, h1_digest);
     }
 }
