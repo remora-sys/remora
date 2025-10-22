@@ -200,7 +200,7 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    tracing::debug!(
+                    tracing::info!(
                         "Proxy {} epoch {:?} snapshot objects: {}",
                         self.id,
                         epoch_id,

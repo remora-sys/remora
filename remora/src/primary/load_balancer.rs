@@ -351,16 +351,10 @@ where
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
                 for (object_id, version) in &failed_proxy_states {
                     if let Some(object) =
-                        collector.get_object_for_proxy(object_id, failed_proxy as usize)
+                        collector.get_object_for_proxy(object_id, *version, failed_proxy as usize)
                     {
-                        if object.version() == *version {
-                            initial_state_blobs.insert(*object_id, object);
-                        } else {
-                            tracing::warn!(
-                                "Version mismatch for failed proxy state {:?}: expected {:?}, got {:?}",
-                                object_id, version, object.version()
-                            );
-                        }
+                        // Version is guaranteed to match now - get_object_for_proxy verifies it
+                        initial_state_blobs.insert(*object_id, object);
                     } else {
                         tracing::info!(
                             "Failed to fetch state {:?} @ {:?} from collector for failed proxy {}",

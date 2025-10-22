@@ -145,23 +145,32 @@ impl StateCollector {
         self.merged_state.get(object_id).map(|e| e.clone())
     }
 
-    /// Get an object for a specific proxy, checking both persisted and that proxy's temp state.
-    /// First checks merged_state (fully acknowledged), then falls back to the proxy's temp state.
-    /// This is useful during recovery to access objects from the failed proxy's incomplete epochs.
+    /// Get an object for a specific proxy at a specific version.
+    /// Checks both persisted state (merged_state) and that proxy's temp state.
+    /// Returns the object only if its version matches the requested version.
+    /// This is useful during recovery to access exact versions owned by the failed proxy.
     pub fn get_object_for_proxy(
         &self,
         object_id: &ObjectID,
+        version: SequenceNumber,
         proxy_id: crate::proxy::core::ProxyId,
     ) -> Option<Object> {
-        // First try persisted state (ground truth)
-        if let Some(obj) = self.merged_state.get(object_id) {
-            return Some(obj.clone());
+        // First try this specific proxy's temp state (for uncommitted versions)
+        if let Some(obj) = self.temp_state_by_proxy.get(&(proxy_id, *object_id)) {
+            if obj.version() == version {
+                return Some(obj.clone());
+            }
         }
 
-        // Fall back to this specific proxy's temp state
-        self.temp_state_by_proxy
-            .get(&(proxy_id, *object_id))
-            .map(|obj| obj.clone())
+        // Then try persisted state (for committed versions)
+        if let Some(obj) = self.merged_state.get(object_id) {
+            if obj.version() == version {
+                return Some(obj.clone());
+            }
+        }
+
+        // Version mismatch or object not found
+        None
     }
 
     /// Get the persisted version for an object without cloning the entire object.
