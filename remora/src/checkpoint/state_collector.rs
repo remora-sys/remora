@@ -263,19 +263,36 @@ impl StateCollector {
     }
 
     /// Check if an epoch is complete (all proxies have reported at least this epoch).
-    /// Returns true if all proxies have a persist_index >= the epoch.
+    /// Returns true if ALL proxies (including failed ones) have a persist_index >= the epoch.
     pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
         if self.per_proxy_persist_index.len() < expected_proxies {
             return false;
         }
 
-        let complete = self
+        // BUG FIX: Check the MINIMUM persist_index across ALL proxies.
+        //
+        // Problem: .take(expected_proxies) uses arbitrary DashMap iteration order.
+        // When a proxy fails but stays in the map (stuck at old epoch) and standby is promoted,
+        // .take(N) might skip the failed proxy, allowing merged_state to advance incorrectly.
+        //
+        // Solution: Check if minimum persist_index >= epoch. This ensures ALL proxies,
+        // including any failed ones, have advanced. A failed proxy acts as a "brake" to keep
+        // merged_state frozen at the safe snapshot point for recovery.
+        let min_persist_index = self
             .per_proxy_persist_index
             .iter()
-            .take(expected_proxies)
-            .all(|entry| entry.value().load(Ordering::SeqCst) >= epoch.0);
+            .map(|entry| entry.value().load(Ordering::SeqCst))
+            .min()
+            .unwrap_or(0);
 
-        tracing::info!("Epoch {} completion check: complete: {}", epoch.0, complete);
+        let complete = min_persist_index >= epoch.0;
+
+        tracing::debug!(
+            "Epoch {} completion check: min_persist_index={}, complete={}",
+            epoch.0,
+            min_persist_index,
+            complete
+        );
         complete
     }
 

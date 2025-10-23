@@ -319,6 +319,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
         for txn in dirty_txns {
             for ((obj_id, required_version), _) in &txn.required_states {
+                if *required_version == SequenceNumber::from(2) {
+                    continue;
+                }
                 match collector.get_persisted_version(obj_id) {
                     Some(current_version) if current_version == *required_version => {
                         // Case 1: Exact match - version available in persisted state
