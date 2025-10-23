@@ -214,6 +214,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_epoch_notify,
             epoch_logger.clone(),
             collector.clone(),
+            config.validator_parameters.max_message_size,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);

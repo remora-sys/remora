@@ -19,6 +19,7 @@ use crate::{
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
+    networking::chunking::{chunk_replay_batch, ChunkingConfig},
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
@@ -61,6 +62,8 @@ pub struct LoadBalancer<E: Executor> {
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
     /// Reference to the collector for persisted version checks
     collector: Arc<StateCollector>,
+    /// Configuration for message chunking to handle large recovery messages
+    chunking_config: ChunkingConfig,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -79,10 +82,17 @@ where
         epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
         epoch_logger: Arc<EpochLogger<E::Transaction>>,
         collector: Arc<StateCollector>,
+        max_message_size: usize,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
         let recovery_coordinator = RecoveryCoordinator::new(epoch_logger.clone());
+        let chunking_config = ChunkingConfig::new(max_message_size);
+        tracing::info!(
+            "LoadBalancer: max_message_size={} bytes, effective_max_size={} bytes",
+            chunking_config.max_message_size,
+            chunking_config.effective_max_size()
+        );
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -99,6 +109,7 @@ where
             standby_excluded: Arc::new(AtomicBool::new(true)),
             states_to_proxy,
             collector,
+            chunking_config,
         }
     }
 
@@ -287,6 +298,7 @@ where
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
         let standby_excluded = self.standby_excluded.clone();
+        let chunking_config = self.chunking_config.clone();
 
         tokio::spawn(async move {
             tracing::info!(
@@ -397,31 +409,50 @@ where
                         state_blobs: initial_state_blobs.clone(),
                     };
 
-                    tracing::debug!(
-                        "Sending initial state transfer batch to replacement proxy: {:?}",
-                        initial_state_blobs.clone()
-                    );
-
                     let state_transfer_batch = crate::executor::api::ReplayBatch {
                         epoch: crate::checkpoint::EpochId(0), // Special epoch for state transfer
                         items: vec![state_transfer_msg],
                     };
 
-                    let msg =
-                        crate::executor::api::PrimaryToProxyMessage::Replay(state_transfer_batch);
-                    if let Err(e) = proxy_tx.value().send(msg).await {
-                        tracing::error!(
-                            "Failed to send initial state transfer to replacement proxy {}: {:?}",
-                            replacement_proxy,
-                            e
+                    // Chunk the state transfer batch if needed
+                    let chunking_result =
+                        chunk_replay_batch(state_transfer_batch, &chunking_config);
+
+                    tracing::info!(
+                        replacement_proxy,
+                        total_state_count = initial_state_blobs.len(),
+                        num_chunks = chunking_result.num_chunks,
+                        max_chunk_size = chunking_result.max_chunk_size,
+                        "Sending initial state transfer ({} chunks) to replacement proxy",
+                        chunking_result.num_chunks
+                    );
+
+                    // Send all chunks
+                    for (chunk_idx, chunk) in chunking_result.chunks.into_iter().enumerate() {
+                        let msg = crate::executor::api::PrimaryToProxyMessage::Replay(chunk);
+                        if let Err(e) = proxy_tx.value().send(msg).await {
+                            tracing::error!(
+                                "Failed to send initial state transfer chunk {}/{} to replacement proxy {}: {:?}",
+                                chunk_idx + 1,
+                                chunking_result.num_chunks,
+                                replacement_proxy,
+                                e
+                            );
+                            return;
+                        }
+                        tracing::debug!(
+                            "Sent initial state transfer chunk {}/{} to replacement proxy {}",
+                            chunk_idx + 1,
+                            chunking_result.num_chunks,
+                            replacement_proxy
                         );
-                        return;
                     }
 
                     tracing::info!(
                         replacement_proxy,
                         state_count = initial_state_blobs.len(),
-                        "Sent initial state transfer batch to replacement proxy"
+                        num_chunks = chunking_result.num_chunks,
+                        "Completed initial state transfer to replacement proxy"
                     );
                 }
 
@@ -521,22 +552,40 @@ where
                         items: replay_items,
                     };
 
+                    // Chunk the replay batch if needed
+                    let chunking_result = chunk_replay_batch(replay_batch, &chunking_config);
+
                     tracing::info!(
                         epoch = epoch.0,
                         batch_size,
                         sent_count,
-                        "Sending replay batch for epoch"
+                        num_chunks = chunking_result.num_chunks,
+                        max_chunk_size = chunking_result.max_chunk_size,
+                        "Sending replay batch for epoch ({} chunks)",
+                        chunking_result.num_chunks
                     );
 
-                    let msg = crate::executor::api::PrimaryToProxyMessage::Replay(replay_batch);
-                    if let Err(e) = proxy_tx.value().send(msg).await {
-                        tracing::error!(
-                            "Failed to send replay batch for epoch {} to replacement proxy {}: {:?}",
+                    // Send all chunks for this epoch
+                    for (chunk_idx, chunk) in chunking_result.chunks.into_iter().enumerate() {
+                        let msg = crate::executor::api::PrimaryToProxyMessage::Replay(chunk);
+                        if let Err(e) = proxy_tx.value().send(msg).await {
+                            tracing::error!(
+                                "Failed to send replay chunk {}/{} for epoch {} to replacement proxy {}: {:?}",
+                                chunk_idx + 1,
+                                chunking_result.num_chunks,
+                                epoch.0,
+                                replacement_proxy,
+                                e
+                            );
+                            return;
+                        }
+                        tracing::debug!(
+                            "Sent replay chunk {}/{} for epoch {} to replacement proxy {}",
+                            chunk_idx + 1,
+                            chunking_result.num_chunks,
                             epoch.0,
-                            replacement_proxy,
-                            e
+                            replacement_proxy
                         );
-                        return;
                     }
                 }
 

@@ -130,7 +130,7 @@ where
                     }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Proxy {} received Replay batch for epoch {:?} ({} items)",
                         self.id,
                         batch.epoch,
@@ -214,7 +214,7 @@ where
                     }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
-                    tracing::debug!(
+                    tracing::info!(
                         "Proxy {} received Replay batch for epoch {:?} ({} items)",
                         self.id,
                         batch.epoch,

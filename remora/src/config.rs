@@ -38,6 +38,14 @@ pub enum LoadBalancingPolicy {
 /// Default channel size for communication between components.
 pub const DEFAULT_CHANNEL_SIZE: usize = 100_000;
 
+/// Default maximum message size in bytes (8 MB).
+/// This is set conservatively below the network layer's 16 MB hard limit
+/// to account for serialization overhead and message framing.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Minimum safe message size (1 MB) to ensure at least one transaction can fit.
+pub const MIN_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// Return a socket address on the local machine with a random port.
 /// This is useful for tests.
 pub fn get_test_address() -> SocketAddr {
@@ -92,6 +100,10 @@ pub struct ValidatorParameters {
     /// The proxy mode (separation or no separation)
     #[serde(default = "default_validator_config::default_proxy_mode")]
     pub proxy_mode: ProxyMode,
+    /// Maximum message size in bytes for primary-to-proxy communication.
+    /// Messages larger than this will be automatically chunked.
+    #[serde(default = "default_validator_config::default_max_message_size")]
+    pub max_message_size: usize,
 }
 
 impl ValidatorParameters {
@@ -102,7 +114,7 @@ impl ValidatorParameters {
 }
 
 mod default_validator_config {
-    use crate::config::{LoadBalancingPolicy, ProxyMode};
+    use crate::config::{LoadBalancingPolicy, ProxyMode, DEFAULT_MAX_MESSAGE_SIZE};
     use crate::primary::mock_consensus::{models::FixedDelay, MockConsensusParameters};
 
     pub fn default_consensus_delay_model() -> FixedDelay {
@@ -120,6 +132,10 @@ mod default_validator_config {
     pub fn default_proxy_mode() -> ProxyMode {
         ProxyMode::Separation
     }
+
+    pub fn default_max_message_size() -> usize {
+        DEFAULT_MAX_MESSAGE_SIZE
+    }
 }
 
 impl Default for ValidatorParameters {
@@ -129,6 +145,7 @@ impl Default for ValidatorParameters {
             consensus_parameters: default_validator_config::default_consensus_parameters(),
             load_balancing_policy: default_validator_config::default_load_balancing_policy(),
             proxy_mode: default_validator_config::default_proxy_mode(),
+            max_message_size: default_validator_config::default_max_message_size(),
         }
     }
 }
