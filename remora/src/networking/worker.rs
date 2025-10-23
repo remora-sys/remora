@@ -87,6 +87,12 @@ where
             while buf.len() >= offset + 4 {
                 let size = BigEndian::read_u32(&buf[offset..offset + 4]) as usize;
                 if size > Self::MAX_MESSAGE_SIZE {
+                    tracing::error!(
+                        "FATAL: Received frame size {} bytes exceeds MAX_MESSAGE_SIZE {} bytes. \
+                         This usually means the sender didn't chunk properly. Closing connection!",
+                        size,
+                        Self::MAX_MESSAGE_SIZE
+                    );
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Frame too large: {} > {}", size, Self::MAX_MESSAGE_SIZE),
@@ -101,6 +107,10 @@ where
                 offset = end;
             }
 
+            if !frames.is_empty() {
+                tracing::trace!("Extracted {} frames from buffer", frames.len());
+            }
+
             // drop consumed bytes
             if offset > 0 {
                 buf.advance(offset);
@@ -111,13 +121,28 @@ where
                 .for_each_concurrent(Some(Self::MAX_BATCH_SIZE), |frame| {
                     let tx = tx_incoming.clone();
                     async move {
+                        let frame_size = frame.len();
                         match bincode::deserialize::<I>(&frame) {
                             Ok(item) => {
+                                tracing::trace!(
+                                    "Successfully deserialized {} byte message",
+                                    frame_size
+                                );
                                 if tx.send(item).await.is_err() {
-                                    tracing::warn!("Incoming channel closed, stopping reader");
+                                    tracing::error!(
+                                        "Incoming channel closed or full! Message lost. \
+                                         This indicates backpressure - receiver is too slow."
+                                    );
                                 }
                             }
-                            Err(e) => tracing::error!("Deserialize error: {:?}", e),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to deserialize {} byte frame: {:?}. \
+                                     This usually indicates version mismatch or corrupted data.",
+                                    frame_size,
+                                    e
+                                );
+                            }
                         }
                     }
                 })
@@ -151,9 +176,30 @@ where
             for transaction in &buffer {
                 let serialized = bincode::serialize(transaction).expect("Infallible serialization");
 
-                let size = serialized.len() as u32;
-                serialized_buffer.extend_from_slice(&size.to_be_bytes());
+                let size = serialized.len();
 
+                // Validate message size before sending
+                if size > Self::MAX_MESSAGE_SIZE {
+                    tracing::error!(
+                        "CRITICAL: Attempting to send message larger than MAX_MESSAGE_SIZE: {} bytes > {} bytes. \
+                         Message will be rejected by receiver. This indicates a chunking bug!",
+                        size,
+                        Self::MAX_MESSAGE_SIZE
+                    );
+                    // Don't crash the connection - skip this message but log the error
+                    continue;
+                }
+
+                if size > Self::MAX_MESSAGE_SIZE / 2 {
+                    tracing::warn!(
+                        "Sending large message: {} bytes ({:.1}% of max size {})",
+                        size,
+                        (size as f64 / Self::MAX_MESSAGE_SIZE as f64) * 100.0,
+                        Self::MAX_MESSAGE_SIZE
+                    );
+                }
+
+                serialized_buffer.extend_from_slice(&(size as u32).to_be_bytes());
                 serialized_buffer.extend_from_slice(&serialized);
             }
 
