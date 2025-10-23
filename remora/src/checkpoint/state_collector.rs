@@ -123,29 +123,15 @@ impl StateCollector {
 
         // Commit all latest versions to merged_state and update version_ownership
         for (obj_id, (version, obj, writer_proxy)) in objects_by_id {
-            // Check if there's an existing version ownership entry for this object
-            // Remove old entries to keep version_ownership clean (one entry per object)
-            let old_entries: Vec<_> = self
-                .version_ownership
-                .iter()
-                .filter_map(|entry| {
-                    let ((oid, ver), _proxy) = entry.pair();
-                    if *oid == obj_id {
-                        Some((*oid, *ver))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Remove old version entries for this object
-            for (old_obj_id, old_version) in old_entries {
-                self.version_ownership.remove(&(old_obj_id, old_version));
-            }
-
             // Insert the new latest version
             self.merged_state.insert(obj_id, obj);
+
             // Record which proxy wrote this version
+            // Note: We don't remove old version entries because:
+            // 1. Cleanup cost is O(N×M) - extremely expensive with millions of entries
+            // 2. Old entries don't affect correctness - get_versions_by_proxy filters to latest
+            // 3. Storage cost is negligible compared to CPU cost of iteration
+            // 4. Old entries will be naturally pruned when objects are eventually deleted
             self.version_ownership
                 .insert((obj_id, version), writer_proxy);
             committed_count += 1;
