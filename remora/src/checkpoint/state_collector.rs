@@ -153,16 +153,14 @@ impl StateCollector {
     }
 
     /// Get an object for a specific proxy at a specific version.
-    /// Checks both persisted state (merged_state) and that proxy's temp state.
+    /// ONLY returns the exact version if it was written by the specified proxy.
     ///
-    /// Fallback logic:
-    /// 1. If exact version found in proxy's temp_state: return it
-    /// 2. If exact version found in merged_state: return it
-    /// 3. If newer version found in merged_state: return it (supersedes old version)
-    /// 4. Otherwise: return None
+    /// Checks:
+    /// 1. Proxy's temp_state (for uncommitted versions)
+    /// 2. merged_state with version_ownership verification
     ///
-    /// This is useful during recovery to access versions owned by the failed proxy,
-    /// with graceful handling when older versions have been superseded.
+    /// This ensures we only return objects that truly belong to the proxy,
+    /// preventing duplicates with different versions during recovery.
     pub fn get_object_for_proxy(
         &self,
         object_id: &ObjectID,
@@ -174,30 +172,33 @@ impl StateCollector {
             if obj.version() == version {
                 return Some(obj.clone());
             }
-            // Don't fallback to newer temp_state version - could be divergent
+            // Don't return if version doesn't match - wrong version
         }
 
         // Then try persisted state (for committed versions)
+        // CRITICAL: Verify ownership - only return if this proxy wrote this version
         if let Some(obj) = self.merged_state.get(object_id) {
             if obj.version() == version {
-                // Exact match
-                return Some(obj.clone());
-            } else if obj.version() > version {
-                // Newer version available in merged_state - this is OK!
-                // The object was updated by healthy proxies after the failed proxy's version.
-                // Return the newer version as it supersedes the old one.
-                tracing::debug!(
-                    "Returning newer version for object {:?}: requested {:?}, found {:?}",
-                    object_id,
-                    version,
-                    obj.version()
-                );
-                return Some(obj.clone());
+                // Exact version match - now verify ownership
+                if let Some(writer) = self.version_ownership.get(&(*object_id, version)) {
+                    if *writer.value() == proxy_id {
+                        return Some(obj.clone());
+                    } else {
+                        tracing::debug!(
+                            "Object {:?} v{} found but was written by proxy {}, not {}",
+                            object_id,
+                            version.value(),
+                            writer.value(),
+                            proxy_id
+                        );
+                    }
+                }
+                // No ownership record or wrong owner - don't return
             }
-            // If merged_state has older version, don't return it (shouldn't happen)
+            // Don't return newer/older versions - must be exact match owned by this proxy
         }
 
-        // Version not found
+        // Version not found or not owned by this proxy
         None
     }
 
