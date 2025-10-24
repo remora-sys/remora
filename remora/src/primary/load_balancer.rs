@@ -154,10 +154,17 @@ where
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             tracing::info!(
                 failed_proxy,
-                "Delay complete, proceeding with dirty transaction collection"
+                "Delay complete, capturing atomic snapshot"
             );
 
-            // NEW: Compute recovery plan with bridging transactions
+            // CRITICAL: Capture failed_proxy_states FIRST to establish snapshot boundary.
+            // This must happen BEFORE computing recovery plan to ensure atomicity.
+            let failed_proxy_states = self.collector.get_versions_by_proxy(failed_proxy);
+
+            // CRITICAL: Compute recovery plan IMMEDIATELY after capturing states,
+            // while temp_state and version_ownership are still consistent.
+            // If epochs commit between these two calls, we get version mismatches
+            // (e.g., init transfer has v3, but replay message references v4).
             let (bridging_txns, dirty_txns) =
                 self.recovery_coordinator.begin_recovery_with_bridging(
                     failed_proxy as usize,
@@ -168,16 +175,15 @@ where
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
+                state_count = failed_proxy_states.len(),
                 bridging_count = bridging_txns.len(),
                 dirty_count = dirty_txns.len(),
                 persist_index,
-                "Beginning recovery with bridging transactions"
+                "Captured atomic snapshot: {} states, {} bridging txns, {} dirty txns",
+                failed_proxy_states.len(),
+                bridging_txns.len(),
+                dirty_txns.len()
             );
-
-            // Begin recovery process (old API for compatibility)
-            let _replacement = self
-                .recovery_coordinator
-                .begin_recovery(failed_proxy as usize, standby_proxy as usize);
 
             // NOTE: Do NOT promote standby here! Promotion happens AFTER replay completes
             // in start_replay_process() to prevent duplicate transactions.
@@ -206,18 +212,7 @@ where
             let mut remapped_count = 0;
             let mut cleared_count = 0;
 
-            // CRITICAL: Capture ALL state versions owned by failed proxy BEFORE clearing.
-            // These will be transferred to the standby even if not referenced by dirty/bridging txns.
-            // Use StateCollector's version_ownership tracking (comprehensive, not rotating like states_to_proxy)
-            let failed_proxy_states = self.collector.get_versions_by_proxy(failed_proxy);
-
-            tracing::info!(
-                failed_proxy,
-                state_count = failed_proxy_states.len(),
-                "Captured {} state versions owned by failed proxy for transfer to standby",
-                failed_proxy_states.len()
-            );
-
+            // failed_proxy_states already captured at line 162 - use that snapshot
             // Remove states that were owned by the failed proxy
             for key in &failed_proxy_states {
                 self.states_to_proxy.remove(key);
@@ -267,7 +262,7 @@ where
                 conn_count,
                 "Replay initiation precheck: replacement presence and connection count"
             );
-            self.start_replay_process(failed_proxy, standby_proxy, failed_proxy_states);
+            self.start_replay_process(failed_proxy, standby_proxy, failed_proxy_states, bridging_txns, dirty_txns);
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
@@ -300,13 +295,17 @@ where
     /// then dirty transactions (from failed proxy) to the replacement proxy.
     /// Also transfers all state versions owned by the failed proxy.
     /// After all replay messages are sent, it promotes the standby to active.
+    ///
+    /// CRITICAL: Takes pre-computed recovery plan to ensure atomicity - computing it again
+    /// inside the spawned task would allow epochs to commit between captures, causing version mismatches.
     fn start_replay_process(
         &self,
         failed_proxy: ProxyId,
         replacement_proxy: ProxyId,
         failed_proxy_states: Vec<(ObjectID, SequenceNumber)>,
+        bridging_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
+        dirty_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
     ) {
-        let recovery_coordinator = self.recovery_coordinator.clone();
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
         let standby_excluded = self.standby_excluded.clone();
@@ -317,23 +316,18 @@ where
             tracing::info!(
                 failed_proxy,
                 replacement_proxy,
-                "Replay task spawned for failed proxy"
+                bridging_count = bridging_txns.len(),
+                dirty_count = dirty_txns.len(),
+                "Replay task spawned with pre-computed recovery plan"
             );
 
-            // Use the failed proxy's own persist_index
-            let persist_index = collector.get_proxy_persist_index(failed_proxy);
             let failed_proxy_id = failed_proxy; // Capture for use in closure
 
-            // NEW: Get complete recovery plan with bridging transactions
-            // Uses version_ownership which is STABLE (only updates on epoch commits)
-            let (bridging_txns, dirty_txns) = recovery_coordinator.begin_recovery_with_bridging(
-                failed_proxy as usize,
-                persist_index,
-                &collector,
-            );
+            // Recovery plan already computed in begin_recovery() to ensure atomicity
+            // with failed_proxy_states capture. Don't recompute here!
 
             if bridging_txns.is_empty() && dirty_txns.is_empty() {
-                tracing::info!(failed_proxy, persist_index, "No transactions to replay");
+                tracing::info!(failed_proxy, "No transactions to replay");
 
                 // No replay needed, but still promote standby to active
                 standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -349,7 +343,6 @@ where
                 replacement_proxy,
                 bridging_count = bridging_txns.len(),
                 dirty_count = dirty_txns.len(),
-                persist_index,
                 state_transfer_count = failed_proxy_states.len(),
                 "Sending state transfer + bridging + dirty transactions to replacement proxy"
             );
@@ -525,25 +518,32 @@ where
                                     continue;
                                 }
 
-                                // Fetch from persisted state only (bridging txns were on healthy proxies)
-                                let object_opt = collector.get_object(object_id);
+                                // CRITICAL: Fetch from the ORIGINAL proxy that executed this bridging transaction
+                                // Using get_object_for_proxy ensures we get the exact version from the proxy's
+                                // snapshot at persist_index, not the latest version from merged_state which may
+                                // have advanced due to epoch commits during recovery.
+                                let source_proxy = record.destination_proxy;
+                                let object_opt = collector.get_object_for_proxy(object_id, *version, source_proxy);
 
                                 if let Some(object) = object_opt {
-                                    // Verify version matches
+                                    // Should always match since get_object_for_proxy returns exact version
                                     if object.version() == *version {
                                         state_blobs.insert(*object_id, object);
                                         sent_blobs.insert((*object_id, *version));
+                                        tracing::debug!(
+                                            "Fetched bridging state {:?} v{:?} from source proxy {}",
+                                            object_id, version.value(), source_proxy
+                                        );
                                     } else {
-                                        tracing::warn!(
-                                            "Version mismatch for object {:?} - expected {:?}, got {:?}. \
-                                            This is OK for bridging txns - will be regenerated",
+                                        tracing::error!(
+                                            "Version mismatch from get_object_for_proxy! {:?} - expected {:?}, got {:?}",
                                             object_id, version, object.version()
                                         );
                                     }
                                 } else {
                                     tracing::debug!(
-                                        "Object {:?} v{:?} not in collector - will be regenerated by replay",
-                                        object_id, version
+                                        "Object {:?} v{:?} not found in source proxy {} - will be regenerated by replay",
+                                        object_id, version, source_proxy
                                     );
                                 }
                             }
