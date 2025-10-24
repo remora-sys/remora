@@ -23,7 +23,8 @@ pub struct StateCollector {
     /// Key: (ObjectID, SequenceNumber) -> ProxyId
     /// Updated when promoting temp state to merged_state during snapshot merging
     /// Used during recovery to identify all versions owned by a failed proxy
-    version_ownership: DashMap<(ObjectID, SequenceNumber), crate::proxy::core::ProxyId>,
+    /// Public for recovery coordinator to check latest versions owned by healthy proxies
+    pub(crate) version_ownership: DashMap<(ObjectID, SequenceNumber), crate::proxy::core::ProxyId>,
 
     /// Number of expected proxies (for determining when all have acknowledged)
     expected_proxies: usize,

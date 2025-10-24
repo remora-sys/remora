@@ -28,7 +28,8 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     pub dependency_controller: Arc<VersionedDependencyController>,
-    pub states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+    pub states_to_proxy:
+        Arc<DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>>,
     pub policy: LoadBalancingPolicy,
     pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
     pub proxy_mode: ProxyMode,
@@ -210,7 +211,9 @@ where
     /// Create a new SharedObjTxnForwarder with worker pool
     pub(crate) fn new(
         dependency_controller: Arc<VersionedDependencyController>,
-        states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         policy: LoadBalancingPolicy,
         proxy_connections: Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
@@ -374,7 +377,13 @@ where
                 let stateful_msg = PrimaryToProxyMessage::CombinedTxn(
                     Arc::clone(&transaction_arc),
                     resolved_stateless.unwrap_or(usize::MAX),
+                    stateful_missing_states.clone(),
+                );
+                tracing::info!(
+                    "stateful message: {:?}, transaction_arc.digest: {:?}, destination: {:?}",
                     stateful_missing_states,
+                    transaction_arc.digest(),
+                    resolved_stateful
                 );
                 if let Some(stateful_pid) = resolved_stateful {
                     Self::send_to_proxy(proxy_connections, stateful_pid, stateful_msg).await;
@@ -399,14 +408,26 @@ where
 
     async fn clone_required_states(
         required_versions: &[(ObjectID, SequenceNumber)],
-        states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         proxy_index: ExecutorIndex,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ExecutorIndex>> {
         let mut required_states = BTreeMap::new();
         for (object_id, seq_num) in required_versions.iter().cloned() {
-            let previous_owner = states_to_proxy.get(&(object_id, seq_num)).map(|o| *o);
-            let prev = previous_owner.filter(|owner| *owner != proxy_index);
-            required_states.insert((object_id, seq_num), prev);
+            // Check if this version is owned by other proxies (not including this proxy)
+            let other_owner = states_to_proxy
+                .get(&(object_id, seq_num))
+                .and_then(|owners| {
+                    // If this proxy already owns it, no need to fetch
+                    if owners.contains(&proxy_index) {
+                        None
+                    } else {
+                        // Return any owner (pick first one arbitrarily)
+                        owners.iter().next().copied()
+                    }
+                });
+            required_states.insert((object_id, seq_num), other_owner);
         }
         required_states
     }
@@ -465,7 +486,9 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         standby_excluded: &Arc<AtomicBool>,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: &Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         txn_cnt: usize,
         required_versions: &[(ObjectID, SequenceNumber)],
         destination: &Option<ProxyId>,
@@ -570,7 +593,9 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         standby_excluded: &Arc<AtomicBool>,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: &Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         required_versions: &[(ObjectID, SequenceNumber)],
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
@@ -587,9 +612,12 @@ where
         // Count how many objects each proxy already has
         let mut proxy_state_counts = vec![0; proxy_count];
         for (id, v) in required_versions {
-            if let Some(proxy_index) = states_to_proxy.get(&(*id, *v)) {
-                if *proxy_index < proxy_count {
-                    proxy_state_counts[*proxy_index] += 1;
+            if let Some(owners) = states_to_proxy.get(&(*id, *v)) {
+                // Increment count for all proxies that own this version
+                for proxy_index in owners.iter() {
+                    if *proxy_index < proxy_count {
+                        proxy_state_counts[*proxy_index] += 1;
+                    }
                 }
             }
         }
@@ -627,7 +655,9 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         standby_excluded: &Arc<AtomicBool>,
-        states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: &Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         txn_duration: &Duration,
@@ -641,10 +671,12 @@ where
         // Calculate locality based on current state ownership
         let mut locality_raw_counts = vec![0usize; proxy_count];
         for (id, v) in required_versions {
-            if let Some(proxy_index_ref) = states_to_proxy.get(&(*id, *v)) {
-                let proxy_index = *proxy_index_ref;
-                if proxy_index < proxy_count {
-                    locality_raw_counts[proxy_index] += 1;
+            if let Some(owners) = states_to_proxy.get(&(*id, *v)) {
+                // Increment count for all proxies that own this version
+                for proxy_index in owners.iter() {
+                    if *proxy_index < proxy_count {
+                        locality_raw_counts[*proxy_index] += 1;
+                    }
                 }
             }
         }
@@ -665,7 +697,9 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         standby_excluded: &Arc<AtomicBool>,
-        _states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        _states_to_proxy: &Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
         required_versions: &[(ObjectID, SequenceNumber)],
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
@@ -826,7 +860,9 @@ where
         transaction: &RemoraTransaction<E>,
         required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
         proxy_index: ExecutorIndex,
-        states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
+        states_to_proxy: Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
+        >,
     ) -> RequiredStates {
         let mut required_states = BTreeMap::new();
 
@@ -848,23 +884,39 @@ where
             let next_version = max_version.next();
 
             for (object_id, seq_num) in required_versions {
-                let previous_owner = states_to_proxy.get(&(object_id, seq_num));
-
-                let previous_owner_value = if let Some(owner) = previous_owner {
-                    if *owner != proxy_index {
-                        Some(*owner)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                // Check if any other proxy owns this version (not including this proxy)
+                let previous_owner_value =
+                    states_to_proxy
+                        .get(&(object_id, seq_num))
+                        .and_then(|owners| {
+                            if owners.contains(&proxy_index) {
+                                // This proxy already owns it
+                                None
+                            } else {
+                                // Return any other owner
+                                owners.iter().next().copied()
+                            }
+                        });
 
                 required_states.insert((object_id, seq_num), previous_owner_value);
 
-                // Update the mapping
-                states_to_proxy.insert((object_id, next_version), proxy_index);
-                states_to_proxy.remove(&(object_id, seq_num));
+                // Update the mapping: Add this proxy as owner of next_version
+                states_to_proxy
+                    .entry((object_id, next_version))
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(proxy_index);
+                tracing::info!(
+                    "Updating states_to_proxy for {:?} to include {:?}",
+                    (object_id, next_version),
+                    proxy_index
+                );
+
+                // Remove this proxy from old version's owner set
+                states_to_proxy
+                    .entry((object_id, seq_num))
+                    .and_modify(|owners| {
+                        owners.remove(&proxy_index);
+                    });
             }
         }
 

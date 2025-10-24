@@ -183,7 +183,7 @@ where
                     stateless_res_proxy_id,
                     missing_states,
                 ) => {
-                    tracing::debug!(
+                    tracing::info!(
                         "Proxy {} received combined transaction {:?}, stateless proxy: {}",
                         self.id,
                         transaction.digest(),
@@ -223,6 +223,10 @@ where
                     for msg in batch.items {
                         // Commit state_blobs using spawn_state_updates
                         if !msg.state_blobs.is_empty() {
+                            tracing::info!(
+                                "Committing state blobs for replay {:?}",
+                                msg.state_blobs.clone()
+                            );
                             self.spawn_state_updates(msg.state_blobs.clone());
                         }
 
@@ -235,7 +239,7 @@ where
                                 .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                                 .collect();
 
-                            tracing::debug!(
+                            tracing::info!(
                                 "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
                                 required_states.keys(),
@@ -654,6 +658,10 @@ where
             .iter()
             .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
             .collect();
+        if objs.is_empty() {
+            tracing::warn!("No objects to commit for stateful reply");
+            return;
+        }
         let (_, current_handles) = self
             .stateful_controller
             .get_prior_dependency_and_update(0, objs, true, false);

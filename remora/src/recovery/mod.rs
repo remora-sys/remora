@@ -289,9 +289,14 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// 3. **required > persisted**: Check if produced by dirty txns OR healthy proxies
     /// 4. **Object not in collector**: Check if created by healthy proxies
     ///
+    /// CRITICAL FIX: Check version_ownership to see if healthy proxies still own required versions.
+    /// version_ownership is STABLE (only updates on epoch commits), unlike states_to_proxy which
+    /// is actively updated during forwarding. If a healthy proxy still owns the required version
+    /// as its LATEST version, NO BRIDGING needed - normal state transfer will handle it.
+    ///
     /// # Arguments
     /// * `dirty_txns` - Transactions from the failed proxy that need replay
-    /// * `collector` - StateCollector with current persisted versions
+    /// * `collector` - StateCollector with current persisted versions and version_ownership
     /// * `persist_index` - Snapshot epoch boundary
     ///
     /// # Returns
@@ -317,6 +322,35 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         let (dirty_productions, healthy_txns_by_object) =
             self.build_version_graph(dirty_txns, persist_index, failed_proxy);
 
+        // CRITICAL: Build a map of latest versions owned by each healthy proxy
+        // This uses version_ownership which is STABLE (only updates on epoch commits)
+        // Key: (ProxyId, ObjectID) -> Latest SequenceNumber owned by that proxy
+        let mut healthy_proxy_latest_versions: std::collections::HashMap<
+            (usize, ObjectID),
+            SequenceNumber,
+        > = std::collections::HashMap::new();
+
+        // Collect latest versions for all healthy proxies from version_ownership
+        for entry in collector.version_ownership.iter() {
+            let ((obj_id, version), proxy_id) = entry.pair();
+            if *proxy_id != failed_proxy {
+                // This is a healthy proxy
+                healthy_proxy_latest_versions
+                    .entry((*proxy_id, *obj_id))
+                    .and_modify(|v| {
+                        if *version > *v {
+                            *v = *version;
+                        }
+                    })
+                    .or_insert(*version);
+            }
+        }
+
+        tracing::debug!(
+            "Built healthy proxy latest versions map with {} entries",
+            healthy_proxy_latest_versions.len()
+        );
+
         for txn in dirty_txns {
             for ((obj_id, required_version), _) in &txn.required_states {
                 if *required_version == SequenceNumber::from(2) {
@@ -325,7 +359,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                 match collector.get_persisted_version(obj_id) {
                     Some(current_version) if current_version == *required_version => {
                         // Case 1: Exact match - version available in persisted state
-                        tracing::trace!(
+                        tracing::debug!(
                             obj_id = ?obj_id,
                             version = required_version.value(),
                             "Version available in persisted state"
@@ -353,51 +387,95 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                             .map(|versions| versions.contains(required_version))
                             .unwrap_or(false)
                         {
-                            tracing::trace!(
+                            tracing::debug!(
                                 obj_id = ?obj_id,
                                 required_version = required_version.value(),
                                 "Version will be produced by dirty transaction replay"
                             );
-                        } else if let Some(healthy_txns) = healthy_txns_by_object.get(obj_id) {
-                            // Check if healthy proxy produces it
-                            let produced_by_healthy = healthy_txns.iter().any(|record| {
-                                record.required_states.iter().any(|((obj, req_ver), _)| {
-                                    *obj == *obj_id
-                                        && SequenceNumber::from_u64(req_ver.value() + 1)
-                                            == *required_version
-                                })
-                            });
+                        } else {
+                            // CRITICAL FIX: Check if a healthy proxy CURRENTLY owns this exact version
+                            // A healthy proxy "currently owns" a version if it's their LATEST version
+                            let owned_by_healthy = healthy_proxy_latest_versions.iter().any(
+                                |((proxy_id, obj), latest_ver)| {
+                                    obj == obj_id
+                                        && latest_ver == required_version
+                                        && *proxy_id != failed_proxy
+                                },
+                            );
 
-                            if produced_by_healthy {
-                                missing.insert((*obj_id, *required_version));
+                            if owned_by_healthy {
+                                // Healthy proxy still owns this version as their latest - NO BRIDGING!
+                                // Normal state transfer via required_states will handle it
                                 tracing::debug!(
                                     obj_id = ?obj_id,
                                     required_version = required_version.value(),
-                                    "Version produced by healthy proxy, needs bridging"
+                                    "Version is latest version owned by healthy proxy, no bridging needed"
                                 );
+                                continue; // Skip this version
+                            }
+
+                            // Version not currently owned by any healthy proxy
+                            // Check if healthy proxy produced it in the past but has since advanced
+                            if let Some(healthy_txns) = healthy_txns_by_object.get(obj_id) {
+                                let produced_by_healthy = healthy_txns.iter().any(|record| {
+                                    record.required_states.iter().any(|((obj, req_ver), _)| {
+                                        *obj == *obj_id
+                                            && SequenceNumber::from_u64(req_ver.value() + 1)
+                                                == *required_version
+                                    })
+                                });
+
+                                if produced_by_healthy {
+                                    missing.insert((*obj_id, *required_version));
+                                    tracing::debug!(
+                                        obj_id = ?obj_id,
+                                        required_version = required_version.value(),
+                                        "Version produced by healthy proxy but no longer owned, needs bridging"
+                                    );
+                                } else {
+                                    // Healthy txns touch this object but don't produce the required version
+                                    tracing::debug!(
+                                        obj_id = ?obj_id,
+                                        required_version = required_version.value(),
+                                        current_version = current_version.value(),
+                                        "Version likely in failed proxy's temp state (already executed but not committed)"
+                                    );
+                                }
                             } else {
-                                // Healthy txns touch this object but don't produce the required version
-                                tracing::trace!(
+                                // No healthy txns for this object at all
+                                // Version is likely in failed proxy's temp state (pre-failure execution)
+                                tracing::debug!(
                                     obj_id = ?obj_id,
                                     required_version = required_version.value(),
                                     current_version = current_version.value(),
-                                    "Version likely in failed proxy's temp state (already executed but not committed)"
+                                    "Version in failed proxy's temp state - will be fetched via get_object_for_proxy()"
                                 );
                             }
-                        } else {
-                            // No healthy txns for this object at all
-                            // Version is likely in failed proxy's temp state (pre-failure execution)
-                            tracing::trace!(
-                                obj_id = ?obj_id,
-                                required_version = required_version.value(),
-                                current_version = current_version.value(),
-                                "Version in failed proxy's temp state - will be fetched via get_object_for_proxy()"
-                            );
                         }
                     }
                     None => {
                         // Case 4: Object doesn't exist in persisted state
-                        // Check if created by healthy proxy
+
+                        // CRITICAL FIX: Check if a healthy proxy currently owns this exact version
+                        let owned_by_healthy = healthy_proxy_latest_versions.iter().any(
+                            |((proxy_id, obj), latest_ver)| {
+                                obj == obj_id
+                                    && latest_ver == required_version
+                                    && *proxy_id != failed_proxy
+                            },
+                        );
+
+                        if owned_by_healthy {
+                            // Healthy proxy owns this version as their latest - NO BRIDGING!
+                            tracing::debug!(
+                                obj_id = ?obj_id,
+                                required_version = required_version.value(),
+                                "Object is latest version owned by healthy proxy, no bridging needed"
+                            );
+                            continue; // Skip this version
+                        }
+
+                        // Check if created by healthy proxy but no longer owned (they've advanced)
                         if let Some(healthy_txns) = healthy_txns_by_object.get(obj_id) {
                             let produced_by_healthy = healthy_txns.iter().any(|record| {
                                 record.required_states.iter().any(|((obj, req_ver), _)| {
@@ -409,13 +487,13 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
                             if produced_by_healthy {
                                 missing.insert((*obj_id, *required_version));
-                                tracing::debug!(
+                                tracing::info!(
                                     obj_id = ?obj_id,
                                     required_version = required_version.value(),
-                                    "Object created by healthy proxy, needs bridging"
+                                    "Object created by healthy proxy but no longer owned, needs bridging"
                                 );
                             } else {
-                                tracing::trace!(
+                                tracing::debug!(
                                     obj_id = ?obj_id,
                                     required_version = required_version.value(),
                                     "Object not in persisted state, will be created during replay"
@@ -427,6 +505,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             }
         }
 
+        tracing::info!("Missing versions: {:?}", missing.clone());
         missing
     }
 
@@ -589,6 +668,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// 2. Identifying missing versions needed by dirty transactions
     /// 3. Collecting bridging transactions to regenerate those versions
     ///
+    /// Uses version_ownership from StateCollector which is STABLE (only updates on epoch commits)
+    /// to determine which versions healthy proxies still own vs. have advanced past.
+    ///
     /// # Returns
     /// Tuple of (bridging_txns, dirty_txns) in the order they should be replayed
     pub fn begin_recovery_with_bridging(
@@ -616,7 +698,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             return (Vec::new(), Vec::new());
         }
 
-        // Step 2: Identify missing versions
+        // Step 2: Identify missing versions using stable version_ownership
         let missing_versions =
             self.identify_missing_versions(&dirty_txns, collector, persist_index);
 

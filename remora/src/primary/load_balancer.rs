@@ -58,8 +58,9 @@ pub struct LoadBalancer<E: Executor> {
     recovery_coordinator: Arc<RecoveryCoordinator<E::Transaction>>,
     /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
     standby_excluded: Arc<AtomicBool>,
-    /// Shared mapping of (object, version) -> proxy index, for gating
-    states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), usize>>,
+    /// Shared mapping of (object, version) -> set of proxy indices that own this version
+    /// Multiple proxies can own the same version (e.g., after bridging transaction replay)
+    states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<usize>>>,
     /// Reference to the collector for persisted version checks
     collector: Arc<StateCollector>,
     /// Configuration for message chunking to handle large recovery messages
@@ -150,7 +151,7 @@ where
                 failed_proxy,
                 "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
             );
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             tracing::info!(
                 failed_proxy,
                 "Delay complete, proceeding with dirty transaction collection"
@@ -225,9 +226,20 @@ where
 
             // Decrement indices for proxies that came after the failed proxy
             for mut entry in self.states_to_proxy.iter_mut() {
-                let current_idx = *entry.value();
-                if current_idx > failed_proxy {
-                    *entry.value_mut() = current_idx - 1;
+                let owners = entry.value_mut();
+                let mut to_remap = Vec::new();
+
+                // Collect indices that need remapping
+                for &idx in owners.iter() {
+                    if idx > failed_proxy {
+                        to_remap.push(idx);
+                    }
+                }
+
+                // Remove old indices and insert remapped ones
+                for idx in to_remap {
+                    owners.remove(&idx);
+                    owners.insert(idx - 1);
                     remapped_count += 1;
                 }
             }
@@ -299,6 +311,7 @@ where
         let collector = self.collector.clone();
         let standby_excluded = self.standby_excluded.clone();
         let chunking_config = self.chunking_config.clone();
+        let states_to_proxy = self.states_to_proxy.clone();
 
         tokio::spawn(async move {
             tracing::info!(
@@ -312,6 +325,7 @@ where
             let failed_proxy_id = failed_proxy; // Capture for use in closure
 
             // NEW: Get complete recovery plan with bridging transactions
+            // Uses version_ownership which is STABLE (only updates on epoch commits)
             let (bridging_txns, dirty_txns) = recovery_coordinator.begin_recovery_with_bridging(
                 failed_proxy as usize,
                 persist_index,
@@ -360,8 +374,7 @@ where
                 );
 
                 // Fetch state blobs for all states owned by the failed proxy
-                // Note: get_object_for_proxy will return the requested version if available,
-                // or a newer version from merged_state if the old version was superseded
+                // Note: get_object_for_proxy now strictly returns exact versions owned by this proxy
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
                 let mut missing_states = Vec::new();
                 for (object_id, version) in &failed_proxy_states {
@@ -596,6 +609,61 @@ where
                     replacement_proxy
                 );
 
+                // CRITICAL: Update states_to_proxy to record that standby now owns versions from bridging txns
+                //
+                // Bridging transactions don't go through normal forwarding path, so get_missing_states_for_transaction()
+                // is never called. We need to manually update states_to_proxy to record that the standby now owns
+                // all versions produced by bridging transactions. This prevents unnecessary state transfers when
+                // future transactions get routed to the standby.
+                //
+                // IMPORTANT: Calculate ExecutorIndex AFTER promotion (without standby exclusion)
+                // We're about to promote the standby, so we need its ExecutorIndex in the post-promotion state.
+                let replacement_proxy_index = {
+                    let mut keys: Vec<usize> = proxy_connections.iter().map(|e| *e.key()).collect();
+                    keys.sort_unstable();
+                    // Don't exclude standby - we want the index AFTER promotion
+                    keys.iter()
+                        .position(|&id| id == replacement_proxy)
+                        .unwrap_or(replacement_proxy)
+                };
+
+                let mut bridging_versions_added = 0;
+                for record in &bridging_txns {
+                    // Find max version across all required states for this transaction
+                    let max_version = record
+                        .required_states
+                        .keys()
+                        .map(|(_, v)| v)
+                        .max()
+                        .copied()
+                        .unwrap_or(sui_types::base_types::SequenceNumber::from(2));
+
+                    // All objects in this transaction advance to max_version + 1
+                    let produced_version =
+                        sui_types::base_types::SequenceNumber::from_u64(max_version.value() + 1);
+
+                    for ((obj_id, _req_version), _) in &record.required_states {
+                        states_to_proxy
+                            .entry((*obj_id, produced_version))
+                            .or_insert_with(std::collections::HashSet::new)
+                            .insert(replacement_proxy_index);
+                        tracing::info!(
+                            "Updated states_to_proxy for {:?} to include {:?}",
+                            (*obj_id, produced_version),
+                            replacement_proxy_index
+                        );
+                        bridging_versions_added += 1;
+                    }
+                }
+
+                tracing::info!(
+                    replacement_proxy,
+                    replacement_proxy_index,
+                    bridging_versions_added,
+                    "Updated states_to_proxy: added {} versions from bridging transactions to standby proxy",
+                    bridging_versions_added
+                );
+
                 // CRITICAL FIX: Promote standby AFTER all replay messages are sent.
                 //
                 // Bug: If we promote the standby before replay completes, new transactions can be
@@ -612,21 +680,18 @@ where
                     "Standby proxy promoted to active after replay completion"
                 );
 
-                // IMPORTANT: Update states_to_proxy ONLY for dirty transactions (from failed proxy).
+                // Note on states_to_proxy updates:
                 //
-                // Bridging transactions are from healthy proxies - they already executed there and
-                // those proxies own the states. We're just replaying them on standby to regenerate
-                // intermediate versions, but ownership remains with the original healthy proxies.
+                // - Bridging transactions: Already updated above. Both healthy proxies AND standby now
+                //   own these versions in the HashSet. This allows future transactions to execute locally
+                //   on either proxy without unnecessary state transfers.
                 //
-                // Dirty transactions are from the failed proxy - after replay on standby, the standby
-                // now owns those state versions. We need to update states_to_proxy to reflect this.
+                // - Dirty transactions: Will be updated naturally through normal forwarding as the standby
+                //   executes new transactions. Since standby is now promoted, future transactions will call
+                //   get_missing_states_for_transaction() which updates states_to_proxy.
                 //
-                // Note: We do NOT pass states_to_proxy to this task because updating it from a spawned
-                // task would be unsafe. Instead, we accept that future transactions will naturally
-                // update the map through normal forwarding when they access these objects.
-                //
-                // The cleared states from the failed proxy (line 196-212 in begin_recovery) will be
-                // re-established organically as new transactions touch those objects.
+                // With HashSet-based ownership, multiple proxies can own the same version simultaneously,
+                // which is correct after bridging transaction replay.
             } else {
                 tracing::error!(
                     "Replacement proxy {} not found in connections",
