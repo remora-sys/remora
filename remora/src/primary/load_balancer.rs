@@ -152,10 +152,7 @@ where
                 "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
             );
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            tracing::info!(
-                failed_proxy,
-                "Delay complete, capturing atomic snapshot"
-            );
+            tracing::info!(failed_proxy, "Delay complete, capturing atomic snapshot");
 
             // CRITICAL: Capture failed_proxy_states FIRST to establish snapshot boundary.
             // This must happen BEFORE computing recovery plan to ensure atomicity.
@@ -262,7 +259,13 @@ where
                 conn_count,
                 "Replay initiation precheck: replacement presence and connection count"
             );
-            self.start_replay_process(failed_proxy, standby_proxy, failed_proxy_states, bridging_txns, dirty_txns);
+            self.start_replay_process(
+                failed_proxy,
+                standby_proxy,
+                failed_proxy_states,
+                bridging_txns,
+                dirty_txns,
+            );
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
@@ -366,11 +369,58 @@ where
                     failed_proxy_states.len()
                 );
 
+                // CRITICAL FIX: Identify objects that will have state blobs in bridging transactions
+                // If a bridging transaction will provide a state blob for object X (at any version),
+                // we must EXCLUDE all versions of object X from the initial transfer to avoid conflicts.
+
+                // First, compute which versions will be produced by bridging transactions
+                let mut bridging_productions = std::collections::HashSet::new();
+                for record in &bridging_txns {
+                    for ((obj_id, req_version), _) in &record.required_states {
+                        let produced_version = SequenceNumber::from_u64(req_version.value() + 1);
+                        bridging_productions.insert((*obj_id, produced_version));
+                    }
+                }
+
+                // Now identify objects that will ACTUALLY have state blobs fetched
+                // (i.e., required but NOT produced by earlier bridging txns)
+                let mut objects_in_bridging_blobs = std::collections::HashSet::new();
+                for record in &bridging_txns {
+                    for ((obj_id, version), _) in &record.required_states {
+                        // Skip if this version will be produced by an earlier bridging txn
+                        if bridging_productions.contains(&(*obj_id, *version)) {
+                            continue;
+                        }
+                        // Skip initial versions
+                        if *version == SequenceNumber::from(2) {
+                            continue;
+                        }
+                        // This object will have a state blob fetched for bridging
+                        objects_in_bridging_blobs.insert(*obj_id);
+                    }
+                }
+                tracing::info!(
+                    "Identified {} objects that will have state blobs in bridging transactions",
+                    objects_in_bridging_blobs.len()
+                );
+
                 // Fetch state blobs for all states owned by the failed proxy
                 // Note: get_object_for_proxy now strictly returns exact versions owned by this proxy
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
                 let mut missing_states = Vec::new();
+                let mut excluded_for_bridging = 0;
                 for (object_id, version) in &failed_proxy_states {
+                    // CRITICAL: Skip objects that will be provided by bridging transaction state blobs
+                    // Even if failed proxy owned V6, if bridging txn will provide V10, exclude V6
+                    if objects_in_bridging_blobs.contains(object_id) {
+                        tracing::debug!(
+                            "Excluding {:?} v{} from initial transfer - will be provided by bridging txn",
+                            object_id,
+                            version.value()
+                        );
+                        excluded_for_bridging += 1;
+                        continue;
+                    }
                     if let Some(object) =
                         collector.get_object_for_proxy(object_id, *version, failed_proxy as usize)
                     {
@@ -399,9 +449,11 @@ where
                     replacement_proxy,
                     fetched_count = initial_state_blobs.len(),
                     requested_count = failed_proxy_states.len(),
-                    "Fetched {} / {} state blobs for initial transfer",
+                    excluded_for_bridging,
+                    "Fetched {} / {} state blobs for initial transfer ({} excluded for bridging txns)",
                     initial_state_blobs.len(),
-                    failed_proxy_states.len()
+                    failed_proxy_states.len(),
+                    excluded_for_bridging
                 );
 
                 // Send initial state transfer as a special replay batch with epoch 0
@@ -488,6 +540,10 @@ where
                 let initial_transfer_states: std::collections::HashSet<(ObjectID, SequenceNumber)> =
                     failed_proxy_states.iter().cloned().collect();
 
+                // Note: bridging_productions was already computed above for excluding objects
+                // from initial transfer, and is reused here to skip fetching state blobs for
+                // versions that will be produced by earlier bridging transactions.
+
                 for (epoch, epoch_records) in txns_by_epoch {
                     let mut replay_items = Vec::new();
                     for record in epoch_records {
@@ -517,13 +573,27 @@ where
                                 if *version == SequenceNumber::from(2) {
                                     continue;
                                 }
+                                // Skip if this version will be produced by an earlier bridging transaction
+                                // This prevents duplicate state blobs when TxnA produces V3 and TxnB requires V3
+                                if bridging_productions.contains(&(*object_id, *version)) {
+                                    tracing::debug!(
+                                        "Skipping state blob fetch for {:?} v{} - will be produced by earlier bridging txn",
+                                        object_id,
+                                        version.value()
+                                    );
+                                    continue;
+                                }
 
                                 // CRITICAL: Fetch from the ORIGINAL proxy that executed this bridging transaction
                                 // Using get_object_for_proxy ensures we get the exact version from the proxy's
                                 // snapshot at persist_index, not the latest version from merged_state which may
                                 // have advanced due to epoch commits during recovery.
                                 let source_proxy = record.destination_proxy;
-                                let object_opt = collector.get_object_for_proxy(object_id, *version, source_proxy);
+                                let object_opt = collector.get_object_for_proxy(
+                                    object_id,
+                                    *version,
+                                    source_proxy,
+                                );
 
                                 if let Some(object) = object_opt {
                                     // Should always match since get_object_for_proxy returns exact version
