@@ -152,7 +152,10 @@ where
                 "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
             );
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            tracing::info!(failed_proxy, "Delay complete, capturing atomic snapshot");
+            tracing::info!(
+                failed_proxy,
+                "Delay complete, capturing atomic snapshot"
+            );
 
             // CRITICAL: Capture failed_proxy_states FIRST to establish snapshot boundary.
             // This must happen BEFORE computing recovery plan to ensure atomicity.
@@ -259,13 +262,7 @@ where
                 conn_count,
                 "Replay initiation precheck: replacement presence and connection count"
             );
-            self.start_replay_process(
-                failed_proxy,
-                standby_proxy,
-                failed_proxy_states,
-                bridging_txns,
-                dirty_txns,
-            );
+            self.start_replay_process(failed_proxy, standby_proxy, failed_proxy_states, bridging_txns, dirty_txns);
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
@@ -526,11 +523,7 @@ where
                                 // snapshot at persist_index, not the latest version from merged_state which may
                                 // have advanced due to epoch commits during recovery.
                                 let source_proxy = record.destination_proxy;
-                                let object_opt = collector.get_object_for_proxy(
-                                    object_id,
-                                    *version,
-                                    source_proxy,
-                                );
+                                let object_opt = collector.get_object_for_proxy(object_id, *version, source_proxy);
 
                                 if let Some(object) = object_opt {
                                     // Should always match since get_object_for_proxy returns exact version
@@ -654,7 +647,7 @@ where
                             .entry((*obj_id, produced_version))
                             .or_insert_with(std::collections::HashSet::new)
                             .insert(replacement_proxy_index);
-                        tracing::debug!(
+                        tracing::info!(
                             "Updated states_to_proxy for {:?} to include {:?}",
                             (*obj_id, produced_version),
                             replacement_proxy_index

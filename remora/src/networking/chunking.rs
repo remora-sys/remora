@@ -369,7 +369,10 @@ where
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use sui_types::base_types::ObjectID;
+    use sui_types::{
+        base_types::{ObjectID, SequenceNumber},
+        object::Object,
+    };
 
     // Mock transaction type for testing
     #[derive(Clone, Serialize)]

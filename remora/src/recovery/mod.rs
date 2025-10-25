@@ -487,7 +487,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
 
                             if produced_by_healthy {
                                 missing.insert((*obj_id, *required_version));
-                                tracing::debug!(
+                                tracing::info!(
                                     obj_id = ?obj_id,
                                     required_version = required_version.value(),
                                     "Object created by healthy proxy but no longer owned, needs bridging"
@@ -702,7 +702,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         let missing_versions =
             self.identify_missing_versions(&dirty_txns, collector, persist_index);
 
-        tracing::debug!(
+        tracing::info!(
             missing_version_count = missing_versions.len(),
             missing_versions = ?missing_versions.iter().take(10).collect::<Vec<_>>(),
             "Identified missing state versions"
