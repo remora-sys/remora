@@ -717,7 +717,7 @@ where
                             .entry((*obj_id, produced_version))
                             .or_insert_with(std::collections::HashSet::new)
                             .insert(replacement_proxy_index);
-                        tracing::info!(
+                        tracing::debug!(
                             "Updated states_to_proxy for {:?} to include {:?}",
                             (*obj_id, produced_version),
                             replacement_proxy_index
