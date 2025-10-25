@@ -379,7 +379,7 @@ where
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states.clone(),
                 );
-                tracing::info!(
+                tracing::debug!(
                     "stateful message: {:?}, transaction_arc.digest: {:?}, destination: {:?}",
                     stateful_missing_states,
                     transaction_arc.digest(),
@@ -905,7 +905,7 @@ where
                     .entry((object_id, next_version))
                     .or_insert_with(std::collections::HashSet::new)
                     .insert(proxy_index);
-                tracing::info!(
+                tracing::debug!(
                     "Updating states_to_proxy for {:?} to include {:?}",
                     (object_id, next_version),
                     proxy_index

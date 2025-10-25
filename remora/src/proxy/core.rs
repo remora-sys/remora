@@ -183,7 +183,7 @@ where
                     stateless_res_proxy_id,
                     missing_states,
                 ) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Proxy {} received combined transaction {:?}, stateless proxy: {}",
                         self.id,
                         transaction.digest(),
@@ -223,10 +223,6 @@ where
                     for msg in batch.items {
                         // Commit state_blobs using spawn_state_updates
                         if !msg.state_blobs.is_empty() {
-                            tracing::info!(
-                                "Committing state blobs for replay {:?}",
-                                msg.state_blobs.clone()
-                            );
                             self.spawn_state_updates(msg.state_blobs.clone());
                         }
 
@@ -239,7 +235,7 @@ where
                                 .map(|(obj_id, seq_num)| ((obj_id, seq_num), None))
                                 .collect();
 
-                            tracing::info!(
+                            tracing::debug!(
                                 "Replaying txn {:?} with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
                                 required_states.keys(),
@@ -857,7 +853,7 @@ where
                                         e
                                     );
                                 } else {
-                                    tracing::info!(
+                                    tracing::debug!(
                                         "Successfully redirected stateful request to standby proxy {}",
                                         standby_id
                                     );
@@ -915,7 +911,7 @@ where
                                     e
                                 );
                             } else {
-                                tracing::info!(
+                                tracing::debug!(
                                     "Successfully redirected stateful request to standby proxy {}",
                                     standby_id
                                 );
