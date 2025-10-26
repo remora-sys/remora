@@ -26,6 +26,21 @@ pub struct LogRecord<T: ExecutableTransaction + Clone> {
     pub epoch: EpochId,
 }
 
+impl<T: ExecutableTransaction + Clone> LogRecord<T> {
+    /// Calculate the produced version for this transaction.
+    /// All objects in a transaction advance to max(all_required_versions) + 1.
+    pub fn produced_version(&self) -> SequenceNumber {
+        let max_version = self
+            .required_states
+            .keys()
+            .map(|(_, v)| v)
+            .max()
+            .copied()
+            .unwrap_or(SequenceNumber::from(2));
+        SequenceNumber::from_u64(max_version.value() + 1)
+    }
+}
+
 /// In-memory per-epoch transaction logger.
 /// Epoch segments can be pruned (removed) atomically when acknowledged.
 #[derive(Default)]
@@ -244,10 +259,12 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         let mut healthy_txns_by_object: HashMap<ObjectID, Vec<LogRecord<T>>> = HashMap::new();
 
         // Build dirty productions: what versions dirty txns will produce
+        // IMPORTANT: All objects in a transaction advance to max(all_req_versions) + 1
         for record in dirty_txns {
-            for ((obj_id, req_version), _) in &record.required_states {
-                // Transaction requiring version V produces version V+1
-                let produced_version = SequenceNumber::from_u64(req_version.value() + 1);
+            let produced_version = record.produced_version();
+
+            // All objects in this transaction advance to the same version
+            for ((obj_id, _req_version), _) in &record.required_states {
                 dirty_productions
                     .entry(*obj_id)
                     .or_default()
@@ -418,11 +435,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                             // Check if healthy proxy produced it in the past but has since advanced
                             if let Some(healthy_txns) = healthy_txns_by_object.get(obj_id) {
                                 let produced_by_healthy = healthy_txns.iter().any(|record| {
-                                    record.required_states.iter().any(|((obj, req_ver), _)| {
-                                        *obj == *obj_id
-                                            && SequenceNumber::from_u64(req_ver.value() + 1)
-                                                == *required_version
-                                    })
+                                    // Check if this transaction touches our object and produces required version
+                                    record.required_states.keys().any(|(obj, _)| obj == obj_id)
+                                        && record.produced_version() == *required_version
                                 });
 
                                 if produced_by_healthy {
@@ -478,11 +493,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                         // Check if created by healthy proxy but no longer owned (they've advanced)
                         if let Some(healthy_txns) = healthy_txns_by_object.get(obj_id) {
                             let produced_by_healthy = healthy_txns.iter().any(|record| {
-                                record.required_states.iter().any(|((obj, req_ver), _)| {
-                                    *obj == *obj_id
-                                        && SequenceNumber::from_u64(req_ver.value() + 1)
-                                            == *required_version
-                                })
+                                // Check if this transaction touches our object and produces required version
+                                record.required_states.keys().any(|(obj, _)| obj == obj_id)
+                                    && record.produced_version() == *required_version
                             });
 
                             if produced_by_healthy {
@@ -505,7 +518,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             }
         }
 
-        tracing::info!("Missing versions: {:?}", missing.clone());
+        //tracing::info!("Missing versions: {:?}", missing.clone());
         missing
     }
 
@@ -546,10 +559,11 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         let mut seen_digests = HashSet::new();
 
         // Build set of versions that will be produced by dirty transaction replay
+        // IMPORTANT: All objects in a transaction advance to max(all_req_versions) + 1
         let mut dirty_productions: HashSet<(ObjectID, SequenceNumber)> = HashSet::new();
         for record in dirty_txns {
-            for ((obj_id, req_version), _) in &record.required_states {
-                let produced_version = SequenceNumber::from_u64(req_version.value() + 1);
+            let produced_version = record.produced_version();
+            for ((obj_id, _req_version), _) in &record.required_states {
                 dirty_productions.insert((*obj_id, produced_version));
             }
         }
@@ -591,15 +605,11 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                     }
 
                     // Check if this transaction produces any of the needed versions
-                    let produces_needed_version =
-                        record
-                            .required_states
-                            .iter()
-                            .any(|((obj_id, req_version), _)| {
-                                let produced_version =
-                                    SequenceNumber::from_u64(req_version.value() + 1);
-                                needed_versions.contains(&(*obj_id, produced_version))
-                            });
+                    let produced_version = record.produced_version();
+                    let produces_needed_version = record
+                        .required_states
+                        .keys()
+                        .any(|(obj_id, _)| needed_versions.contains(&(*obj_id, produced_version)));
 
                     if !produces_needed_version {
                         continue;

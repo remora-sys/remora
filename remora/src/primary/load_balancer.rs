@@ -369,62 +369,125 @@ where
                     failed_proxy_states.len()
                 );
 
-                // CRITICAL FIX: Identify objects that will have state blobs in bridging transactions
-                // If a bridging transaction will provide a state blob for object X (at any version),
-                // we must EXCLUDE all versions of object X from the initial transfer to avoid conflicts.
+                // CRITICAL FIX: Identify "touched" objects that are handled by dirty/bridging txns
+                // Recovery plan: persist_state + dirty_txns + bridging_txns = complete state
+                // Initial transfer should ONLY include objects NOT touched by dirty/bridging
+                //
+                // Touched objects = any object appearing in:
+                // 1. Dirty transaction required_states (will get state blob or be produced)
+                // 2. Bridging transaction required_states (will get state blob or be produced)
+                // 3. Bridging transaction outputs (produced by execution)
+                //
+                // Untouched objects = objects owned by failed proxy but not involved in replay
 
-                // First, compute which versions will be produced by bridging transactions
-                let mut bridging_productions = std::collections::HashSet::new();
+                let mut touched_objects = std::collections::HashSet::new();
+                let mut touched_by_dirty_count = 0;
+                let mut touched_by_bridging_count = 0;
+
+                // Mark objects touched by dirty transactions
+                tracing::debug!(
+                    "Marking objects touched by {} dirty transactions",
+                    dirty_txns.len()
+                );
+                for record in &dirty_txns {
+                    for ((obj_id, version), _) in &record.required_states {
+                        if touched_objects.insert(*obj_id) {
+                            touched_by_dirty_count += 1;
+                            tracing::debug!(
+                                "Marked {:?} as touched by DIRTY txn (requires v{}, digest={:?})",
+                                obj_id,
+                                version.value(),
+                                record.txn_digest
+                            );
+                        }
+                    }
+                }
+
+                // Mark objects touched by bridging transactions (inputs and outputs)
+                tracing::debug!(
+                    "Marking objects touched by {} bridging transactions",
+                    bridging_txns.len()
+                );
                 for record in &bridging_txns {
                     for ((obj_id, req_version), _) in &record.required_states {
-                        let produced_version = SequenceNumber::from_u64(req_version.value() + 1);
-                        bridging_productions.insert((*obj_id, produced_version));
+                        if touched_objects.insert(*obj_id) {
+                            touched_by_bridging_count += 1;
+                            tracing::debug!(
+                                "Marked {:?} as touched by BRIDGING txn (requires v{}, digest={:?})",
+                                obj_id, req_version.value(), record.txn_digest
+                            );
+                        }
+                        // Also mark the produced version's object (same object)
+                        // produced_version = req_version + 1, but it's the same object
                     }
                 }
 
-                // Now identify objects that will ACTUALLY have state blobs fetched
-                // (i.e., required but NOT produced by earlier bridging txns)
-                let mut objects_in_bridging_blobs = std::collections::HashSet::new();
+                tracing::info!(
+                    replacement_proxy,
+                    touched_count = touched_objects.len(),
+                    touched_by_dirty = touched_by_dirty_count,
+                    touched_by_bridging = touched_by_bridging_count,
+                    "Identified {} objects touched by dirty/bridging transactions ({} by dirty, {} by bridging) - will exclude from initial transfer",
+                    touched_objects.len(),
+                    touched_by_dirty_count,
+                    touched_by_bridging_count
+                );
+
+                // Compute bridging_productions for later use in Step 3.2
+                // This prevents fetching state blobs for versions produced by earlier bridging txns
+                // IMPORTANT: All objects in a transaction advance to max(all_req_versions) + 1
+                let mut bridging_productions = std::collections::HashSet::new();
+                tracing::debug!(
+                    "Computing bridging_productions for {} bridging transactions",
+                    bridging_txns.len()
+                );
                 for record in &bridging_txns {
-                    for ((obj_id, version), _) in &record.required_states {
-                        // Skip if this version will be produced by an earlier bridging txn
-                        if bridging_productions.contains(&(*obj_id, *version)) {
-                            continue;
-                        }
-                        // Skip initial versions
-                        if *version == SequenceNumber::from(2) {
-                            continue;
-                        }
-                        // This object will have a state blob fetched for bridging
-                        objects_in_bridging_blobs.insert(*obj_id);
+                    let produced_version = record.produced_version();
+                    for ((obj_id, _req_version), _) in &record.required_states {
+                        bridging_productions.insert((*obj_id, produced_version));
+                        tracing::debug!(
+                            "Bridging txn {:?} will produce {:?} @ v{}",
+                            record.txn_digest,
+                            obj_id,
+                            produced_version.value()
+                        );
                     }
                 }
-                tracing::info!(
-                    "Identified {} objects that will have state blobs in bridging transactions",
-                    objects_in_bridging_blobs.len()
+                tracing::debug!(
+                    "Computed {} bridging production entries",
+                    bridging_productions.len()
                 );
 
                 // Fetch state blobs for all states owned by the failed proxy
+                // EXCEPT for "touched" objects that are handled by dirty/bridging transactions
                 // Note: get_object_for_proxy now strictly returns exact versions owned by this proxy
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
                 let mut missing_states = Vec::new();
-                let mut excluded_for_bridging = 0;
+                let mut excluded_for_replay = 0;
                 for (object_id, version) in &failed_proxy_states {
-                    // CRITICAL: Skip objects that will be provided by bridging transaction state blobs
-                    // Even if failed proxy owned V6, if bridging txn will provide V10, exclude V6
-                    if objects_in_bridging_blobs.contains(object_id) {
+                    // CRITICAL: Skip "touched" objects that appear in dirty/bridging transactions
+                    // These objects will be handled by:
+                    // - State blobs attached to dirty/bridging transactions
+                    // - Execution of bridging transactions (producing new versions)
+                    // Initial transfer should only include "untouched" passive objects
+                    if touched_objects.contains(object_id) {
                         tracing::debug!(
-                            "Excluding {:?} v{} from initial transfer - will be provided by bridging txn",
+                            "✗ Excluding {:?} v{} from initial transfer - touched by dirty/bridging txns",
                             object_id,
                             version.value()
                         );
-                        excluded_for_bridging += 1;
+                        excluded_for_replay += 1;
                         continue;
                     }
                     if let Some(object) =
                         collector.get_object_for_proxy(object_id, *version, failed_proxy as usize)
                     {
                         initial_state_blobs.insert(*object_id, object);
+                        tracing::info!(
+                            "✓ Including {:?} v{} in initial transfer - untouched object",
+                            object_id,
+                            version.value()
+                        );
                     } else {
                         tracing::warn!(
                             "Failed to fetch state {:?} @ {:?} from collector for failed proxy {}",
@@ -449,11 +512,11 @@ where
                     replacement_proxy,
                     fetched_count = initial_state_blobs.len(),
                     requested_count = failed_proxy_states.len(),
-                    excluded_for_bridging,
-                    "Fetched {} / {} state blobs for initial transfer ({} excluded for bridging txns)",
+                    excluded_for_replay,
+                    "Fetched {} / {} state blobs for initial transfer ({} excluded - touched by replay txns)",
                     initial_state_blobs.len(),
                     failed_proxy_states.len(),
-                    excluded_for_bridging
+                    excluded_for_replay
                 );
 
                 // Send initial state transfer as a special replay batch with epoch 0
@@ -544,6 +607,17 @@ where
                 // from initial transfer, and is reused here to skip fetching state blobs for
                 // versions that will be produced by earlier bridging transactions.
 
+                // CAUSALITY VALIDATION: Track highest STATE BLOB version per object
+                // We only track actual state blobs sent, NOT produced versions from transaction execution.
+                // This ensures state blobs are sent in increasing order per object.
+                let mut highest_blob_version: std::collections::HashMap<ObjectID, SequenceNumber> =
+                    std::collections::HashMap::new();
+
+                // Initialize with versions from initial transfer (untouched objects only)
+                for (obj_id, object) in &initial_state_blobs {
+                    highest_blob_version.insert(*obj_id, object.version());
+                }
+
                 for (epoch, epoch_records) in txns_by_epoch {
                     let mut replay_items = Vec::new();
                     for record in epoch_records {
@@ -598,11 +672,14 @@ where
                                 if let Some(object) = object_opt {
                                     // Should always match since get_object_for_proxy returns exact version
                                     if object.version() == *version {
-                                        state_blobs.insert(*object_id, object);
+                                        state_blobs.insert(*object_id, object.clone());
                                         sent_blobs.insert((*object_id, *version));
+
                                         tracing::debug!(
-                                            "Fetched bridging state {:?} v{:?} from source proxy {}",
-                                            object_id, version.value(), source_proxy
+                                            "Fetched BRIDGING state blob: {:?} v{} from source proxy {} \
+                                             (txn digest={:?}, epoch={}, consensus_index={:?})",
+                                            object_id, version.value(), source_proxy,
+                                            record.txn_digest, epoch.0, record.consensus_index
                                         );
                                     } else {
                                         tracing::error!(
@@ -617,6 +694,51 @@ where
                                     );
                                 }
                             }
+                        }
+
+                        // CAUSALITY VALIDATION: Validate that state_blobs for THIS transaction
+                        // are in increasing order per object (no blob version <= previous blob version)
+                        // We do NOT check produced versions here - those will be validated by execution order.
+                        for (obj_id, object) in &state_blobs {
+                            let blob_version = object.version();
+                            if let Some(prev_blob_version) = highest_blob_version.get(obj_id) {
+                                if blob_version <= *prev_blob_version {
+                                    let txn_type = if is_from_failed_proxy {
+                                        "DIRTY (from failed proxy)"
+                                    } else {
+                                        "BRIDGING (from healthy proxy)"
+                                    };
+                                    tracing::error!(
+                                        "STATE BLOB CAUSALITY VIOLATION DETECTED!\n\
+                                         \n\
+                                         Object: {:?}\n\
+                                         Previous state blob version: v{}\n\
+                                         Current state blob version: v{}\n\
+                                         \n\
+                                         State blobs must be in increasing order!\n\
+                                         \n\
+                                         Transaction details:\n\
+                                         - Type: {}\n\
+                                         - Digest: {:?}\n\
+                                         - Epoch: {}\n\
+                                         - Consensus index: {:?}\n\
+                                         - Destination proxy: {}\n\
+                                         \n\
+                                         This indicates a bug in state blob fetching logic.",
+                                        obj_id,
+                                        prev_blob_version.value(),
+                                        blob_version.value(),
+                                        txn_type,
+                                        record.txn_digest,
+                                        epoch.0,
+                                        record.consensus_index,
+                                        record.destination_proxy
+                                    );
+                                    panic!("State blob causality violation - aborting recovery");
+                                }
+                            }
+                            // Update tracking with this blob version
+                            highest_blob_version.insert(*obj_id, blob_version);
                         }
 
                         replay_items.push(crate::executor::api::ReplayMsg {
@@ -699,19 +821,7 @@ where
 
                 let mut bridging_versions_added = 0;
                 for record in &bridging_txns {
-                    // Find max version across all required states for this transaction
-                    let max_version = record
-                        .required_states
-                        .keys()
-                        .map(|(_, v)| v)
-                        .max()
-                        .copied()
-                        .unwrap_or(sui_types::base_types::SequenceNumber::from(2));
-
-                    // All objects in this transaction advance to max_version + 1
-                    let produced_version =
-                        sui_types::base_types::SequenceNumber::from_u64(max_version.value() + 1);
-
+                    let produced_version = record.produced_version();
                     for ((obj_id, _req_version), _) in &record.required_states {
                         states_to_proxy
                             .entry((*obj_id, produced_version))
