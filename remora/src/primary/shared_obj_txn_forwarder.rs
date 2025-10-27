@@ -349,8 +349,10 @@ where
             );
 
             if proxy_mode == ProxyMode::Separation {
-                let stateless_msg =
-                    PrimaryToProxyMessage::StatelessTxn(Arc::clone(&transaction_arc));
+                let stateless_msg = PrimaryToProxyMessage::StatelessTxn(
+                    task.consensus_index,
+                    Arc::clone(&transaction_arc),
+                );
                 if let Some(stateless_pid) = resolved_stateless {
                     Self::send_to_proxy(proxy_connections, stateless_pid, stateless_msg).await;
                 } else {
@@ -361,6 +363,7 @@ where
                 }
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
+                    task.consensus_index,
                     Arc::clone(&transaction_arc),
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states,
@@ -375,6 +378,7 @@ where
                 }
             } else {
                 let stateful_msg = PrimaryToProxyMessage::CombinedTxn(
+                    task.consensus_index,
                     Arc::clone(&transaction_arc),
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states.clone(),

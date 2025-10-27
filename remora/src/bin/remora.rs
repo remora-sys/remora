@@ -70,10 +70,24 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading executor");
     if benchmark_config.workload.is_fake() {
         let executor = FakeExecutor::new(&benchmark_config).await;
-        start_node(args.role, executor, validator_config, metrics).await;
+        start_node(
+            args.role,
+            executor,
+            validator_config,
+            benchmark_config,
+            metrics,
+        )
+        .await;
     } else {
         let executor = SuiExecutor::new(&benchmark_config).await;
-        start_node(args.role, executor, validator_config, metrics).await;
+        start_node(
+            args.role,
+            executor,
+            validator_config,
+            benchmark_config,
+            metrics,
+        )
+        .await;
     }
 
     Ok(())
@@ -83,6 +97,7 @@ async fn start_node<E>(
     role: Role,
     executor: E,
     validator_config: ValidatorConfig,
+    benchmark_config: BenchmarkParameters,
     metrics: Arc<Metrics>,
 ) where
     E: Executor + Send + Sync + 'static,
@@ -102,7 +117,7 @@ async fn start_node<E>(
                 "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
-            PrimaryNode::start(executor, &validator_config, metrics)
+            PrimaryNode::start(executor, &validator_config, &benchmark_config, metrics)
                 .await
                 .collect_results()
                 .await;
@@ -119,10 +134,16 @@ async fn start_node<E>(
 
             // Check if the proxy_id exists in the configuration
             if let Some(_proxy_config) = validator_config.proxies.get(proxy_id) {
-                ProxyNode::start(proxy_id, executor, &validator_config, metrics)
-                    .await
-                    .await_completion()
-                    .await;
+                ProxyNode::start(
+                    proxy_id,
+                    executor,
+                    &validator_config,
+                    &benchmark_config,
+                    metrics,
+                )
+                .await
+                .await_completion()
+                .await;
             } else {
                 tracing::error!("Proxy ID {:?} not found in configuration", proxy_id);
                 panic!("Invalid proxy ID: proxy not defined in configuration");

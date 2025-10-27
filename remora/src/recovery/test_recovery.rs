@@ -91,7 +91,7 @@ mod tests {
         // Simulate proxy 0 reporting epoch 100 via process_snapshot
         use std::collections::BTreeMap;
         let snapshot = BTreeMap::new();
-        state_collector.process_snapshot::<TestTransaction>(0, EpochId(100), snapshot, 3, None);
+        state_collector.process_snapshot::<TestTransaction>(0, 100, snapshot, 3, None);
 
         let updated_persist_index = coordinator.get_persist_index(&state_collector);
         assert_eq!(updated_persist_index, 100);
@@ -155,13 +155,7 @@ mod tests {
         use std::collections::BTreeMap;
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(1),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1, snapshot, 3, None);
         }
 
         // Add records to different epochs
@@ -269,13 +263,7 @@ mod tests {
         // Simulate all proxies reporting epoch 100 (persist_index = 100)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(100),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 100, snapshot, 3, None);
         }
 
         // Test that get_next_replay_batch returns all dirty transactions
@@ -301,13 +289,7 @@ mod tests {
         // Simulate all proxies reporting high epoch 1000
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(1000),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1000, snapshot, 3, None);
         }
 
         // Add records below persist index
@@ -337,13 +319,7 @@ mod tests {
         // Simulate all proxies reporting epoch 1 (persist_index = 1)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(1),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1, snapshot, 3, None);
         }
 
         // Add records to different epochs and proxies
@@ -428,13 +404,7 @@ mod tests {
         // Simulate all proxies reporting epoch 100 (persist_index = 100)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(100),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 100, snapshot, 3, None);
         }
 
         // Test collect_replay_set with different from_index values (uses consensus_index filtering)
@@ -467,13 +437,7 @@ mod tests {
         // Simulate all proxies reporting epoch 1
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(1),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1, snapshot, 3, None);
         }
 
         let epoch = EpochId(2); // > persist_index
@@ -540,26 +504,14 @@ mod tests {
         // Simulate all proxies reporting epoch 500
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(500),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 500, snapshot, 3, None);
         }
         assert_eq!(coordinator.get_persist_index(&state_collector), 500);
 
         // Simulate all proxies reporting epoch 1000
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(1000),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1000, snapshot, 3, None);
         }
         assert_eq!(coordinator.get_persist_index(&state_collector), 1000);
     }
@@ -612,13 +564,7 @@ mod tests {
         // Simulate all proxies reporting epoch 100 (persist_index = 100)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(100),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 100, snapshot, 3, None);
         }
 
         // Test that get_next_replay_batch returns all dirty transactions
@@ -655,13 +601,7 @@ mod tests {
         // Step 1: All proxies report completion of epoch 10
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(10),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 10, snapshot, 3, None);
         }
 
         // Verify persist_index is now 10
@@ -741,13 +681,7 @@ mod tests {
         // All proxies report completion of epoch 20
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(20),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 20, snapshot, 3, None);
         }
 
         let persist_index = state_collector.get_persist_index();
@@ -815,13 +749,7 @@ mod tests {
         // Simulate persist_index = 100 (all proxies completed epoch 100)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(100),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 100, snapshot, 3, None);
         }
 
         let persist_index = state_collector.get_persist_index();
@@ -905,13 +833,7 @@ mod tests {
         // All proxies report epoch 10
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(10),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 10, snapshot, 3, None);
         }
 
         // Add transactions in epoch 11 for all proxies
@@ -929,20 +851,8 @@ mod tests {
         }
 
         // Proxy 1 and 2 report epoch 11, but proxy 0 fails
-        state_collector.process_snapshot::<TestTransaction>(
-            1,
-            EpochId(11),
-            BTreeMap::new(),
-            3,
-            None,
-        );
-        state_collector.process_snapshot::<TestTransaction>(
-            2,
-            EpochId(11),
-            BTreeMap::new(),
-            3,
-            None,
-        );
+        state_collector.process_snapshot::<TestTransaction>(1, 11, BTreeMap::new(), 3, None);
+        state_collector.process_snapshot::<TestTransaction>(2, 11, BTreeMap::new(), 3, None);
 
         // At this point:
         // - Proxy 0 persist_index = 10 (failed, didn't report epoch 11)
@@ -983,13 +893,7 @@ mod tests {
         // All proxies report epoch 500
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(
-                proxy_id,
-                EpochId(500),
-                snapshot,
-                3,
-                None,
-            );
+            state_collector.process_snapshot::<TestTransaction>(proxy_id, 500, snapshot, 3, None);
         }
 
         let persist_index = state_collector.get_persist_index();

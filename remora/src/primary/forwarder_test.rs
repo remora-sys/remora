@@ -214,16 +214,18 @@ mod tests {
             tokio::select! {
                 Some(msg) = rx_from_processor1.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
-                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
-                        PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
+                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
+                        PrimaryToProxyMessage::Txn(_, _, _, _) => received_stateful += 1,
+                        PrimaryToProxyMessage::CombinedTxn(_, _, _, _) => unreachable!(),
+                        _ => unreachable!(),
                     }
                 }
                 Some(msg) = rx_from_processor2.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
-                        PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
-                        PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
+                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
+                        PrimaryToProxyMessage::Txn(_, _, _, _) => received_stateful += 1,
+                        PrimaryToProxyMessage::CombinedTxn(_, _, _, _) => unreachable!(),
+                        _ => unreachable!(),
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
@@ -500,8 +502,8 @@ mod tests {
                 }
                 let tx = Arc::new(transaction);
                 (
-                    PrimaryToProxyMessage::StatelessTxn(tx.clone()),
-                    PrimaryToProxyMessage::Txn(tx, 0, required_states),
+                    PrimaryToProxyMessage::StatelessTxn(0, tx.clone()),
+                    PrimaryToProxyMessage::Txn(0, tx, 0, required_states),
                 )
             })
             .collect::<Vec<_>>();

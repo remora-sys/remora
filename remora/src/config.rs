@@ -358,6 +358,9 @@ pub struct BenchmarkParameters {
     /// The assignment mode for transaction scheduling.
     #[serde(default)]
     pub assignment_mode: AssignmentMode,
+    /// The fixed batch size for consensus batches (used for epoch completion tracking).
+    #[serde(default = "default_benchmark_config::default_consensus_batch_size")]
+    pub consensus_batch_size: usize,
 }
 
 impl BenchmarkParameters {
@@ -371,6 +374,7 @@ impl BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 
@@ -386,6 +390,7 @@ impl BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 
@@ -399,6 +404,7 @@ impl BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 
@@ -416,6 +422,7 @@ impl BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 
@@ -433,6 +440,7 @@ impl BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 }
@@ -457,6 +465,10 @@ mod default_benchmark_config {
     pub fn default_fake_verification_duration() -> Duration {
         Duration::from_micros(2000)
     }
+
+    pub fn default_consensus_batch_size() -> usize {
+        10_000
+    }
 }
 
 impl Default for BenchmarkParameters {
@@ -469,6 +481,7 @@ impl Default for BenchmarkParameters {
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
             assignment_mode: AssignmentMode::default(),
+            consensus_batch_size: default_benchmark_config::default_consensus_batch_size(),
         }
     }
 }

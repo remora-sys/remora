@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
     digests::TransactionDigest,
@@ -49,6 +56,10 @@ struct PrimaryMessageProcessor<E: Executor> {
     // Phase 1 checkpoint trackers
     epoch_tracker: EpochTracker,
     modified_tracker: ModifiedObjectTracker,
+    // Epoch completion tracking
+    batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+    completed_up_to: Arc<AtomicU64>,
+    batch_size: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> PrimaryMessageProcessor<E>
@@ -87,25 +98,33 @@ where
     ) {
         if self.mode == ProxyMode::Separation {
             match message {
-                PrimaryToProxyMessage::StatelessTxn(transaction) => {
+                PrimaryToProxyMessage::StatelessTxn(consensus_index, transaction) => {
                     tracing::debug!(
-                        "Proxy {} received stateless transaction {:?}",
+                        "Proxy {} received stateless transaction {:?} (batch {})",
                         self.id,
-                        transaction.digest()
+                        transaction.digest(),
+                        consensus_index
                     );
-                    self.process_stateless_transaction(transaction.deref().clone())
+                    self.process_stateless_transaction(consensus_index, transaction.deref().clone())
                         .await
                 }
 
-                PrimaryToProxyMessage::Txn(transaction, stateless_res_proxy_id, missing_states) => {
+                PrimaryToProxyMessage::Txn(
+                    consensus_index,
+                    transaction,
+                    stateless_res_proxy_id,
+                    missing_states,
+                ) => {
                     tracing::debug!(
-                        "Proxy {} received stateful transaction {:?}, stateless proxy: {}",
+                        "Proxy {} received stateful transaction {:?} (batch {}), stateless proxy: {}",
                         self.id,
                         transaction.digest(),
+                        consensus_index,
                         stateless_res_proxy_id
                     );
 
                     self.process_stateful_transaction(
+                        consensus_index,
                         transaction,
                         stateless_res_proxy_id,
                         missing_states,
@@ -116,15 +135,18 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
+                    let completed_up_to = self.completed_up_to.load(Ordering::SeqCst);
                     tracing::info!(
-                        "Proxy {} epoch {:?} snapshot objects: {}",
+                        "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
                         self.id,
                         epoch_id,
-                        snapshot.len()
+                        snapshot.len(),
+                        completed_up_to
                     );
 
-                    // Send snapshot back to primary
-                    let reply = ProxyToPrimaryMessage::StateSnapshot(self.id, epoch_id, snapshot);
+                    // Send snapshot back to primary with completion watermark
+                    let reply =
+                        ProxyToPrimaryMessage::StateSnapshot(self.id, completed_up_to, snapshot);
                     if let Err(e) = self.tx_primary_replies.send(reply).await {
                         tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
                     }
@@ -137,6 +159,8 @@ where
                         batch.items.len()
                     );
                     for msg in batch.items {
+                        let consensus_index = msg.consensus_index;
+
                         // Commit state_blobs using spawn_state_updates
                         if !msg.state_blobs.is_empty() {
                             self.spawn_state_updates(msg.state_blobs.clone());
@@ -152,22 +176,29 @@ where
                                 .collect();
 
                             tracing::debug!(
-                                "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                                "Replaying txn {:?} (batch {}) with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
+                                consensus_index,
                                 required_states.keys(),
                                 msg.state_blobs.keys()
                             );
 
-                            // Spawn stateful transaction
+                            // Spawn stateful transaction with original consensus_index
                             let transaction = Arc::new(transaction);
-                            self.spawn_stateful_txn(transaction, None, required_states)
-                                .await
-                                .expect("Failed to spawn replay transaction");
+                            self.spawn_stateful_txn(
+                                consensus_index,
+                                transaction,
+                                None,
+                                required_states,
+                            )
+                            .await
+                            .expect("Failed to spawn replay transaction");
                         } else {
                             tracing::debug!(
-                                "Proxy {} received pure state transfer with {} state blobs (no transaction)",
+                                "Proxy {} received pure state transfer with {} state blobs (no transaction, batch {})",
                                 self.id,
-                                msg.state_blobs.len()
+                                msg.state_blobs.len(),
+                                consensus_index
                             );
                         }
                     }
@@ -179,17 +210,20 @@ where
         } else {
             match message {
                 PrimaryToProxyMessage::CombinedTxn(
+                    consensus_index,
                     transaction,
                     stateless_res_proxy_id,
                     missing_states,
                 ) => {
                     tracing::debug!(
-                        "Proxy {} received combined transaction {:?}, stateless proxy: {}",
+                        "Proxy {} received combined transaction {:?} (batch {}), stateless proxy: {}",
                         self.id,
                         transaction.digest(),
+                        consensus_index,
                         stateless_res_proxy_id
                     );
                     self.process_stateful_transaction(
+                        consensus_index,
                         transaction,
                         stateless_res_proxy_id,
                         missing_states,
@@ -200,15 +234,18 @@ where
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
                     let snapshot = self.modified_tracker.take_epoch_snapshot();
+                    let completed_up_to = self.completed_up_to.load(Ordering::SeqCst);
                     tracing::info!(
-                        "Proxy {} epoch {:?} snapshot objects: {}",
+                        "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
                         self.id,
                         epoch_id,
-                        snapshot.len()
+                        snapshot.len(),
+                        completed_up_to
                     );
 
-                    // Send snapshot back to primary
-                    let reply = ProxyToPrimaryMessage::StateSnapshot(self.id, epoch_id, snapshot);
+                    // Send snapshot back to primary with completion watermark
+                    let reply =
+                        ProxyToPrimaryMessage::StateSnapshot(self.id, completed_up_to, snapshot);
                     if let Err(e) = self.tx_primary_replies.send(reply).await {
                         tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
                     }
@@ -221,6 +258,8 @@ where
                         batch.items.len()
                     );
                     for msg in batch.items {
+                        let consensus_index = msg.consensus_index;
+
                         // Commit state_blobs using spawn_state_updates
                         if !msg.state_blobs.is_empty() {
                             self.spawn_state_updates(msg.state_blobs.clone());
@@ -236,22 +275,29 @@ where
                                 .collect();
 
                             tracing::debug!(
-                                "Replaying txn {:?} with required states {:?} and state blobs {:?}",
+                                "Replaying txn {:?} (batch {}) with required states {:?} and state blobs {:?}",
                                 transaction.digest(),
+                                consensus_index,
                                 required_states.keys(),
                                 msg.state_blobs
                             );
 
-                            // Spawn stateful transaction
+                            // Spawn stateful transaction with original consensus_index
                             let transaction = Arc::new(transaction);
-                            self.spawn_stateful_txn(transaction, None, required_states)
-                                .await
-                                .expect("Failed to spawn replay transaction");
+                            self.spawn_stateful_txn(
+                                consensus_index,
+                                transaction,
+                                None,
+                                required_states,
+                            )
+                            .await
+                            .expect("Failed to spawn replay transaction");
                         } else {
                             tracing::debug!(
-                                "Proxy {} received pure state transfer with {} state blobs (no transaction)",
+                                "Proxy {} received pure state transfer with {} state blobs (no transaction, batch {})",
                                 self.id,
-                                msg.state_blobs.len()
+                                msg.state_blobs.len(),
+                                consensus_index
                             );
                         }
                     }
@@ -266,6 +312,7 @@ where
 
     async fn process_stateful_transaction(
         &mut self,
+        consensus_index: u64,
         transaction: Arc<RemoraTransaction<E>>,
         stateless_res_proxy_id: ProxyId,
         required_states: RequiredStates,
@@ -295,15 +342,20 @@ where
             None
         };
 
-        self.schedule_stateful_transaction(transaction, required_states, rx)
+        self.schedule_stateful_transaction(consensus_index, transaction, required_states, rx)
             .await;
     }
 
-    async fn process_stateless_transaction(&self, transaction: RemoraTransaction<E>) {
+    async fn process_stateless_transaction(
+        &self,
+        consensus_index: u64,
+        transaction: RemoraTransaction<E>,
+    ) {
         tracing::debug!(
-            "Proxy {} processing stateless transaction {:?}",
+            "Proxy {} processing stateless transaction {:?} (batch {})",
             self.id,
-            transaction.digest()
+            transaction.digest(),
+            consensus_index
         );
 
         let tx = self
@@ -315,9 +367,10 @@ where
         tokio::spawn(async move {
             let res = E::verify_transaction(context, &transaction).await;
             tracing::debug!(
-                "Proxy {} completed stateless verification for {:?}, result: {}",
+                "Proxy {} completed stateless verification for {:?} (batch {}), result: {}",
                 id,
                 transaction.digest(),
+                consensus_index,
                 res
             );
             tx.send(res).expect("Failed to send result");
@@ -328,6 +381,7 @@ where
     /// including sending requests for missing states to other proxies.
     async fn schedule_stateful_transaction(
         &mut self,
+        consensus_index: u64,
         transaction: Arc<RemoraTransaction<E>>,
         required_states: RequiredStates,
         rx: Option<oneshot::Receiver<bool>>,
@@ -368,7 +422,7 @@ where
 
         self.metrics.increase_proxy_load(self.id);
 
-        self.spawn_stateful_txn(transaction, rx, required_states)
+        self.spawn_stateful_txn(consensus_index, transaction, rx, required_states)
             .await
             .expect("Failed to schedule transaction");
     }
@@ -435,6 +489,7 @@ where
 
     pub async fn spawn_stateful_txn(
         &mut self,
+        consensus_index: u64,
         transaction: Arc<RemoraTransaction<E>>,
         stateless_handle: Option<oneshot::Receiver<bool>>,
         required_states: RequiredStates,
@@ -456,6 +511,9 @@ where
         let executor = self.executor.clone();
         let mode = self.mode.clone();
         let modified_tracker = self.modified_tracker.clone();
+        let batch_completion_count = self.batch_completion_count.clone();
+        let completed_up_to = self.completed_up_to.clone();
+        let batch_size = self.batch_size;
 
         tokio::spawn(async move {
             // Assign shared objects version.
@@ -558,10 +616,126 @@ where
                 .map_err(|_| NodeError::ShuttingDown)?;
 
             metrics.decrease_proxy_load(&id);
+
+            // Track batch completion
+            Self::record_transaction_complete(
+                id,
+                consensus_index,
+                batch_completion_count,
+                completed_up_to,
+                batch_size,
+            );
+
             //metrics.update_metrics(transaction.timestamp());
             Ok::<_, NodeError>(())
         });
         Ok(())
+    }
+
+    /// Static helper to record transaction completion from spawned tasks.
+    fn record_transaction_complete(
+        id: ProxyId,
+        consensus_index: u64,
+        batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+        completed_up_to: Arc<AtomicU64>,
+        batch_size: usize,
+    ) {
+        // Increment completion count for this batch atomically
+        let count = {
+            let counter = batch_completion_count
+                .entry(consensus_index)
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+            counter.fetch_add(1, Ordering::SeqCst) + 1
+        }; // counter is dropped here, releasing the DashMap lock
+
+        tracing::debug!(
+            "Proxy {} batch {} completion: {}/{} transactions done",
+            id,
+            consensus_index,
+            count,
+            batch_size
+        );
+
+        // If batch is fully complete, try to advance watermark
+        if count == batch_size {
+            Self::advance_watermark(
+                id,
+                batch_completion_count.clone(),
+                completed_up_to,
+                batch_size,
+            );
+        }
+    }
+
+    /// Static helper to advance the watermark from spawned tasks.
+    fn advance_watermark(
+        id: ProxyId,
+        batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+        completed_up_to: Arc<AtomicU64>,
+        batch_size: usize,
+    ) {
+        // Keep advancing the watermark as long as the next sequential batch is complete
+        loop {
+            let current = completed_up_to.load(Ordering::SeqCst);
+            let next_batch = current + 1;
+
+            tracing::info!(
+                "Proxy {} advance_watermark loop: current={}, next_batch={}, batch_size={}",
+                id,
+                current,
+                next_batch,
+                batch_size
+            );
+
+            // Check if the next sequential batch is complete
+            if let Some(counter) = batch_completion_count.get(&next_batch) {
+                let count_value = counter.load(Ordering::SeqCst);
+                tracing::debug!(
+                    "Proxy {} batch {} counter: {}/{}",
+                    id,
+                    next_batch,
+                    count_value,
+                    batch_size
+                );
+
+                if count_value == batch_size {
+                    // Next batch is complete, try to advance the watermark
+                    if completed_up_to
+                        .compare_exchange(current, next_batch, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        tracing::info!(
+                            "Proxy {} ✓ Batch {} fully completed, advanced watermark to {}",
+                            id,
+                            next_batch,
+                            next_batch
+                        );
+                        // Successfully advanced, continue to check subsequent batches
+                        continue;
+                    }
+                    tracing::debug!(
+                        "Proxy {} batch {} CAS failed, retrying (watermark changed)",
+                        id,
+                        next_batch
+                    );
+                    // Someone else advanced it, retry from the top
+                    continue;
+                }
+            } else {
+                tracing::info!(
+                    "Proxy {} batch {} not found in map or not complete, stopping",
+                    id,
+                    next_batch
+                );
+            }
+
+            // Next batch is not complete, stop advancing
+            break;
+        }
+
+        // Clean up old tracking data
+        let final_watermark = completed_up_to.load(Ordering::SeqCst);
+        batch_completion_count.retain(|batch, _| *batch > final_watermark);
     }
 }
 
@@ -965,6 +1139,10 @@ pub struct ProxyCore<E: Executor> {
     /// Phase 1 checkpoint trackers
     epoch_tracker: EpochTracker,
     modified_tracker: ModifiedObjectTracker,
+    /// Epoch completion tracking
+    batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+    completed_up_to: Arc<AtomicU64>,
+    batch_size: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
@@ -988,6 +1166,7 @@ where
         tx_primary_replies: Sender<ProxyToPrimaryMessage>,
         mode: ProxyMode,
         metrics: Arc<Metrics>,
+        batch_size: usize,
     ) -> Self {
         Self {
             id,
@@ -1004,6 +1183,9 @@ where
             metrics,
             epoch_tracker: EpochTracker::new(crate::checkpoint::EpochId(1)),
             modified_tracker: ModifiedObjectTracker::new(),
+            batch_completion_count: Arc::new(DashMap::new()),
+            completed_up_to: Arc::new(AtomicU64::new(0)),
+            batch_size,
         }
     }
 
@@ -1025,6 +1207,9 @@ where
             metrics: self.metrics.clone(),
             epoch_tracker: self.epoch_tracker,
             modified_tracker: self.modified_tracker,
+            batch_completion_count: self.batch_completion_count.clone(),
+            completed_up_to: self.completed_up_to.clone(),
+            batch_size: self.batch_size,
         };
 
         let mut proxy_processor = ProxyMessageProcessor::<E> {
@@ -1111,6 +1296,7 @@ mod tests {
             tx_primary_replies,
             ProxyMode::Separation,
             metrics,
+            10_000, // batch_size for tests
         );
 
         (
@@ -1151,9 +1337,9 @@ mod tests {
         for tx in transactions {
             let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
 
-            // First send the stateless transaction
+            // First send the stateless transaction (use consensus_index 0 for tests)
             let stateless_message =
-                PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+                PrimaryToProxyMessage::StatelessTxn(0, Arc::new(transaction.clone()));
             tx_to_proxy.send(stateless_message).await.unwrap();
 
             use crate::executor::api::TransactionWithTimestamp;
@@ -1184,8 +1370,9 @@ mod tests {
 
             // Then send the stateful transaction with required_states (empty or not)
             let stateful_message = PrimaryToProxyMessage::Txn(
+                0, // consensus_index
                 Arc::new(RemoraTransaction::<E>::new_for_tests(tx)),
-                0,
+                0, // stateless_res_proxy_id
                 required_states,
             );
             tx_to_proxy.send(stateful_message).await.unwrap();
@@ -1237,14 +1424,15 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy
-        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+        let message = PrimaryToProxyMessage::StatelessTxn(0, Arc::new(transaction.clone()));
         tx_to_proxy.send(message).await.unwrap();
 
         // Allow time for processing
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Now send the stateful part
-        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 0, BTreeMap::new());
+        let message =
+            PrimaryToProxyMessage::Txn(0, Arc::new(transaction.clone()), 0, BTreeMap::new());
         tx_to_proxy.send(message).await.unwrap();
     }
 
@@ -1272,12 +1460,13 @@ mod tests {
         let transaction = RemoraTransaction::<SuiExecutor>::new_for_tests(transactions[0].clone());
 
         // Send stateless transaction to proxy2
-        let message = PrimaryToProxyMessage::StatelessTxn(Arc::new(transaction.clone()));
+        let message = PrimaryToProxyMessage::StatelessTxn(0, Arc::new(transaction.clone()));
         tx_to_proxy2.send(message).await.unwrap();
 
         // Send transaction to proxy1, but indicate stateless result is on proxy2
         let required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>> = BTreeMap::new();
-        let message = PrimaryToProxyMessage::Txn(Arc::new(transaction.clone()), 1, required_states);
+        let message =
+            PrimaryToProxyMessage::Txn(0, Arc::new(transaction.clone()), 1, required_states);
         tx_to_proxy1.send(message).await.unwrap();
     }
 

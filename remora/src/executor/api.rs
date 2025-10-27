@@ -289,11 +289,24 @@ where
     T: ExecutableTransaction + Clone,
 {
     /// Stateful transaction that requires object access and execution
-    Txn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
+    /// Fields: consensus_index, transaction, stateless_proxy_id, required_states
+    Txn(
+        u64,
+        Arc<TransactionWithTimestamp<T>>,
+        ProxyId,
+        RequiredStates,
+    ),
     /// Stateless transaction that only requires signature verification
-    StatelessTxn(Arc<TransactionWithTimestamp<T>>),
+    /// Fields: consensus_index, transaction
+    StatelessTxn(u64, Arc<TransactionWithTimestamp<T>>),
     /// Combined stateless+stateful
-    CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
+    /// Fields: consensus_index, transaction, stateless_proxy_id, required_states
+    CombinedTxn(
+        u64,
+        Arc<TransactionWithTimestamp<T>>,
+        ProxyId,
+        RequiredStates,
+    ),
     /// Primary requests checkpoint at epoch boundary: proxies finalize prior epoch
     /// and prepare/report their snapshot for this epoch.
     Checkpoint(EpochId),
@@ -322,6 +335,7 @@ pub enum ProxyToProxyMessage {
 /// Messages from proxies back to primary
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ProxyToPrimaryMessage {
-    /// Proxy reports its modified object states snapshot for an epoch
-    StateSnapshot(ProxyId, EpochId, EpochObjectStates),
+    /// Proxy reports its modified object states and completion watermark
+    /// Fields: ProxyId, completed_up_to (highest fully-completed batch), EpochObjectStates
+    StateSnapshot(ProxyId, u64, EpochObjectStates),
 }

@@ -57,7 +57,12 @@ pub struct PrimaryNode<E: Executor> {
 
 impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     /// Start the single machine validator.
-    pub async fn start(_executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
+    pub async fn start(
+        _executor: E,
+        config: &ValidatorConfig,
+        benchmark_config: &crate::config::BenchmarkParameters,
+        metrics: Arc<Metrics>,
+    ) -> Self
     where
         <E as Executor>::Store: Sync + Send,
         <E as Executor>::Transaction: Send + Sync + 'static,
@@ -174,15 +179,15 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         let logger = logger.clone();
                         tokio::spawn(async move {
                             match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
-                                Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, epoch, snapshot)) => {
+                                Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, completed_up_to, snapshot)) => {
                                     tracing::info!(
-                                        "Processing snapshot from proxy {} for epoch {}: {} objects",
+                                        "Processing snapshot from proxy {} with completed_up_to {}: {} objects",
                                         proxy_id,
-                                        epoch.0,
+                                        completed_up_to,
                                         snapshot.len()
                                     );
                                     collector_ctx.collector
-                                        .process_snapshot(proxy_id, epoch, snapshot, collector_ctx.expected_proxies, Some(&logger));
+                                        .process_snapshot(proxy_id, completed_up_to, snapshot, collector_ctx.expected_proxies, Some(&logger));
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -215,6 +220,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             epoch_logger.clone(),
             collector.clone(),
             config.validator_parameters.max_message_size,
+            benchmark_config.consensus_batch_size,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
@@ -296,7 +302,8 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let _primary = PrimaryNode::start(executor, &config, validator_metrics).await;
+        let _primary =
+            PrimaryNode::start(executor, &config, &benchmark_config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -322,7 +329,13 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let _validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
+        let _validator = PrimaryNode::start(
+            executor.clone(),
+            &config,
+            &benchmark_config,
+            validator_metrics,
+        )
+        .await;
         tokio::task::yield_now().await;
 
         // Generate transactions.

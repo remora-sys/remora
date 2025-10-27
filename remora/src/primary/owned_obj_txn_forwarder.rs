@@ -32,16 +32,18 @@ where
 {
     pub(crate) async fn process_owned_txns(
         &mut self,
-        mut owned_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
+        mut owned_txn_receiver: Receiver<(u64, Vec<RemoraTransaction<E>>)>,
     ) {
-        while let Some(owned_txns) = owned_txn_receiver.recv().await {
-            self.forward_owned_txns_in_parallel(owned_txns).await;
+        while let Some((consensus_index, owned_txns)) = owned_txn_receiver.recv().await {
+            self.forward_owned_txns_in_parallel(consensus_index, owned_txns)
+                .await;
         }
     }
 
     /// Forward owned-object transactions in parallel with true concurrency
     pub(crate) async fn forward_owned_txns_in_parallel(
         &mut self,
+        consensus_index: u64,
         transactions: Vec<RemoraTransaction<E>>,
     ) {
         let proxy_count = self.proxy_connections.len();
@@ -65,8 +67,13 @@ where
             let fut = async move {
                 if let Some(proxy_conn) = proxy_connections.get(&idx) {
                     if proxy_mode == ProxyMode::Separation {
-                        let msg1 = PrimaryToProxyMessage::StatelessTxn(tx.clone());
-                        let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, BTreeMap::new());
+                        let msg1 = PrimaryToProxyMessage::StatelessTxn(consensus_index, tx.clone());
+                        let msg2 = PrimaryToProxyMessage::Txn(
+                            consensus_index,
+                            tx.clone(),
+                            idx,
+                            BTreeMap::new(),
+                        );
 
                         if proxy_conn.send(msg1).await.is_err() {
                             tracing::warn!("Failed to send stateless txn to proxy {}", idx);
@@ -75,8 +82,12 @@ where
                             tracing::warn!("Failed to send stateful txn to proxy {}", idx);
                         }
                     } else {
-                        let msg =
-                            PrimaryToProxyMessage::CombinedTxn(tx.clone(), idx, BTreeMap::new());
+                        let msg = PrimaryToProxyMessage::CombinedTxn(
+                            consensus_index,
+                            tx.clone(),
+                            idx,
+                            BTreeMap::new(),
+                        );
                         if proxy_conn.send(msg).await.is_err() {
                             tracing::warn!("Failed to send combined txn to proxy {}", idx);
                         }

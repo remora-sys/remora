@@ -65,6 +65,12 @@ pub struct LoadBalancer<E: Executor> {
     collector: Arc<StateCollector>,
     /// Configuration for message chunking to handle large recovery messages
     chunking_config: ChunkingConfig,
+    /// Target batch size for consensus batches sent to proxies
+    target_batch_size: usize,
+    /// Current consensus index counter
+    consensus_index_counter: u64,
+    /// Count of transactions assigned to current consensus_index
+    current_batch_count: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -84,15 +90,17 @@ where
         epoch_logger: Arc<EpochLogger<E::Transaction>>,
         collector: Arc<StateCollector>,
         max_message_size: usize,
+        target_batch_size: usize,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
         let recovery_coordinator = RecoveryCoordinator::new(epoch_logger.clone());
         let chunking_config = ChunkingConfig::new(max_message_size);
         tracing::info!(
-            "LoadBalancer: max_message_size={} bytes, effective_max_size={} bytes",
+            "LoadBalancer: max_message_size={} bytes, effective_max_size={} bytes, target_batch_size={} txns",
             chunking_config.max_message_size,
-            chunking_config.effective_max_size()
+            chunking_config.effective_max_size(),
+            target_batch_size
         );
         Self {
             _phantom: PhantomData,
@@ -111,6 +119,9 @@ where
             states_to_proxy,
             collector,
             chunking_config,
+            target_batch_size,
+            consensus_index_counter: 1,
+            current_batch_count: 0,
         }
     }
 
@@ -938,12 +949,12 @@ where
     fn initialize_processors(
         &self,
     ) -> (
-        Sender<Vec<RemoraTransaction<E>>>,   // owned_txn_sender
-        Sender<(u64, RemoraTransaction<E>)>, // shared_txn_sender with consensus index
+        Sender<(u64, Vec<RemoraTransaction<E>>)>, // owned_txn_sender with consensus index
+        Sender<(u64, RemoraTransaction<E>)>,      // shared_txn_sender with consensus index
     ) {
         // Create channels for transactions
         let (owned_txn_sender, owned_txn_receiver) =
-            tokio::sync::mpsc::channel(DEFAULT_CHANNEL_SIZE);
+            tokio::sync::mpsc::channel::<(u64, Vec<RemoraTransaction<E>>)>(DEFAULT_CHANNEL_SIZE);
         let (shared_txn_sender, shared_txn_receiver) =
             tokio::sync::mpsc::channel::<(u64, RemoraTransaction<E>)>(DEFAULT_CHANNEL_SIZE);
         let (version_assignment_sender, version_assignment_receiver) =
@@ -1046,45 +1057,49 @@ where
                         self.metrics.register_start_time();
                     }
 
-                    // Separate transactions into owned-only and shared-object transactions
-                    let mut owned_txns = Vec::new();
-                    let mut shared_txns = Vec::new();
-
+                    // Process transactions one by one, assigning consensus_index strictly
+                    // to ensure batches don't exceed target_batch_size
+                    let num_transactions = transactions.len();
                     for transaction in transactions {
                         self.metrics.update_metrics(transaction.timestamp(), "lb-ingress");
+
+                        // Get current consensus index for this transaction
+                        let consensus_index = self.consensus_index_counter;
+
+                        // Increment counter for current batch
+                        self.current_batch_count += 1;
+
+                        // Check if we've reached target batch size
+                        if self.current_batch_count >= self.target_batch_size {
+                            tracing::debug!(
+                                "LoadBalancer: Batch {} completed with {} transactions, advancing to batch {}",
+                                consensus_index,
+                                self.current_batch_count,
+                                self.consensus_index_counter + 1
+                            );
+                            self.consensus_index_counter += 1;
+                            self.current_batch_count = 0;
+                        }
+
+                        _last_consensus_index = consensus_index;
+
+                        // Send transaction to appropriate forwarder based on type
                         let shared_object_ids = transaction.shared_objects();
                         if shared_object_ids.is_empty() {
-                            owned_txns.push(transaction);
+                            // Owned-only transaction - send as single-element vec to maintain interface
+                            if let Err(e) = owned_txn_sender.send((consensus_index, vec![transaction])).await {
+                                tracing::error!("Failed to send owned transaction: {:?}", e);
+                            }
                         } else {
-                            shared_txns.push(transaction);
-                        }
-                    }
-
-                    // Count current batch size before moving vectors
-                    let batch_size = owned_txns.len() + shared_txns.len();
-
-                    // Send owned-only transactions to the dedicated task
-                    if !owned_txns.is_empty() {
-                        let owned = owned_txns;
-                        if let Err(e) = owned_txn_sender.send(owned).await {
-                            tracing::error!("Failed to send owned transactions: {:?}", e);
-                        }
-                    }
-
-                    // Send shared-object transactions to the dedicated task
-                    if !shared_txns.is_empty() {
-                        // Simulated consensus index (monotonic) per batch
-                        let consensus_index = self.next_epoch_id /* placeholder */ * 1_000_000 + txn_cnt as u64;
-                        _last_consensus_index = consensus_index;
-                        for tx in shared_txns {
-                            if let Err(e) = shared_txn_sender.send((consensus_index, tx)).await {
-                                tracing::error!("Failed to send shared transactions: {:?}", e);
+                            // Shared-object transaction
+                            if let Err(e) = shared_txn_sender.send((consensus_index, transaction)).await {
+                                tracing::error!("Failed to send shared transaction: {:?}", e);
                             }
                         }
                     }
 
                     // Phase 2+: Broadcast checkpoint when cumulative txns reach threshold
-                    self.txns_since_last_epoch = self.txns_since_last_epoch.saturating_add(batch_size);
+                    self.txns_since_last_epoch = self.txns_since_last_epoch.saturating_add(num_transactions);
 
                     const EPOCH_TXN_THRESHOLD: usize = 10_000;
                     if self.txns_since_last_epoch >= EPOCH_TXN_THRESHOLD {

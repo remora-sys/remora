@@ -53,7 +53,7 @@ impl StateCollector {
     pub fn process_snapshot<T>(
         &self,
         proxy_id: crate::proxy::core::ProxyId,
-        epoch: EpochId,
+        completed_up_to: u64,
         snapshot: EpochObjectStates,
         _expected_proxies: usize,
         _epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
@@ -61,9 +61,9 @@ impl StateCollector {
         T: crate::executor::api::ExecutableTransaction + Clone,
     {
         tracing::info!(
-            "Process_snapshot: Received snapshot from proxy {} for epoch {}: {} objects",
+            "Process_snapshot: Received snapshot from proxy {} with completed_up_to {}: {} objects",
             proxy_id,
-            epoch.0,
+            completed_up_to,
             snapshot.len()
         );
 
@@ -72,23 +72,31 @@ impl StateCollector {
             self.temp_state_by_proxy.insert((proxy_id, obj_id), obj);
         }
 
-        // Update this proxy's persist index to the epoch just completed
-        let consensus_index = epoch.0;
+        // Update this proxy's persist index to the completed_up_to watermark
         self.per_proxy_persist_index
             .entry(proxy_id)
             .or_insert_with(|| AtomicU64::new(0))
-            .store(consensus_index, Ordering::SeqCst);
+            .store(completed_up_to, Ordering::SeqCst);
 
         tracing::info!(
-            "Stored temp snapshot for proxy {} at epoch {}",
+            "Stored temp snapshot for proxy {} at completed_up_to {}",
             proxy_id,
-            epoch.0
+            completed_up_to
         );
 
-        // Phase 2: Check if all proxies have reached this epoch
+        // Phase 2: Check if all proxies have reached this watermark
         // If yes, promote temp states to merged_state (commit point)
-        if self.is_epoch_complete(epoch, self.expected_proxies) {
-            self.commit_epoch(epoch);
+        // Skip committing when completed_up_to = 0 (no batches completed yet)
+        if completed_up_to > 0 {
+            let epoch = EpochId(completed_up_to);
+            if self.is_epoch_complete(epoch, self.expected_proxies) {
+                self.commit_epoch(epoch);
+            }
+        } else {
+            tracing::info!(
+                "Skipping commit for completed_up_to=0 from proxy {} (no batches completed yet)",
+                proxy_id
+            );
         }
     }
 
@@ -377,10 +385,10 @@ mod tests {
         snapshot.insert(obj_id1, obj1);
         snapshot.insert(obj_id2, obj2);
 
-        // Process snapshot from proxy 1
+        // Process snapshot from proxy 1 with completed_up_to = 5
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             1,
-            EpochId(5),
+            5,
             snapshot.clone(),
             2,
             None,
@@ -391,13 +399,8 @@ mod tests {
         assert_eq!(collector.merged_state_len(), 0);
 
         // Process snapshot from proxy 2
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            2,
-            EpochId(5),
-            snapshot,
-            2,
-            None,
-        );
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(2, 5, snapshot, 2, None);
         // Check proxy 2's persist index
         assert_eq!(collector.get_proxy_persist_index(2), 5);
         // Minimum should be 5
@@ -410,29 +413,24 @@ mod tests {
     fn test_state_collector_multiple_epochs() {
         let collector = StateCollector::new(2);
 
-        // Process snapshots for different epochs - no ordering required
+        // Process snapshots for different batches - no ordering required
         let snapshot = EpochObjectStates::new();
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             1,
-            EpochId(6),
+            6,
             snapshot.clone(),
             2,
             None,
         );
 
-        // Proxy 1 should be at epoch 6
+        // Proxy 1 should be at completed_up_to 6
         assert_eq!(collector.get_proxy_persist_index(1), 6);
 
-        // Process snapshot for epoch 5 from proxy 2 - out of order is fine
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            2,
-            EpochId(5),
-            snapshot,
-            2,
-            None,
-        );
+        // Process snapshot for batch 5 from proxy 2 - out of order is fine
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(2, 5, snapshot, 2, None);
 
-        // Proxy 2 should be at epoch 5
+        // Proxy 2 should be at completed_up_to 5
         assert_eq!(collector.get_proxy_persist_index(2), 5);
         // Minimum should be 5
         assert_eq!(collector.get_persist_index(), 5);
@@ -442,30 +440,25 @@ mod tests {
     fn test_state_collector_per_proxy_tracking() {
         let collector = StateCollector::new(3);
 
-        // Process snapshots from different proxies at different epochs
+        // Process snapshots from different proxies at different completed_up_to values
         let snapshot = EpochObjectStates::new();
 
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             0,
-            EpochId(10),
+            10,
             snapshot.clone(),
             3,
             None,
         );
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             1,
-            EpochId(5),
+            5,
             snapshot.clone(),
             3,
             None,
         );
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            2,
-            EpochId(7),
-            snapshot,
-            3,
-            None,
-        );
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(2, 7, snapshot, 3, None);
 
         // Check individual persist indices
         assert_eq!(collector.get_proxy_persist_index(0), 10);
@@ -501,22 +494,12 @@ mod tests {
         snapshot2.insert(obj_id3, obj3);
 
         // Process both snapshots
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            1,
-            EpochId(5),
-            snapshot1,
-            2,
-            None,
-        );
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            2,
-            EpochId(5),
-            snapshot2,
-            2,
-            None,
-        );
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(1, 5, snapshot1, 2, None);
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(2, 5, snapshot2, 2, None);
 
-        // Both proxies should be at epoch 5
+        // Both proxies should be at completed_up_to 5
         assert_eq!(collector.get_proxy_persist_index(1), 5);
         assert_eq!(collector.get_proxy_persist_index(2), 5);
         // All 3 objects should be in merged state (last-writer-wins for obj_id1)
@@ -525,36 +508,31 @@ mod tests {
 
     #[test]
     fn test_per_proxy_independent_progress() {
-        // Test that each proxy can progress independently through epochs
+        // Test that each proxy can progress independently through batches
         let collector = StateCollector::new(3);
         let snapshot = EpochObjectStates::new();
 
-        // Proxy 0 reports up to epoch 10
+        // Proxy 0 reports up to batch 10
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             0,
-            EpochId(10),
+            10,
             snapshot.clone(),
             3,
             None,
         );
 
-        // Proxy 1 reports up to epoch 5
+        // Proxy 1 reports up to batch 5
         collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
             1,
-            EpochId(5),
+            5,
             snapshot.clone(),
             3,
             None,
         );
 
-        // Proxy 2 reports up to epoch 7
-        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
-            2,
-            EpochId(7),
-            snapshot,
-            3,
-            None,
-        );
+        // Proxy 2 reports up to batch 7
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(2, 7, snapshot, 3, None);
 
         // Each proxy should track its own progress
         assert_eq!(collector.get_proxy_persist_index(0), 10);
@@ -563,5 +541,132 @@ mod tests {
 
         // Global persist index is the minimum (safe point for pruning)
         assert_eq!(collector.get_persist_index(), 5);
+    }
+
+    #[test]
+    fn test_initial_snapshot_with_zero_completed_up_to() {
+        // Test that initial snapshots with completed_up_to = 0 don't trigger commit
+        let collector = StateCollector::new(2);
+
+        // Create test objects
+        let obj_id1 = ObjectID::random();
+        let obj_id2 = ObjectID::random();
+        let obj1 = create_test_object(obj_id1);
+        let obj2 = create_test_object(obj_id2);
+
+        let mut snapshot = EpochObjectStates::new();
+        snapshot.insert(obj_id1, obj1);
+        snapshot.insert(obj_id2, obj2);
+
+        // Both proxies send initial snapshots with completed_up_to = 0
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            0,
+            snapshot.clone(),
+            2,
+            None,
+        );
+
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(1, 0, snapshot, 2, None);
+
+        // Both proxies should be at completed_up_to 0
+        assert_eq!(collector.get_proxy_persist_index(0), 0);
+        assert_eq!(collector.get_proxy_persist_index(1), 0);
+        assert_eq!(collector.get_persist_index(), 0);
+
+        // IMPORTANT: merged_state should be EMPTY because completed_up_to = 0
+        // means no batches have been completed yet, so we shouldn't commit
+        assert_eq!(collector.merged_state_len(), 0);
+    }
+
+    #[test]
+    fn test_initial_then_real_snapshots() {
+        // Test the progression: initial snapshot (0) -> real snapshot (1+)
+        let collector = StateCollector::new(2);
+
+        let obj_id1 = ObjectID::random();
+        let obj1_v1 = create_test_object(obj_id1);
+        let obj1_v2 = create_test_object(obj_id1);
+
+        // Initial snapshots with completed_up_to = 0
+        let mut initial_snapshot = EpochObjectStates::new();
+        initial_snapshot.insert(obj_id1, obj1_v1);
+
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            0,
+            initial_snapshot.clone(),
+            2,
+            None,
+        );
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            0,
+            initial_snapshot,
+            2,
+            None,
+        );
+
+        // No commit should happen
+        assert_eq!(collector.merged_state_len(), 0);
+
+        // Now proxies complete batch 1 and send real snapshots
+        let mut real_snapshot = EpochObjectStates::new();
+        real_snapshot.insert(obj_id1, obj1_v2);
+
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            1,
+            real_snapshot.clone(),
+            2,
+            None,
+        );
+
+        // Still no commit (only 1 proxy reported batch 1)
+        assert_eq!(collector.merged_state_len(), 0);
+
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            1,
+            real_snapshot,
+            2,
+            None,
+        );
+
+        // NOW commit should happen (both proxies at batch 1)
+        assert_eq!(collector.get_persist_index(), 1);
+        assert_eq!(collector.merged_state_len(), 1);
+    }
+
+    #[test]
+    fn test_mixed_zero_and_nonzero_snapshots() {
+        // Test when one proxy is at 0 and another is ahead
+        let collector = StateCollector::new(2);
+
+        let snapshot = EpochObjectStates::new();
+
+        // Proxy 0 sends initial snapshot (completed_up_to = 0)
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            0,
+            0,
+            snapshot.clone(),
+            2,
+            None,
+        );
+
+        // Proxy 1 has already completed batch 5
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(1, 5, snapshot, 2, None);
+
+        // Persist indices should be tracked independently
+        assert_eq!(collector.get_proxy_persist_index(0), 0);
+        assert_eq!(collector.get_proxy_persist_index(1), 5);
+
+        // Global persist index should be the minimum (0)
+        assert_eq!(collector.get_persist_index(), 0);
+
+        // No commit should happen (can't commit batch 0)
+        assert_eq!(collector.merged_state_len(), 0);
     }
 }

@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{ValidatorConfig, DEFAULT_CHANNEL_SIZE},
+    config::{BenchmarkParameters, ValidatorConfig, DEFAULT_CHANNEL_SIZE},
     error::NodeResult,
     executor::api::{
         ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToPrimaryMessage,
@@ -45,6 +45,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         proxy_id: ProxyId,
         executor: E,
         config: &ValidatorConfig,
+        benchmark_config: &BenchmarkParameters,
         metrics: Arc<Metrics>,
     ) -> Self
     where
@@ -173,6 +174,22 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
         }
 
         let store = executor.init_store();
+
+        // Calculate per-proxy expected batch size
+        // The global batch has consensus_batch_size transactions, but each proxy
+        // only executes a fraction based on load balancing policy.
+        // Exclude the standby proxy (last one) from active count.
+        let num_active_proxies = config.proxies.len().saturating_sub(1).max(1);
+        let per_proxy_batch_size = benchmark_config.consensus_batch_size / num_active_proxies;
+
+        tracing::info!(
+            "Proxy {}: Global batch size = {}, Active proxies = {}, Expected per-proxy batch size = {}",
+            id,
+            benchmark_config.consensus_batch_size,
+            num_active_proxies,
+            per_proxy_batch_size
+        );
+
         let core_handle = ProxyCore::new(
             id,
             executor.clone(),
@@ -184,6 +201,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_primary_replies,
             config.validator_parameters.proxy_mode,
             metrics.clone(),
+            per_proxy_batch_size,
         )
         .spawn();
         core_handles.push(core_handle);
@@ -228,7 +246,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             if sampled_results_count % 10 == 0 {
                 let now_secs = Metrics::now().as_secs_f64();
                 let latency_ms = (now_secs - submit_timestamp) * 1000.0;
-                tracing::info!("ts={:.6} latency_ms={:.2}", now_secs, latency_ms);
+                tracing::debug!("ts={:.6} latency_ms={:.2}", now_secs, latency_ms);
             }
         }
 

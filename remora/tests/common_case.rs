@@ -41,6 +41,7 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
     let _primary = PrimaryNode::start(
         executor.clone(),
         &validator_config,
+        &benchmark_config,
         validator_metrics.clone(),
     )
     .await;
@@ -54,14 +55,21 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
         proxy_id_1,
         executor.clone(),
         &validator_config,
+        &benchmark_config,
         validator_metrics.clone(),
     )
     .await;
     tokio::task::yield_now().await;
 
     let proxy_id_2 = 1;
-    let _proxy2 =
-        ProxyNode::start(proxy_id_2, executor, &validator_config, validator_metrics).await;
+    let _proxy2 = ProxyNode::start(
+        proxy_id_2,
+        executor,
+        &validator_config,
+        &benchmark_config,
+        validator_metrics,
+    )
+    .await;
     tokio::task::yield_now().await;
 
     // Generate transactions.
