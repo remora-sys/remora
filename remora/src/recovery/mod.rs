@@ -110,11 +110,16 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// Uses watermark-based filtering: transactions with consensus_index > completed_up_to
     /// are uncommitted and need to be replayed.
     ///
+    /// **Important:** Transactions are sorted by (epoch, consensus_index) to maintain causality.
+    /// consensus_index alone is insufficient because the same consensus_index can appear in
+    /// different epochs (if consensus_index resets per-epoch or there's overlap during
+    /// epoch transitions).
+    ///
     /// # Arguments
     /// * `completed_up_to` - Batch watermark (highest fully completed batch across all proxies)
     ///
     /// # Returns
-    /// All uncommitted transactions in consensus order, including transactions to ALL proxies
+    /// All uncommitted transactions in consensus order (sorted by epoch then consensus_index)
     pub fn collect_uncommitted_transactions(&self, completed_up_to: u64) -> Vec<LogRecord<T>> {
         let mut uncommitted_txns = Vec::new();
 
@@ -142,8 +147,9 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             uncommitted_txns.extend(uncommitted_entries);
         }
 
-        // Sort by consensus_index to maintain causality
-        uncommitted_txns.sort_by_key(|r| r.consensus_index.unwrap_or(0));
+        // Sort by (epoch, consensus_index) to maintain causality
+        // Epoch comes first because consensus_index may reset or overlap across epochs
+        uncommitted_txns.sort_by_key(|r| (r.epoch.0, r.consensus_index.unwrap_or(0)));
 
         tracing::info!(
             total_uncommitted = uncommitted_txns.len(),
