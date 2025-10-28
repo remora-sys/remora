@@ -98,7 +98,6 @@ mod tests {
                 consensus_index: Some(i),
                 txn_digest: TransactionDigest::random(),
                 transaction: create_test_transaction(i),
-                destination_proxy: 0,
                 required_states: BTreeMap::new(),
                 epoch,
             };
@@ -110,7 +109,6 @@ mod tests {
             consensus_index: None,
             txn_digest: TransactionDigest::random(),
             transaction: create_test_transaction(999),
-            destination_proxy: 1,
             required_states: BTreeMap::new(),
             epoch,
         };

@@ -12,7 +12,7 @@ use crate::{
     metrics::Metrics,
     primary::load_balancer::PRIMARY_FETCH_SENTINEL,
     proxy::core::ProxyId,
-    recovery::{EpochLogger, LogRecord},
+    recovery::EpochLogger,
 };
 use dashmap::DashMap;
 use rand::Rng;
@@ -50,8 +50,6 @@ where
     pub metrics: Arc<Metrics>,
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-    pub epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
-    pub current_epoch: Arc<AtomicU64>,
     pub standby_excluded: Arc<AtomicBool>,
     pub collector: Arc<StateCollector>,
 }
@@ -63,6 +61,10 @@ where
 {
     // Mapping of object ID to its current version for shared objects
     pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    // Epoch logger for sequential transaction recording
+    pub(crate) epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
+    // Current epoch for transaction logging
+    pub(crate) current_epoch: Arc<AtomicU64>,
     // PhantomData to indicate we're using the generic parameter
     pub(crate) _phantom: PhantomData<E>,
 }
@@ -84,6 +86,37 @@ where
                 "Version assignment task received transaction {:?}",
                 transaction.digest()
             );
+
+            // Record transaction sequentially in epoch logger (preserves consensus order)
+            if let Some(logger) = &self.epoch_logger {
+                let epoch = crate::checkpoint::EpochId(self.current_epoch.load(Ordering::SeqCst));
+
+                // Build required_states map from required_versions
+                let required_states: std::collections::BTreeMap<
+                    (ObjectID, SequenceNumber),
+                    Option<usize>,
+                > = required_versions
+                    .iter()
+                    .map(|(obj_id, version)| ((*obj_id, *version), None))
+                    .collect();
+
+                let rec = crate::recovery::LogRecord {
+                    consensus_index: Some(consensus_index),
+                    txn_digest: *transaction.digest(),
+                    transaction: Arc::new(transaction.clone()),
+                    required_states,
+                    epoch,
+                };
+
+                logger.append(epoch, rec);
+
+                tracing::debug!(
+                    epoch = epoch.0,
+                    consensus_index = consensus_index,
+                    txn = ?transaction.digest(),
+                    "Sequential epoch logger: appended transaction in consensus order"
+                );
+            }
 
             sender
                 .send((consensus_index, transaction, required_versions))
@@ -211,18 +244,6 @@ where
         keys.get(idx).copied()
     }
 
-    #[inline]
-    fn proxy_id_to_index(
-        proxy_connections: &Arc<
-            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
-        >,
-        proxy_id: ProxyId,
-    ) -> Option<ExecutorIndex> {
-        // Map ProxyId to its positional index in sorted keys
-        let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
-        keys.sort_unstable();
-        keys.iter().position(|&id| id == proxy_id)
-    }
     /// Create a new SharedObjTxnForwarder with worker pool
     pub(crate) fn new(
         dependency_controller: Arc<VersionedDependencyController>,
@@ -237,8 +258,6 @@ where
         metrics: Arc<Metrics>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-        epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
-        current_epoch: Arc<AtomicU64>,
         standby_excluded: Arc<AtomicBool>,
         collector: Arc<StateCollector>,
     ) -> Self {
@@ -251,8 +270,6 @@ where
             metrics: metrics.clone(),
             proxy_loads: proxy_loads.clone(),
             proxy_access_histories: proxy_access_histories.clone(),
-            epoch_logger,
-            current_epoch,
             standby_excluded,
             collector,
         };
@@ -320,36 +337,9 @@ where
                 stateless_proxy_id,
             );
 
-            // Append per-epoch log record when context is available
-            if let (Some(logger), Some(dest_pid)) = (&context.epoch_logger, resolved_stateful) {
-                let epoch =
-                    crate::checkpoint::EpochId(context.current_epoch.load(Ordering::SeqCst));
-                // Convert ProxyId to positional index for clone_required_states
-                let dest_index =
-                    Self::proxy_id_to_index(proxy_connections, dest_pid).unwrap_or(dest_pid);
-                let rec = LogRecord {
-                    consensus_index: Some(task.consensus_index),
-                    txn_digest: *transaction_arc.digest(),
-                    transaction: transaction_arc.clone(),
-                    destination_proxy: dest_pid,
-                    required_states: Self::clone_required_states(
-                        &task.required_versions,
-                        states_to_proxy.clone(),
-                        dest_index,
-                    )
-                    .await,
-                    epoch,
-                };
-                logger.append(epoch, rec);
-                tracing::debug!(
-                    epoch = epoch.0,
-                    consensus_index = task.consensus_index,
-                    dest_proxy = dest_pid,
-                    stateless = resolved_stateless.unwrap_or(usize::MAX),
-                    txn = ?transaction_arc.digest(),
-                    "Appended LogRecord for txn to epoch log"
-                );
-            }
+            // Note: Epoch logging now happens sequentially in VersionAssignmentTask
+            // (preserves consensus order for correct recovery tracking)
+
             let missing_states_result = Self::get_missing_states_for_transaction(
                 &transaction_arc,
                 Some(task.required_versions),
@@ -452,32 +442,6 @@ where
         for notify in current_handles {
             notify.notify_one();
         }
-    }
-
-    async fn clone_required_states(
-        required_versions: &[(ObjectID, SequenceNumber)],
-        states_to_proxy: Arc<
-            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
-        >,
-        proxy_index: ExecutorIndex,
-    ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ExecutorIndex>> {
-        let mut required_states = BTreeMap::new();
-        for (object_id, seq_num) in required_versions.iter().cloned() {
-            // Check if this version is owned by other proxies (not including this proxy)
-            let other_owner = states_to_proxy
-                .get(&(object_id, seq_num))
-                .and_then(|owners| {
-                    // If this proxy already owns it, no need to fetch
-                    if owners.contains(&proxy_index) {
-                        None
-                    } else {
-                        // Return any owner (pick first one arbitrarily)
-                        owners.iter().next().copied()
-                    }
-                });
-            required_states.insert((object_id, seq_num), other_owner);
-        }
-        required_states
     }
 
     /// Convert required_states from positional indices to ProxyIds

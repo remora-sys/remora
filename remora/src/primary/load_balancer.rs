@@ -382,25 +382,34 @@ where
                 }
 
                 // This state must be fetched and attached
-                // Fetch from the ORIGINAL proxy that produced this version
-                let source_proxy = record.destination_proxy;
-
-                if let Some(object) = collector.get_object_for_proxy(obj_id, *version, source_proxy)
-                {
-                    state_blobs.insert(*obj_id, object);
-                    tracing::debug!(
-                        "Attached state blob {:?} v{} from proxy {} for txn {:?}",
-                        obj_id,
-                        version.value(),
-                        source_proxy,
-                        record.txn_digest
-                    );
+                // Fetch from merged_state (committed state from any proxy that produced this version)
+                // Note: We no longer track destination_proxy in LogRecord since it's recorded
+                // sequentially in VersionAssignmentTask before proxy selection. State ownership
+                // is tracked separately in StateCollector's version_ownership map.
+                if let Some(object) = collector.get_object(obj_id) {
+                    // Verify this is the exact version we need
+                    if object.version() == *version {
+                        state_blobs.insert(*obj_id, object);
+                        tracing::debug!(
+                            "Attached state blob {:?} v{} from merged_state for txn {:?}",
+                            obj_id,
+                            version.value(),
+                            record.txn_digest
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Version mismatch: need {:?} v{} but merged_state has v{} for txn {:?}",
+                            obj_id,
+                            version.value(),
+                            object.version().value(),
+                            record.txn_digest
+                        );
+                    }
                 } else {
                     tracing::warn!(
-                        "Failed to fetch state blob {:?} v{} from proxy {} for txn {:?}",
+                        "Failed to fetch state blob {:?} v{} from merged_state for txn {:?}",
                         obj_id,
                         version.value(),
-                        source_proxy,
                         record.txn_digest
                     );
                 }
@@ -667,53 +676,6 @@ where
         });
     }
 
-    /// Prune epoch logger based on current persist index from state collector.
-    /// This should be called periodically to clean up old epoch logs.
-    ///
-    /// With per-proxy persist_index, we can safely prune any epoch where the epoch ID
-    /// is less than the minimum persist_index across all proxies, since that means
-    /// all proxies have moved past that epoch.
-    pub fn prune_epoch_logger(&self) {
-        let min_persist_index = self.collector.get_persist_index();
-
-        // Simply prune all epochs below the minimum persist index
-        // Since persist_index represents epoch IDs, and all proxies report in order,
-        // any epoch with ID < min_persist_index has been completed by all proxies
-        let epochs_to_prune: Vec<crate::checkpoint::EpochId> = self
-            .epoch_logger
-            .get_segments()
-            .iter()
-            .filter_map(|entry| {
-                let epoch = *entry.key();
-                // Prune if epoch ID is less than the minimum persist index
-                if epoch.0 < min_persist_index {
-                    Some(epoch)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Prune the identified epochs
-        let pruned_count = epochs_to_prune.len();
-        for epoch in epochs_to_prune {
-            self.epoch_logger.prune_epoch(epoch);
-            tracing::debug!(
-                "Pruned epoch {} (epoch < min_persist_index {})",
-                epoch.0,
-                min_persist_index
-            );
-        }
-
-        if pruned_count > 0 {
-            tracing::info!(
-                "Epoch logger pruning completed. Min persist index: {}, pruned {} epochs",
-                min_persist_index,
-                pruned_count
-            );
-        }
-    }
-
     /// Initialize transaction processors and return the senders
     fn initialize_processors(
         &self,
@@ -745,6 +707,8 @@ where
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            epoch_logger: Some(self.epoch_logger.clone()),
+            current_epoch: self.current_epoch_atomic.clone(),
             _phantom: PhantomData,
         };
         version_assignment_processor
@@ -763,8 +727,6 @@ where
             (0..self.proxy_connections.len())
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))
                 .collect(),
-            Some(self.epoch_logger.clone()),
-            self.current_epoch_atomic.clone(),
             self.standby_excluded.clone(),
             self.collector.clone(),
         );
@@ -893,9 +855,6 @@ where
                         self.current_epoch_atomic.store(self.next_epoch_id, Ordering::SeqCst);
 
                         self.broadcast_checkpoint(epoch).await;
-
-                        // Periodically prune old epochs from the logger
-                        self.prune_epoch_logger();
                     }
                 }
 
@@ -977,7 +936,8 @@ mod tests {
     }
 
     // Counter for generating unique watermarks
-    static ADD_OBJECT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Start at 1 because process_snapshot skips committing when completed_up_to = 0
+    static ADD_OBJECT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     // Helper to add object to collector for a specific proxy
     // Using the public API, each proxy can have different versions in temp_state
@@ -991,19 +951,39 @@ mod tests {
         let mut snapshot = std::collections::BTreeMap::new();
         snapshot.insert(obj_id, obj);
 
-        // Use unique, increasing completed_up_to values to avoid commits
-        // Each call gets a unique watermark based on proxy_id and a counter
+        // Use a shared epoch counter so all proxies report the same epoch
+        // This triggers commits to merged_state
         let counter = ADD_OBJECT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let completed_up_to = proxy_id as u64 * 10000 + counter;
+        let completed_up_to = counter;
 
-        collector.process_snapshot::<FakeTransaction>(proxy_id, completed_up_to, snapshot, 3, None);
+        // Add the snapshot for this proxy
+        collector.process_snapshot::<FakeTransaction>(
+            proxy_id,
+            completed_up_to,
+            snapshot.clone(),
+            3,
+            None,
+        );
+
+        // Also add empty snapshots for other proxies to trigger commit
+        // StateCollector needs all 3 proxies to report before committing
+        for other_proxy in 0..3 {
+            if other_proxy != proxy_id {
+                collector.process_snapshot::<FakeTransaction>(
+                    other_proxy,
+                    completed_up_to,
+                    std::collections::BTreeMap::new(),
+                    3,
+                    None,
+                );
+            }
+        }
     }
 
     // Helper to create a test LogRecord
     fn create_test_log_record(
         consensus_index: u64,
         epoch: u64,
-        destination_proxy: usize,
         required_states: Vec<(ObjectID, SequenceNumber)>,
         txn_digest: TransactionDigest,
     ) -> LogRecord<FakeTransaction> {
@@ -1025,7 +1005,6 @@ mod tests {
         LogRecord {
             consensus_index: Some(consensus_index),
             epoch: EpochId(epoch),
-            destination_proxy,
             transaction: Arc::new(txn_with_ts),
             required_states: required_states_map,
             txn_digest,
@@ -1059,7 +1038,6 @@ mod tests {
         let uncommitted_txns = vec![create_test_log_record(
             101,
             10,
-            0,
             vec![(obj_a, SequenceNumber::from(2))],
             txn_digest,
         )];
@@ -1090,7 +1068,6 @@ mod tests {
         let uncommitted_txns = vec![create_test_log_record(
             101,
             10,
-            0,
             vec![(obj_a, SequenceNumber::from(3))],
             txn_digest,
         )];
@@ -1119,20 +1096,8 @@ mod tests {
         // Transaction 1: requires A v3, will produce A v4
         // Transaction 2: requires A v4 (produced by txn 1)
         let uncommitted_txns = vec![
-            create_test_log_record(
-                101,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(3))],
-                txn1_digest,
-            ),
-            create_test_log_record(
-                102,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(4))],
-                txn2_digest,
-            ),
+            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1162,27 +1127,9 @@ mod tests {
 
         // Chain: Txn1 (requires v3) → v4, Txn2 (requires v4) → v5, Txn3 (requires v5) → v6
         let uncommitted_txns = vec![
-            create_test_log_record(
-                101,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(3))],
-                txn1_digest,
-            ),
-            create_test_log_record(
-                102,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(4))],
-                txn2_digest,
-            ),
-            create_test_log_record(
-                103,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(5))],
-                txn3_digest,
-            ),
+            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
+            create_test_log_record(103, 10, vec![(obj_a, SequenceNumber::from(5))], txn3_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1211,7 +1158,6 @@ mod tests {
         let uncommitted_txns = vec![create_test_log_record(
             101,
             10,
-            0,
             vec![
                 (obj_a, SequenceNumber::from(3)),
                 (obj_b, SequenceNumber::from(5)),
@@ -1244,7 +1190,6 @@ mod tests {
         let uncommitted_txns = vec![create_test_log_record(
             101,
             10,
-            0,
             vec![
                 (obj_a, SequenceNumber::from(3)),
                 (obj_b, SequenceNumber::from(2)), // initial version
@@ -1282,7 +1227,6 @@ mod tests {
         let uncommitted_txns = vec![create_test_log_record(
             101,
             10,
-            0,
             vec![(obj_a, SequenceNumber::from(3))],
             txn_digest,
         )];
@@ -1313,20 +1257,8 @@ mod tests {
         // Txn1 (proxy 0): requires A v3, produces A v4
         // Txn2 (proxy 1): requires A v4 (cross-proxy dependency)
         let uncommitted_txns = vec![
-            create_test_log_record(
-                101,
-                10,
-                0,
-                vec![(obj_a, SequenceNumber::from(3))],
-                txn1_digest,
-            ),
-            create_test_log_record(
-                102,
-                10,
-                1,
-                vec![(obj_a, SequenceNumber::from(4))],
-                txn2_digest,
-            ),
+            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1358,21 +1290,18 @@ mod tests {
             create_test_log_record(
                 101,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(3))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 102,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 103,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
@@ -1408,14 +1337,12 @@ mod tests {
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_b, SequenceNumber::from(3))],
                 TransactionDigest::random(),
             ),
@@ -1459,21 +1386,18 @@ mod tests {
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(3))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
@@ -1519,14 +1443,12 @@ mod tests {
             create_test_log_record(
                 100,
                 10,
-                1,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![(obj_b, SequenceNumber::from(6))],
                 TransactionDigest::random(),
             ),
@@ -1578,7 +1500,6 @@ mod tests {
             create_test_log_record(
                 100,
                 10,
-                0,
                 vec![
                     (obj_a, SequenceNumber::from(3)),
                     (obj_c, SequenceNumber::from(5)),
@@ -1588,7 +1509,6 @@ mod tests {
             create_test_log_record(
                 100,
                 10,
-                1,
                 vec![
                     (obj_a, SequenceNumber::from(6)), // Produced by Txn 1, should be skipped
                     (obj_b, SequenceNumber::from(4)), // From proxy 1, should be attached
@@ -1631,10 +1551,9 @@ mod tests {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
 
-        // Add version 5 to collector from one proxy, version 3 from another
-        // This simulates the scenario where different proxies had different versions
+        // Add version 5 to merged_state (latest committed version)
+        // In the new implementation, merged_state only keeps the latest version
         add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(5));
-        add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(3));
 
         // VIOLATION: Txn 1 (from proxy 0) requires v5, then Txn 2 (from proxy 1) requires v3
         // This violates partial dependency ordering - we're going backwards in version numbers
@@ -1642,14 +1561,12 @@ mod tests {
             create_test_log_record(
                 101,
                 10,
-                0,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
                 102,
                 10,
-                1,
                 vec![(obj_a, SequenceNumber::from(3))], // Lower version after higher!
                 TransactionDigest::random(),
             ),
@@ -1665,14 +1582,17 @@ mod tests {
         // Function completes despite violation
         assert_eq!(result.len(), 2, "Should have 2 results even with violation");
 
-        // Both transactions still get their state blobs
-        // Txn 1 should attach v5
+        // Txn 1 should attach v5 (available in merged_state)
         assert_eq!(result[0].1.len(), 1);
         assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(5));
 
-        // Txn 2 should attach v3 (even though it violates ordering)
-        // Note: It won't be skipped as "produced" because v3 != v6 (the produced version from txn1)
-        assert_eq!(result[1].1.len(), 1);
-        assert_eq!(result[1].1[&obj_a].version(), SequenceNumber::from(3));
+        // Txn 2 requires v3, but merged_state only has v5 (latest version)
+        // Since the exact version doesn't match, no state blob is attached
+        // This is expected behavior with the new implementation
+        assert_eq!(
+            result[1].1.len(),
+            0,
+            "v3 not available in merged_state, only v5"
+        );
     }
 }

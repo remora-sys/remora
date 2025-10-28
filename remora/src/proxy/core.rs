@@ -1238,7 +1238,7 @@ where
 #[cfg(test)]
 mod tests {
     use dashmap::DashMap;
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::atomic::AtomicU64, sync::Arc};
     use sui_types::base_types::{ObjectID, SequenceNumber};
     use tokio::sync::mpsc;
 
@@ -1330,6 +1330,8 @@ mod tests {
         // Set up version assignment
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            epoch_logger: None,
+            current_epoch: Arc::new(AtomicU64::new(0)),
             _phantom: std::marker::PhantomData,
         };
 

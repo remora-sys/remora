@@ -18,7 +18,6 @@ pub struct LogRecord<T: ExecutableTransaction + Clone> {
     pub consensus_index: Option<u64>,
     pub txn_digest: TransactionDigest,
     pub transaction: Arc<TransactionWithTimestamp<T>>,
-    pub destination_proxy: usize,
     pub required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>>,
     pub epoch: EpochId,
 }
@@ -61,7 +60,6 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
 
         tracing::debug!(
             epoch = epoch.0,
-            destination_proxy = record.destination_proxy,
             consensus_index = record.consensus_index,
             txn_digest = ?record.txn_digest,
             "EpochLogger: appended transaction"

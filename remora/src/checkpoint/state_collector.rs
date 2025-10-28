@@ -56,7 +56,7 @@ impl StateCollector {
         completed_up_to: u64,
         snapshot: EpochObjectStates,
         _expected_proxies: usize,
-        _epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
+        epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
     ) where
         T: crate::executor::api::ExecutableTransaction + Clone,
     {
@@ -90,7 +90,7 @@ impl StateCollector {
         if completed_up_to > 0 {
             let epoch = EpochId(completed_up_to);
             if self.is_epoch_complete(epoch, self.expected_proxies) {
-                self.commit_epoch(epoch);
+                self.commit_epoch(epoch, epoch_logger);
             }
         } else {
             tracing::info!(
@@ -102,7 +102,13 @@ impl StateCollector {
 
     /// Commit an epoch: promote all temp states to merged_state
     /// This happens when ALL proxies have acknowledged the epoch
-    fn commit_epoch(&self, epoch: EpochId) {
+    fn commit_epoch<T>(
+        &self,
+        epoch: EpochId,
+        epoch_logger: Option<&crate::recovery::EpochLogger<T>>,
+    ) where
+        T: crate::executor::api::ExecutableTransaction + Clone,
+    {
         let mut committed_count = 0;
 
         // Collect all object IDs and their latest versions from temp state
@@ -154,6 +160,13 @@ impl StateCollector {
             epoch.0,
             committed_count
         );
+
+        // Prune the epoch logger after successful commit
+        // All transactions up to this epoch have been persisted by all proxies
+        if let Some(logger) = epoch_logger {
+            logger.prune_epoch(epoch);
+            tracing::info!("Pruned epoch {} from epoch logger after commit", epoch.0);
+        }
     }
 
     /// Get an object from the in-memory store (persisted state only).
