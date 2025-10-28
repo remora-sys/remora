@@ -337,12 +337,38 @@ where
         // This prevents fetching state blobs for versions that will be created during replay
         let mut replay_produced_versions = std::collections::HashSet::new();
 
+        // Track highest version seen per object to validate partial dependency ordering
+        // Versions for the same object should be non-decreasing in consensus order
+        let mut highest_version_per_object = std::collections::HashMap::new();
+
         tracing::debug!(
             uncommitted_count = uncommitted_txns.len(),
             "Building replay messages with intelligent state blob attachment"
         );
 
         for record in uncommitted_txns {
+            // Validate partial dependency ordering for required versions
+            for ((obj_id, version), _) in &record.required_states {
+                if let Some(&prev_highest) = highest_version_per_object.get(obj_id) {
+                    if *version < prev_highest {
+                        tracing::error!(
+                            obj_id = ?obj_id,
+                            required_version = version.value(),
+                            prev_highest = prev_highest.value(),
+                            txn_digest = ?record.txn_digest,
+                            consensus_index = ?record.consensus_index,
+                            "VIOLATION: Partial dependency ordering broken - transaction requires lower version after higher version was seen for same object"
+                        );
+                    }
+                }
+
+                // Update highest version seen for this object (track input versions)
+                highest_version_per_object
+                    .entry(*obj_id)
+                    .and_modify(|v| *v = (*v).max(*version))
+                    .or_insert(*version);
+            }
+
             // Intelligent state blob attachment:
             // Attach state blobs for required states that replacement proxy won't have
             let mut state_blobs = std::collections::BTreeMap::new();
@@ -1611,5 +1637,55 @@ mod tests {
             "Txn 2 should have object B"
         );
         assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(4));
+    }
+
+    #[test]
+    fn test_build_replay_messages_detects_version_ordering_violation() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+
+        // Add version 5 to collector from one proxy, version 3 from another
+        // This simulates the scenario where different proxies had different versions
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(5));
+        add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(3));
+
+        // VIOLATION: Txn 1 (from proxy 0) requires v5, then Txn 2 (from proxy 1) requires v3
+        // This violates partial dependency ordering - we're going backwards in version numbers
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                101,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(5))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                102,
+                10,
+                1,
+                vec![(obj_a, SequenceNumber::from(3))], // Lower version after higher!
+                TransactionDigest::random(),
+            ),
+        ];
+
+        // The function should still complete but log an error
+        // (In production this would indicate a serious bug in consensus ordering)
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        // Function completes despite violation
+        assert_eq!(result.len(), 2, "Should have 2 results even with violation");
+
+        // Both transactions still get their state blobs
+        // Txn 1 should attach v5
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(5));
+
+        // Txn 2 should attach v3 (even though it violates ordering)
+        // Note: It won't be skipped as "produced" because v3 != v6 (the produced version from txn1)
+        assert_eq!(result[1].1.len(), 1);
+        assert_eq!(result[1].1[&obj_a].version(), SequenceNumber::from(3));
     }
 }
