@@ -264,7 +264,6 @@ where
             self.start_replay_process(
                 failed_proxy,
                 standby_proxy,
-                failed_proxy_states,
                 uncommitted_txns,
             );
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
@@ -296,7 +295,7 @@ where
 
     /// Start the replay process for a replacement proxy.
     /// This method spawns a task to send ALL uncommitted transactions (from all proxies) to the
-    /// replacement proxy, along with initial state transfer for untouched objects.
+    /// replacement proxy. States are fetched lazily on-demand during execution (Task 2.4).
     /// After all replay messages are sent, it promotes the standby to active.
     ///
     /// CRITICAL: Takes pre-computed recovery plan to ensure atomicity - computing it again
@@ -305,11 +304,9 @@ where
         &self,
         failed_proxy: ProxyId,
         replacement_proxy: ProxyId,
-        failed_proxy_states: Vec<(ObjectID, SequenceNumber)>,
         uncommitted_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
     ) {
         let proxy_connections = self.proxy_connections.clone();
-        let collector = self.collector.clone();
         let standby_excluded = self.standby_excluded.clone();
         let chunking_config = self.chunking_config.clone();
         let states_to_proxy = self.states_to_proxy.clone();
@@ -322,10 +319,8 @@ where
                 "Replay task spawned with simplified recovery plan (all uncommitted txns)"
             );
 
-            let failed_proxy_id = failed_proxy; // Capture for use in closure
-
-            // Recovery plan already computed in begin_recovery() to ensure atomicity
-            // with failed_proxy_states capture. Don't recompute here!
+            // Recovery plan (uncommitted transactions) already computed in begin_recovery() 
+            // to ensure atomicity. Don't recompute here!
 
             if uncommitted_txns.is_empty() {
                 tracing::info!(failed_proxy, "No transactions to replay");
@@ -343,207 +338,24 @@ where
                 failed_proxy,
                 replacement_proxy,
                 uncommitted_count = uncommitted_txns.len(),
-                state_transfer_count = failed_proxy_states.len(),
-                "Sending state transfer + uncommitted transactions to replacement proxy"
+                "Sending uncommitted transactions to replacement proxy (Task 2.4: NO initial state transfer)"
             );
 
             // Convert LogRecord to ReplayMsg and send to replacement proxy
             if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
-                // CRITICAL: First, transfer ALL states owned by failed proxy as initial snapshot.
+                // Task 2.4: NO INITIAL STATE TRANSFER!
+                // 
+                // Old approach: Transfer all states owned by failed proxy upfront
+                // New approach: States fetched lazily on-demand during execution
                 //
-                // Problem: Uncommitted transactions only cover states actually used by those
-                // transactions. But the failed proxy may own many other state versions that aren't
-                // referenced. When other proxies redirect state requests to the standby, it won't
-                // have those states!
-                //
-                // Solution: Send an initial batch containing all state blobs owned by the failed proxy.
-                // This ensures standby can respond to any state request that might be redirected to it.
+                // Benefits:
+                // - Eliminates large upfront data transfer
+                // - Reduces recovery latency
+                // - Only transfers states that are actually needed
+                // - Relies on primary's lazy state serving (Task 3.1)
 
-                tracing::info!(
-                    replacement_proxy,
-                    state_count = failed_proxy_states.len(),
-                    "Fetching {} state blobs owned by failed proxy for initial transfer",
-                    failed_proxy_states.len()
-                );
-
-                // SIMPLIFIED: Identify "touched" objects handled by uncommitted txns
-                // Initial transfer should ONLY include objects NOT touched by replay transactions
-                //
-                // Touched objects = any object appearing in uncommitted transaction required_states
-
-                let mut touched_objects = std::collections::HashSet::new();
-
-                // Mark objects touched by uncommitted transactions
-                tracing::debug!(
-                    "Marking objects touched by {} uncommitted transactions",
-                    uncommitted_txns.len()
-                );
-                for record in &uncommitted_txns {
-                    for ((obj_id, version), _) in &record.required_states {
-                        if touched_objects.insert(*obj_id) {
-                            tracing::debug!(
-                                "Marked {:?} as touched by uncommitted txn (requires v{}, digest={:?})",
-                                obj_id,
-                                version.value(),
-                                record.txn_digest
-                            );
-                        }
-                    }
-                }
-
-                tracing::info!(
-                    replacement_proxy,
-                    touched_count = touched_objects.len(),
-                    "Identified {} objects touched by uncommitted transactions - will exclude from initial transfer",
-                    touched_objects.len()
-                );
-
-                // Compute productions from uncommitted txns
-                // This prevents fetching state blobs for versions produced by earlier uncommitted txns
-                // IMPORTANT: All objects in a transaction advance to max(all_req_versions) + 1
-                let mut uncommitted_productions = std::collections::HashSet::new();
-                tracing::debug!(
-                    "Computing uncommitted_productions for {} transactions",
-                    uncommitted_txns.len()
-                );
-                for record in &uncommitted_txns {
-                    let produced_version = record.produced_version();
-                    for ((obj_id, _req_version), _) in &record.required_states {
-                        uncommitted_productions.insert((*obj_id, produced_version));
-                        tracing::debug!(
-                            "Uncommitted txn {:?} will produce {:?} @ v{}",
-                            record.txn_digest,
-                            obj_id,
-                            produced_version.value()
-                        );
-                    }
-                }
-                tracing::debug!(
-                    "Computed {} uncommitted production entries",
-                    uncommitted_productions.len()
-                );
-
-                // Fetch state blobs for all states owned by the failed proxy
-                // EXCEPT for "touched" objects that are handled by uncommitted transactions
-                // Note: get_object_for_proxy now strictly returns exact versions owned by this proxy
-                let mut initial_state_blobs = std::collections::BTreeMap::new();
-                let mut missing_states = Vec::new();
-                let mut excluded_for_replay = 0;
-                for (object_id, version) in &failed_proxy_states {
-                    // CRITICAL: Skip "touched" objects that appear in uncommitted transactions
-                    // These objects will be handled by:
-                    // - State blobs attached to uncommitted transactions
-                    // - Execution of uncommitted transactions (producing new versions)
-                    // Initial transfer should only include "untouched" passive objects
-                    if touched_objects.contains(object_id) {
-                        tracing::debug!(
-                            "✗ Excluding {:?} v{} from initial transfer - touched by uncommitted txns",
-                            object_id,
-                            version.value()
-                        );
-                        excluded_for_replay += 1;
-                        continue;
-                    }
-                    if let Some(object) =
-                        collector.get_object_for_proxy(object_id, *version, failed_proxy as usize)
-                    {
-                        initial_state_blobs.insert(*object_id, object);
-                        tracing::info!(
-                            "✓ Including {:?} v{} in initial transfer - untouched object",
-                            object_id,
-                            version.value()
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Failed to fetch state {:?} @ {:?} from collector for failed proxy {}",
-                            object_id,
-                            version,
-                            failed_proxy
-                        );
-                        missing_states.push((*object_id, *version));
-                    }
-                }
-
-                if !missing_states.is_empty() {
-                    tracing::warn!(
-                        "Failed to fetch {} state blobs for failed proxy {}: {:?}",
-                        missing_states.len(),
-                        failed_proxy,
-                        missing_states
-                    );
-                }
-
-                tracing::info!(
-                    replacement_proxy,
-                    fetched_count = initial_state_blobs.len(),
-                    requested_count = failed_proxy_states.len(),
-                    excluded_for_replay,
-                    "Fetched {} / {} state blobs for initial transfer ({} excluded - touched by replay txns)",
-                    initial_state_blobs.len(),
-                    failed_proxy_states.len(),
-                    excluded_for_replay
-                );
-
-                // Send initial state transfer as a special replay batch with epoch 0
-                if !initial_state_blobs.is_empty() {
-                    // Create a pure state transfer message (transaction = None)
-                    // The proxy will only commit the state blobs without executing any transaction
-                    let state_transfer_msg = crate::executor::api::ReplayMsg {
-                        consensus_index: 0,
-                        transaction: None, // No transaction - pure state transfer
-                        required_versions: vec![],
-                        state_blobs: initial_state_blobs.clone(),
-                    };
-
-                    let state_transfer_batch = crate::executor::api::ReplayBatch {
-                        epoch: crate::checkpoint::EpochId(0), // Special epoch for state transfer
-                        items: vec![state_transfer_msg],
-                    };
-
-                    // Chunk the state transfer batch if needed
-                    let chunking_result =
-                        chunk_replay_batch(state_transfer_batch, &chunking_config);
-
-                    tracing::info!(
-                        replacement_proxy,
-                        total_state_count = initial_state_blobs.len(),
-                        num_chunks = chunking_result.num_chunks,
-                        max_chunk_size = chunking_result.max_chunk_size,
-                        "Sending initial state transfer ({} chunks) to replacement proxy",
-                        chunking_result.num_chunks
-                    );
-
-                    // Send all chunks
-                    for (chunk_idx, chunk) in chunking_result.chunks.into_iter().enumerate() {
-                        let msg = crate::executor::api::PrimaryToProxyMessage::Replay(chunk);
-                        if let Err(e) = proxy_tx.value().send(msg).await {
-                            tracing::error!(
-                                "Failed to send initial state transfer chunk {}/{} to replacement proxy {}: {:?}",
-                                chunk_idx + 1,
-                                chunking_result.num_chunks,
-                                replacement_proxy,
-                                e
-                            );
-                            return;
-                        }
-                        tracing::debug!(
-                            "Sent initial state transfer chunk {}/{} to replacement proxy {}",
-                            chunk_idx + 1,
-                            chunking_result.num_chunks,
-                            replacement_proxy
-                        );
-                    }
-
-                    tracing::info!(
-                        replacement_proxy,
-                        state_count = initial_state_blobs.len(),
-                        num_chunks = chunking_result.num_chunks,
-                        "Completed initial state transfer to replacement proxy"
-                    );
-                }
-
-                // SIMPLIFIED RECOVERY: Replay ALL uncommitted transactions in consensus order
-                // Clone the transactions so we can use them later to update states_to_proxy
+                // SIMPLIFIED RECOVERY (Task 2.3 + 2.4): Replay ALL uncommitted transactions in consensus order
+                // NO STATE BLOB FETCHING - states will be fetched lazily by proxies during execution
                 let all_txns = uncommitted_txns.iter().cloned();
 
                 // Group transactions by epoch and send one batch per epoch
@@ -558,29 +370,13 @@ where
 
                 let total_epochs = txns_by_epoch.len();
                 let mut sent_count = 0;
-                // CRITICAL FIX: Track (object_id, version) pairs, not just object_id!
-                // Multiple transactions may need different versions of the same object.
-                let mut sent_blobs = std::collections::HashSet::new();
 
-                // Build set of all states already sent in initial transfer
-                // These are ALL versions owned by the failed proxy
-                let initial_transfer_states: std::collections::HashSet<(ObjectID, SequenceNumber)> =
-                    failed_proxy_states.iter().cloned().collect();
-
-                // Note: uncommitted_productions was already computed above for excluding objects
-                // from initial transfer, and is reused here to skip fetching state blobs for
-                // versions that will be produced by earlier uncommitted transactions.
-
-                // CAUSALITY VALIDATION: Track highest STATE BLOB version per object
-                // We only track actual state blobs sent, NOT produced versions from transaction execution.
-                // This ensures state blobs are sent in increasing order per object.
-                let mut highest_blob_version: std::collections::HashMap<ObjectID, SequenceNumber> =
-                    std::collections::HashMap::new();
-
-                // Initialize with versions from initial transfer (untouched objects only)
-                for (obj_id, object) in &initial_state_blobs {
-                    highest_blob_version.insert(*obj_id, object.version());
-                }
+                tracing::info!(
+                    replacement_proxy,
+                    total_epochs,
+                    uncommitted_count = uncommitted_txns.len(),
+                    "Building replay messages with NO state blobs (lazy state fetching enabled)"
+                );
 
                 for (epoch, epoch_records) in txns_by_epoch {
                     let mut replay_items = Vec::new();
@@ -588,128 +384,15 @@ where
                         // Hydrate transaction data from LogRecord
                         let transaction = (*record.transaction).clone();
 
-                        // Fetch state blobs from StateCollector when available
-                        // OPTIMIZATION: Skip state blobs for transactions from failed proxy
-                        // since they're already in the initial transfer. Only fetch for uncommitted
-                        // transactions from other proxies.
-                        let mut state_blobs = std::collections::BTreeMap::new();
-                        let is_from_failed_proxy =
-                            record.destination_proxy == failed_proxy_id as usize;
-
-                        // Only fetch state blobs for transactions from other proxies
-                        // Failed proxy transaction states are already in initial transfer
-                        if !is_from_failed_proxy {
-                            for (object_id, version) in record.required_states.keys() {
-                                // Skip if already sent in this replay batch
-                                if sent_blobs.contains(&(*object_id, *version)) {
-                                    continue;
-                                }
-                                // Skip if already in initial transfer
-                                if initial_transfer_states.contains(&(*object_id, *version)) {
-                                    continue;
-                                }
-                                if *version == SequenceNumber::from(2) {
-                                    continue;
-                                }
-                                // Skip if this version will be produced by an earlier uncommitted transaction
-                                // This prevents duplicate state blobs when TxnA produces V3 and TxnB requires V3
-                                if uncommitted_productions.contains(&(*object_id, *version)) {
-                                    tracing::debug!(
-                                        "Skipping state blob fetch for {:?} v{} - will be produced by earlier uncommitted txn",
-                                        object_id,
-                                        version.value()
-                                    );
-                                    continue;
-                                }
-
-                                // CRITICAL: Fetch from the ORIGINAL proxy that executed this uncommitted transaction
-                                // Using get_object_for_proxy ensures we get the exact version from the proxy's
-                                // snapshot at persist_index, not the latest version from merged_state which may
-                                // have advanced due to epoch commits during recovery.
-                                let source_proxy = record.destination_proxy;
-                                let object_opt = collector.get_object_for_proxy(
-                                    object_id,
-                                    *version,
-                                    source_proxy,
-                                );
-
-                                if let Some(object) = object_opt {
-                                    // Should always match since get_object_for_proxy returns exact version
-                                    if object.version() == *version {
-                                        state_blobs.insert(*object_id, object.clone());
-                                        sent_blobs.insert((*object_id, *version));
-
-                                        tracing::debug!(
-                                            "Fetched state blob: {:?} v{} from source proxy {} \
-                                             (txn digest={:?}, epoch={}, consensus_index={:?})",
-                                            object_id, version.value(), source_proxy,
-                                            record.txn_digest, epoch.0, record.consensus_index
-                                        );
-                                    } else {
-                                        tracing::error!(
-                                            "Version mismatch from get_object_for_proxy! {:?} - expected {:?}, got {:?}",
-                                            object_id, version, object.version()
-                                        );
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        "Object {:?} v{:?} not found in source proxy {} - will be regenerated by replay",
-                                        object_id, version, source_proxy
-                                    );
-                                }
-                            }
-                        }
-
-                        // CAUSALITY VALIDATION: Validate that state_blobs for THIS transaction
-                        // are in increasing order per object (no blob version <= previous blob version)
-                        // We do NOT check produced versions here - those will be validated by execution order.
-                        for (obj_id, object) in &state_blobs {
-                            let blob_version = object.version();
-                            if let Some(prev_blob_version) = highest_blob_version.get(obj_id) {
-                                if blob_version <= *prev_blob_version {
-                                    let txn_source = if is_from_failed_proxy {
-                                        "from failed proxy"
-                                    } else {
-                                        "from other proxy"
-                                    };
-                                    tracing::error!(
-                                        "STATE BLOB CAUSALITY VIOLATION DETECTED!\n\
-                                         \n\
-                                         Object: {:?}\n\
-                                         Previous state blob version: v{}\n\
-                                         Current state blob version: v{}\n\
-                                         \n\
-                                         State blobs must be in increasing order!\n\
-                                         \n\
-                                         Transaction details:\n\
-                                         - Source: {}\n\
-                                         - Digest: {:?}\n\
-                                         - Epoch: {}\n\
-                                         - Consensus index: {:?}\n\
-                                         - Destination proxy: {}\n\
-                                         \n\
-                                         This indicates a bug in state blob fetching logic.",
-                                        obj_id,
-                                        prev_blob_version.value(),
-                                        blob_version.value(),
-                                        txn_source,
-                                        record.txn_digest,
-                                        epoch.0,
-                                        record.consensus_index,
-                                        record.destination_proxy
-                                    );
-                                    panic!("State blob causality violation - aborting recovery");
-                                }
-                            }
-                            // Update tracking with this blob version
-                            highest_blob_version.insert(*obj_id, blob_version);
-                        }
+                        // Task 2.3: NO STATE BLOB FETCHING!
+                        // state_blobs is ALWAYS EMPTY - proxies will fetch states lazily during execution
+                        // This eliminates complex state blob fetching logic and enables lazy state serving
 
                         replay_items.push(crate::executor::api::ReplayMsg {
                             consensus_index: record.consensus_index.unwrap_or(0),
                             transaction: Some(transaction),
                             required_versions: record.required_states.keys().cloned().collect(),
-                            state_blobs,
+                            state_blobs: std::collections::BTreeMap::new(), // ALWAYS EMPTY
                         });
                     }
 
