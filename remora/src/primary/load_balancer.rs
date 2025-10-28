@@ -302,19 +302,6 @@ where
         }
     }
 
-    /// Get the next batch of replay items for a failed proxy.
-    /// Returns None when all items have been replayed.
-    pub fn get_next_replay_batch(
-        &self,
-        failed_proxy: ProxyId,
-    ) -> Option<Vec<crate::recovery::LogRecord<E::Transaction>>> {
-        // Use the failed proxy's own persist_index to find dirty transactions
-        // in epochs after its last reported epoch
-        let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
-        self.recovery_coordinator
-            .get_next_replay_batch(failed_proxy as usize, persist_index)
-    }
-
     /// Build replay messages with intelligent state blob attachment.
     ///
     /// This function determines which state blobs need to be attached to each replay message
