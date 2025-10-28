@@ -936,4 +936,389 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_collect_uncommitted_transactions_all_proxies() {
+        // Test that collect_uncommitted_transactions includes transactions to ALL proxies
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        let epoch1 = EpochId(1);
+        let epoch2 = EpochId(2);
+
+        // Add transactions to different proxies with various consensus_indices
+        // Proxy 0: consensus_index 1, 2, 3
+        for i in 1..=3 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: 0,
+                required_states: BTreeMap::new(),
+                epoch: epoch1,
+            };
+            logger.append(epoch1, record);
+        }
+
+        // Proxy 1: consensus_index 4, 5, 6
+        for i in 4..=6 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: 1,
+                required_states: BTreeMap::new(),
+                epoch: epoch1,
+            };
+            logger.append(epoch1, record);
+        }
+
+        // Proxy 2: consensus_index 7, 8, 9
+        for i in 7..=9 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: 2,
+                required_states: BTreeMap::new(),
+                epoch: epoch2,
+            };
+            logger.append(epoch2, record);
+        }
+
+        // Set watermark at batch 3
+        let completed_up_to = 3;
+
+        // Collect uncommitted transactions
+        let uncommitted = coordinator.collect_uncommitted_transactions(completed_up_to);
+
+        // Should include transactions from ALL proxies with consensus_index > 3
+        assert_eq!(
+            uncommitted.len(),
+            6,
+            "Should collect 6 transactions (indices 4-9) from all proxies"
+        );
+
+        // Verify all have consensus_index > 3
+        for record in &uncommitted {
+            assert!(
+                record.consensus_index.unwrap() > completed_up_to,
+                "All transactions should have consensus_index > {}",
+                completed_up_to
+            );
+        }
+
+        // Verify transactions from all proxies are included
+        let proxy_0_count = uncommitted
+            .iter()
+            .filter(|r| r.destination_proxy == 0)
+            .count();
+        let proxy_1_count = uncommitted
+            .iter()
+            .filter(|r| r.destination_proxy == 1)
+            .count();
+        let proxy_2_count = uncommitted
+            .iter()
+            .filter(|r| r.destination_proxy == 2)
+            .count();
+
+        assert_eq!(proxy_0_count, 0, "Proxy 0 has no txns with index > 3");
+        assert_eq!(proxy_1_count, 3, "Proxy 1 should have 3 transactions");
+        assert_eq!(proxy_2_count, 3, "Proxy 2 should have 3 transactions");
+
+        // Verify sorted by consensus_index
+        for i in 0..uncommitted.len() - 1 {
+            assert!(
+                uncommitted[i].consensus_index <= uncommitted[i + 1].consensus_index,
+                "Transactions should be sorted by consensus_index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_uncommitted_transactions_watermark_boundary() {
+        // Test exact boundary: transactions at watermark are excluded, above are included
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        let epoch = EpochId(10);
+
+        // Add transactions with consensus_indices around watermark
+        for i in 3..=7 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: i as usize % 3, // Distribute across proxies
+                required_states: BTreeMap::new(),
+                epoch,
+            };
+            logger.append(epoch, record);
+        }
+
+        // Test watermark at 5
+        let completed_up_to = 5;
+        let uncommitted = coordinator.collect_uncommitted_transactions(completed_up_to);
+
+        // Should include only 6 and 7
+        assert_eq!(uncommitted.len(), 2, "Should only include indices 6 and 7");
+        assert_eq!(uncommitted[0].consensus_index, Some(6));
+        assert_eq!(uncommitted[1].consensus_index, Some(7));
+
+        // Test watermark at 3
+        let completed_up_to = 3;
+        let uncommitted = coordinator.collect_uncommitted_transactions(completed_up_to);
+
+        // Should include 4, 5, 6, 7
+        assert_eq!(
+            uncommitted.len(),
+            4,
+            "Should include indices 4, 5, 6, 7"
+        );
+
+        // Test watermark at 7 (all complete)
+        let completed_up_to = 7;
+        let uncommitted = coordinator.collect_uncommitted_transactions(completed_up_to);
+
+        // Should be empty
+        assert_eq!(
+            uncommitted.len(),
+            0,
+            "Should be empty when all batches complete"
+        );
+    }
+
+    #[test]
+    fn test_collect_uncommitted_transactions_empty() {
+        // Test with no transactions
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        let uncommitted = coordinator.collect_uncommitted_transactions(0);
+        assert_eq!(uncommitted.len(), 0, "Should be empty with no transactions");
+
+        // Test with transactions but all complete
+        let epoch = EpochId(5);
+        for i in 1..=5 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: 0,
+                required_states: BTreeMap::new(),
+                epoch,
+            };
+            logger.append(epoch, record);
+        }
+
+        let uncommitted = coordinator.collect_uncommitted_transactions(10);
+        assert_eq!(
+            uncommitted.len(),
+            0,
+            "Should be empty when watermark exceeds all transactions"
+        );
+    }
+
+    #[test]
+    fn test_collect_uncommitted_transactions_consensus_order() {
+        // Test that transactions are returned in consensus order
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        // Add transactions in non-sequential order across epochs
+        let records_data = vec![
+            (EpochId(3), 15),
+            (EpochId(1), 3),
+            (EpochId(2), 8),
+            (EpochId(1), 1),
+            (EpochId(3), 12),
+            (EpochId(2), 5),
+        ];
+
+        for (epoch, consensus_index) in records_data {
+            let record = LogRecord {
+                consensus_index: Some(consensus_index),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(consensus_index),
+                destination_proxy: (consensus_index % 3) as usize,
+                required_states: BTreeMap::new(),
+                epoch,
+            };
+            logger.append(epoch, record);
+        }
+
+        // Collect with watermark at 2
+        let uncommitted = coordinator.collect_uncommitted_transactions(2);
+
+        // Should get: 3, 5, 8, 12, 15 (in order)
+        assert_eq!(uncommitted.len(), 5);
+
+        let indices: Vec<u64> = uncommitted
+            .iter()
+            .map(|r| r.consensus_index.unwrap())
+            .collect();
+        assert_eq!(indices, vec![3, 5, 8, 12, 15], "Should be in consensus order");
+    }
+
+    #[test]
+    fn test_collect_uncommitted_transactions_handles_none_consensus_index() {
+        // Test behavior with transactions that have None consensus_index
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        let epoch = EpochId(5);
+
+        // Add transactions with consensus_index
+        for i in 1..=5 {
+            let record = LogRecord {
+                consensus_index: Some(i),
+                txn_digest: TransactionDigest::random(),
+                transaction: create_test_transaction(i),
+                destination_proxy: 0,
+                required_states: BTreeMap::new(),
+                epoch,
+            };
+            logger.append(epoch, record);
+        }
+
+        // Add a transaction with None consensus_index
+        let record_none = LogRecord {
+            consensus_index: None,
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(999),
+            destination_proxy: 1,
+            required_states: BTreeMap::new(),
+            epoch,
+        };
+        logger.append(epoch, record_none);
+
+        // Collect with watermark at 2
+        let uncommitted = coordinator.collect_uncommitted_transactions(2);
+
+        // Should include indices 3, 4, 5
+        // Note: transactions with None are treated as 0, so excluded (0 <= 2)
+        assert_eq!(uncommitted.len(), 3, "Should not include None consensus_index");
+
+        for record in uncommitted {
+            assert!(record.consensus_index.is_some(), "Should only have Some values");
+            assert!(record.consensus_index.unwrap() > 2);
+        }
+    }
+
+    #[test]
+    fn test_collect_uncommitted_vs_drain_dirty_queue() {
+        // Compare old approach (drain_dirty_queue) vs new approach (collect_uncommitted_transactions)
+        // Note: drain_dirty_queue uses epoch-based filtering (epoch.0 > persist_index)
+        //       collect_uncommitted_transactions uses batch watermark (consensus_index > completed_up_to)
+        let logger = EpochLogger::<TestTransaction>::new();
+        let coordinator = RecoveryCoordinator::new(logger.clone());
+
+        let epoch1 = EpochId(1);
+        let epoch2 = EpochId(2);
+        let epoch3 = EpochId(3);
+
+        // Add transactions to different proxies with consensus_indices
+        // Proxy 0 (will "fail"): consensus_index 1, 3, 5 in epochs 1, 2, 3
+        let record1 = LogRecord {
+            consensus_index: Some(1),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(1),
+            destination_proxy: 0,
+            required_states: BTreeMap::new(),
+            epoch: epoch1,
+        };
+        logger.append(epoch1, record1);
+
+        let record3 = LogRecord {
+            consensus_index: Some(3),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(3),
+            destination_proxy: 0,
+            required_states: BTreeMap::new(),
+            epoch: epoch2,
+        };
+        logger.append(epoch2, record3);
+
+        let record5 = LogRecord {
+            consensus_index: Some(5),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(5),
+            destination_proxy: 0,
+            required_states: BTreeMap::new(),
+            epoch: epoch3,
+        };
+        logger.append(epoch3, record5);
+
+        // Proxy 1: consensus_index 2, 4, 6 in epochs 1, 2, 3
+        let record2 = LogRecord {
+            consensus_index: Some(2),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(2),
+            destination_proxy: 1,
+            required_states: BTreeMap::new(),
+            epoch: epoch1,
+        };
+        logger.append(epoch1, record2);
+
+        let record4 = LogRecord {
+            consensus_index: Some(4),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(4),
+            destination_proxy: 1,
+            required_states: BTreeMap::new(),
+            epoch: epoch2,
+        };
+        logger.append(epoch2, record4);
+
+        let record6 = LogRecord {
+            consensus_index: Some(6),
+            txn_digest: TransactionDigest::random(),
+            transaction: create_test_transaction(6),
+            destination_proxy: 1,
+            required_states: BTreeMap::new(),
+            epoch: epoch3,
+        };
+        logger.append(epoch3, record6);
+
+        // Test with watermark/persist_index = 2
+        // OLD APPROACH: drain_dirty_queue filters by epoch.0 > 2, so gets epochs 3+
+        let dirty_only = coordinator.drain_dirty_queue(0, 2);
+
+        // NEW APPROACH: collect_uncommitted_transactions filters by consensus_index > 2
+        let all_uncommitted = coordinator.collect_uncommitted_transactions(2);
+
+        // Old approach: only proxy 0's transactions in epochs > 2 (index 5 in epoch 3)
+        assert_eq!(dirty_only.len(), 1, "drain_dirty_queue: epoch-based, only proxy 0");
+        assert_eq!(dirty_only[0].consensus_index, Some(5));
+
+        // New approach: all proxies' transactions with consensus_index > 2 (indices 3, 4, 5, 6)
+        assert_eq!(
+            all_uncommitted.len(),
+            4,
+            "collect_uncommitted_transactions: watermark-based, all proxies"
+        );
+
+        // Verify new approach includes healthy proxy transactions
+        let has_proxy_1_txns = all_uncommitted
+            .iter()
+            .any(|r| r.destination_proxy == 1);
+        assert!(
+            has_proxy_1_txns,
+            "New approach should include healthy proxy transactions"
+        );
+
+        // Verify old approach does NOT include healthy proxy transactions
+        let has_proxy_1_in_dirty = dirty_only.iter().any(|r| r.destination_proxy == 1);
+        assert!(
+            !has_proxy_1_in_dirty,
+            "Old approach should NOT include healthy proxy transactions"
+        );
+
+        // Verify consensus order in new approach
+        let indices: Vec<u64> = all_uncommitted
+            .iter()
+            .map(|r| r.consensus_index.unwrap())
+            .collect();
+        assert_eq!(indices, vec![3, 4, 5, 6], "Should be in consensus order");
+    }
 }

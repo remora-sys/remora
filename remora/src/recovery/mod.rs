@@ -240,6 +240,65 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         dirty_entries
     }
 
+    /// Collect ALL uncommitted transactions from ALL proxies.
+    ///
+    /// This is the core of the simplified recovery approach:
+    /// - Replays ALL transactions (not just dirty ones for failed proxy)
+    /// - Dependencies across proxies satisfied automatically by replaying all
+    /// - No bridging transaction computation needed
+    ///
+    /// Uses watermark-based filtering: transactions with consensus_index > completed_up_to
+    /// are uncommitted and need to be replayed.
+    ///
+    /// # Arguments
+    /// * `completed_up_to` - Batch watermark (highest fully completed batch across all proxies)
+    ///
+    /// # Returns
+    /// All uncommitted transactions in consensus order, including transactions to ALL proxies
+    pub fn collect_uncommitted_transactions(
+        &self,
+        completed_up_to: u64,
+    ) -> Vec<LogRecord<T>> {
+        let mut uncommitted_txns = Vec::new();
+
+        // Scan ALL epoch logger entries
+        for epoch_entry in self.logger.segments.iter() {
+            let epoch = *epoch_entry.key();
+            let records = epoch_entry.value();
+
+            // Include ALL transactions with consensus_index > completed_up_to
+            // Note: We do NOT filter by destination_proxy - include transactions to ALL proxies
+            let uncommitted_entries: Vec<LogRecord<T>> = records
+                .iter()
+                .filter(|r| r.consensus_index.unwrap_or(0) > completed_up_to)
+                .cloned()
+                .collect();
+
+            tracing::debug!(
+                epoch = epoch.0,
+                epoch_total = records.len(),
+                uncommitted_count = uncommitted_entries.len(),
+                completed_up_to = completed_up_to,
+                "Scanned epoch for uncommitted transactions"
+            );
+
+            uncommitted_txns.extend(uncommitted_entries);
+        }
+
+        // Sort by consensus_index to maintain causality
+        uncommitted_txns.sort_by_key(|r| r.consensus_index.unwrap_or(0));
+
+        tracing::info!(
+            total_uncommitted = uncommitted_txns.len(),
+            completed_up_to = completed_up_to,
+            epochs_scanned = self.logger.segments.len(),
+            "Collected ALL uncommitted transactions from batch {} onward (includes all proxies)",
+            completed_up_to + 1
+        );
+
+        uncommitted_txns
+    }
+
     /// Build a version production graph for all transactions after persist_index.
     /// Returns (dirty_productions, healthy_productions) where:
     /// - dirty_productions[obj_id][version] = true if dirty txn produces it
