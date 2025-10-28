@@ -30,6 +30,11 @@ use crate::{
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
 
+/// Sentinel value in states_to_proxy indicating state should be lazily fetched from primary.
+/// When a proxy fails, its owned states are marked with this sentinel instead of being removed.
+/// Future transactions needing these states will trigger lazy fetch from primary's persisted snapshot.
+pub const PRIMARY_FETCH_SENTINEL: usize = usize::MAX;
+
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
     /// The executor trait
@@ -208,18 +213,38 @@ where
             //          After removing 0: connections = {1, 2}, index 0 maps to ProxyId 1 (shifted!)
             //
             // States owned by the failed proxy need special handling:
-            // - They will be replayed to the replacement proxy
-            // - We clear them from the map so they'll be re-established during replay
-            // - When replay transactions execute, they'll update states_to_proxy naturally
+            // - Mark them with PRIMARY_FETCH_SENTINEL for lazy fetching from primary
+            // - States touched by uncommitted transactions will be updated to point to replacement
+            // - Untouched states remain marked for lazy fetch on-demand
             let mut remapped_count = 0;
-            let mut cleared_count = 0;
+            let mut marked_for_lazy_fetch = 0;
 
             // failed_proxy_states already captured at line 162 - use that snapshot
-            // Remove states that were owned by the failed proxy
-            for key in &failed_proxy_states {
-                self.states_to_proxy.remove(key);
-                cleared_count += 1;
+            // Mark states owned by the failed proxy for lazy fetch from primary
+            for (obj_id, version) in &failed_proxy_states {
+                self.states_to_proxy
+                    .entry((*obj_id, *version))
+                    .and_modify(|owners| {
+                        owners.remove(&failed_proxy);
+                        if owners.is_empty() {
+                            // No other proxy owns this version - mark for lazy fetch
+                            owners.insert(PRIMARY_FETCH_SENTINEL);
+                        }
+                    })
+                    .or_insert_with(|| {
+                        let mut set = std::collections::HashSet::new();
+                        set.insert(PRIMARY_FETCH_SENTINEL);
+                        set
+                    });
+                marked_for_lazy_fetch += 1;
             }
+
+            tracing::info!(
+                failed_proxy,
+                marked_for_lazy_fetch,
+                "Marked {} failed proxy states for lazy fetch from primary",
+                marked_for_lazy_fetch
+            );
 
             // Decrement indices for proxies that came after the failed proxy
             for mut entry in self.states_to_proxy.iter_mut() {
@@ -243,10 +268,8 @@ where
             tracing::info!(
                 failed_proxy,
                 remapped_count,
-                cleared_count,
-                "Adjusted state ownership indices after proxy removal: remapped {}, cleared {}",
-                remapped_count,
-                cleared_count
+                "Adjusted state ownership indices after proxy removal: remapped {}",
+                remapped_count
             );
 
             tracing::info!(
@@ -730,6 +753,7 @@ where
             Some(self.epoch_logger.clone()),
             self.current_epoch_atomic.clone(),
             self.standby_excluded.clone(),
+            self.collector.clone(),
         );
 
         thread::spawn(move || {

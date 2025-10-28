@@ -1,4 +1,5 @@
 use crate::{
+    checkpoint::state_collector::StateCollector,
     config::{LoadBalancingPolicy, ProxyMode},
     executor::{
         api::{
@@ -9,6 +10,7 @@ use crate::{
         worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
+    primary::load_balancer::PRIMARY_FETCH_SENTINEL,
     proxy::core::ProxyId,
     recovery::{EpochLogger, LogRecord},
 };
@@ -18,7 +20,19 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::object::Object;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Result of analyzing missing states for a transaction.
+/// Contains both the required_states map (for inter-proxy requests) and
+/// lazy-fetched state blobs (from primary's persisted snapshot).
+struct MissingStatesResult {
+    /// Map of (object, version) -> proxy index that owns it (for inter-proxy transfer)
+    required_states: RequiredStates,
+    /// State blobs lazy-fetched from primary (for states marked with PRIMARY_FETCH_SENTINEL)
+    /// These are sent via Replay message and bypass inter-proxy transfer
+    lazy_fetched_blobs: BTreeMap<ObjectID, Object>,
+}
 
 /// Context for forwarding tasks containing all necessary dependencies
 #[derive(Clone)]
@@ -39,6 +53,7 @@ where
     pub epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
     pub current_epoch: Arc<AtomicU64>,
     pub standby_excluded: Arc<AtomicBool>,
+    pub collector: Arc<StateCollector>,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -225,6 +240,7 @@ where
         epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
         current_epoch: Arc<AtomicU64>,
         standby_excluded: Arc<AtomicBool>,
+        collector: Arc<StateCollector>,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -238,6 +254,7 @@ where
             epoch_logger,
             current_epoch,
             standby_excluded,
+            collector,
         };
 
         let config = WorkerPoolConfig {
@@ -259,6 +276,7 @@ where
         let metrics = &context.metrics;
         let proxy_loads = &context.proxy_loads;
         let proxy_access_histories = &context.proxy_access_histories;
+        let collector = &context.collector;
         let (prior_handles, current_handles) = match task.required_versions.is_empty() {
             true => (Vec::new(), Vec::new()),
             false => dependency_controller.get_prior_dependency_and_update(
@@ -332,18 +350,44 @@ where
                     "Appended LogRecord for txn to epoch log"
                 );
             }
-            let stateful_missing_states = Self::get_missing_states_for_transaction(
+            let missing_states_result = Self::get_missing_states_for_transaction(
                 &transaction_arc,
                 Some(task.required_versions),
                 proxy_index,
                 states_to_proxy.clone(),
+                collector.clone(),
             )
             .await;
+
+            // Send lazy-fetched state blobs via Replay message if any
+            if !missing_states_result.lazy_fetched_blobs.is_empty() {
+                if let Some(dest_pid) = resolved_stateful {
+                    let replay_msg = crate::executor::api::ReplayMsg {
+                        consensus_index: 0,
+                        transaction: None,
+                        required_versions: vec![],
+                        state_blobs: missing_states_result.lazy_fetched_blobs.clone(),
+                    };
+                    let replay_batch = crate::executor::api::ReplayBatch {
+                        epoch: crate::checkpoint::EpochId(0),
+                        items: vec![replay_msg],
+                    };
+                    let replay_message = PrimaryToProxyMessage::Replay(replay_batch);
+                    Self::send_to_proxy(proxy_connections, dest_pid, replay_message).await;
+
+                    tracing::info!(
+                        "Sent {} lazy-fetched states to proxy {} for txn {:?}",
+                        missing_states_result.lazy_fetched_blobs.len(),
+                        dest_pid,
+                        transaction_arc.digest()
+                    );
+                }
+            }
 
             // CRITICAL: Resolve positional indices to ProxyIds before sending to proxies
             // Proxies use these values to look up peer connections, so they must be actual ProxyIds
             let stateful_missing_states = Self::resolve_required_states_to_proxy_ids(
-                stateful_missing_states,
+                missing_states_result.required_states,
                 proxy_connections,
                 &context.standby_excluded,
             );
@@ -858,8 +902,6 @@ where
         Some((proxy_index, proxy_index))
     }
 
-    /// Helper method to determine missing states for a transaction
-    /// and update the states ownership map
     async fn get_missing_states_for_transaction(
         transaction: &RemoraTransaction<E>,
         required_versions: Option<Vec<(ObjectID, SequenceNumber)>>,
@@ -867,70 +909,72 @@ where
         states_to_proxy: Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
-    ) -> RequiredStates {
+        collector: Arc<StateCollector>,
+    ) -> MissingStatesResult {
         let mut required_states = BTreeMap::new();
+        let mut lazy_fetched_blobs = BTreeMap::new();
 
-        tracing::debug!(
-            "Transaction {:?} required versions: {:?}",
-            transaction.digest(),
-            required_versions
-        );
+        let Some(required_versions) = required_versions else {
+            return MissingStatesResult {
+                required_states,
+                lazy_fetched_blobs,
+            };
+        };
 
-        if let Some(required_versions) = required_versions {
-            let mut max_version = SequenceNumber::from(2);
-            for (_, seq_num) in &required_versions {
-                if *seq_num > max_version {
-                    max_version = *seq_num;
+        let max_version = required_versions
+            .iter()
+            .map(|(_, v)| v)
+            .max()
+            .copied()
+            .unwrap_or(SequenceNumber::from(2));
+        let next_version = max_version.next();
+
+        for (object_id, seq_num) in required_versions {
+            let owner = states_to_proxy
+                .get(&(object_id, seq_num))
+                .and_then(|owners| {
+                    if owners.contains(&proxy_index) {
+                        None
+                    } else {
+                        owners.iter().next().copied()
+                    }
+                });
+
+            match owner {
+                Some(PRIMARY_FETCH_SENTINEL) => {
+                    if let Some(blob) = collector.get_object(&object_id) {
+                        lazy_fetched_blobs.insert(object_id, blob);
+                    } else {
+                        tracing::warn!(
+                            "Lazy fetch failed for {:?} v{} in txn {:?}",
+                            object_id,
+                            seq_num.value(),
+                            transaction.digest()
+                        );
+                        required_states.insert((object_id, seq_num), None);
+                    }
+                }
+                owner_opt => {
+                    required_states.insert((object_id, seq_num), owner_opt);
                 }
             }
 
-            // Calculate the new version (max + 1) for mapping updates
-            let next_version = max_version.next();
+            states_to_proxy
+                .entry((object_id, next_version))
+                .or_insert_with(std::collections::HashSet::new)
+                .insert(proxy_index);
 
-            for (object_id, seq_num) in required_versions {
-                // Check if any other proxy owns this version (not including this proxy)
-                let previous_owner_value =
-                    states_to_proxy
-                        .get(&(object_id, seq_num))
-                        .and_then(|owners| {
-                            if owners.contains(&proxy_index) {
-                                // This proxy already owns it
-                                None
-                            } else {
-                                // Return any other owner
-                                owners.iter().next().copied()
-                            }
-                        });
-
-                required_states.insert((object_id, seq_num), previous_owner_value);
-
-                // Update the mapping: Add this proxy as owner of next_version
-                states_to_proxy
-                    .entry((object_id, next_version))
-                    .or_insert_with(std::collections::HashSet::new)
-                    .insert(proxy_index);
-                tracing::debug!(
-                    "Updating states_to_proxy for {:?} to include {:?}",
-                    (object_id, next_version),
-                    proxy_index
-                );
-
-                // Remove this proxy from old version's owner set
-                states_to_proxy
-                    .entry((object_id, seq_num))
-                    .and_modify(|owners| {
-                        owners.remove(&proxy_index);
-                    });
-            }
+            states_to_proxy
+                .entry((object_id, seq_num))
+                .and_modify(|owners| {
+                    owners.remove(&proxy_index);
+                });
         }
 
-        tracing::debug!(
-            "Transaction {:?} missing states: {:?}",
-            transaction.digest(),
-            required_states
-        );
-
-        required_states
+        MissingStatesResult {
+            required_states,
+            lazy_fetched_blobs,
+        }
     }
 
     /// Simplified method to send a message to a proxy
