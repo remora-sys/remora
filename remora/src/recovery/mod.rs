@@ -252,10 +252,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     ///
     /// # Returns
     /// All uncommitted transactions in consensus order, including transactions to ALL proxies
-    pub fn collect_uncommitted_transactions(
-        &self,
-        completed_up_to: u64,
-    ) -> Vec<LogRecord<T>> {
+    pub fn collect_uncommitted_transactions(&self, completed_up_to: u64) -> Vec<LogRecord<T>> {
         let mut uncommitted_txns = Vec::new();
 
         // Scan ALL epoch logger entries
@@ -309,10 +306,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     ///
     /// # Returns
     /// All uncommitted transactions ready for replay, in consensus order
-    pub fn begin_recovery_simple(
-        &self,
-        completed_up_to: u64,
-    ) -> Vec<LogRecord<T>> {
+    pub fn begin_recovery_simple(&self, completed_up_to: u64) -> Vec<LogRecord<T>> {
         tracing::info!(
             completed_up_to,
             "Beginning simplified recovery (no bridging computation)"

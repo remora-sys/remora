@@ -28,6 +28,7 @@ use crate::{
     recovery::{EpochLogger, RecoveryCoordinator},
 };
 use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::object::Object;
 
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
@@ -171,7 +172,9 @@ where
 
             // SIMPLIFIED RECOVERY: Collect ALL uncommitted transactions (no bridging computation)
             // Uses watermark-based filtering for precise recovery boundaries
-            let uncommitted_txns = self.recovery_coordinator.begin_recovery_simple(persist_index);
+            let uncommitted_txns = self
+                .recovery_coordinator
+                .begin_recovery_simple(persist_index);
 
             tracing::info!(
                 failed_proxy,
@@ -261,11 +264,7 @@ where
                 conn_count,
                 "Replay initiation precheck: replacement presence and connection count"
             );
-            self.start_replay_process(
-                failed_proxy,
-                standby_proxy,
-                uncommitted_txns,
-            );
+            self.start_replay_process(failed_proxy, standby_proxy, uncommitted_txns);
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
             Some(standby_proxy)
@@ -293,6 +292,102 @@ where
             .get_next_replay_batch(failed_proxy as usize, persist_index)
     }
 
+    /// Build replay messages with intelligent state blob attachment.
+    ///
+    /// This function determines which state blobs need to be attached to each replay message
+    /// based on what the replacement proxy will have available:
+    /// - Replacement proxy starts EMPTY (only has v2 initial versions)
+    /// - Skip v2 versions (replacement has them)
+    /// - Skip versions that will be produced by earlier replay transactions
+    ///
+    /// Returns: Vec of (LogRecord, state_blobs) tuples in consensus order
+    fn build_replay_messages_with_state_blobs(
+        uncommitted_txns: &[crate::recovery::LogRecord<E::Transaction>],
+        collector: &StateCollector,
+    ) -> Vec<(
+        crate::recovery::LogRecord<E::Transaction>,
+        std::collections::BTreeMap<ObjectID, Object>,
+    )> {
+        let mut result = Vec::new();
+
+        // Track which object versions will be produced by replay transactions (in consensus order)
+        // This prevents fetching state blobs for versions that will be created during replay
+        let mut replay_produced_versions = std::collections::HashSet::new();
+
+        tracing::debug!(
+            uncommitted_count = uncommitted_txns.len(),
+            "Building replay messages with intelligent state blob attachment"
+        );
+
+        for record in uncommitted_txns {
+            // Intelligent state blob attachment:
+            // Attach state blobs for required states that replacement proxy won't have
+            let mut state_blobs = std::collections::BTreeMap::new();
+
+            for ((obj_id, version), _) in &record.required_states {
+                // Skip initial versions (v2) - replacement proxy has these
+                if *version == SequenceNumber::from(2) {
+                    tracing::trace!(
+                        "Skipping state blob for {:?} v{} - initial version",
+                        obj_id,
+                        version.value()
+                    );
+                    continue;
+                }
+
+                // Skip if this version will be produced by an earlier replay transaction
+                if replay_produced_versions.contains(&(*obj_id, *version)) {
+                    tracing::trace!(
+                        "Skipping state blob for {:?} v{} - will be produced by earlier replay txn",
+                        obj_id,
+                        version.value()
+                    );
+                    continue;
+                }
+
+                // This state must be fetched and attached
+                // Fetch from the ORIGINAL proxy that produced this version
+                let source_proxy = record.destination_proxy;
+
+                if let Some(object) = collector.get_object_for_proxy(obj_id, *version, source_proxy)
+                {
+                    state_blobs.insert(*obj_id, object);
+                    tracing::debug!(
+                        "Attached state blob {:?} v{} from proxy {} for txn {:?}",
+                        obj_id,
+                        version.value(),
+                        source_proxy,
+                        record.txn_digest
+                    );
+                } else {
+                    tracing::warn!(
+                        "Failed to fetch state blob {:?} v{} from proxy {} for txn {:?}",
+                        obj_id,
+                        version.value(),
+                        source_proxy,
+                        record.txn_digest
+                    );
+                }
+            }
+
+            // Mark versions that will be produced by THIS transaction
+            let produced_version = record.produced_version();
+            for ((obj_id, _), _) in &record.required_states {
+                replay_produced_versions.insert((*obj_id, produced_version));
+                tracing::trace!(
+                    "Marked {:?} v{} as will-be-produced by replay txn {:?}",
+                    obj_id,
+                    produced_version.value(),
+                    record.txn_digest
+                );
+            }
+
+            result.push((record.clone(), state_blobs));
+        }
+
+        result
+    }
+
     /// Start the replay process for a replacement proxy.
     /// This method spawns a task to send ALL uncommitted transactions (from all proxies) to the
     /// replacement proxy. States are fetched lazily on-demand during execution (Task 2.4).
@@ -307,6 +402,7 @@ where
         uncommitted_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
     ) {
         let proxy_connections = self.proxy_connections.clone();
+        let collector = self.collector.clone();
         let standby_excluded = self.standby_excluded.clone();
         let chunking_config = self.chunking_config.clone();
         let states_to_proxy = self.states_to_proxy.clone();
@@ -319,7 +415,7 @@ where
                 "Replay task spawned with simplified recovery plan (all uncommitted txns)"
             );
 
-            // Recovery plan (uncommitted transactions) already computed in begin_recovery() 
+            // Recovery plan (uncommitted transactions) already computed in begin_recovery()
             // to ensure atomicity. Don't recompute here!
 
             if uncommitted_txns.is_empty() {
@@ -344,7 +440,7 @@ where
             // Convert LogRecord to ReplayMsg and send to replacement proxy
             if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
                 // Task 2.4: NO INITIAL STATE TRANSFER!
-                // 
+                //
                 // Old approach: Transfer all states owned by failed proxy upfront
                 // New approach: States fetched lazily on-demand during execution
                 //
@@ -354,18 +450,22 @@ where
                 // - Only transfers states that are actually needed
                 // - Relies on primary's lazy state serving (Task 3.1)
 
-                // SIMPLIFIED RECOVERY (Task 2.3 + 2.4): Replay ALL uncommitted transactions in consensus order
-                // NO STATE BLOB FETCHING - states will be fetched lazily by proxies during execution
-                let all_txns = uncommitted_txns.iter().cloned();
+                // SIMPLIFIED RECOVERY (Task 2.3 FIX): Replay ALL uncommitted transactions with INTELLIGENT state blob attachment
+                // Uses extracted helper function for testability
+                let replay_messages_with_blobs =
+                    Self::build_replay_messages_with_state_blobs(&uncommitted_txns, &collector);
 
-                // Group transactions by epoch and send one batch per epoch
+                // Group by epoch for sending
                 let mut txns_by_epoch: std::collections::BTreeMap<
                     crate::checkpoint::EpochId,
                     Vec<_>,
                 > = std::collections::BTreeMap::new();
 
-                for record in all_txns {
-                    txns_by_epoch.entry(record.epoch).or_default().push(record);
+                for (record, state_blobs) in replay_messages_with_blobs {
+                    txns_by_epoch
+                        .entry(record.epoch)
+                        .or_default()
+                        .push((record, state_blobs));
                 }
 
                 let total_epochs = txns_by_epoch.len();
@@ -375,24 +475,21 @@ where
                     replacement_proxy,
                     total_epochs,
                     uncommitted_count = uncommitted_txns.len(),
-                    "Building replay messages with NO state blobs (lazy state fetching enabled)"
+                    "Sending replay messages with intelligent state blob attachment"
                 );
 
                 for (epoch, epoch_records) in txns_by_epoch {
                     let mut replay_items = Vec::new();
-                    for record in epoch_records {
+
+                    for (record, state_blobs) in epoch_records {
                         // Hydrate transaction data from LogRecord
                         let transaction = (*record.transaction).clone();
-
-                        // Task 2.3: NO STATE BLOB FETCHING!
-                        // state_blobs is ALWAYS EMPTY - proxies will fetch states lazily during execution
-                        // This eliminates complex state blob fetching logic and enables lazy state serving
 
                         replay_items.push(crate::executor::api::ReplayMsg {
                             consensus_index: record.consensus_index.unwrap_or(0),
                             transaction: Some(transaction),
                             required_versions: record.required_states.keys().cloned().collect(),
-                            state_blobs: std::collections::BTreeMap::new(), // ALWAYS EMPTY
+                            state_blobs,
                         });
                     }
 
@@ -815,5 +912,680 @@ where
         <E as Executor>::Transaction: Send + Sync,
     {
         tokio::spawn(async move { self.run().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::state_collector::StateCollector;
+    use crate::recovery::LogRecord;
+    use std::sync::Arc;
+    use sui_types::{
+        base_types::{ObjectID, SequenceNumber, TransactionDigest},
+        object::{MoveObject, Object},
+    };
+
+    // Use FakeExecutor's transaction type
+    use crate::executor::fake::{FakeExecutor, FakeTransaction};
+    type TestExecutor = FakeExecutor;
+
+    // Helper to create a test object
+    fn create_test_object(obj_id: ObjectID, version: SequenceNumber) -> Object {
+        let move_obj = MoveObject::new_gas_coin(version, obj_id, 1000);
+        let txn_digest = TransactionDigest::random();
+        let owner =
+            sui_types::object::Owner::AddressOwner(sui_types::base_types::SuiAddress::default());
+        Object::new_move(move_obj, owner, txn_digest)
+    }
+
+    // Counter for generating unique watermarks
+    static ADD_OBJECT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // Helper to add object to collector for a specific proxy
+    // Using the public API, each proxy can have different versions in temp_state
+    fn add_object_to_collector(
+        collector: &StateCollector,
+        proxy_id: usize,
+        obj_id: ObjectID,
+        version: SequenceNumber,
+    ) {
+        let obj = create_test_object(obj_id, version);
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(obj_id, obj);
+
+        // Use unique, increasing completed_up_to values to avoid commits
+        // Each call gets a unique watermark based on proxy_id and a counter
+        let counter = ADD_OBJECT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let completed_up_to = proxy_id as u64 * 10000 + counter;
+
+        collector.process_snapshot::<FakeTransaction>(proxy_id, completed_up_to, snapshot, 3, None);
+    }
+
+    // Helper to create a test LogRecord
+    fn create_test_log_record(
+        consensus_index: u64,
+        epoch: u64,
+        destination_proxy: usize,
+        required_states: Vec<(ObjectID, SequenceNumber)>,
+        txn_digest: TransactionDigest,
+    ) -> LogRecord<FakeTransaction> {
+        let required_states_map: std::collections::BTreeMap<
+            (ObjectID, SequenceNumber),
+            Option<usize>,
+        > = required_states.into_iter().map(|k| (k, None)).collect();
+
+        let txn = FakeTransaction::new(vec![]);
+        let txn_with_ts = crate::executor::api::TransactionWithTimestamp::new(
+            txn,
+            0.0,
+            vec![],
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_millis(0),
+            Some(0),
+        );
+
+        LogRecord {
+            consensus_index: Some(consensus_index),
+            epoch: EpochId(epoch),
+            destination_proxy,
+            transaction: Arc::new(txn_with_ts),
+            required_states: required_states_map,
+            txn_digest,
+        }
+    }
+
+    #[test]
+    fn test_build_replay_messages_empty_uncommitted() {
+        let collector = StateCollector::new(3);
+        let uncommitted_txns = vec![];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(
+            result.len(),
+            0,
+            "Should return empty vec for no uncommitted transactions"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_skip_v2_initial_versions() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn_digest = TransactionDigest::random();
+
+        // Transaction requires object A version 2 (initial version)
+        let uncommitted_txns = vec![create_test_log_record(
+            101,
+            10,
+            0,
+            vec![(obj_a, SequenceNumber::from(2))],
+            txn_digest,
+        )];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 1, "Should have 1 result");
+        assert_eq!(
+            result[0].1.len(),
+            0,
+            "Should skip v2 initial version - no state blobs attached"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_attach_v3_state() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn_digest = TransactionDigest::random();
+
+        // Add object A v3 to collector for proxy 0
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // Transaction requires object A version 3
+        let uncommitted_txns = vec![create_test_log_record(
+            101,
+            10,
+            0,
+            vec![(obj_a, SequenceNumber::from(3))],
+            txn_digest,
+        )];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 1, "Should have 1 result");
+        assert_eq!(result[0].1.len(), 1, "Should attach 1 state blob");
+        assert!(result[0].1.contains_key(&obj_a), "Should contain object A");
+        assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(3));
+    }
+
+    #[test]
+    fn test_build_replay_messages_skip_produced_versions() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn1_digest = TransactionDigest::random();
+        let txn2_digest = TransactionDigest::random();
+
+        // Add object A v3 to collector for proxy 0
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // Transaction 1: requires A v3, will produce A v4
+        // Transaction 2: requires A v4 (produced by txn 1)
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                101,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(3))],
+                txn1_digest,
+            ),
+            create_test_log_record(
+                102,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(4))],
+                txn2_digest,
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 2, "Should have 2 results");
+        assert_eq!(result[0].1.len(), 1, "Txn 1 should attach A v3");
+        assert_eq!(
+            result[1].1.len(),
+            0,
+            "Txn 2 should skip A v4 (produced by txn 1)"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_chain_of_dependencies() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn1_digest = TransactionDigest::random();
+        let txn2_digest = TransactionDigest::random();
+        let txn3_digest = TransactionDigest::random();
+
+        // Add object A v3 to collector for proxy 0
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // Chain: Txn1 (requires v3) → v4, Txn2 (requires v4) → v5, Txn3 (requires v5) → v6
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                101,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(3))],
+                txn1_digest,
+            ),
+            create_test_log_record(
+                102,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(4))],
+                txn2_digest,
+            ),
+            create_test_log_record(
+                103,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(5))],
+                txn3_digest,
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 3, "Should have 3 results");
+        assert_eq!(result[0].1.len(), 1, "Txn 1 should attach A v3");
+        assert_eq!(result[1].1.len(), 0, "Txn 2 should skip A v4");
+        assert_eq!(result[2].1.len(), 0, "Txn 3 should skip A v5");
+    }
+
+    #[test]
+    fn test_build_replay_messages_multiple_objects() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+        let txn_digest = TransactionDigest::random();
+
+        // Add objects to collector - both on proxy 0 (same proxy as transaction)
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(5));
+
+        // Transaction on proxy 0 requires both A v3 and B v5
+        let uncommitted_txns = vec![create_test_log_record(
+            101,
+            10,
+            0,
+            vec![
+                (obj_a, SequenceNumber::from(3)),
+                (obj_b, SequenceNumber::from(5)),
+            ],
+            txn_digest,
+        )];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 1, "Should have 1 result");
+        assert_eq!(result[0].1.len(), 2, "Should attach 2 state blobs");
+        assert!(result[0].1.contains_key(&obj_a), "Should contain object A");
+        assert!(result[0].1.contains_key(&obj_b), "Should contain object B");
+    }
+
+    #[test]
+    fn test_build_replay_messages_mixed_v2_and_higher() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+        let txn_digest = TransactionDigest::random();
+
+        // Add object A v3 to collector
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // Transaction requires A v3 (should attach) and B v2 (should skip)
+        let uncommitted_txns = vec![create_test_log_record(
+            101,
+            10,
+            0,
+            vec![
+                (obj_a, SequenceNumber::from(3)),
+                (obj_b, SequenceNumber::from(2)), // initial version
+            ],
+            txn_digest,
+        )];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 1, "Should have 1 result");
+        assert_eq!(
+            result[0].1.len(),
+            1,
+            "Should attach only 1 state blob (not v2)"
+        );
+        assert!(result[0].1.contains_key(&obj_a), "Should contain object A");
+        assert!(
+            !result[0].1.contains_key(&obj_b),
+            "Should NOT contain object B (v2)"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_missing_state_in_collector() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn_digest = TransactionDigest::random();
+
+        // Don't add object to collector - it's missing
+
+        // Transaction requires object A version 3 (not in collector)
+        let uncommitted_txns = vec![create_test_log_record(
+            101,
+            10,
+            0,
+            vec![(obj_a, SequenceNumber::from(3))],
+            txn_digest,
+        )];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 1, "Should have 1 result");
+        assert_eq!(
+            result[0].1.len(),
+            0,
+            "Should have no state blobs (missing from collector)"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_cross_proxy_dependencies() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let txn1_digest = TransactionDigest::random();
+        let txn2_digest = TransactionDigest::random();
+
+        // Proxy 0 produces A v3
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // Txn1 (proxy 0): requires A v3, produces A v4
+        // Txn2 (proxy 1): requires A v4 (cross-proxy dependency)
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                101,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(3))],
+                txn1_digest,
+            ),
+            create_test_log_record(
+                102,
+                10,
+                1,
+                vec![(obj_a, SequenceNumber::from(4))],
+                txn2_digest,
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 2, "Should have 2 results");
+        assert_eq!(result[0].1.len(), 1, "Txn1 should attach A v3 from proxy 0");
+        assert_eq!(
+            result[1].1.len(),
+            0,
+            "Txn2 should skip A v4 (produced by txn1)"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_preserves_consensus_order() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+
+        // Add objects to collector
+        for v in 3..=6 {
+            add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(v));
+        }
+
+        // Create transactions in consensus order
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                101,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(3))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                102,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(4))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                103,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(5))],
+                TransactionDigest::random(),
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 3, "Should have 3 results");
+        // Verify consensus indices are preserved in order
+        assert_eq!(result[0].0.consensus_index, Some(101));
+        assert_eq!(result[1].0.consensus_index, Some(102));
+        assert_eq!(result[2].0.consensus_index, Some(103));
+    }
+
+    #[test]
+    fn test_build_replay_messages_same_batch_out_of_order_versions() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+
+        // SAME consensus_index (same batch), but out-of-order version touching
+        // Different objects with different version numbers
+        // Txn 1: requires A v4 → produces A v5
+        // Txn 2: requires B v3 → produces B v4
+        // This shows that same-batch txns can have "out of order" version numbers for different objects
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(4));
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(3));
+
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(4))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_b, SequenceNumber::from(3))],
+                TransactionDigest::random(),
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 2, "Should have 2 results");
+        // Both should attach their required states (different objects)
+        assert_eq!(result[0].1.len(), 1, "Txn 1 should attach A v4");
+        assert!(
+            result[0].1.contains_key(&obj_a),
+            "Txn 1 should have object A"
+        );
+        assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(4));
+
+        assert_eq!(result[1].1.len(), 1, "Txn 2 should attach B v3");
+        assert!(
+            result[1].1.contains_key(&obj_b),
+            "Txn 2 should have object B"
+        );
+        assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(3));
+    }
+
+    #[test]
+    fn test_build_replay_messages_same_batch_dependency_chain() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+
+        // Add initial version to collector
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+
+        // SAME consensus_index (same batch), with dependency chain
+        // Txn 1: requires v3, will produce v4
+        // Txn 2: requires v4 (produced by Txn 1)
+        // Txn 3: requires v5 (produced by Txn 2)
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(3))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(4))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_a, SequenceNumber::from(5))],
+                TransactionDigest::random(),
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 3, "Should have 3 results");
+        // Only first transaction should attach state blob
+        assert_eq!(result[0].1.len(), 1, "Txn 1 should attach A v3");
+        assert_eq!(
+            result[1].1.len(),
+            0,
+            "Txn 2 should skip A v4 (produced by Txn 1)"
+        );
+        assert_eq!(
+            result[2].1.len(),
+            0,
+            "Txn 3 should skip A v5 (produced by Txn 2)"
+        );
+    }
+
+    #[test]
+    fn test_build_replay_messages_same_batch_interleaved_objects() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+
+        // Simplified scenario: Each proxy has ONE object
+        // Proxy 1: A v5
+        // Proxy 0: B v6
+        add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(5));
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(6));
+
+        // SAME consensus_index, each txn needs a state from a different proxy
+        // Txn 1 (from Proxy 1): requires A v5 (own proxy), will produce A v6
+        // Txn 2 (from Proxy 0): requires B v6 (own proxy), will produce B v7
+        // Shows that same-batch txns can access their own proxy's states
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                100,
+                10,
+                1,
+                vec![(obj_a, SequenceNumber::from(5))],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![(obj_b, SequenceNumber::from(6))],
+                TransactionDigest::random(),
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 2, "Should have 2 results");
+
+        // Txn 1 should attach A v5
+        assert_eq!(result[0].1.len(), 1, "Txn 1 should attach 1 state blob");
+        assert!(
+            result[0].1.contains_key(&obj_a),
+            "Txn 1 should have object A"
+        );
+        assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(5));
+
+        // Txn 2 should attach B v6
+        assert_eq!(result[1].1.len(), 1, "Txn 2 should attach 1 state blob");
+        assert!(
+            result[1].1.contains_key(&obj_b),
+            "Txn 2 should have object B"
+        );
+        assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(6));
+    }
+
+    #[test]
+    fn test_build_replay_messages_same_batch_partial_production() {
+        let collector = StateCollector::new(3);
+        let obj_a = ObjectID::random();
+        let obj_b = ObjectID::random();
+        let obj_c = ObjectID::random();
+
+        // Realistic scenario: different proxies have different objects
+        // Proxy 0 has A v3 and C v5
+        // Proxy 1 has B v4
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_c, SequenceNumber::from(5));
+        add_object_to_collector(&collector, 1, obj_b, SequenceNumber::from(4));
+
+        // SAME consensus_index
+        // Txn 1: requires A v3, C v5 → produces A v6, C v6 (max(3,5)+1=6)
+        // Txn 2: requires A v6 (produced by Txn 1), B v4 → produces A v7, B v7 (max(6,4)+1=7)
+        // Shows that production tracking works correctly: A v6 is skipped, B v4 is attached
+        let uncommitted_txns = vec![
+            create_test_log_record(
+                100,
+                10,
+                0,
+                vec![
+                    (obj_a, SequenceNumber::from(3)),
+                    (obj_c, SequenceNumber::from(5)),
+                ],
+                TransactionDigest::random(),
+            ),
+            create_test_log_record(
+                100,
+                10,
+                1,
+                vec![
+                    (obj_a, SequenceNumber::from(6)), // Produced by Txn 1, should be skipped
+                    (obj_b, SequenceNumber::from(4)), // From proxy 1, should be attached
+                ],
+                TransactionDigest::random(),
+            ),
+        ];
+
+        let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
+            &uncommitted_txns,
+            &collector,
+        );
+
+        assert_eq!(result.len(), 2, "Should have 2 results");
+
+        // Txn 1 should attach both states
+        assert_eq!(result[0].1.len(), 2, "Txn 1 should attach 2 state blobs");
+        assert!(result[0].1.contains_key(&obj_a));
+        assert!(result[0].1.contains_key(&obj_c));
+
+        // Txn 2 should skip A v6 (produced by Txn 1) but attach B v4
+        assert_eq!(
+            result[1].1.len(),
+            1,
+            "Txn 2 should attach 1 state blob (only B v4)"
+        );
+        assert!(
+            !result[1].1.contains_key(&obj_a),
+            "Txn 2 should NOT have object A (produced by Txn 1)"
+        );
+        assert!(
+            result[1].1.contains_key(&obj_b),
+            "Txn 2 should have object B"
+        );
+        assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(4));
     }
 }

@@ -1070,11 +1070,7 @@ mod tests {
         let uncommitted = coordinator.collect_uncommitted_transactions(completed_up_to);
 
         // Should include 4, 5, 6, 7
-        assert_eq!(
-            uncommitted.len(),
-            4,
-            "Should include indices 4, 5, 6, 7"
-        );
+        assert_eq!(uncommitted.len(), 4, "Should include indices 4, 5, 6, 7");
 
         // Test watermark at 7 (all complete)
         let completed_up_to = 7;
@@ -1157,7 +1153,11 @@ mod tests {
             .iter()
             .map(|r| r.consensus_index.unwrap())
             .collect();
-        assert_eq!(indices, vec![3, 5, 8, 12, 15], "Should be in consensus order");
+        assert_eq!(
+            indices,
+            vec![3, 5, 8, 12, 15],
+            "Should be in consensus order"
+        );
     }
 
     #[test]
@@ -1197,10 +1197,17 @@ mod tests {
 
         // Should include indices 3, 4, 5
         // Note: transactions with None are treated as 0, so excluded (0 <= 2)
-        assert_eq!(uncommitted.len(), 3, "Should not include None consensus_index");
+        assert_eq!(
+            uncommitted.len(),
+            3,
+            "Should not include None consensus_index"
+        );
 
         for record in uncommitted {
-            assert!(record.consensus_index.is_some(), "Should only have Some values");
+            assert!(
+                record.consensus_index.is_some(),
+                "Should only have Some values"
+            );
             assert!(record.consensus_index.unwrap() > 2);
         }
     }
@@ -1288,7 +1295,11 @@ mod tests {
         let all_uncommitted = coordinator.collect_uncommitted_transactions(2);
 
         // Old approach: only proxy 0's transactions in epochs > 2 (index 5 in epoch 3)
-        assert_eq!(dirty_only.len(), 1, "drain_dirty_queue: epoch-based, only proxy 0");
+        assert_eq!(
+            dirty_only.len(),
+            1,
+            "drain_dirty_queue: epoch-based, only proxy 0"
+        );
         assert_eq!(dirty_only[0].consensus_index, Some(5));
 
         // New approach: all proxies' transactions with consensus_index > 2 (indices 3, 4, 5, 6)
@@ -1299,9 +1310,7 @@ mod tests {
         );
 
         // Verify new approach includes healthy proxy transactions
-        let has_proxy_1_txns = all_uncommitted
-            .iter()
-            .any(|r| r.destination_proxy == 1);
+        let has_proxy_1_txns = all_uncommitted.iter().any(|r| r.destination_proxy == 1);
         assert!(
             has_proxy_1_txns,
             "New approach should include healthy proxy transactions"
