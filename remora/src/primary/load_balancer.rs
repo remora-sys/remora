@@ -59,7 +59,7 @@ pub struct LoadBalancer<E: Executor> {
     /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
     standby_excluded: Arc<AtomicBool>,
     /// Shared mapping of (object, version) -> set of proxy indices that own this version
-    /// Multiple proxies can own the same version (e.g., after bridging transaction replay)
+    /// Multiple proxies can own the same version (e.g., after uncommitted transaction replay during recovery)
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<usize>>>,
     /// Reference to the collector for persisted version checks
     collector: Arc<StateCollector>,
@@ -169,28 +169,19 @@ where
             // This must happen BEFORE computing recovery plan to ensure atomicity.
             let failed_proxy_states = self.collector.get_versions_by_proxy(failed_proxy);
 
-            // CRITICAL: Compute recovery plan IMMEDIATELY after capturing states,
-            // while temp_state and version_ownership are still consistent.
-            // If epochs commit between these two calls, we get version mismatches
-            // (e.g., init transfer has v3, but replay message references v4).
-            let (bridging_txns, dirty_txns) =
-                self.recovery_coordinator.begin_recovery_with_bridging(
-                    failed_proxy as usize,
-                    persist_index,
-                    &self.collector,
-                );
+            // SIMPLIFIED RECOVERY: Collect ALL uncommitted transactions (no bridging computation)
+            // Uses watermark-based filtering for precise recovery boundaries
+            let uncommitted_txns = self.recovery_coordinator.begin_recovery_simple(persist_index);
 
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
                 state_count = failed_proxy_states.len(),
-                bridging_count = bridging_txns.len(),
-                dirty_count = dirty_txns.len(),
+                uncommitted_count = uncommitted_txns.len(),
                 persist_index,
-                "Captured atomic snapshot: {} states, {} bridging txns, {} dirty txns",
+                "Captured atomic snapshot: {} states, {} uncommitted txns (all proxies)",
                 failed_proxy_states.len(),
-                bridging_txns.len(),
-                dirty_txns.len()
+                uncommitted_txns.len()
             );
 
             // NOTE: Do NOT promote standby here! Promotion happens AFTER replay completes
@@ -274,8 +265,7 @@ where
                 failed_proxy,
                 standby_proxy,
                 failed_proxy_states,
-                bridging_txns,
-                dirty_txns,
+                uncommitted_txns,
             );
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
@@ -305,9 +295,8 @@ where
     }
 
     /// Start the replay process for a replacement proxy.
-    /// This method spawns a task to send bridging transactions (from healthy proxies) first,
-    /// then dirty transactions (from failed proxy) to the replacement proxy.
-    /// Also transfers all state versions owned by the failed proxy.
+    /// This method spawns a task to send ALL uncommitted transactions (from all proxies) to the
+    /// replacement proxy, along with initial state transfer for untouched objects.
     /// After all replay messages are sent, it promotes the standby to active.
     ///
     /// CRITICAL: Takes pre-computed recovery plan to ensure atomicity - computing it again
@@ -317,8 +306,7 @@ where
         failed_proxy: ProxyId,
         replacement_proxy: ProxyId,
         failed_proxy_states: Vec<(ObjectID, SequenceNumber)>,
-        bridging_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
-        dirty_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
+        uncommitted_txns: Vec<crate::recovery::LogRecord<E::Transaction>>,
     ) {
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
@@ -330,9 +318,8 @@ where
             tracing::info!(
                 failed_proxy,
                 replacement_proxy,
-                bridging_count = bridging_txns.len(),
-                dirty_count = dirty_txns.len(),
-                "Replay task spawned with pre-computed recovery plan"
+                uncommitted_count = uncommitted_txns.len(),
+                "Replay task spawned with simplified recovery plan (all uncommitted txns)"
             );
 
             let failed_proxy_id = failed_proxy; // Capture for use in closure
@@ -340,7 +327,7 @@ where
             // Recovery plan already computed in begin_recovery() to ensure atomicity
             // with failed_proxy_states capture. Don't recompute here!
 
-            if bridging_txns.is_empty() && dirty_txns.is_empty() {
+            if uncommitted_txns.is_empty() {
                 tracing::info!(failed_proxy, "No transactions to replay");
 
                 // No replay needed, but still promote standby to active
@@ -355,19 +342,18 @@ where
             tracing::info!(
                 failed_proxy,
                 replacement_proxy,
-                bridging_count = bridging_txns.len(),
-                dirty_count = dirty_txns.len(),
+                uncommitted_count = uncommitted_txns.len(),
                 state_transfer_count = failed_proxy_states.len(),
-                "Sending state transfer + bridging + dirty transactions to replacement proxy"
+                "Sending state transfer + uncommitted transactions to replacement proxy"
             );
 
             // Convert LogRecord to ReplayMsg and send to replacement proxy
             if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
                 // CRITICAL: First, transfer ALL states owned by failed proxy as initial snapshot.
                 //
-                // Problem: Dirty + bridging transactions only cover states actually used by those
+                // Problem: Uncommitted transactions only cover states actually used by those
                 // transactions. But the failed proxy may own many other state versions that aren't
-                // referenced. When healthy proxies redirect state requests to the standby, it won't
+                // referenced. When other proxies redirect state requests to the standby, it won't
                 // have those states!
                 //
                 // Solution: Send an initial batch containing all state blobs owned by the failed proxy.
@@ -380,32 +366,23 @@ where
                     failed_proxy_states.len()
                 );
 
-                // CRITICAL FIX: Identify "touched" objects that are handled by dirty/bridging txns
-                // Recovery plan: persist_state + dirty_txns + bridging_txns = complete state
-                // Initial transfer should ONLY include objects NOT touched by dirty/bridging
+                // SIMPLIFIED: Identify "touched" objects handled by uncommitted txns
+                // Initial transfer should ONLY include objects NOT touched by replay transactions
                 //
-                // Touched objects = any object appearing in:
-                // 1. Dirty transaction required_states (will get state blob or be produced)
-                // 2. Bridging transaction required_states (will get state blob or be produced)
-                // 3. Bridging transaction outputs (produced by execution)
-                //
-                // Untouched objects = objects owned by failed proxy but not involved in replay
+                // Touched objects = any object appearing in uncommitted transaction required_states
 
                 let mut touched_objects = std::collections::HashSet::new();
-                let mut touched_by_dirty_count = 0;
-                let mut touched_by_bridging_count = 0;
 
-                // Mark objects touched by dirty transactions
+                // Mark objects touched by uncommitted transactions
                 tracing::debug!(
-                    "Marking objects touched by {} dirty transactions",
-                    dirty_txns.len()
+                    "Marking objects touched by {} uncommitted transactions",
+                    uncommitted_txns.len()
                 );
-                for record in &dirty_txns {
+                for record in &uncommitted_txns {
                     for ((obj_id, version), _) in &record.required_states {
                         if touched_objects.insert(*obj_id) {
-                            touched_by_dirty_count += 1;
                             tracing::debug!(
-                                "Marked {:?} as touched by DIRTY txn (requires v{}, digest={:?})",
+                                "Marked {:?} as touched by uncommitted txn (requires v{}, digest={:?})",
                                 obj_id,
                                 version.value(),
                                 record.txn_digest
@@ -414,50 +391,27 @@ where
                     }
                 }
 
-                // Mark objects touched by bridging transactions (inputs and outputs)
-                tracing::debug!(
-                    "Marking objects touched by {} bridging transactions",
-                    bridging_txns.len()
-                );
-                for record in &bridging_txns {
-                    for ((obj_id, req_version), _) in &record.required_states {
-                        if touched_objects.insert(*obj_id) {
-                            touched_by_bridging_count += 1;
-                            tracing::debug!(
-                                "Marked {:?} as touched by BRIDGING txn (requires v{}, digest={:?})",
-                                obj_id, req_version.value(), record.txn_digest
-                            );
-                        }
-                        // Also mark the produced version's object (same object)
-                        // produced_version = req_version + 1, but it's the same object
-                    }
-                }
-
                 tracing::info!(
                     replacement_proxy,
                     touched_count = touched_objects.len(),
-                    touched_by_dirty = touched_by_dirty_count,
-                    touched_by_bridging = touched_by_bridging_count,
-                    "Identified {} objects touched by dirty/bridging transactions ({} by dirty, {} by bridging) - will exclude from initial transfer",
-                    touched_objects.len(),
-                    touched_by_dirty_count,
-                    touched_by_bridging_count
+                    "Identified {} objects touched by uncommitted transactions - will exclude from initial transfer",
+                    touched_objects.len()
                 );
 
-                // Compute bridging_productions for later use in Step 3.2
-                // This prevents fetching state blobs for versions produced by earlier bridging txns
+                // Compute productions from uncommitted txns
+                // This prevents fetching state blobs for versions produced by earlier uncommitted txns
                 // IMPORTANT: All objects in a transaction advance to max(all_req_versions) + 1
-                let mut bridging_productions = std::collections::HashSet::new();
+                let mut uncommitted_productions = std::collections::HashSet::new();
                 tracing::debug!(
-                    "Computing bridging_productions for {} bridging transactions",
-                    bridging_txns.len()
+                    "Computing uncommitted_productions for {} transactions",
+                    uncommitted_txns.len()
                 );
-                for record in &bridging_txns {
+                for record in &uncommitted_txns {
                     let produced_version = record.produced_version();
                     for ((obj_id, _req_version), _) in &record.required_states {
-                        bridging_productions.insert((*obj_id, produced_version));
+                        uncommitted_productions.insert((*obj_id, produced_version));
                         tracing::debug!(
-                            "Bridging txn {:?} will produce {:?} @ v{}",
+                            "Uncommitted txn {:?} will produce {:?} @ v{}",
                             record.txn_digest,
                             obj_id,
                             produced_version.value()
@@ -465,25 +419,25 @@ where
                     }
                 }
                 tracing::debug!(
-                    "Computed {} bridging production entries",
-                    bridging_productions.len()
+                    "Computed {} uncommitted production entries",
+                    uncommitted_productions.len()
                 );
 
                 // Fetch state blobs for all states owned by the failed proxy
-                // EXCEPT for "touched" objects that are handled by dirty/bridging transactions
+                // EXCEPT for "touched" objects that are handled by uncommitted transactions
                 // Note: get_object_for_proxy now strictly returns exact versions owned by this proxy
                 let mut initial_state_blobs = std::collections::BTreeMap::new();
                 let mut missing_states = Vec::new();
                 let mut excluded_for_replay = 0;
                 for (object_id, version) in &failed_proxy_states {
-                    // CRITICAL: Skip "touched" objects that appear in dirty/bridging transactions
+                    // CRITICAL: Skip "touched" objects that appear in uncommitted transactions
                     // These objects will be handled by:
-                    // - State blobs attached to dirty/bridging transactions
-                    // - Execution of bridging transactions (producing new versions)
+                    // - State blobs attached to uncommitted transactions
+                    // - Execution of uncommitted transactions (producing new versions)
                     // Initial transfer should only include "untouched" passive objects
                     if touched_objects.contains(object_id) {
                         tracing::debug!(
-                            "✗ Excluding {:?} v{} from initial transfer - touched by dirty/bridging txns",
+                            "✗ Excluding {:?} v{} from initial transfer - touched by uncommitted txns",
                             object_id,
                             version.value()
                         );
@@ -588,10 +542,9 @@ where
                     );
                 }
 
-                // Combine bridging and dirty transactions in order
-                // Bridging transactions must be replayed FIRST to regenerate missing versions
+                // SIMPLIFIED RECOVERY: Replay ALL uncommitted transactions in consensus order
                 // Clone the transactions so we can use them later to update states_to_proxy
-                let all_txns = bridging_txns.iter().chain(dirty_txns.iter()).cloned();
+                let all_txns = uncommitted_txns.iter().cloned();
 
                 // Group transactions by epoch and send one batch per epoch
                 let mut txns_by_epoch: std::collections::BTreeMap<
@@ -614,9 +567,9 @@ where
                 let initial_transfer_states: std::collections::HashSet<(ObjectID, SequenceNumber)> =
                     failed_proxy_states.iter().cloned().collect();
 
-                // Note: bridging_productions was already computed above for excluding objects
+                // Note: uncommitted_productions was already computed above for excluding objects
                 // from initial transfer, and is reused here to skip fetching state blobs for
-                // versions that will be produced by earlier bridging transactions.
+                // versions that will be produced by earlier uncommitted transactions.
 
                 // CAUSALITY VALIDATION: Track highest STATE BLOB version per object
                 // We only track actual state blobs sent, NOT produced versions from transaction execution.
@@ -636,15 +589,15 @@ where
                         let transaction = (*record.transaction).clone();
 
                         // Fetch state blobs from StateCollector when available
-                        // OPTIMIZATION: Skip state blobs for dirty transactions (from failed proxy)
-                        // since they're already in the initial transfer. Only fetch for bridging
-                        // transactions (from healthy proxies).
+                        // OPTIMIZATION: Skip state blobs for transactions from failed proxy
+                        // since they're already in the initial transfer. Only fetch for uncommitted
+                        // transactions from other proxies.
                         let mut state_blobs = std::collections::BTreeMap::new();
                         let is_from_failed_proxy =
                             record.destination_proxy == failed_proxy_id as usize;
 
-                        // Only fetch state blobs for bridging transactions
-                        // Dirty transaction states are already in initial transfer
+                        // Only fetch state blobs for transactions from other proxies
+                        // Failed proxy transaction states are already in initial transfer
                         if !is_from_failed_proxy {
                             for (object_id, version) in record.required_states.keys() {
                                 // Skip if already sent in this replay batch
@@ -658,18 +611,18 @@ where
                                 if *version == SequenceNumber::from(2) {
                                     continue;
                                 }
-                                // Skip if this version will be produced by an earlier bridging transaction
+                                // Skip if this version will be produced by an earlier uncommitted transaction
                                 // This prevents duplicate state blobs when TxnA produces V3 and TxnB requires V3
-                                if bridging_productions.contains(&(*object_id, *version)) {
+                                if uncommitted_productions.contains(&(*object_id, *version)) {
                                     tracing::debug!(
-                                        "Skipping state blob fetch for {:?} v{} - will be produced by earlier bridging txn",
+                                        "Skipping state blob fetch for {:?} v{} - will be produced by earlier uncommitted txn",
                                         object_id,
                                         version.value()
                                     );
                                     continue;
                                 }
 
-                                // CRITICAL: Fetch from the ORIGINAL proxy that executed this bridging transaction
+                                // CRITICAL: Fetch from the ORIGINAL proxy that executed this uncommitted transaction
                                 // Using get_object_for_proxy ensures we get the exact version from the proxy's
                                 // snapshot at persist_index, not the latest version from merged_state which may
                                 // have advanced due to epoch commits during recovery.
@@ -687,7 +640,7 @@ where
                                         sent_blobs.insert((*object_id, *version));
 
                                         tracing::debug!(
-                                            "Fetched BRIDGING state blob: {:?} v{} from source proxy {} \
+                                            "Fetched state blob: {:?} v{} from source proxy {} \
                                              (txn digest={:?}, epoch={}, consensus_index={:?})",
                                             object_id, version.value(), source_proxy,
                                             record.txn_digest, epoch.0, record.consensus_index
@@ -714,10 +667,10 @@ where
                             let blob_version = object.version();
                             if let Some(prev_blob_version) = highest_blob_version.get(obj_id) {
                                 if blob_version <= *prev_blob_version {
-                                    let txn_type = if is_from_failed_proxy {
-                                        "DIRTY (from failed proxy)"
+                                    let txn_source = if is_from_failed_proxy {
+                                        "from failed proxy"
                                     } else {
-                                        "BRIDGING (from healthy proxy)"
+                                        "from other proxy"
                                     };
                                     tracing::error!(
                                         "STATE BLOB CAUSALITY VIOLATION DETECTED!\n\
@@ -729,7 +682,7 @@ where
                                          State blobs must be in increasing order!\n\
                                          \n\
                                          Transaction details:\n\
-                                         - Type: {}\n\
+                                         - Source: {}\n\
                                          - Digest: {:?}\n\
                                          - Epoch: {}\n\
                                          - Consensus index: {:?}\n\
@@ -739,7 +692,7 @@ where
                                         obj_id,
                                         prev_blob_version.value(),
                                         blob_version.value(),
-                                        txn_type,
+                                        txn_source,
                                         record.txn_digest,
                                         epoch.0,
                                         record.consensus_index,
@@ -812,12 +765,12 @@ where
                     replacement_proxy
                 );
 
-                // CRITICAL: Update states_to_proxy to record that standby now owns versions from bridging txns
+                // CRITICAL: Update states_to_proxy to record that standby now owns versions from uncommitted txns
                 //
-                // Bridging transactions don't go through normal forwarding path, so get_missing_states_for_transaction()
-                // is never called. We need to manually update states_to_proxy to record that the standby now owns
-                // all versions produced by bridging transactions. This prevents unnecessary state transfers when
-                // future transactions get routed to the standby.
+                // Uncommitted transactions replayed to the standby don't go through normal forwarding path, so
+                // get_missing_states_for_transaction() is never called. We need to manually update states_to_proxy
+                // to record that the standby now owns all versions produced by uncommitted transactions.
+                // This prevents unnecessary state transfers when future transactions get routed to the standby.
                 //
                 // IMPORTANT: Calculate ExecutorIndex AFTER promotion (without standby exclusion)
                 // We're about to promote the standby, so we need its ExecutorIndex in the post-promotion state.
@@ -830,8 +783,8 @@ where
                         .unwrap_or(replacement_proxy)
                 };
 
-                let mut bridging_versions_added = 0;
-                for record in &bridging_txns {
+                let mut versions_added = 0;
+                for record in &uncommitted_txns {
                     let produced_version = record.produced_version();
                     for ((obj_id, _req_version), _) in &record.required_states {
                         states_to_proxy
@@ -843,16 +796,16 @@ where
                             (*obj_id, produced_version),
                             replacement_proxy_index
                         );
-                        bridging_versions_added += 1;
+                        versions_added += 1;
                     }
                 }
 
                 tracing::info!(
                     replacement_proxy,
                     replacement_proxy_index,
-                    bridging_versions_added,
-                    "Updated states_to_proxy: added {} versions from bridging transactions to standby proxy",
-                    bridging_versions_added
+                    versions_added,
+                    "Updated states_to_proxy: added {} versions from uncommitted transactions to standby proxy",
+                    versions_added
                 );
 
                 // CRITICAL FIX: Promote standby AFTER all replay messages are sent.
@@ -873,16 +826,16 @@ where
 
                 // Note on states_to_proxy updates:
                 //
-                // - Bridging transactions: Already updated above. Both healthy proxies AND standby now
+                // - Uncommitted transactions: Already updated above. Both the original proxy AND standby now
                 //   own these versions in the HashSet. This allows future transactions to execute locally
                 //   on either proxy without unnecessary state transfers.
                 //
-                // - Dirty transactions: Will be updated naturally through normal forwarding as the standby
+                // - Future transactions: Will be updated naturally through normal forwarding as the standby
                 //   executes new transactions. Since standby is now promoted, future transactions will call
                 //   get_missing_states_for_transaction() which updates states_to_proxy.
                 //
                 // With HashSet-based ownership, multiple proxies can own the same version simultaneously,
-                // which is correct after bridging transaction replay.
+                // which is correct after uncommitted transaction replay.
             } else {
                 tracing::error!(
                     "Replacement proxy {} not found in connections",
