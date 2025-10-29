@@ -140,8 +140,8 @@ where
         // If this single item is too large, we need to split it
         if item_size > effective_max_size {
             tracing::warn!(
-                "Single ReplayMsg (consensus_index={}) is too large ({} bytes > {} bytes), splitting state blobs",
-                item.consensus_index,
+                "Single ReplayMsg (epoch_id={}) is too large ({} bytes > {} bytes), splitting state blobs",
+                item.epoch_id.0,
                 item_size,
                 effective_max_size
             );
@@ -245,7 +245,7 @@ where
 
     // Create a base message size estimate (transaction + required_versions)
     let base_msg = ReplayMsg {
-        consensus_index: msg.consensus_index,
+        epoch_id: msg.epoch_id,
         transaction: msg.transaction.clone(),
         required_versions: msg.required_versions.clone(),
         state_blobs: BTreeMap::new(),
@@ -265,7 +265,7 @@ where
         chunks.push(ReplayBatch {
             epoch,
             items: vec![ReplayMsg {
-                consensus_index: msg.consensus_index,
+                epoch_id: msg.epoch_id,
                 transaction: msg.transaction.clone(),
                 required_versions: msg.required_versions.clone(),
                 state_blobs: BTreeMap::new(),
@@ -293,7 +293,7 @@ where
         chunks.push(ReplayBatch {
             epoch,
             items: vec![ReplayMsg {
-                consensus_index: msg.consensus_index,
+                epoch_id: msg.epoch_id,
                 transaction: msg.transaction,
                 required_versions: msg.required_versions,
                 state_blobs: current_state_blobs,
@@ -307,7 +307,7 @@ where
         let mut current_state_blobs = BTreeMap::new();
         let mut current_size = estimate_empty_batch_size::<T>(&epoch)
             + estimate_replay_msg_size(&ReplayMsg::<T> {
-                consensus_index: msg.consensus_index,
+                epoch_id: msg.epoch_id,
                 transaction: None,
                 required_versions: Vec::new(),
                 state_blobs: BTreeMap::new(),
@@ -322,7 +322,7 @@ where
                 chunks.push(ReplayBatch {
                     epoch,
                     items: vec![ReplayMsg {
-                        consensus_index: msg.consensus_index,
+                        epoch_id: msg.epoch_id,
                         transaction: None,
                         required_versions: Vec::new(),
                         state_blobs: current_state_blobs,
@@ -331,7 +331,7 @@ where
                 current_state_blobs = BTreeMap::new();
                 current_size = estimate_empty_batch_size::<T>(&epoch)
                     + estimate_replay_msg_size(&ReplayMsg::<T> {
-                        consensus_index: msg.consensus_index,
+                        epoch_id: msg.epoch_id,
                         transaction: None,
                         required_versions: Vec::new(),
                         state_blobs: BTreeMap::new(),
@@ -347,7 +347,7 @@ where
             chunks.push(ReplayBatch {
                 epoch,
                 items: vec![ReplayMsg {
-                    consensus_index: msg.consensus_index,
+                    epoch_id: msg.epoch_id,
                     transaction: None,
                     required_versions: Vec::new(),
                     state_blobs: current_state_blobs,
@@ -357,8 +357,8 @@ where
     }
 
     tracing::debug!(
-        "Split large ReplayMsg (consensus_index={}) into {} chunks",
-        msg.consensus_index,
+        "Split large ReplayMsg (epoch_id={}) into {} chunks",
+        msg.epoch_id.0,
         chunks.len()
     );
 
@@ -405,7 +405,7 @@ mod tests {
     fn test_small_batch_no_chunking() {
         // Create a small batch that should not be chunked
         let msg = ReplayMsg::<MockTransaction> {
-            consensus_index: 1,
+            epoch_id: EpochId(1),
             transaction: None,
             required_versions: vec![],
             state_blobs: BTreeMap::new(),

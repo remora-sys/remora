@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -50,14 +50,12 @@ pub struct LoadBalancer<E: Executor> {
     proxy_mode: ProxyMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
-    /// Next epoch id to broadcast at consensus boundary (Phase 2 default: every batch)
-    next_epoch_id: u64,
-    /// Atomic current epoch id shared with forwarders for logging
-    current_epoch_atomic: Arc<AtomicU64>,
+    /// Current epoch counter (increments every 10k transactions)
+    epoch_counter: u64,
+    /// Count of transactions in current epoch
+    txn_count_in_epoch: usize,
     /// Sender to notify the checkpoint collector of new epochs
     epoch_tx: tokio::sync::mpsc::Sender<EpochId>,
-    /// Cumulative transactions since last checkpoint
-    txns_since_last_epoch: usize,
     /// In-memory per-epoch transaction logger
     epoch_logger: Arc<EpochLogger<E::Transaction>>,
     /// Recovery coordinator for failure handling
@@ -71,12 +69,6 @@ pub struct LoadBalancer<E: Executor> {
     collector: Arc<StateCollector>,
     /// Configuration for message chunking to handle large recovery messages
     chunking_config: ChunkingConfig,
-    /// Target batch size for consensus batches sent to proxies
-    target_batch_size: usize,
-    /// Current consensus index counter
-    consensus_index_counter: u64,
-    /// Count of transactions assigned to current consensus_index
-    current_batch_count: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -96,17 +88,15 @@ where
         epoch_logger: Arc<EpochLogger<E::Transaction>>,
         collector: Arc<StateCollector>,
         max_message_size: usize,
-        target_batch_size: usize,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
         let recovery_coordinator = RecoveryCoordinator::new(epoch_logger.clone());
         let chunking_config = ChunkingConfig::new(max_message_size);
         tracing::info!(
-            "LoadBalancer: max_message_size={} bytes, effective_max_size={} bytes, target_batch_size={} txns",
+            "LoadBalancer: max_message_size={} bytes, effective_max_size={} bytes",
             chunking_config.max_message_size,
             chunking_config.effective_max_size(),
-            target_batch_size
         );
         Self {
             _phantom: PhantomData,
@@ -115,19 +105,15 @@ where
             policy,
             proxy_mode,
             metrics,
-            next_epoch_id: 1,
-            current_epoch_atomic: Arc::new(AtomicU64::new(0)),
+            epoch_counter: 1,
+            txn_count_in_epoch: 0,
             epoch_tx,
-            txns_since_last_epoch: 0,
             epoch_logger,
             recovery_coordinator,
             standby_excluded: Arc::new(AtomicBool::new(true)),
             states_to_proxy,
             collector,
             chunking_config,
-            target_batch_size,
-            consensus_index_counter: 1,
-            current_batch_count: 0,
         }
     }
 
@@ -148,8 +134,8 @@ where
             .unwrap_or(failed_proxy);
 
         if standby_proxy != failed_proxy {
-            // Use the failed proxy's own persist_index
-            let persist_index = self.collector.get_proxy_persist_index(failed_proxy);
+            // Use the failed proxy's own persist_index as epoch_id
+            let persist_epoch = EpochId(self.collector.get_proxy_persist_index(failed_proxy));
 
             // CRITICAL FIX: Wait for in-flight forwarding tasks to complete their epoch logger appends.
             //
@@ -179,14 +165,14 @@ where
             // Uses watermark-based filtering for precise recovery boundaries
             let uncommitted_txns = self
                 .recovery_coordinator
-                .begin_recovery_simple(persist_index);
+                .begin_recovery_simple(persist_epoch);
 
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
                 state_count = failed_proxy_states.len(),
                 uncommitted_count = uncommitted_txns.len(),
-                persist_index,
+                persist_epoch = persist_epoch.0,
                 "Captured atomic snapshot: {} states, {} uncommitted txns (all proxies)",
                 failed_proxy_states.len(),
                 uncommitted_txns.len()
@@ -343,7 +329,7 @@ where
                             required_version = version.value(),
                             prev_highest = prev_highest.value(),
                             txn_digest = ?record.txn_digest,
-                            consensus_index = ?record.consensus_index,
+                            epoch = record.epoch.0,
                             "VIOLATION: Partial dependency ordering broken - transaction requires lower version after higher version was seen for same object"
                         );
                     }
@@ -531,7 +517,7 @@ where
                         let transaction = (*record.transaction).clone();
 
                         replay_items.push(crate::executor::api::ReplayMsg {
-                            consensus_index: record.consensus_index.unwrap_or(0),
+                            epoch_id: record.epoch,
                             transaction: Some(transaction),
                             required_versions: record.required_states.keys().cloned().collect(),
                             state_blobs,
@@ -680,17 +666,19 @@ where
     fn initialize_processors(
         &self,
     ) -> (
-        Sender<(u64, Vec<RemoraTransaction<E>>)>, // owned_txn_sender with consensus index
-        Sender<(u64, RemoraTransaction<E>)>,      // shared_txn_sender with consensus index
+        Sender<(EpochId, Vec<RemoraTransaction<E>>)>, // owned_txn_sender with epoch_id
+        Sender<(EpochId, RemoraTransaction<E>)>,      // shared_txn_sender with epoch_id
     ) {
         // Create channels for transactions
-        let (owned_txn_sender, owned_txn_receiver) =
-            tokio::sync::mpsc::channel::<(u64, Vec<RemoraTransaction<E>>)>(DEFAULT_CHANNEL_SIZE);
+        let (owned_txn_sender, owned_txn_receiver) = tokio::sync::mpsc::channel::<(
+            EpochId,
+            Vec<RemoraTransaction<E>>,
+        )>(DEFAULT_CHANNEL_SIZE);
         let (shared_txn_sender, shared_txn_receiver) =
-            tokio::sync::mpsc::channel::<(u64, RemoraTransaction<E>)>(DEFAULT_CHANNEL_SIZE);
+            tokio::sync::mpsc::channel::<(EpochId, RemoraTransaction<E>)>(DEFAULT_CHANNEL_SIZE);
         let (version_assignment_sender, version_assignment_receiver) =
             tokio::sync::mpsc::channel::<(
-                u64,
+                EpochId,
                 RemoraTransaction<E>,
                 Vec<(
                     sui_types::base_types::ObjectID,
@@ -708,7 +696,6 @@ where
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
             epoch_logger: Some(self.epoch_logger.clone()),
-            current_epoch: self.current_epoch_atomic.clone(),
             _phantom: PhantomData,
         };
         version_assignment_processor
@@ -780,7 +767,6 @@ where
         let (owned_txn_sender, shared_txn_sender) = self.initialize_processors();
 
         let mut txn_cnt = 0;
-        let mut _last_consensus_index: u64 = 0;
         loop {
             tokio::select! {
                 Some(transactions) = self.rx_committed_txns.recv() => {
@@ -789,72 +775,47 @@ where
                         self.metrics.register_start_time();
                     }
 
-                    // Process transactions one by one, assigning consensus_index strictly
-                    // to ensure batches don't exceed target_batch_size
-                    let num_transactions = transactions.len();
                     for transaction in transactions {
+                        // Calculate current epoch per transaction to ensure precise 10k transaction epochs
+                        let current_epoch = EpochId(self.epoch_counter);
+
                         self.metrics.update_metrics(transaction.timestamp(), "lb-ingress");
 
-                        // Get current consensus index for this transaction
-                        let consensus_index = self.consensus_index_counter;
-
-                        // Increment counter for current batch
-                        self.current_batch_count += 1;
-
-                        // Check if we've reached target batch size
-                        if self.current_batch_count >= self.target_batch_size {
-                            tracing::debug!(
-                                "LoadBalancer: Batch {} completed with {} transactions, advancing to batch {}",
-                                consensus_index,
-                                self.current_batch_count,
-                                self.consensus_index_counter + 1
-                            );
-                            self.consensus_index_counter += 1;
-                            self.current_batch_count = 0;
-                        }
-
-                        _last_consensus_index = consensus_index;
-
-                        // Send transaction to appropriate forwarder based on type
+                        // Send transaction with current epoch_id
                         let shared_object_ids = transaction.shared_objects();
                         if shared_object_ids.is_empty() {
                             // Owned-only transaction - send as single-element vec to maintain interface
-                            if let Err(e) = owned_txn_sender.send((consensus_index, vec![transaction])).await {
+                            if let Err(e) = owned_txn_sender.send((current_epoch, vec![transaction])).await {
                                 tracing::error!("Failed to send owned transaction: {:?}", e);
                             }
                         } else {
                             // Shared-object transaction
-                            if let Err(e) = shared_txn_sender.send((consensus_index, transaction)).await {
+                            if let Err(e) = shared_txn_sender.send((current_epoch, transaction)).await {
                                 tracing::error!("Failed to send shared transaction: {:?}", e);
                             }
                         }
-                    }
 
-                    // Phase 2+: Broadcast checkpoint when cumulative txns reach threshold
-                    self.txns_since_last_epoch = self.txns_since_last_epoch.saturating_add(num_transactions);
+                        // Increment transaction count for current epoch
+                        self.txn_count_in_epoch += 1;
 
-                    const EPOCH_TXN_THRESHOLD: usize = 10_000;
-                    if self.txns_since_last_epoch >= EPOCH_TXN_THRESHOLD {
-                        self.txns_since_last_epoch = 0;
-                        let epoch = EpochId(self.next_epoch_id);
-                        // Notify collector first; if channel is full, log and continue
-                        if let Err(e) = self.epoch_tx.try_send(epoch) {
-                            tracing::warn!("Failed to notify collector of epoch {:?}: {:?}", epoch, e);
+                        // Check if we've reached epoch threshold (10k transactions)
+                        // When threshold is reached, the current transaction belongs to the completed epoch,
+                        // and the next transaction will start a new epoch
+                        const EPOCH_TXN_THRESHOLD: usize = 10_000;
+                        if self.txn_count_in_epoch >= EPOCH_TXN_THRESHOLD {
+                            // Broadcast checkpoint for the epoch that just completed
+                            // Notify collector first; if channel is full, log and continue
+                            if let Err(e) = self.epoch_tx.try_send(current_epoch) {
+                                tracing::warn!("Failed to notify collector of epoch {:?}: {:?}", current_epoch, e);
+                            }
+
+                            // Increment epoch counter for the next transaction
+                            // This ensures: transactions 1-10k get epoch 1, transactions 10,001-20k get epoch 2, etc.
+                            self.epoch_counter += 1;
+                            self.txn_count_in_epoch = 0;
+
+                            self.broadcast_checkpoint(current_epoch).await;
                         }
-
-                        // CRITICAL FIX: Update epoch counter BEFORE broadcast to prevent transaction spillover.
-                        //
-                        // Bug: If we update current_epoch_atomic AFTER broadcast_checkpoint completes,
-                        // transactions forwarded during the broadcast window will be tagged with the OLD
-                        // epoch ID. This causes epoch logs to grow unboundedly - later epochs accumulate
-                        // spillover from all previous broadcasts.
-                        //
-                        // Solution: Increment and store the next epoch ID immediately, so any transactions
-                        // forwarded during broadcast are correctly tagged with the new epoch.
-                        self.next_epoch_id += 1;
-                        self.current_epoch_atomic.store(self.next_epoch_id, Ordering::SeqCst);
-
-                        self.broadcast_checkpoint(epoch).await;
                     }
                 }
 
@@ -982,7 +943,6 @@ mod tests {
 
     // Helper to create a test LogRecord
     fn create_test_log_record(
-        consensus_index: u64,
         epoch: u64,
         required_states: Vec<(ObjectID, SequenceNumber)>,
         txn_digest: TransactionDigest,
@@ -1003,7 +963,6 @@ mod tests {
         );
 
         LogRecord {
-            consensus_index: Some(consensus_index),
             epoch: EpochId(epoch),
             transaction: Arc::new(txn_with_ts),
             required_states: required_states_map,
@@ -1036,7 +995,6 @@ mod tests {
 
         // Transaction requires object A version 2 (initial version)
         let uncommitted_txns = vec![create_test_log_record(
-            101,
             10,
             vec![(obj_a, SequenceNumber::from(2))],
             txn_digest,
@@ -1066,7 +1024,6 @@ mod tests {
 
         // Transaction requires object A version 3
         let uncommitted_txns = vec![create_test_log_record(
-            101,
             10,
             vec![(obj_a, SequenceNumber::from(3))],
             txn_digest,
@@ -1096,8 +1053,8 @@ mod tests {
         // Transaction 1: requires A v3, will produce A v4
         // Transaction 2: requires A v4 (produced by txn 1)
         let uncommitted_txns = vec![
-            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
-            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1127,9 +1084,9 @@ mod tests {
 
         // Chain: Txn1 (requires v3) → v4, Txn2 (requires v4) → v5, Txn3 (requires v5) → v6
         let uncommitted_txns = vec![
-            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
-            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
-            create_test_log_record(103, 10, vec![(obj_a, SequenceNumber::from(5))], txn3_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(5))], txn3_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1156,7 +1113,6 @@ mod tests {
 
         // Transaction on proxy 0 requires both A v3 and B v5
         let uncommitted_txns = vec![create_test_log_record(
-            101,
             10,
             vec![
                 (obj_a, SequenceNumber::from(3)),
@@ -1188,7 +1144,6 @@ mod tests {
 
         // Transaction requires A v3 (should attach) and B v2 (should skip)
         let uncommitted_txns = vec![create_test_log_record(
-            101,
             10,
             vec![
                 (obj_a, SequenceNumber::from(3)),
@@ -1225,7 +1180,6 @@ mod tests {
 
         // Transaction requires object A version 3 (not in collector)
         let uncommitted_txns = vec![create_test_log_record(
-            101,
             10,
             vec![(obj_a, SequenceNumber::from(3))],
             txn_digest,
@@ -1257,8 +1211,8 @@ mod tests {
         // Txn1 (proxy 0): requires A v3, produces A v4
         // Txn2 (proxy 1): requires A v4 (cross-proxy dependency)
         let uncommitted_txns = vec![
-            create_test_log_record(101, 10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
-            create_test_log_record(102, 10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(3))], txn1_digest),
+            create_test_log_record(10, vec![(obj_a, SequenceNumber::from(4))], txn2_digest),
         ];
 
         let result = LoadBalancer::<TestExecutor>::build_replay_messages_with_state_blobs(
@@ -1288,19 +1242,16 @@ mod tests {
         // Create transactions in consensus order
         let uncommitted_txns = vec![
             create_test_log_record(
-                101,
                 10,
                 vec![(obj_a, SequenceNumber::from(3))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                102,
                 10,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                103,
                 10,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
@@ -1313,10 +1264,10 @@ mod tests {
         );
 
         assert_eq!(result.len(), 3, "Should have 3 results");
-        // Verify consensus indices are preserved in order
-        assert_eq!(result[0].0.consensus_index, Some(101));
-        assert_eq!(result[1].0.consensus_index, Some(102));
-        assert_eq!(result[2].0.consensus_index, Some(103));
+        // Verify epochs are preserved in order
+        assert_eq!(result[0].0.epoch.0, 10);
+        assert_eq!(result[1].0.epoch.0, 10);
+        assert_eq!(result[2].0.epoch.0, 10);
     }
 
     #[test]
@@ -1325,23 +1276,21 @@ mod tests {
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
 
-        // SAME consensus_index (same batch), but out-of-order version touching
+        // SAME epoch, but out-of-order version touching
         // Different objects with different version numbers
         // Txn 1: requires A v4 → produces A v5
         // Txn 2: requires B v3 → produces B v4
-        // This shows that same-batch txns can have "out of order" version numbers for different objects
+        // This shows that same-epoch txns can have "out of order" version numbers for different objects
         add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(4));
         add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(3));
 
         let uncommitted_txns = vec![
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_b, SequenceNumber::from(3))],
                 TransactionDigest::random(),
@@ -1378,25 +1327,22 @@ mod tests {
         // Add initial version to collector
         add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
 
-        // SAME consensus_index (same batch), with dependency chain
+        // SAME epoch (same batch), with dependency chain
         // Txn 1: requires v3, will produce v4
         // Txn 2: requires v4 (produced by Txn 1)
         // Txn 3: requires v5 (produced by Txn 2)
         let uncommitted_txns = vec![
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_a, SequenceNumber::from(3))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_a, SequenceNumber::from(4))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
@@ -1435,19 +1381,17 @@ mod tests {
         add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(5));
         add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(6));
 
-        // SAME consensus_index, each txn needs a state from a different proxy
+        // SAME epoch, each txn needs a state from a different proxy
         // Txn 1 (from Proxy 1): requires A v5 (own proxy), will produce A v6
         // Txn 2 (from Proxy 0): requires B v6 (own proxy), will produce B v7
-        // Shows that same-batch txns can access their own proxy's states
+        // Shows that same-epoch txns can access their own proxy's states
         let uncommitted_txns = vec![
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                100,
                 10,
                 vec![(obj_b, SequenceNumber::from(6))],
                 TransactionDigest::random(),
@@ -1492,13 +1436,12 @@ mod tests {
         add_object_to_collector(&collector, 0, obj_c, SequenceNumber::from(5));
         add_object_to_collector(&collector, 1, obj_b, SequenceNumber::from(4));
 
-        // SAME consensus_index
+        // SAME epoch
         // Txn 1: requires A v3, C v5 → produces A v6, C v6 (max(3,5)+1=6)
         // Txn 2: requires A v6 (produced by Txn 1), B v4 → produces A v7, B v7 (max(6,4)+1=7)
         // Shows that production tracking works correctly: A v6 is skipped, B v4 is attached
         let uncommitted_txns = vec![
             create_test_log_record(
-                100,
                 10,
                 vec![
                     (obj_a, SequenceNumber::from(3)),
@@ -1507,7 +1450,6 @@ mod tests {
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                100,
                 10,
                 vec![
                     (obj_a, SequenceNumber::from(6)), // Produced by Txn 1, should be skipped
@@ -1559,13 +1501,11 @@ mod tests {
         // This violates partial dependency ordering - we're going backwards in version numbers
         let uncommitted_txns = vec![
             create_test_log_record(
-                101,
                 10,
                 vec![(obj_a, SequenceNumber::from(5))],
                 TransactionDigest::random(),
             ),
             create_test_log_record(
-                102,
                 10,
                 vec![(obj_a, SequenceNumber::from(3))], // Lower version after higher!
                 TransactionDigest::random(),

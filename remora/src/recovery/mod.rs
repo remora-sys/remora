@@ -15,7 +15,6 @@ mod test_recovery;
 
 #[derive(Clone, Debug)]
 pub struct LogRecord<T: ExecutableTransaction + Clone> {
-    pub consensus_index: Option<u64>,
     pub txn_digest: TransactionDigest,
     pub transaction: Arc<TransactionWithTimestamp<T>>,
     pub required_states: BTreeMap<(ObjectID, SequenceNumber), Option<usize>>,
@@ -60,7 +59,6 @@ impl<T: ExecutableTransaction + Clone> EpochLogger<T> {
 
         tracing::debug!(
             epoch = epoch.0,
-            consensus_index = record.consensus_index,
             txn_digest = ?record.txn_digest,
             "EpochLogger: appended transaction"
         );
@@ -92,12 +90,12 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
         Arc::new(Self { logger })
     }
 
-    /// Get the current primary persist index (replay cut) from the state collector.
-    pub fn get_persist_index(
+    /// Get the current primary persist epoch (replay cut) from the state collector.
+    pub fn get_persist_epoch(
         &self,
         state_collector: &crate::checkpoint::state_collector::StateCollector,
-    ) -> u64 {
-        state_collector.get_persist_index()
+    ) -> EpochId {
+        EpochId(state_collector.get_persist_index())
     }
 
     /// Collect ALL uncommitted transactions from ALL proxies.
@@ -110,17 +108,25 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     /// Uses watermark-based filtering: transactions with consensus_index > completed_up_to
     /// are uncommitted and need to be replayed.
     ///
-    /// **Important:** Transactions are sorted by (epoch, consensus_index) to maintain causality.
-    /// consensus_index alone is insufficient because the same consensus_index can appear in
-    /// different epochs (if consensus_index resets per-epoch or there's overlap during
-    /// epoch transitions).
+    /// Collect ALL uncommitted transactions from ALL proxies.
+    ///
+    /// This is the core of the simplified recovery approach:
+    /// - Replays ALL transactions (not just dirty ones for failed proxy)
+    /// - Dependencies across proxies satisfied automatically by replaying all
+    /// - No bridging transaction computation needed
+    ///
+    /// Uses epoch-based filtering: transactions with epoch > completed_epoch_id
+    /// are uncommitted and need to be replayed.
     ///
     /// # Arguments
-    /// * `completed_up_to` - Batch watermark (highest fully completed batch across all proxies)
+    /// * `completed_epoch_id` - Epoch watermark (highest fully completed epoch across all proxies)
     ///
     /// # Returns
-    /// All uncommitted transactions in consensus order (sorted by epoch then consensus_index)
-    pub fn collect_uncommitted_transactions(&self, completed_up_to: u64) -> Vec<LogRecord<T>> {
+    /// All uncommitted transactions in epoch order
+    pub fn collect_uncommitted_transactions(
+        &self,
+        completed_epoch_id: EpochId,
+    ) -> Vec<LogRecord<T>> {
         let mut uncommitted_txns = Vec::new();
 
         // Scan ALL epoch logger entries
@@ -128,35 +134,29 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
             let epoch = *epoch_entry.key();
             let records = epoch_entry.value();
 
-            // Include ALL transactions with consensus_index > completed_up_to
+            // Include ALL transactions with epoch > completed_epoch_id
             // Note: We do NOT filter by destination_proxy - include transactions to ALL proxies
-            let uncommitted_entries: Vec<LogRecord<T>> = records
-                .iter()
-                .filter(|r| r.consensus_index.unwrap_or(0) > completed_up_to)
-                .cloned()
-                .collect();
+            if epoch > completed_epoch_id {
+                uncommitted_txns.extend(records.iter().cloned());
 
-            tracing::debug!(
-                epoch = epoch.0,
-                epoch_total = records.len(),
-                uncommitted_count = uncommitted_entries.len(),
-                completed_up_to = completed_up_to,
-                "Scanned epoch for uncommitted transactions"
-            );
-
-            uncommitted_txns.extend(uncommitted_entries);
+                tracing::debug!(
+                    epoch = epoch.0,
+                    epoch_total = records.len(),
+                    completed_epoch_id = completed_epoch_id.0,
+                    "Collected epoch for uncommitted transactions"
+                );
+            }
         }
 
-        // Sort by (epoch, consensus_index) to maintain causality
-        // Epoch comes first because consensus_index may reset or overlap across epochs
-        uncommitted_txns.sort_by_key(|r| (r.epoch.0, r.consensus_index.unwrap_or(0)));
+        // Sort by epoch to maintain causality
+        uncommitted_txns.sort_by_key(|r| r.epoch.0);
 
         tracing::info!(
             total_uncommitted = uncommitted_txns.len(),
-            completed_up_to = completed_up_to,
+            completed_epoch_id = completed_epoch_id.0,
             epochs_scanned = self.logger.segments.len(),
-            "Collected ALL uncommitted transactions from batch {} onward (includes all proxies)",
-            completed_up_to + 1
+            "Collected ALL uncommitted transactions from epoch {} onward (includes all proxies)",
+            completed_epoch_id.0 + 1
         );
 
         uncommitted_txns
@@ -166,27 +166,27 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
     ///
     /// This replaces the complex `begin_recovery_with_bridging()` approach with a simpler flow:
     /// 1. Collect ALL uncommitted transactions (from all proxies)
-    /// 2. Return them in consensus order for replay
+    /// 2. Return them in epoch order for replay
     ///
     /// No bridging transaction computation needed - dependencies satisfied by replaying all.
     ///
     /// # Arguments
-    /// * `completed_up_to` - Batch watermark (from failed proxy's persist_index)
+    /// * `completed_epoch_id` - Epoch watermark (from failed proxy's persist_index)
     ///
     /// # Returns
-    /// All uncommitted transactions ready for replay, in consensus order
-    pub fn begin_recovery_simple(&self, completed_up_to: u64) -> Vec<LogRecord<T>> {
+    /// All uncommitted transactions ready for replay, in epoch order
+    pub fn begin_recovery_simple(&self, completed_epoch_id: EpochId) -> Vec<LogRecord<T>> {
         tracing::info!(
-            completed_up_to,
+            completed_epoch_id = completed_epoch_id.0,
             "Beginning simplified recovery (no bridging computation)"
         );
 
         // Collect ALL uncommitted transactions
-        let uncommitted_txns = self.collect_uncommitted_transactions(completed_up_to);
+        let uncommitted_txns = self.collect_uncommitted_transactions(completed_epoch_id);
 
         tracing::info!(
             total_replay_txns = uncommitted_txns.len(),
-            completed_up_to,
+            completed_epoch_id = completed_epoch_id.0,
             "Simplified recovery plan ready: {} transactions to replay",
             uncommitted_txns.len()
         );

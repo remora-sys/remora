@@ -1,5 +1,5 @@
 use crate::{
-    checkpoint::state_collector::StateCollector,
+    checkpoint::{state_collector::StateCollector, EpochId},
     config::{LoadBalancingPolicy, ProxyMode},
     executor::{
         api::{
@@ -17,7 +17,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
@@ -63,8 +63,6 @@ where
     pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
     // Epoch logger for sequential transaction recording
     pub(crate) epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
-    // Current epoch for transaction logging
-    pub(crate) current_epoch: Arc<AtomicU64>,
     // PhantomData to indicate we're using the generic parameter
     pub(crate) _phantom: PhantomData<E>,
 }
@@ -76,10 +74,14 @@ where
 {
     pub(crate) async fn process_version_assignments(
         &mut self,
-        mut shared_txn_receiver: Receiver<(u64, RemoraTransaction<E>)>,
-        sender: Sender<(u64, RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
+        mut shared_txn_receiver: Receiver<(EpochId, RemoraTransaction<E>)>,
+        sender: Sender<(
+            EpochId,
+            RemoraTransaction<E>,
+            Vec<(ObjectID, SequenceNumber)>,
+        )>,
     ) {
-        while let Some((consensus_index, mut transaction)) = shared_txn_receiver.recv().await {
+        while let Some((epoch_id, mut transaction)) = shared_txn_receiver.recv().await {
             let required_versions = self.assign_shared_object_versions(&mut transaction);
 
             tracing::debug!(
@@ -87,10 +89,8 @@ where
                 transaction.digest()
             );
 
-            // Record transaction sequentially in epoch logger (preserves consensus order)
+            // Record transaction sequentially in epoch logger (preserves epoch order)
             if let Some(logger) = &self.epoch_logger {
-                let epoch = crate::checkpoint::EpochId(self.current_epoch.load(Ordering::SeqCst));
-
                 // Build required_states map from required_versions
                 let required_states: std::collections::BTreeMap<
                     (ObjectID, SequenceNumber),
@@ -101,25 +101,23 @@ where
                     .collect();
 
                 let rec = crate::recovery::LogRecord {
-                    consensus_index: Some(consensus_index),
                     txn_digest: *transaction.digest(),
                     transaction: Arc::new(transaction.clone()),
                     required_states,
-                    epoch,
+                    epoch: epoch_id,
                 };
 
-                logger.append(epoch, rec);
+                logger.append(epoch_id, rec);
 
                 tracing::debug!(
-                    epoch = epoch.0,
-                    consensus_index = consensus_index,
+                    epoch = epoch_id.0,
                     txn = ?transaction.digest(),
-                    "Sequential epoch logger: appended transaction in consensus order"
+                    "Sequential epoch logger: appended transaction in epoch order"
                 );
             }
 
             sender
-                .send((consensus_index, transaction, required_versions))
+                .send((epoch_id, transaction, required_versions))
                 .await
                 .unwrap();
         }
@@ -205,7 +203,7 @@ where
     pub transaction: RemoraTransaction<E>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub txn_cnt: usize,
-    pub consensus_index: u64,
+    pub epoch_id: EpochId,
 }
 
 impl<E> WorkerTask for ForwardingTask<E>
@@ -353,7 +351,7 @@ where
             if !missing_states_result.lazy_fetched_blobs.is_empty() {
                 if let Some(dest_pid) = resolved_stateful {
                     let replay_msg = crate::executor::api::ReplayMsg {
-                        consensus_index: 0,
+                        epoch_id: crate::checkpoint::EpochId(0),
                         transaction: None,
                         required_versions: vec![],
                         state_blobs: missing_states_result.lazy_fetched_blobs.clone(),
@@ -384,7 +382,7 @@ where
 
             if proxy_mode == ProxyMode::Separation {
                 let stateless_msg = PrimaryToProxyMessage::StatelessTxn(
-                    task.consensus_index,
+                    task.epoch_id,
                     Arc::clone(&transaction_arc),
                 );
                 if let Some(stateless_pid) = resolved_stateless {
@@ -397,7 +395,7 @@ where
                 }
 
                 let stateful_msg = PrimaryToProxyMessage::Txn(
-                    task.consensus_index,
+                    task.epoch_id,
                     Arc::clone(&transaction_arc),
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states,
@@ -412,7 +410,7 @@ where
                 }
             } else {
                 let stateful_msg = PrimaryToProxyMessage::CombinedTxn(
-                    task.consensus_index,
+                    task.epoch_id,
                     Arc::clone(&transaction_arc),
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states.clone(),
@@ -466,20 +464,20 @@ where
     pub(crate) async fn process_shared_txns(
         &mut self,
         mut shared_txn_receiver: Receiver<(
-            u64,
+            EpochId,
             RemoraTransaction<E>,
             Vec<(ObjectID, SequenceNumber)>,
         )>,
     ) {
         let mut txn_cnt = 0;
-        while let Some((consensus_index, transaction, required_versions)) =
+        while let Some((epoch_id, transaction, required_versions)) =
             shared_txn_receiver.recv().await
         {
             let task = ForwardingTask {
                 transaction,
                 required_versions,
                 txn_cnt,
-                consensus_index,
+                epoch_id,
             };
 
             if let Err(e) = self.worker_pool.send_task(task).await {

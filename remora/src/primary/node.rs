@@ -60,7 +60,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     pub async fn start(
         _executor: E,
         config: &ValidatorConfig,
-        benchmark_config: &crate::config::BenchmarkParameters,
         metrics: Arc<Metrics>,
     ) -> Self
     where
@@ -220,7 +219,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             epoch_logger.clone(),
             collector.clone(),
             config.validator_parameters.max_message_size,
-            benchmark_config.consensus_batch_size,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
@@ -303,7 +301,7 @@ mod tests {
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
         let _primary =
-            PrimaryNode::start(executor, &config, &benchmark_config, validator_metrics).await;
+            PrimaryNode::start(executor, &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -332,7 +330,6 @@ mod tests {
         let _validator = PrimaryNode::start(
             executor.clone(),
             &config,
-            &benchmark_config,
             validator_metrics,
         )
         .await;

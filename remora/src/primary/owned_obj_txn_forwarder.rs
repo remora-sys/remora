@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
+    checkpoint::EpochId,
     config::ProxyMode,
     executor::api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
     proxy::core::ProxyId,
@@ -32,10 +33,10 @@ where
 {
     pub(crate) async fn process_owned_txns(
         &mut self,
-        mut owned_txn_receiver: Receiver<(u64, Vec<RemoraTransaction<E>>)>,
+        mut owned_txn_receiver: Receiver<(EpochId, Vec<RemoraTransaction<E>>)>,
     ) {
-        while let Some((consensus_index, owned_txns)) = owned_txn_receiver.recv().await {
-            self.forward_owned_txns_in_parallel(consensus_index, owned_txns)
+        while let Some((epoch_id, owned_txns)) = owned_txn_receiver.recv().await {
+            self.forward_owned_txns_in_parallel(epoch_id, owned_txns)
                 .await;
         }
     }
@@ -43,7 +44,7 @@ where
     /// Forward owned-object transactions in parallel with true concurrency
     pub(crate) async fn forward_owned_txns_in_parallel(
         &mut self,
-        consensus_index: u64,
+        epoch_id: EpochId,
         transactions: Vec<RemoraTransaction<E>>,
     ) {
         let proxy_count = self.proxy_connections.len();
@@ -67,13 +68,9 @@ where
             let fut = async move {
                 if let Some(proxy_conn) = proxy_connections.get(&idx) {
                     if proxy_mode == ProxyMode::Separation {
-                        let msg1 = PrimaryToProxyMessage::StatelessTxn(consensus_index, tx.clone());
-                        let msg2 = PrimaryToProxyMessage::Txn(
-                            consensus_index,
-                            tx.clone(),
-                            idx,
-                            BTreeMap::new(),
-                        );
+                        let msg1 = PrimaryToProxyMessage::StatelessTxn(epoch_id, tx.clone());
+                        let msg2 =
+                            PrimaryToProxyMessage::Txn(epoch_id, tx.clone(), idx, BTreeMap::new());
 
                         if proxy_conn.send(msg1).await.is_err() {
                             tracing::warn!("Failed to send stateless txn to proxy {}", idx);
@@ -83,7 +80,7 @@ where
                         }
                     } else {
                         let msg = PrimaryToProxyMessage::CombinedTxn(
-                            consensus_index,
+                            epoch_id,
                             tx.clone(),
                             idx,
                             BTreeMap::new(),

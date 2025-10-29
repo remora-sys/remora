@@ -117,7 +117,7 @@ async fn start_node<E>(
                 "Primary accepting client connections on {}",
                 validator_config.client_server_address
             );
-            PrimaryNode::start(executor, &validator_config, &benchmark_config, metrics)
+            PrimaryNode::start(executor, &validator_config, metrics)
                 .await
                 .collect_results()
                 .await;

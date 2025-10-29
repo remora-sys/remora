@@ -265,7 +265,7 @@ pub struct ReplayItem<T>
 where
     T: ExecutableTransaction + Clone,
 {
-    pub consensus_index: u64,
+    pub epoch_id: EpochId,
     pub transaction: TransactionWithTimestamp<T>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub state_blobs: BTreeMap<ObjectID, Object>,
@@ -276,7 +276,7 @@ pub struct ReplayMsg<T>
 where
     T: ExecutableTransaction + Clone,
 {
-    pub consensus_index: u64,
+    pub epoch_id: EpochId,
     /// Transaction to replay. If None, this is a pure state transfer (only commit state_blobs).
     pub transaction: Option<TransactionWithTimestamp<T>>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
@@ -298,20 +298,20 @@ where
     T: ExecutableTransaction + Clone,
 {
     /// Stateful transaction that requires object access and execution
-    /// Fields: consensus_index, transaction, stateless_proxy_id, required_states
+    /// Fields: epoch_id, transaction, stateless_proxy_id, required_states
     Txn(
-        u64,
+        EpochId,
         Arc<TransactionWithTimestamp<T>>,
         ProxyId,
         RequiredStates,
     ),
     /// Stateless transaction that only requires signature verification
-    /// Fields: consensus_index, transaction
-    StatelessTxn(u64, Arc<TransactionWithTimestamp<T>>),
+    /// Fields: epoch_id, transaction
+    StatelessTxn(EpochId, Arc<TransactionWithTimestamp<T>>),
     /// Combined stateless+stateful
-    /// Fields: consensus_index, transaction, stateless_proxy_id, required_states
+    /// Fields: epoch_id, transaction, stateless_proxy_id, required_states
     CombinedTxn(
-        u64,
+        EpochId,
         Arc<TransactionWithTimestamp<T>>,
         ProxyId,
         RequiredStates,
