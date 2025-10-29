@@ -26,6 +26,7 @@ use sui_types::{
 };
 use tokio::time::Instant;
 
+use super::api::PreExecuteCheckResult;
 use super::{
     api::{ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore},
     calibration::Calibration,
@@ -395,14 +396,19 @@ impl Executor for SuiExecutor {
         ctx: Arc<SuiExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool {
+    ) -> PreExecuteCheckResult {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.benchmark_ctx().validator();
         let epoch_store = validator.get_epoch_store();
 
-        store
+        if store
             .read_objects_for_execution(&**epoch_store, &transaction.key(), &input_objects)
             .is_ok()
+        {
+            PreExecuteCheckResult::Ready
+        } else {
+            PreExecuteCheckResult::Reject
+        }
     }
 
     async fn assign_shared_object_versions_with_required_versions(

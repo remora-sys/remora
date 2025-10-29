@@ -206,12 +206,15 @@ pub trait Executor: Clone {
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send;
 
-    /// Check version ID prior to execution
+    /// Outcome of pre-execute checks
+    /// Ready: execute now
+    /// Skip: skip execution (e.g., actual version is above required)
+    /// Reject: cannot execute yet (e.g., missing state or version below required)
     fn pre_execute_check(
         ctx: Arc<Self::ExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool;
+    ) -> PreExecuteCheckResult;
 
     /// Assign a shared object version.
     /// This API is supposed to be called in the proxy node, and can run multi-threaded.
@@ -250,6 +253,12 @@ pub type NewStates = BTreeMap<ObjectID, Object>;
 pub type RequiredStates = BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>>;
 
 pub type ExecutorIndex = usize;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PreExecuteCheckResult {
+    Ready,
+    Skip,
+    Reject,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ReplayItem<T>

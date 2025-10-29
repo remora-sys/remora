@@ -24,6 +24,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::executor::api::PreExecuteCheckResult;
 use crate::{
     checkpoint::proxy::{EpochTracker, ModifiedObjectTracker},
     config::ProxyMode,
@@ -561,17 +562,18 @@ where
 
             // check the version ID for shared objects
             // skip if versions don't match
-            let ready_to_execute =
-                !transaction.input_objects().iter().any(|input_object| {
-                    matches!(
-                        input_object,
-                        InputObjectKind::SharedMoveObject {
-                            id: _,
-                            initial_shared_version: _,
-                            mutable: _,
-                        }
-                    )
-                }) || E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
+            let has_shared = transaction.input_objects().iter().any(|input_object| {
+                matches!(
+                    input_object,
+                    InputObjectKind::SharedMoveObject {
+                        id: _,
+                        initial_shared_version: _,
+                        mutable: _,
+                    }
+                )
+            });
+            let pre_check = E::pre_execute_check(ctx.clone(), store.clone(), &transaction);
+            let ready_to_execute = !has_shared || matches!(pre_check, PreExecuteCheckResult::Ready);
 
             let execution_result = if ready_to_execute {
                 tracing::debug!(
@@ -584,11 +586,22 @@ where
                 }
                 E::execute(ctx, store, transaction.deref().clone()).await
             } else {
-                tracing::warn!(
-                    "Proxy {} skipped execution for transaction {:?}",
-                    id,
-                    transaction.digest()
-                );
+                match pre_check {
+                    PreExecuteCheckResult::Skip => {
+                        tracing::warn!(
+                            "Proxy {} skipped execution (actual version above required) for transaction {:?}",
+                            id,
+                            transaction.digest()
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Proxy {} skipped execution for transaction {:?}",
+                            id,
+                            transaction.digest()
+                        );
+                    }
+                }
                 ExecutionResults::<E>::new(transaction.deref().clone(), None, None)
             };
 
@@ -610,10 +623,18 @@ where
                 notify.notify_one();
             }
 
-            tx_results
-                .send(execution_result)
-                .await
-                .map_err(|_| NodeError::ShuttingDown)?;
+            // Forward results when it is not skipped
+            if pre_check != PreExecuteCheckResult::Skip {
+                tx_results
+                    .send(execution_result)
+                    .await
+                    .map_err(|_| NodeError::ShuttingDown)?;
+            } else {
+                tracing::debug!(
+                    "skip forward results for transaction {:?}",
+                    transaction.digest()
+                );
+            }
 
             metrics.decrease_proxy_load(&id);
 

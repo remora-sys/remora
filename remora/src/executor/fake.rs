@@ -23,6 +23,7 @@ use sui_types::{
     transaction::InputObjectKind,
 };
 
+use super::api::PreExecuteCheckResult;
 use super::{
     super::config::{BenchmarkParameters, WorkloadType},
     api::{
@@ -417,7 +418,7 @@ impl Executor for FakeExecutor {
         _ctx: Arc<FakeExecutionContext>,
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
-    ) -> bool {
+    ) -> PreExecuteCheckResult {
         for reference in &transaction.inputs {
             let id = reference.object_id();
             if let Some(object) = store.read_object(&id).expect("failed to access store") {
@@ -433,25 +434,31 @@ impl Executor for FakeExecutor {
                             version.unwrap(),
                             object.version()
                         );
-                        if object.version() != version.unwrap() {
+                        let expected = version.unwrap();
+                        let actual = object.version();
+                        if actual != expected {
                             tracing::info!(
                                 "Version mismatch for object {:?} - transaction {:?}
                                 actual version is {:?} while expected is {:?}",
                                 id,
                                 transaction.digest(),
-                                object.version(),
-                                version.unwrap()
+                                actual,
+                                expected
                             );
-                            return false;
+                            if actual > expected {
+                                return PreExecuteCheckResult::Skip;
+                            } else {
+                                return PreExecuteCheckResult::Reject;
+                            }
                         }
                     }
                 }
             } else {
                 tracing::debug!("Object {:?} not found in store", id);
-                return false;
+                return PreExecuteCheckResult::Reject;
             }
         }
-        true
+        PreExecuteCheckResult::Ready
     }
 
     /// Assign a shared object version.
