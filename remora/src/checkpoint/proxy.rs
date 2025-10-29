@@ -1,4 +1,5 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,28 +32,37 @@ impl EpochTracker {
 #[derive(Clone)]
 pub struct ModifiedObjectTracker {
     // map of object -> latest object state in this epoch
-    modified: Arc<DashMap<ObjectID, Object>>,
+    modified: Arc<ArcSwap<DashMap<ObjectID, Object>>>,
 }
 
 impl ModifiedObjectTracker {
     pub fn new() -> Self {
         Self {
-            modified: Arc::new(DashMap::new()),
+            modified: Arc::new(ArcSwap::from(Arc::new(DashMap::new()))),
         }
     }
 
     pub fn record_object(&self, object_id: ObjectID, object: Object) {
-        self.modified.insert(object_id, object);
+        tracing::info!(
+            "recording object for obj_id {}: version {}",
+            object_id,
+            object.version().value()
+        );
+        self.modified.load().insert(object_id, object);
     }
 
     /// Drain current epoch modifications and reset.
     pub fn take_epoch_snapshot(&self) -> EpochObjectStates {
         let mut out = EpochObjectStates::new();
-        // DashMap has no drain; iterate and then clear
-        for entry in self.modified.iter() {
+        let old_map = self.modified.swap(Arc::new(DashMap::new()));
+        for entry in old_map.iter() {
+            tracing::info!(
+                "taking epoch snapshot for obj_id {}: version {}",
+                entry.key(),
+                entry.value().version().value()
+            );
             out.insert(*entry.key(), entry.value().clone());
         }
-        self.modified.clear();
         out
     }
 }
