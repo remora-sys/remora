@@ -348,56 +348,43 @@ where
 
             for ((obj_id, version), _) in &record.required_states {
                 // Skip initial versions (v2) - replacement proxy has these
-                if *version == SequenceNumber::from(2) {
+                let should_skip_attaching = *version == SequenceNumber::from(2)
+                    || replay_produced_versions.contains(&(*obj_id, *version));
+
+                if should_skip_attaching {
                     tracing::trace!(
-                        "Skipping state blob for {:?} v{} - initial version",
+                        "Skipping state blob for {:?} v{} (initial or produced by replay)",
                         obj_id,
                         version.value()
                     );
-                    continue;
-                }
-
-                // Skip if this version will be produced by an earlier replay transaction
-                if replay_produced_versions.contains(&(*obj_id, *version)) {
-                    tracing::trace!(
-                        "Skipping state blob for {:?} v{} - will be produced by earlier replay txn",
-                        obj_id,
-                        version.value()
-                    );
-                    continue;
-                }
-
-                // This state must be fetched and attached
-                // Fetch from merged_state (committed state from any proxy that produced this version)
-                // Note: We no longer track destination_proxy in LogRecord since it's recorded
-                // sequentially in VersionAssignmentTask before proxy selection. State ownership
-                // is tracked separately in StateCollector's version_ownership map.
-                if let Some(object) = collector.get_object(obj_id) {
-                    // Verify this is the exact version we need
-                    if object.version() == *version {
-                        state_blobs.insert(*obj_id, object);
-                        tracing::debug!(
-                            "Attached state blob {:?} v{} from merged_state for txn {:?}",
-                            obj_id,
-                            version.value(),
-                            record.txn_digest
-                        );
+                } else {
+                    // This state must be fetched and attached
+                    if let Some(object) = collector.get_object(obj_id) {
+                        if object.version() == *version {
+                            state_blobs.insert(*obj_id, object);
+                            tracing::debug!(
+                                "Attached state blob {:?} v{} from merged_state for txn {:?}",
+                                obj_id,
+                                version.value(),
+                                record.txn_digest
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Version mismatch: need {:?} v{} but merged_state has v{} for txn {:?}",
+                                obj_id,
+                                version.value(),
+                                object.version().value(),
+                                record.txn_digest
+                            );
+                        }
                     } else {
                         tracing::warn!(
-                            "Version mismatch: need {:?} v{} but merged_state has v{} for txn {:?}",
+                            "Failed to fetch state blob {:?} v{} from merged_state for txn {:?}",
                             obj_id,
                             version.value(),
-                            object.version().value(),
                             record.txn_digest
                         );
                     }
-                } else {
-                    tracing::warn!(
-                        "Failed to fetch state blob {:?} v{} from merged_state for txn {:?}",
-                        obj_id,
-                        version.value(),
-                        record.txn_digest
-                    );
                 }
             }
 
@@ -405,7 +392,7 @@ where
             let produced_version = record.produced_version();
             for ((obj_id, _), _) in &record.required_states {
                 replay_produced_versions.insert((*obj_id, produced_version));
-                tracing::debug!(
+                tracing::info!(
                     "Marked {:?} v{} as will-be-produced by replay txn {:?}",
                     obj_id,
                     produced_version.value(),

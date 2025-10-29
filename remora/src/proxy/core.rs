@@ -138,22 +138,6 @@ where
                 PrimaryToProxyMessage::Checkpoint(epoch_id) => {
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
-                    let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    let completed_up_to = self.completed_up_to.load(Ordering::SeqCst);
-                    tracing::info!(
-                        "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
-                        self.id,
-                        epoch_id,
-                        snapshot.len(),
-                        completed_up_to
-                    );
-
-                    // Send snapshot back to primary with completion watermark
-                    let reply =
-                        ProxyToPrimaryMessage::StateSnapshot(self.id, completed_up_to, snapshot);
-                    if let Err(e) = self.tx_primary_replies.send(reply).await {
-                        tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
-                    }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
                     tracing::debug!(
@@ -232,22 +216,6 @@ where
                 PrimaryToProxyMessage::Checkpoint(epoch_id) => {
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
-                    let snapshot = self.modified_tracker.take_epoch_snapshot();
-                    let completed_up_to = self.completed_up_to.load(Ordering::SeqCst);
-                    tracing::info!(
-                        "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
-                        self.id,
-                        epoch_id,
-                        snapshot.len(),
-                        completed_up_to
-                    );
-
-                    // Send snapshot back to primary with completion watermark
-                    let reply =
-                        ProxyToPrimaryMessage::StateSnapshot(self.id, completed_up_to, snapshot);
-                    if let Err(e) = self.tx_primary_replies.send(reply).await {
-                        tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
-                    }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
                     tracing::info!(
@@ -504,6 +472,7 @@ where
         let stateless_controller = self.stateless_controller.clone();
         let executor = self.executor.clone();
         let mode = self.mode.clone();
+        let tx_primary_replies = self.tx_primary_replies.clone();
         let modified_tracker = self.modified_tracker.clone();
         let batch_completion_count = self.batch_completion_count.clone();
         let completed_up_to = self.completed_up_to.clone();
@@ -639,7 +608,10 @@ where
                 batch_completion_count,
                 completed_up_to,
                 batch_size,
-            );
+                modified_tracker,
+                tx_primary_replies,
+            )
+            .await;
 
             //metrics.update_metrics(transaction.timestamp());
             Ok::<_, NodeError>(())
@@ -648,12 +620,14 @@ where
     }
 
     /// Static helper to record transaction completion from spawned tasks.
-    fn record_transaction_complete(
+    async fn record_transaction_complete(
         id: ProxyId,
         epoch_id: u64,
         batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
         completed_up_to: Arc<AtomicU64>,
         batch_size: usize,
+        modified_tracker: ModifiedObjectTracker,
+        tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     ) {
         // Increment completion count for this epoch atomically
         let count = {
@@ -678,16 +652,21 @@ where
                 batch_completion_count.clone(),
                 completed_up_to,
                 batch_size,
-            );
+                modified_tracker,
+                tx_primary_replies,
+            )
+            .await;
         }
     }
 
     /// Static helper to advance the watermark from spawned tasks.
-    fn advance_watermark(
+    async fn advance_watermark(
         id: ProxyId,
         batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
         completed_up_to: Arc<AtomicU64>,
         batch_size: usize,
+        modified_tracker: ModifiedObjectTracker,
+        tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     ) {
         // Keep advancing the watermark as long as the next sequential batch is complete
         loop {
@@ -725,6 +704,21 @@ where
                             next_epoch,
                             next_epoch
                         );
+
+                        // Take snapshot and send to primary
+                        let snapshot = modified_tracker.take_epoch_snapshot();
+                        tracing::info!(
+                            "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
+                            id,
+                            next_epoch,
+                            snapshot.len(),
+                            next_epoch
+                        );
+                        let reply = ProxyToPrimaryMessage::StateSnapshot(id, next_epoch, snapshot);
+                        if let Err(e) = tx_primary_replies.send(reply).await {
+                            tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
+                        }
+
                         // Successfully advanced, continue to check subsequent epochs
                         continue;
                     }

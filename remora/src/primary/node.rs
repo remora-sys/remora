@@ -57,11 +57,7 @@ pub struct PrimaryNode<E: Executor> {
 
 impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     /// Start the single machine validator.
-    pub async fn start(
-        _executor: E,
-        config: &ValidatorConfig,
-        metrics: Arc<Metrics>,
-    ) -> Self
+    pub async fn start(_executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
     where
         <E as Executor>::Store: Sync + Send,
         <E as Executor>::Transaction: Send + Sync + 'static,
@@ -300,8 +296,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let _primary =
-            PrimaryNode::start(executor, &config, validator_metrics).await;
+        let _primary = PrimaryNode::start(executor, &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.
@@ -327,12 +322,7 @@ mod tests {
 
         // Start the validator.
         let validator_metrics = Arc::new(Metrics::new_for_tests());
-        let _validator = PrimaryNode::start(
-            executor.clone(),
-            &config,
-            validator_metrics,
-        )
-        .await;
+        let _validator = PrimaryNode::start(executor.clone(), &config, validator_metrics).await;
         tokio::task::yield_now().await;
 
         // Generate transactions.

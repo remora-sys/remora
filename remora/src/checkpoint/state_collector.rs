@@ -69,6 +69,12 @@ impl StateCollector {
 
         // Phase 1: Store in temporary per-proxy state
         for (obj_id, obj) in snapshot.into_iter() {
+            tracing::info!(
+                "Storing temp snapshot for proxy {} with obj_id {}: {}",
+                proxy_id,
+                obj_id,
+                obj.version().value()
+            );
             self.temp_state_by_proxy.insert((proxy_id, obj_id), obj);
         }
 
@@ -139,6 +145,11 @@ impl StateCollector {
         // Commit all latest versions to merged_state and update version_ownership
         for (obj_id, (version, obj, writer_proxy)) in objects_by_id {
             // Insert the new latest version
+            tracing::info!(
+                "Inserting new latest version for obj_id {}: {}",
+                obj_id,
+                version.value()
+            );
             self.merged_state.insert(obj_id, obj);
 
             // Record which proxy wrote this version
