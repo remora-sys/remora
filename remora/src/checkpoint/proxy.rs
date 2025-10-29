@@ -43,7 +43,7 @@ impl ModifiedObjectTracker {
     }
 
     pub fn record_object(&self, object_id: ObjectID, object: Object) {
-        tracing::info!(
+        tracing::debug!(
             "recording object for obj_id {}: version {}",
             object_id,
             object.version().value()
@@ -56,7 +56,7 @@ impl ModifiedObjectTracker {
         let mut out = EpochObjectStates::new();
         let old_map = self.modified.swap(Arc::new(DashMap::new()));
         for entry in old_map.iter() {
-            tracing::info!(
+            tracing::debug!(
                 "taking epoch snapshot for obj_id {}: version {}",
                 entry.key(),
                 entry.value().version().value()

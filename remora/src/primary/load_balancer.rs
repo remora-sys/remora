@@ -369,7 +369,7 @@ where
                                 record.txn_digest
                             );
                         } else {
-                            tracing::debug!(
+                            tracing::info!(
                                 "Version mismatch: need {:?} v{} but merged_state has v{} for txn {:?}",
                                 obj_id,
                                 version.value(),

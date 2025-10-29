@@ -109,7 +109,7 @@ where
 
                 logger.append(epoch_id, rec);
 
-                tracing::info!(
+                tracing::debug!(
                     epoch = epoch_id.0,
                     txn = ?transaction.digest(),
                     "Sequential epoch logger: appended transaction in epoch order"
