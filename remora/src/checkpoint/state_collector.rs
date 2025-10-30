@@ -19,13 +19,6 @@ pub struct StateCollector {
     /// Key: ProxyId, Value: last acknowledged epoch ID
     pub(crate) per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
 
-    /// Version ownership: tracks which proxy wrote each persisted version
-    /// Key: (ObjectID, SequenceNumber) -> ProxyId
-    /// Updated when promoting temp state to merged_state during snapshot merging
-    /// Used during recovery to identify all versions owned by a failed proxy
-    /// Public for recovery coordinator to check latest versions owned by healthy proxies
-    pub(crate) version_ownership: DashMap<(ObjectID, SequenceNumber), crate::proxy::core::ProxyId>,
-
     /// Number of expected proxies (for determining when all have acknowledged)
     expected_proxies: usize,
 }
@@ -36,7 +29,6 @@ impl StateCollector {
             merged_state: DashMap::new(),
             temp_state_by_proxy: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
-            version_ownership: DashMap::new(),
             expected_proxies,
         }
     }
@@ -158,8 +150,6 @@ impl StateCollector {
             // 2. Old entries don't affect correctness - get_versions_by_proxy filters to latest
             // 3. Storage cost is negligible compared to CPU cost of iteration
             // 4. Old entries will be naturally pruned when objects are eventually deleted
-            self.version_ownership
-                .insert((obj_id, version), writer_proxy);
             committed_count += 1;
         }
 
