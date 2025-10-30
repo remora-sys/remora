@@ -137,19 +137,7 @@ where
             // Use the failed proxy's own persist_index as epoch_id
             let persist_epoch = EpochId(self.collector.get_proxy_persist_index(failed_proxy));
 
-            // CRITICAL FIX: Wait for in-flight forwarding tasks to complete their epoch logger appends.
-            //
-            // Race condition: Forwarding tasks run in parallel worker threads and append to the epoch
-            // logger asynchronously. When we detect proxy failure and call begin_recovery(), some
-            // forwarding tasks may still be in-flight - they've sent (or tried to send) to the failed
-            // proxy but haven't yet appended to the epoch logger. If we collect dirty transactions
-            // immediately, we'll miss these late-arriving transactions.
-            //
-            // Solution: Add a small delay after detecting failure to allow in-flight tasks to complete.
-            // This gives worker threads time to finish their logger.append() calls (line 322 in
-            // shared_obj_txn_forwarder.rs) before we snapshot the dirty transaction set.
-            //
-            // TODO: Replace with proper synchronization (e.g., worker pool flush or epoch barrier).
+            // TODO: Replace the sleep with a proper synchronization mechanism (e.g., worker pool flush or epoch barrier).
             tracing::info!(
                 failed_proxy,
                 "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
@@ -157,12 +145,7 @@ where
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             tracing::info!(failed_proxy, "Delay complete, capturing atomic snapshot");
 
-            // CRITICAL: Capture failed_proxy_states FIRST to establish snapshot boundary.
-            // This must happen BEFORE computing recovery plan to ensure atomicity.
-            let failed_proxy_states = self.collector.get_versions_by_proxy(failed_proxy);
-
-            // SIMPLIFIED RECOVERY: Collect ALL uncommitted transactions (no bridging computation)
-            // Uses watermark-based filtering for precise recovery boundaries
+            // Collect all uncommitted transactions from the epoch logger.
             let uncommitted_txns = self
                 .recovery_coordinator
                 .begin_recovery_simple(persist_epoch);
@@ -170,93 +153,18 @@ where
             tracing::info!(
                 failed_proxy,
                 standby_proxy,
-                state_count = failed_proxy_states.len(),
                 uncommitted_count = uncommitted_txns.len(),
                 persist_epoch = persist_epoch.0,
-                "Captured atomic snapshot: {} states, {} uncommitted txns (all proxies)",
-                failed_proxy_states.len(),
+                "Captured atomic snapshot: {} uncommitted txns (all proxies)",
                 uncommitted_txns.len()
             );
 
-            // NOTE: Do NOT promote standby here! Promotion happens AFTER replay completes
-            // in start_replay_process() to prevent duplicate transactions.
-            // The standby_excluded flag remains true during recovery.
+            // Remove failed proxy from connections.
+            self.proxy_connections.remove(&failed_proxy);
+            tracing::info!(failed_proxy, "Removed failed proxy connection");
 
-            // Remove failed proxy from connections
-            tracing::info!(failed_proxy, "Attempting to remove failed proxy connection");
-            let removed = self.proxy_connections.remove(&failed_proxy).is_some();
-            tracing::info!(
-                "Failed proxy removal result failed_proxy={} removed={}",
-                failed_proxy,
-                removed
-            );
-
-            // CRITICAL FIX: After removing a proxy, the resolve_proxy_id mapping changes.
-            // Positional indices in states_to_proxy need to be adjusted to account for
-            // the removed proxy. All indices > failed_proxy must be decremented by 1.
-            //
-            // Example: Before removal: connections = {0, 1, 2}, index 1 maps to ProxyId 1
-            //          After removing 0: connections = {1, 2}, index 0 maps to ProxyId 1 (shifted!)
-            //
-            // States owned by the failed proxy need special handling:
-            // - Mark them with PRIMARY_FETCH_SENTINEL for lazy fetching from primary
-            // - States touched by uncommitted transactions will be updated to point to replacement
-            // - Untouched states remain marked for lazy fetch on-demand
-            let mut remapped_count = 0;
-            let mut marked_for_lazy_fetch = 0;
-
-            // failed_proxy_states already captured at line 162 - use that snapshot
-            // Mark states owned by the failed proxy for lazy fetch from primary
-            for (obj_id, version) in &failed_proxy_states {
-                self.states_to_proxy
-                    .entry((*obj_id, *version))
-                    .and_modify(|owners| {
-                        owners.remove(&failed_proxy);
-                        if owners.is_empty() {
-                            // No other proxy owns this version - mark for lazy fetch
-                            owners.insert(PRIMARY_FETCH_SENTINEL);
-                        }
-                    })
-                    .or_insert_with(|| {
-                        let mut set = std::collections::HashSet::new();
-                        set.insert(PRIMARY_FETCH_SENTINEL);
-                        set
-                    });
-                marked_for_lazy_fetch += 1;
-            }
-
-            tracing::info!(
-                failed_proxy,
-                marked_for_lazy_fetch,
-                "Marked {} failed proxy states for lazy fetch from primary",
-                marked_for_lazy_fetch
-            );
-
-            // Decrement indices for proxies that came after the failed proxy
-            for mut entry in self.states_to_proxy.iter_mut() {
-                let owners = entry.value_mut();
-                let mut to_remap = Vec::new();
-
-                // Collect indices that need remapping
-                for &idx in owners.iter() {
-                    if idx > failed_proxy {
-                        to_remap.push(idx);
-                    }
-                }
-
-                // Remove old indices and insert remapped ones
-                for idx in to_remap {
-                    owners.remove(&idx);
-                    owners.insert(idx - 1);
-                    remapped_count += 1;
-                }
-            }
-            tracing::info!(
-                failed_proxy,
-                remapped_count,
-                "Adjusted state ownership indices after proxy removal: remapped {}",
-                remapped_count
-            );
+            // Remap ownership and mark states of the failed proxy for lazy fetching.
+            self.update_state_ownership_after_failure(failed_proxy);
 
             tracing::info!(
                 "Recovery begun: failed proxy {} replaced by standby {}",
@@ -264,15 +172,7 @@ where
                 standby_proxy
             );
 
-            // Start replay process for the replacement proxy
-            let replacement_present = self.proxy_connections.contains_key(&standby_proxy);
-            let conn_count = self.proxy_connections.len();
-            tracing::info!(
-                standby_proxy,
-                replacement_present,
-                conn_count,
-                "Replay initiation precheck: replacement presence and connection count"
-            );
+            // Start replay process for the replacement proxy.
             self.start_replay_process(failed_proxy, standby_proxy, uncommitted_txns);
             tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
 
@@ -286,6 +186,62 @@ where
                 .register_error(crate::metrics::ErrorType::TransactionRateTooHigh);
             None
         }
+    }
+
+    /// In a single pass over the `states_to_proxy` map, this function performs all necessary updates
+    /// after a proxy has failed. It correctly and efficiently remaps ownership by:
+    /// 1. Removing the `failed_proxy` from any owner sets.
+    /// 2. If the `failed_proxy` was the sole owner, marking the state for lazy fetching from the primary.
+    /// 3. Compacting indices by decrementing the index of any proxy with an ID greater than `failed_proxy`.
+    fn update_state_ownership_after_failure(&self, failed_proxy: ProxyId) {
+        let mut remapped_count = 0;
+        let mut marked_for_lazy_fetch = 0;
+
+        self.states_to_proxy.iter_mut().for_each(|mut entry| {
+            let owners = entry.value_mut();
+
+            // Fast path to skip entries that don't need changes.
+            let failed_is_owner = owners.contains(&failed_proxy);
+            let has_indices_to_remap = owners.iter().any(|&idx| idx > failed_proxy);
+
+            if !failed_is_owner && !has_indices_to_remap {
+                return;
+            }
+
+            // Build a new set of owners, remapping indices as we go.
+            let mut new_owners = std::collections::HashSet::new();
+            for &owner_idx in owners.iter() {
+                if owner_idx == failed_proxy {
+                    continue; // Remove failed proxy by not adding it.
+                }
+
+                if owner_idx > failed_proxy {
+                    new_owners.insert(owner_idx - 1);
+                } else {
+                    new_owners.insert(owner_idx);
+                }
+            }
+
+            if failed_is_owner && new_owners.is_empty() {
+                new_owners.insert(PRIMARY_FETCH_SENTINEL);
+                marked_for_lazy_fetch += 1;
+            }
+
+            // Count remappings for this entry for logging.
+            remapped_count += owners.iter().filter(|&&idx| idx > failed_proxy).count();
+
+            // Replace the old owner set with the new one.
+            *owners = new_owners;
+        });
+
+        tracing::info!(
+            failed_proxy,
+            marked_for_lazy_fetch,
+            remapped_count,
+            "Completed ownership update: {} states marked for lazy fetch, {} indices remapped",
+            marked_for_lazy_fetch,
+            remapped_count
+        );
     }
 
     /// Build replay messages with intelligent state blob attachment.
@@ -440,7 +396,7 @@ where
                 tracing::info!(failed_proxy, "No transactions to replay");
 
                 // No replay needed, but still promote standby to active
-                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
+                //standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
                 tracing::info!(
                     replacement_proxy,
                     "Standby proxy promoted to active (no replay needed)"

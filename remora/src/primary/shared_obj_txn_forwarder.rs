@@ -364,8 +364,8 @@ where
                     Self::send_to_proxy(proxy_connections, dest_pid, replay_message).await;
 
                     tracing::info!(
-                        "Sent {} lazy-fetched states to proxy {} for txn {:?}",
-                        missing_states_result.lazy_fetched_blobs.len(),
+                        "Sent {:?} lazy-fetched states to proxy {} for txn {:?}",
+                        missing_states_result.lazy_fetched_blobs,
                         dest_pid,
                         transaction_arc.digest()
                     );
@@ -913,8 +913,8 @@ where
                             seq_num.value(),
                             transaction.digest()
                         );
-                        required_states.insert((object_id, seq_num), None);
                     }
+                    required_states.insert((object_id, seq_num), None);
                 }
                 owner_opt => {
                     required_states.insert((object_id, seq_num), owner_opt);
