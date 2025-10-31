@@ -415,7 +415,7 @@ where
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states.clone(),
                 );
-                tracing::info!(
+                tracing::debug!(
                     "stateful message: {:?}, transaction_arc.digest: {:?}, destination: {:?}",
                     stateful_missing_states,
                     transaction_arc.digest(),

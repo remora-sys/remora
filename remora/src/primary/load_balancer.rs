@@ -362,13 +362,15 @@ where
         result
     }
 
-    /// Start the replay process for a replacement proxy.
-    /// This method spawns a task to send ALL uncommitted transactions (from all proxies) to the
-    /// replacement proxy. States are fetched lazily on-demand during execution (Task 2.4).
-    /// After all replay messages are sent, it promotes the standby to active.
+    /// Spawns a Tokio task to replay uncommitted transactions to a replacement proxy.
     ///
-    /// CRITICAL: Takes pre-computed recovery plan to ensure atomicity - computing it again
-    /// inside the spawned task would allow epochs to commit between captures, causing version mismatches.
+    /// The replay process consists of several steps:
+    /// 1. Prepare replay batches from the uncommitted transactions.
+    /// 2. Send these batches to the replacement proxy.
+    /// 3. If sending is successful, update the ownership of the replayed states.
+    /// 4. Finally, promote the standby proxy to active service.
+    ///
+    /// This function orchestrates the replay process by calling helper methods for each step.
     fn start_replay_process(
         &self,
         failed_proxy: ProxyId,
@@ -386,223 +388,188 @@ where
                 failed_proxy,
                 replacement_proxy,
                 uncommitted_count = uncommitted_txns.len(),
-                "Replay task spawned with simplified recovery plan (all uncommitted txns)"
+                "Replay task spawned."
             );
 
-            // Recovery plan (uncommitted transactions) already computed in begin_recovery()
-            // to ensure atomicity. Don't recompute here!
-
             if uncommitted_txns.is_empty() {
-                tracing::info!(failed_proxy, "No transactions to replay");
-
-                // No replay needed, but still promote standby to active
-                //standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
                 tracing::info!(
-                    replacement_proxy,
-                    "Standby proxy promoted to active (no replay needed)"
+                    failed_proxy,
+                    "No transactions to replay. Promoting standby immediately."
                 );
+                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
+                return;
+            }
+
+            let replay_chunks =
+                Self::prepare_replay_batches(&uncommitted_txns, &collector, &chunking_config);
+
+            if let Err(e) =
+                Self::send_replay_batches(replacement_proxy, replay_chunks, &proxy_connections)
+                    .await
+            {
+                tracing::error!(
+                    "Failed to send replay batches to replacement proxy {}: {:?}",
+                    replacement_proxy,
+                    e
+                );
+                // Promote standby anyway to avoid system deadlock.
+                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
                 return;
             }
 
             tracing::info!(
-                failed_proxy,
-                replacement_proxy,
-                uncommitted_count = uncommitted_txns.len(),
-                "Sending uncommitted transactions to replacement proxy (Task 2.4: NO initial state transfer)"
+                "Completed replay transmission to replacement proxy {}",
+                replacement_proxy
             );
 
-            // Convert LogRecord to ReplayMsg and send to replacement proxy
-            if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
-                // Task 2.4: NO INITIAL STATE TRANSFER!
-                //
-                // Old approach: Transfer all states owned by failed proxy upfront
-                // New approach: States fetched lazily on-demand during execution
-                //
-                // Benefits:
-                // - Eliminates large upfront data transfer
-                // - Reduces recovery latency
-                // - Only transfers states that are actually needed
-                // - Relies on primary's lazy state serving (Task 3.1)
+            Self::update_ownership_after_replay(
+                &uncommitted_txns,
+                replacement_proxy,
+                &states_to_proxy,
+                &proxy_connections,
+            );
 
-                // SIMPLIFIED RECOVERY (Task 2.3 FIX): Replay ALL uncommitted transactions with INTELLIGENT state blob attachment
-                // Uses extracted helper function for testability
-                let replay_messages_with_blobs =
-                    Self::build_replay_messages_with_state_blobs(&uncommitted_txns, &collector);
+            Self::promote_standby_proxy(standby_excluded, replacement_proxy);
+        });
+    }
 
-                // Group by epoch for sending
-                let mut txns_by_epoch: std::collections::BTreeMap<
-                    crate::checkpoint::EpochId,
-                    Vec<_>,
-                > = std::collections::BTreeMap::new();
+    /// Prepares and chunks replay batches from uncommitted transactions.
+    fn prepare_replay_batches(
+        uncommitted_txns: &[crate::recovery::LogRecord<E::Transaction>],
+        collector: &StateCollector,
+        chunking_config: &ChunkingConfig,
+    ) -> Vec<crate::executor::api::ReplayBatch<E::Transaction>> {
+        let replay_messages_with_blobs =
+            Self::build_replay_messages_with_state_blobs(uncommitted_txns, collector);
 
-                for (record, state_blobs) in replay_messages_with_blobs {
-                    txns_by_epoch
-                        .entry(record.epoch)
-                        .or_default()
-                        .push((record, state_blobs));
-                }
+        let mut txns_by_epoch: std::collections::BTreeMap<crate::checkpoint::EpochId, Vec<_>> =
+            std::collections::BTreeMap::new();
 
-                let total_epochs = txns_by_epoch.len();
-                let mut sent_count = 0;
+        for (record, state_blobs) in replay_messages_with_blobs {
+            txns_by_epoch
+                .entry(record.epoch)
+                .or_default()
+                .push((record, state_blobs));
+        }
 
-                tracing::info!(
-                    replacement_proxy,
-                    total_epochs,
-                    uncommitted_count = uncommitted_txns.len(),
-                    "Sending replay messages with intelligent state blob attachment"
-                );
+        let mut all_chunks = Vec::new();
+        for (epoch, epoch_records) in txns_by_epoch {
+            let mut replay_items = Vec::new();
+            for (record, state_blobs) in epoch_records {
+                let transaction = (*record.transaction).clone();
+                replay_items.push(crate::executor::api::ReplayMsg {
+                    epoch_id: record.epoch,
+                    transaction: Some(transaction),
+                    required_versions: record.required_states.keys().cloned().collect(),
+                    state_blobs,
+                });
+            }
 
-                for (epoch, epoch_records) in txns_by_epoch {
-                    let mut replay_items = Vec::new();
+            let replay_batch = crate::executor::api::ReplayBatch {
+                epoch,
+                items: replay_items,
+            };
 
-                    for (record, state_blobs) in epoch_records {
-                        // Hydrate transaction data from LogRecord
-                        let transaction = (*record.transaction).clone();
+            let chunking_result = chunk_replay_batch(replay_batch, chunking_config);
+            all_chunks.extend(chunking_result.chunks);
+        }
+        all_chunks
+    }
 
-                        replay_items.push(crate::executor::api::ReplayMsg {
-                            epoch_id: record.epoch,
-                            transaction: Some(transaction),
-                            required_versions: record.required_states.keys().cloned().collect(),
-                            state_blobs,
-                        });
-                    }
+    /// Sends the prepared replay batches to the replacement proxy.
+    async fn send_replay_batches(
+        replacement_proxy: ProxyId,
+        replay_chunks: Vec<crate::executor::api::ReplayBatch<E::Transaction>>,
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+    ) -> Result<(), NodeError> {
+        if let Some(proxy_tx) = proxy_connections.get(&replacement_proxy) {
+            let total_chunks = replay_chunks.len();
+            tracing::info!(
+                replacement_proxy,
+                total_chunks,
+                "Sending replay batches to replacement proxy"
+            );
 
-                    let batch_size = replay_items.len();
-                    sent_count += batch_size;
-
-                    let replay_batch = crate::executor::api::ReplayBatch {
-                        epoch,
-                        items: replay_items,
-                    };
-
-                    // Chunk the replay batch if needed
-                    let chunking_result = chunk_replay_batch(replay_batch, &chunking_config);
-
-                    tracing::info!(
-                        epoch = epoch.0,
-                        batch_size,
-                        sent_count,
-                        num_chunks = chunking_result.num_chunks,
-                        max_chunk_size = chunking_result.max_chunk_size,
-                        "Sending replay batch for epoch ({} chunks)",
-                        chunking_result.num_chunks
+            for (chunk_idx, chunk) in replay_chunks.into_iter().enumerate() {
+                let epoch = chunk.epoch;
+                let msg = crate::executor::api::PrimaryToProxyMessage::Replay(chunk);
+                if let Err(e) = proxy_tx.value().send(msg).await {
+                    tracing::error!(
+                        "Failed to send replay chunk {}/{} for epoch {} to replacement proxy {}: {:?}",
+                        chunk_idx + 1,
+                        total_chunks,
+                        epoch.0,
+                        replacement_proxy,
+                        e
                     );
-
-                    // Send all chunks for this epoch
-                    for (chunk_idx, chunk) in chunking_result.chunks.into_iter().enumerate() {
-                        let msg = crate::executor::api::PrimaryToProxyMessage::Replay(chunk);
-                        if let Err(e) = proxy_tx.value().send(msg).await {
-                            tracing::error!(
-                                "Failed to send replay chunk {}/{} for epoch {} to replacement proxy {}: {:?}",
-                                chunk_idx + 1,
-                                chunking_result.num_chunks,
-                                epoch.0,
-                                replacement_proxy,
-                                e
-                            );
-                            return;
-                        }
-                        tracing::debug!(
-                            "Sent replay chunk {}/{} for epoch {} to replacement proxy {}",
-                            chunk_idx + 1,
-                            chunking_result.num_chunks,
-                            epoch.0,
-                            replacement_proxy
-                        );
-                    }
+                    return Err(NodeError::FailedToReplayBatches(e.to_string()));
                 }
-
-                tracing::info!(
-                    "Completed replay: sent {} transactions across {} epochs to replacement proxy {}",
-                    sent_count,
-                    total_epochs,
+                tracing::debug!(
+                    "Sent replay chunk {}/{} for epoch {} to replacement proxy {}",
+                    chunk_idx + 1,
+                    total_chunks,
+                    epoch.0,
                     replacement_proxy
-                );
-
-                // CRITICAL: Update states_to_proxy to record that standby now owns versions from uncommitted txns
-                //
-                // Uncommitted transactions replayed to the standby don't go through normal forwarding path, so
-                // get_missing_states_for_transaction() is never called. We need to manually update states_to_proxy
-                // to record that the standby now owns all versions produced by uncommitted transactions.
-                // This prevents unnecessary state transfers when future transactions get routed to the standby.
-                //
-                // IMPORTANT: Calculate ExecutorIndex AFTER promotion (without standby exclusion)
-                // We're about to promote the standby, so we need its ExecutorIndex in the post-promotion state.
-                let replacement_proxy_index = {
-                    let mut keys: Vec<usize> = proxy_connections.iter().map(|e| *e.key()).collect();
-                    keys.sort_unstable();
-                    // Don't exclude standby - we want the index AFTER promotion
-                    keys.iter()
-                        .position(|&id| id == replacement_proxy)
-                        .unwrap_or(replacement_proxy)
-                };
-
-                let mut versions_added = 0;
-                for record in &uncommitted_txns {
-                    let produced_version = record.produced_version();
-                    for ((obj_id, _req_version), _) in &record.required_states {
-                        states_to_proxy
-                            .entry((*obj_id, produced_version))
-                            .or_insert_with(std::collections::HashSet::new)
-                            .insert(replacement_proxy_index);
-                        tracing::debug!(
-                            "Updated states_to_proxy for {:?} to include {:?}",
-                            (*obj_id, produced_version),
-                            replacement_proxy_index
-                        );
-                        versions_added += 1;
-                    }
-                }
-
-                tracing::info!(
-                    replacement_proxy,
-                    replacement_proxy_index,
-                    versions_added,
-                    "Updated states_to_proxy: added {} versions from uncommitted transactions to standby proxy",
-                    versions_added
-                );
-
-                // CRITICAL FIX: Promote standby AFTER all replay messages are sent.
-                //
-                // Bug: If we promote the standby before replay completes, new transactions can be
-                // forwarded to the standby while it's still processing replay messages. This causes
-                // duplicates: the same transaction appears both as a normal CombinedTxn (from new
-                // forwarding) and as a Replay message (from recovery).
-                //
-                // Solution: Keep standby_excluded=true during replay, then promote after sending
-                // all replay messages. This ensures the standby only receives replay traffic until
-                // it's fully caught up.
-                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!(
-                    replacement_proxy,
-                    "Standby proxy promoted to active after replay completion"
-                );
-
-                // Note on states_to_proxy updates:
-                //
-                // - Uncommitted transactions: Already updated above. Both the original proxy AND standby now
-                //   own these versions in the HashSet. This allows future transactions to execute locally
-                //   on either proxy without unnecessary state transfers.
-                //
-                // - Future transactions: Will be updated naturally through normal forwarding as the standby
-                //   executes new transactions. Since standby is now promoted, future transactions will call
-                //   get_missing_states_for_transaction() which updates states_to_proxy.
-                //
-                // With HashSet-based ownership, multiple proxies can own the same version simultaneously,
-                // which is correct after uncommitted transaction replay.
-            } else {
-                tracing::error!(
-                    "Replacement proxy {} not found in connections",
-                    replacement_proxy
-                );
-                // Promote standby anyway to avoid system deadlock
-                standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!(
-                    replacement_proxy,
-                    "Standby promoted despite replay failure to avoid deadlock"
                 );
             }
-        });
+            Ok(())
+        } else {
+            tracing::error!(
+                "Replacement proxy {} not found in connections",
+                replacement_proxy
+            );
+            Err(NodeError::ProxyConnectionNotFound(replacement_proxy))
+        }
+    }
+
+    /// Updates the state ownership map to include the replacement proxy for replayed transactions.
+    fn update_ownership_after_replay(
+        uncommitted_txns: &[crate::recovery::LogRecord<E::Transaction>],
+        replacement_proxy: ProxyId,
+        states_to_proxy: &Arc<
+            DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<usize>>,
+        >,
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+    ) {
+        let replacement_proxy_index = {
+            let mut keys: Vec<usize> = proxy_connections.iter().map(|e| *e.key()).collect();
+            keys.sort_unstable();
+            keys.iter()
+                .position(|&id| id == replacement_proxy)
+                .unwrap_or(replacement_proxy)
+        };
+
+        let mut versions_added = 0;
+        for record in uncommitted_txns {
+            let produced_version = record.produced_version();
+            for ((obj_id, _req_version), _) in &record.required_states {
+                states_to_proxy
+                    .entry((*obj_id, produced_version))
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(replacement_proxy_index);
+                versions_added += 1;
+            }
+        }
+        tracing::info!(
+            replacement_proxy,
+            replacement_proxy_index,
+            versions_added,
+            "Updated states_to_proxy: added {} versions from uncommitted transactions to standby proxy",
+            versions_added
+        );
+    }
+
+    /// Promotes the standby proxy to active service.
+    fn promote_standby_proxy(standby_excluded: Arc<AtomicBool>, replacement_proxy: ProxyId) {
+        standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            replacement_proxy,
+            "Standby proxy promoted to active after replay completion"
+        );
     }
 
     /// Initialize transaction processors and return the senders

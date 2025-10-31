@@ -1,6 +1,5 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
-use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use sui_types::base_types::ObjectID;
@@ -31,39 +30,88 @@ impl EpochTracker {
 /// Tracks modified objects in the current epoch.
 #[derive(Clone)]
 pub struct ModifiedObjectTracker {
-    // map of object -> latest object state in this epoch
-    modified: Arc<ArcSwap<DashMap<ObjectID, Object>>>,
+    // Map of epoch -> (object -> latest object state in that epoch)
+    modified: Arc<DashMap<EpochId, DashMap<ObjectID, Object>>>,
+    // Highest epoch that has been fully snapped/committed.
+    committed_up_to: Arc<AtomicU64>,
 }
 
 impl ModifiedObjectTracker {
     pub fn new() -> Self {
         Self {
-            modified: Arc::new(ArcSwap::from(Arc::new(DashMap::new()))),
+            modified: Arc::new(DashMap::new()),
+            committed_up_to: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn record_object(&self, object_id: ObjectID, object: Object) {
+    pub fn record_object(&self, epoch: EpochId, object_id: ObjectID, object: Object) {
+        let committed = self.committed_up_to.load(Ordering::SeqCst);
+        if epoch.0 <= committed {
+            tracing::warn!(
+                "dropping object for obj_id {} in committed epoch {} (committed_up_to={})",
+                object_id,
+                epoch.0,
+                committed
+            );
+            return;
+        }
+
         tracing::debug!(
-            "recording object for obj_id {}: version {}",
+            "recording object for epoch {} obj_id {}: version {}",
+            epoch.0,
             object_id,
             object.version().value()
         );
-        self.modified.load().insert(object_id, object);
+
+        match self.modified.entry(epoch) {
+            Entry::Occupied(entry) => {
+                entry.get().insert(object_id, object);
+            }
+            Entry::Vacant(entry) => {
+                let inner = DashMap::new();
+                inner.insert(object_id, object);
+                entry.insert(inner);
+            }
+        }
     }
 
     /// Drain current epoch modifications and reset.
-    pub fn take_epoch_snapshot(&self) -> EpochObjectStates {
+    pub fn take_epoch_snapshot(&self, epoch: EpochId) -> EpochObjectStates {
         let mut out = EpochObjectStates::new();
-        let old_map = self.modified.swap(Arc::new(DashMap::new()));
-        for entry in old_map.iter() {
-            tracing::debug!(
-                "taking epoch snapshot for obj_id {}: version {}",
-                entry.key(),
-                entry.value().version().value()
+        self.update_committed_up_to(epoch);
+        if let Some((_, epoch_map)) = self.modified.remove(&epoch) {
+            for entry in epoch_map.into_iter() {
+                let (obj_id, obj) = entry;
+                tracing::debug!(
+                    "taking epoch {} snapshot for obj_id {}: version {}",
+                    epoch.0,
+                    obj_id,
+                    obj.version().value()
+                );
+                out.insert(obj_id, obj);
+            }
+        } else {
+            tracing::warn!(
+                "take_epoch_snapshot called for already-drained epoch {}",
+                epoch.0
             );
-            out.insert(*entry.key(), entry.value().clone());
         }
         out
+    }
+
+    fn update_committed_up_to(&self, epoch: EpochId) {
+        let mut current = self.committed_up_to.load(Ordering::SeqCst);
+        while epoch.0 > current {
+            match self.committed_up_to.compare_exchange(
+                current,
+                epoch.0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(new_current) => current = new_current,
+            }
+        }
     }
 }
 
@@ -121,7 +169,7 @@ mod tests {
     #[test]
     fn test_modified_object_tracker_new() {
         let tracker = ModifiedObjectTracker::new();
-        let snapshot = tracker.take_epoch_snapshot();
+        let snapshot = tracker.take_epoch_snapshot(EpochId(1));
         assert!(snapshot.is_empty());
     }
 
@@ -134,17 +182,17 @@ mod tests {
         let obj2 = create_test_object(obj_id2);
 
         // Record objects
-        tracker.record_object(obj_id1, obj1.clone());
-        tracker.record_object(obj_id2, obj2.clone());
+        tracker.record_object(EpochId(1), obj_id1, obj1.clone());
+        tracker.record_object(EpochId(1), obj_id2, obj2.clone());
 
         // Take snapshot
-        let snapshot = tracker.take_epoch_snapshot();
+        let snapshot = tracker.take_epoch_snapshot(EpochId(1));
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot.get(&obj_id1), Some(&obj1));
         assert_eq!(snapshot.get(&obj_id2), Some(&obj2));
 
         // Snapshot should be empty after taking
-        let empty_snapshot = tracker.take_epoch_snapshot();
+        let empty_snapshot = tracker.take_epoch_snapshot(EpochId(1));
         assert!(empty_snapshot.is_empty());
     }
 
@@ -156,13 +204,13 @@ mod tests {
         let obj2 = create_test_object(obj_id); // Same ID, different object
 
         // Record first object
-        tracker.record_object(obj_id, obj1.clone());
+        tracker.record_object(EpochId(1), obj_id, obj1.clone());
 
         // Overwrite with second object
-        tracker.record_object(obj_id, obj2.clone());
+        tracker.record_object(EpochId(1), obj_id, obj2.clone());
 
         // Snapshot should contain only the second object
-        let snapshot = tracker.take_epoch_snapshot();
+        let snapshot = tracker.take_epoch_snapshot(EpochId(1));
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.get(&obj_id), Some(&obj2));
     }
@@ -181,7 +229,7 @@ mod tests {
             let handle = thread::spawn(move || {
                 let obj_id = ObjectID::random();
                 let obj = create_test_object(obj_id);
-                tracker.record_object(obj_id, obj);
+                tracker.record_object(EpochId(1), obj_id, obj);
             });
             handles.push(handle);
         }
@@ -192,7 +240,7 @@ mod tests {
         }
 
         // Snapshot should contain all recorded objects
-        let snapshot = tracker.take_epoch_snapshot();
+        let snapshot = tracker.take_epoch_snapshot(EpochId(1));
         assert_eq!(snapshot.len(), 10);
     }
 }

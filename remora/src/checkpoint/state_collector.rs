@@ -1,4 +1,5 @@
 use crate::checkpoint::{EpochId, EpochObjectStates};
+use crate::proxy::core::ProxyId;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use sui_types::base_types::{ObjectID, SequenceNumber};
@@ -10,14 +11,14 @@ pub struct StateCollector {
     /// This is the "commit point" - all proxies have reached consensus on these versions
     pub merged_state: DashMap<ObjectID, Object>,
 
-    /// Temporary per-proxy state: Snapshots received but not yet fully acknowledged
-    /// Key: (ProxyId, ObjectID) -> Object
-    /// Once all proxies report for an epoch, temp states are promoted to merged_state
-    temp_state_by_proxy: DashMap<(crate::proxy::core::ProxyId, ObjectID), Object>,
+    /// Temporary state, grouped by epoch: (EpochId -> (ProxyId, ObjectID) -> Object)
+    /// This structure isolates epochs to prevent race conditions during commits.
+    /// An epoch's data is atomically removed from here and processed by `commit_epoch`.
+    temp_state_by_epoch: DashMap<EpochId, DashMap<(ProxyId, ObjectID), Object>>,
 
     /// Per-proxy persist index: tracks the last acknowledged epoch for each proxy
     /// Key: ProxyId, Value: last acknowledged epoch ID
-    pub(crate) per_proxy_persist_index: DashMap<crate::proxy::core::ProxyId, AtomicU64>,
+    pub(crate) per_proxy_persist_index: DashMap<ProxyId, AtomicU64>,
 
     /// Number of expected proxies (for determining when all have acknowledged)
     expected_proxies: usize,
@@ -27,7 +28,7 @@ impl StateCollector {
     pub fn new(expected_proxies: usize) -> Self {
         Self {
             merged_state: DashMap::new(),
-            temp_state_by_proxy: DashMap::new(),
+            temp_state_by_epoch: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
             expected_proxies,
         }
@@ -36,7 +37,7 @@ impl StateCollector {
     /// Process a state snapshot from a proxy
     ///
     /// Two-phase commit protocol:
-    /// 1. Store snapshot in temp_state_by_proxy (per-proxy temporary storage)
+    /// 1. Store snapshot in temp_state_by_epoch (per-proxy temporary storage)
     /// 2. Check if ALL proxies have reported for this epoch
     /// 3. If yes, promote temp states to merged_state (persisted, stable)
     ///
@@ -44,7 +45,7 @@ impl StateCollector {
     /// eliminating version gaps during recovery.
     pub fn process_snapshot<T>(
         &self,
-        proxy_id: crate::proxy::core::ProxyId,
+        proxy_id: ProxyId,
         completed_up_to: u64,
         snapshot: EpochObjectStates,
         _expected_proxies: usize,
@@ -59,15 +60,19 @@ impl StateCollector {
             snapshot.len()
         );
 
-        // Phase 1: Store in temporary per-proxy state
-        for (obj_id, obj) in snapshot.into_iter() {
-            tracing::debug!(
-                "Storing temp snapshot for proxy {} with obj_id {}: {}",
-                proxy_id,
-                obj_id,
-                obj.version().value()
-            );
-            self.temp_state_by_proxy.insert((proxy_id, obj_id), obj);
+        if completed_up_to > 0 {
+            let epoch = EpochId(completed_up_to);
+            let epoch_state = self.temp_state_by_epoch.entry(epoch).or_default();
+            for (obj_id, obj) in snapshot.into_iter() {
+                tracing::debug!(
+                    "Storing temp snapshot for proxy {} in epoch {} with obj_id {}: {}",
+                    proxy_id,
+                    epoch.0,
+                    obj_id,
+                    obj.version().value()
+                );
+                epoch_state.insert((proxy_id, obj_id), obj);
+            }
         }
 
         // Update this proxy's persist index to the completed_up_to watermark
@@ -77,14 +82,12 @@ impl StateCollector {
             .store(completed_up_to, Ordering::SeqCst);
 
         tracing::info!(
-            "Stored temp snapshot for proxy {} at completed_up_to {}",
+            "Updated persist index for proxy {} to {}",
             proxy_id,
             completed_up_to
         );
 
-        // Phase 2: Check if all proxies have reached this watermark
-        // If yes, promote temp states to merged_state (commit point)
-        // Skip committing when completed_up_to = 0 (no batches completed yet)
+        // Check if all proxies have reached this watermark and commit if so
         if completed_up_to > 0 {
             let epoch = EpochId(completed_up_to);
             if self.is_epoch_complete(epoch, self.expected_proxies) {
@@ -107,66 +110,55 @@ impl StateCollector {
     ) where
         T: crate::executor::api::ExecutableTransaction + Clone,
     {
-        let mut committed_count = 0;
+        // Atomically remove the epoch's data to ensure we are the only ones processing it.
+        if let Some((_, epoch_state)) = self.temp_state_by_epoch.remove(&epoch) {
+            let mut committed_count = 0;
 
-        // Collect all object IDs and their latest versions from temp state
-        // Track which proxy wrote each latest version for recovery
-        let mut objects_by_id: std::collections::HashMap<
-            ObjectID,
-            (SequenceNumber, Object, crate::proxy::core::ProxyId),
-        > = std::collections::HashMap::new();
+            // Collect all object IDs and their latest versions from the isolated epoch state.
+            let mut objects_by_id: std::collections::HashMap<
+                ObjectID,
+                (SequenceNumber, Object, ProxyId),
+            > = std::collections::HashMap::new();
 
-        // Scan all temp states to find latest version of each object
-        for entry in self.temp_state_by_proxy.iter() {
-            let ((proxy_id, obj_id), obj) = entry.pair();
-            let version = obj.version();
+            // Scan all temp states for this epoch to find the latest version of each object.
+            for entry in epoch_state.iter() {
+                let ((proxy_id, obj_id), obj) = entry.pair();
+                let version = obj.version();
 
-            // Keep the latest version for each object, and track which proxy wrote it
-            objects_by_id
-                .entry(*obj_id)
-                .and_modify(|(current_version, current_obj, writer_proxy)| {
-                    if version > *current_version {
-                        *current_version = version;
-                        *current_obj = obj.clone();
-                        *writer_proxy = *proxy_id;
-                    }
-                })
-                .or_insert((version, obj.clone(), *proxy_id));
-        }
+                objects_by_id
+                    .entry(*obj_id)
+                    .and_modify(|(current_version, current_obj, writer_proxy)| {
+                        if version > *current_version {
+                            *current_version = version;
+                            *current_obj = obj.clone();
+                            *writer_proxy = *proxy_id;
+                        }
+                    })
+                    .or_insert((version, obj.clone(), *proxy_id));
+            }
 
-        // Commit all latest versions to merged_state and update version_ownership
-        for (obj_id, (version, obj, writer_proxy)) in objects_by_id {
-            // Insert the new latest version
-            tracing::debug!(
-                "Inserting new latest version for obj_id {}: {}",
-                obj_id,
-                version.value()
+            // Commit all latest versions to merged_state.
+            for (obj_id, (version, obj, _writer_proxy)) in objects_by_id {
+                tracing::debug!(
+                    "Inserting new latest version for obj_id {}: {}",
+                    obj_id,
+                    version.value()
+                );
+                self.merged_state.insert(obj_id, obj);
+                committed_count += 1;
+            }
+
+            tracing::info!(
+                "Committed epoch {} to merged_state: {} objects promoted",
+                epoch.0,
+                committed_count
             );
-            self.merged_state.insert(obj_id, obj);
 
-            // Record which proxy wrote this version
-            // Note: We don't remove old version entries because:
-            // 1. Cleanup cost is O(N×M) - extremely expensive with millions of entries
-            // 2. Old entries don't affect correctness - get_versions_by_proxy filters to latest
-            // 3. Storage cost is negligible compared to CPU cost of iteration
-            // 4. Old entries will be naturally pruned when objects are eventually deleted
-            committed_count += 1;
-        }
-
-        // Clear temp states for committed objects (optional optimization)
-        // Keep temp states for now to support partial epochs during recovery
-
-        tracing::info!(
-            "Committed epoch {} to merged_state: {} objects promoted",
-            epoch.0,
-            committed_count
-        );
-
-        // Prune the epoch logger after successful commit
-        // All transactions up to this epoch have been persisted by all proxies
-        if let Some(logger) = epoch_logger {
-            logger.prune_epoch(epoch);
-            tracing::info!("Pruned epoch {} from epoch logger after commit", epoch.0);
+            // Prune the epoch logger after successful commit.
+            if let Some(logger) = epoch_logger {
+                logger.prune_epoch(epoch);
+                tracing::info!("Pruned epoch {} from epoch logger after commit", epoch.0);
+            }
         }
     }
 
@@ -237,7 +229,7 @@ impl StateCollector {
     }
 
     /// Get the persist index for a specific proxy (for debugging/diagnostics).
-    pub fn get_proxy_persist_index(&self, proxy_id: crate::proxy::core::ProxyId) -> u64 {
+    pub fn get_proxy_persist_index(&self, proxy_id: ProxyId) -> u64 {
         self.per_proxy_persist_index
             .get(&proxy_id)
             .map(|atomic| atomic.load(Ordering::SeqCst))
@@ -248,7 +240,7 @@ impl StateCollector {
     /// This is used during recovery to calculate the persist_index without
     /// including the failed proxy, which would otherwise prevent finding
     /// dirty transactions for that proxy.
-    pub fn get_persist_index_excluding(&self, excluded_proxy: crate::proxy::core::ProxyId) -> u64 {
+    pub fn get_persist_index_excluding(&self, excluded_proxy: ProxyId) -> u64 {
         if self.per_proxy_persist_index.is_empty() {
             return 0;
         }
@@ -581,5 +573,72 @@ mod tests {
 
         // No commit should happen (can't commit batch 0)
         assert_eq!(collector.merged_state_len(), 0);
+    }
+
+    #[test]
+    fn test_epoch_commit_is_isolated() {
+        let collector = StateCollector::new(2);
+
+        // --- Epoch 5 Setup ---
+        let obj_id_5 = ObjectID::random();
+        let obj_5 = create_test_object(obj_id_5);
+        let mut snapshot_5 = EpochObjectStates::new();
+        snapshot_5.insert(obj_id_5, obj_5);
+
+        // --- Epoch 6 Setup ---
+        let obj_id_6 = ObjectID::random();
+        let obj_6 = create_test_object(obj_id_6);
+        let mut snapshot_6 = EpochObjectStates::new();
+        snapshot_6.insert(obj_id_6, obj_6);
+
+        // --- Simulate Race ---
+
+        // 1. Proxy 1 reports for epoch 5. This should not trigger a commit.
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            5,
+            snapshot_5.clone(),
+            2,
+            None,
+        );
+        assert_eq!(collector.merged_state_len(), 0);
+        assert!(collector.temp_state_by_epoch.contains_key(&EpochId(5)));
+
+        // 2. Before epoch 5 is committed, proxy 1 reports for epoch 6.
+        // This should also not trigger a commit.
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            1,
+            6,
+            snapshot_6.clone(),
+            2,
+            None,
+        );
+        assert_eq!(collector.merged_state_len(), 0);
+        assert!(collector.temp_state_by_epoch.contains_key(&EpochId(6)));
+
+        // 3. Now, proxy 2 reports for epoch 5. This SHOULD trigger the commit for epoch 5.
+        collector.process_snapshot::<crate::executor::fake::FakeTransaction>(
+            2,
+            5,
+            snapshot_5.clone(),
+            2,
+            None,
+        );
+
+        // --- Assertions ---
+
+        // The commit for epoch 5 should be complete.
+        assert_eq!(collector.get_persist_index(), 5);
+
+        // merged_state should contain ONLY the object from epoch 5.
+        assert_eq!(collector.merged_state_len(), 1);
+        assert!(collector.get_object(&obj_id_5).is_some());
+        assert!(collector.get_object(&obj_id_6).is_none()); // Crucial check
+
+        // The temp state for epoch 5 should be gone.
+        assert!(!collector.temp_state_by_epoch.contains_key(&EpochId(5)));
+
+        // The temp state for epoch 6 should still be there.
+        assert!(collector.temp_state_by_epoch.contains_key(&EpochId(6)));
     }
 }

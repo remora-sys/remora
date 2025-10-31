@@ -571,7 +571,7 @@ where
             // Record modified objects into the per-epoch tracker
             if let Some(new_state) = &execution_result.new_state {
                 for (obj_id, obj) in new_state.iter() {
-                    modified_tracker.record_object(*obj_id, obj.clone());
+                    modified_tracker.record_object(epoch_id_for_tracking, *obj_id, obj.clone());
                 }
             }
 
@@ -706,7 +706,7 @@ where
                         );
 
                         // Take snapshot and send to primary
-                        let snapshot = modified_tracker.take_epoch_snapshot();
+                        let snapshot = modified_tracker.take_epoch_snapshot(EpochId(next_epoch));
                         tracing::info!(
                             "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
                             id,
