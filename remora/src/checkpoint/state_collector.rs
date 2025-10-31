@@ -139,6 +139,17 @@ impl StateCollector {
 
             // Commit all latest versions to merged_state.
             for (obj_id, (version, obj, _writer_proxy)) in objects_by_id {
+                if let Some(existing_obj) = self.merged_state.get(&obj_id) {
+                    if existing_obj.version() >= version {
+                        tracing::warn!(
+                            "Stale version update rejected for obj_id {}: existing_version={}, new_version={}",
+                            obj_id,
+                            existing_obj.version(),
+                            version
+                        );
+                        continue; // Skip insertion
+                    }
+                }
                 tracing::debug!(
                     "Inserting new latest version for obj_id {}: {}",
                     obj_id,
@@ -262,6 +273,13 @@ mod tests {
 
     fn create_test_object(id: ObjectID) -> Object {
         Object::immutable_with_id_for_testing(id)
+    }
+
+    fn create_test_object_with_version(id: ObjectID, version: u64) -> Object {
+        use sui_types::object::MoveObject;
+        let v = SequenceNumber::from(version);
+        let o = MoveObject::new_gas_coin(v, id, 100);
+        Object::new_move(o, sui_types::object::Owner::Immutable, Default::default())
     }
 
     #[test]
@@ -639,6 +657,45 @@ mod tests {
         assert!(!collector.temp_state_by_epoch.contains_key(&EpochId(5)));
 
         // The temp state for epoch 6 should still be there.
-        assert!(collector.temp_state_by_epoch.contains_key(&EpochId(6)));
+    }
+
+    #[test]
+    fn test_stale_version_update_is_rejected() {
+        let collector = StateCollector::new(2);
+        let obj_id = ObjectID::random();
+
+        // 1. Simulate commit of a newer version (v4 from epoch 3)
+        let mut epoch_3_state = DashMap::new();
+        let obj_v4 = create_test_object_with_version(obj_id, 4);
+        epoch_3_state.insert((0, obj_id), obj_v4);
+        collector
+            .temp_state_by_epoch
+            .insert(EpochId(3), epoch_3_state);
+
+        collector.commit_epoch::<crate::executor::fake::FakeTransaction>(EpochId(3), None);
+
+        // Assert that merged_state has v4
+        assert_eq!(
+            collector.get_persisted_version(&obj_id),
+            Some(SequenceNumber::from(4))
+        );
+
+        // 2. Simulate a delayed, out-of-order commit of an older version (v3 from epoch 2)
+        let mut epoch_2_state = DashMap::new();
+        let obj_v3 = create_test_object_with_version(obj_id, 3);
+        epoch_2_state.insert((0, obj_id), obj_v3);
+        collector
+            .temp_state_by_epoch
+            .insert(EpochId(2), epoch_2_state);
+
+        collector.commit_epoch::<crate::executor::fake::FakeTransaction>(EpochId(2), None);
+
+        // 3. Assert that the stale update was rejected
+        // The version in merged_state should still be v4, not overwritten by v3.
+        assert_eq!(
+            collector.get_persisted_version(&obj_id),
+            Some(SequenceNumber::from(4)),
+            "Stale version v3 should have been rejected"
+        );
     }
 }

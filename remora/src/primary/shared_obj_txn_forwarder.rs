@@ -363,7 +363,7 @@ where
                     let replay_message = PrimaryToProxyMessage::Replay(replay_batch);
                     Self::send_to_proxy(proxy_connections, dest_pid, replay_message).await;
 
-                    tracing::info!(
+                    tracing::debug!(
                         "Sent {:?} lazy-fetched states to proxy {} for txn {:?}",
                         missing_states_result.lazy_fetched_blobs,
                         dest_pid,
