@@ -2,3 +2,4 @@
 *.yml
 !assets/example-*.yml
 *.log
+*.swp
