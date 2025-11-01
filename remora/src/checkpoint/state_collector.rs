@@ -64,7 +64,7 @@ impl StateCollector {
             let epoch = EpochId(completed_up_to);
             let epoch_state = self.temp_state_by_epoch.entry(epoch).or_default();
             for (obj_id, obj) in snapshot.into_iter() {
-                tracing::debug!(
+                tracing::info!(
                     "Storing temp snapshot for proxy {} in epoch {} with obj_id {}: {}",
                     proxy_id,
                     epoch.0,
@@ -150,7 +150,7 @@ impl StateCollector {
                         continue; // Skip insertion
                     }
                 }
-                tracing::debug!(
+                tracing::info!(
                     "Inserting new latest version for obj_id {}: {}",
                     obj_id,
                     version.value()
@@ -665,7 +665,7 @@ mod tests {
         let obj_id = ObjectID::random();
 
         // 1. Simulate commit of a newer version (v4 from epoch 3)
-        let mut epoch_3_state = DashMap::new();
+        let epoch_3_state = DashMap::new();
         let obj_v4 = create_test_object_with_version(obj_id, 4);
         epoch_3_state.insert((0, obj_id), obj_v4);
         collector
@@ -681,7 +681,7 @@ mod tests {
         );
 
         // 2. Simulate a delayed, out-of-order commit of an older version (v3 from epoch 2)
-        let mut epoch_2_state = DashMap::new();
+        let epoch_2_state = DashMap::new();
         let obj_v3 = create_test_object_with_version(obj_id, 3);
         epoch_2_state.insert((0, obj_id), obj_v3);
         collector

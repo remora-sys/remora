@@ -109,7 +109,7 @@ where
 
                 logger.append(epoch_id, rec);
 
-                tracing::debug!(
+                tracing::info!(
                     epoch = epoch_id.0,
                     txn = ?transaction.digest(),
                     "Sequential epoch logger: appended transaction in epoch order"
@@ -415,7 +415,7 @@ where
                     resolved_stateless.unwrap_or(usize::MAX),
                     stateful_missing_states.clone(),
                 );
-                tracing::debug!(
+                tracing::info!(
                     "stateful message: {:?}, transaction_arc.digest: {:?}, destination: {:?}",
                     stateful_missing_states,
                     transaction_arc.digest(),

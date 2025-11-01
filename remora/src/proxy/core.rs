@@ -46,6 +46,70 @@ use crate::{
 
 pub type ProxyId = ExecutorIndex;
 
+fn spawn_state_updates_helper<E: Executor + Send + Sync + 'static>(
+    state_blobs: BTreeMap<ObjectID, Object>,
+    store: Store<E>,
+    stateful_controller: Arc<VersionedDependencyController>,
+) where
+    Store<E>: Send + Sync,
+{
+    if state_blobs.is_empty() {
+        tracing::warn!("No state blobs to commit");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut valid_state_blobs = BTreeMap::new();
+        for (object_id, new_object) in state_blobs {
+            let new_version = new_object.version();
+            let should_commit = match store.read_object(&object_id) {
+                Ok(Some(current_object)) => new_version > current_object.version(),
+                Ok(None) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read object for version check {:?}: {:?}",
+                        object_id,
+                        e
+                    );
+                    false
+                }
+            };
+
+            if should_commit {
+                valid_state_blobs.insert(object_id, new_object);
+            } else {
+                tracing::warn!(
+                    "Skipping state update for object {:?} with older or same version {}",
+                    object_id,
+                    new_version
+                );
+            }
+        }
+
+        if valid_state_blobs.is_empty() {
+            return;
+        }
+
+        // atomic notify for each object version
+        let mut all_handles = Vec::new();
+        for (oid, obj) in valid_state_blobs.iter() {
+            let version = obj.compute_object_reference().1.one_before().unwrap();
+            let (_, handles) = stateful_controller.get_prior_dependency_and_update(
+                0,
+                vec![(*oid, version)],
+                true,
+                false,
+            );
+            all_handles.extend(handles);
+        }
+
+        store.commit_new_objects(valid_state_blobs);
+        for notify in all_handles {
+            notify.notify_one();
+        }
+    });
+}
+
 struct PrimaryMessageProcessor<E: Executor> {
     id: ProxyId,
     executor: E,
@@ -416,63 +480,7 @@ where
 
     /// Spawn a task to commit state updates and notify dependencies
     fn spawn_state_updates(&self, state_blobs: BTreeMap<ObjectID, Object>) {
-        if state_blobs.is_empty() {
-            tracing::warn!("No state blobs to commit");
-            return;
-        }
-
-        let store = self.store.clone();
-        let stateful_controller = self.stateful_controller.clone();
-        tokio::spawn(async move {
-            let mut valid_state_blobs = BTreeMap::new();
-            for (object_id, new_object) in state_blobs {
-                let new_version = new_object.version();
-                let should_commit = match store.read_object(&object_id) {
-                    Ok(Some(current_object)) => new_version > current_object.version(),
-                    Ok(None) => true,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to read object for version check {:?}: {:?}",
-                            object_id,
-                            e
-                        );
-                        false
-                    }
-                };
-
-                if should_commit {
-                    valid_state_blobs.insert(object_id, new_object);
-                } else {
-                    tracing::warn!(
-                        "Skipping state update for object {:?} with older or same version {}",
-                        object_id,
-                        new_version
-                    );
-                }
-            }
-
-            if valid_state_blobs.is_empty() {
-                return;
-            }
-
-            // atomic notify for each object version
-            let mut all_handles = Vec::new();
-            for (oid, obj) in valid_state_blobs.iter() {
-                let version = obj.compute_object_reference().1.one_before().unwrap();
-                let (_, handles) = stateful_controller.get_prior_dependency_and_update(
-                    0,
-                    vec![(*oid, version)],
-                    true,
-                    false,
-                );
-                all_handles.extend(handles);
-            }
-
-            store.commit_new_objects(valid_state_blobs);
-            for notify in all_handles {
-                notify.notify_one();
-            }
-        });
+        spawn_state_updates_helper::<E>(state_blobs, self.store.clone(), self.stateful_controller.clone());
     }
 
     pub async fn spawn_stateful_txn(
@@ -855,31 +863,9 @@ where
         tracing::debug!(
             "Proxy {} handling stateful reply with objects: {:?}",
             self.id,
-            objects
+            objects.keys()
         );
-
-        // Mock the states update (oid, v) as a txn from (oid, v - 1) to (oid, v)
-        let objs: Vec<_> = objects
-            .iter()
-            .map(|(oid, o)| (*oid, o.compute_object_reference().1.one_before().unwrap()))
-            .collect();
-        if objs.is_empty() {
-            tracing::warn!("No objects to commit for stateful reply");
-            return;
-        }
-        let (_, current_handles) = self
-            .stateful_controller
-            .get_prior_dependency_and_update(0, objs, true, false);
-
-        let store = self.store.clone();
-        tokio::spawn(async move {
-            // Newly migrated states can be committed directly
-            // without waiting for the prior dependencies
-            store.commit_new_objects(objects);
-            for notify in current_handles {
-                notify.notify_one();
-            }
-        });
+        spawn_state_updates_helper::<E>(objects, self.store.clone(), self.stateful_controller.clone());
     }
 
     async fn handle_stateless_reply(&mut self, digest: TransactionDigest, result: bool) {
