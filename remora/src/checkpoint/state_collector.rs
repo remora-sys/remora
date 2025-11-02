@@ -22,6 +22,8 @@ pub struct StateCollector {
 
     /// Number of expected proxies (for determining when all have acknowledged)
     expected_proxies: usize,
+    /// The last epoch that was successfully committed to merged_state.
+    last_committed_epoch: AtomicU64,
 }
 
 impl StateCollector {
@@ -31,6 +33,7 @@ impl StateCollector {
             temp_state_by_epoch: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
             expected_proxies,
+            last_committed_epoch: AtomicU64::new(0),
         }
     }
 
@@ -53,14 +56,17 @@ impl StateCollector {
     ) where
         T: crate::executor::api::ExecutableTransaction + Clone,
     {
-        tracing::info!(
-            "Process_snapshot: Received snapshot from proxy {} with completed_up_to {}: {} objects",
-            proxy_id,
-            completed_up_to,
-            snapshot.len()
-        );
+        let last_committed = self.last_committed_epoch.load(Ordering::SeqCst);
+        let is_stale = completed_up_to > 0 && completed_up_to <= last_committed;
 
-        if completed_up_to > 0 {
+        if is_stale {
+            tracing::warn!(
+                "Received stale snapshot for already-committed epoch {}. Last committed epoch is {}. Discarding snapshot data.",
+                completed_up_to,
+                last_committed
+            );
+        } else if completed_up_to > 0 {
+            // Only store snapshot data if it's for a future, non-stale epoch.
             let epoch = EpochId(completed_up_to);
             let epoch_state = self.temp_state_by_epoch.entry(epoch).or_default();
             for (obj_id, obj) in snapshot.into_iter() {
@@ -75,29 +81,40 @@ impl StateCollector {
             }
         }
 
-        // Update this proxy's persist index to the completed_up_to watermark
+        // Atomically update the persist index for the reporting proxy.
         self.per_proxy_persist_index
             .entry(proxy_id)
             .or_insert_with(|| AtomicU64::new(0))
-            .store(completed_up_to, Ordering::SeqCst);
+            .fetch_max(completed_up_to, Ordering::SeqCst);
 
-        tracing::info!(
-            "Updated persist index for proxy {} to {}",
-            proxy_id,
-            completed_up_to
-        );
+        // ALWAYS run the commit loop. The index update (even from a stale snapshot)
+        // might be what completes the next sequential epoch.
+        loop {
+            let current_last_committed = self.last_committed_epoch.load(Ordering::SeqCst);
+            let next_epoch_to_commit = current_last_committed + 1;
 
-        // Check if all proxies have reached this watermark and commit if so
-        if completed_up_to > 0 {
-            let epoch = EpochId(completed_up_to);
-            if self.is_epoch_complete(epoch, self.expected_proxies) {
-                self.commit_epoch(epoch, epoch_logger);
+            // If the next epoch isn't ready to commit, we're done.
+            if !self.is_epoch_complete(EpochId(next_epoch_to_commit), self.expected_proxies) {
+                break;
             }
-        } else {
-            tracing::info!(
-                "Skipping commit for completed_up_to=0 from proxy {} (no batches completed yet)",
-                proxy_id
-            );
+
+            // Try to atomically advance the committed epoch. If we fail, another
+            // thread has already done it, so we can stop.
+            if self
+                .last_committed_epoch
+                .compare_exchange(
+                    current_last_committed,
+                    next_epoch_to_commit,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                break;
+            }
+
+            // We successfully claimed this epoch, so now we can commit it.
+            self.commit_epoch(EpochId(next_epoch_to_commit), epoch_logger);
         }
     }
 
@@ -195,15 +212,6 @@ impl StateCollector {
             return false;
         }
 
-        // BUG FIX: Check the MINIMUM persist_index across ALL proxies.
-        //
-        // Problem: .take(expected_proxies) uses arbitrary DashMap iteration order.
-        // When a proxy fails but stays in the map (stuck at old epoch) and standby is promoted,
-        // .take(N) might skip the failed proxy, allowing merged_state to advance incorrectly.
-        //
-        // Solution: Check if minimum persist_index >= epoch. This ensures ALL proxies,
-        // including any failed ones, have advanced. A failed proxy acts as a "brake" to keep
-        // merged_state frozen at the safe snapshot point for recovery.
         let min_persist_index = self
             .per_proxy_persist_index
             .iter()
@@ -660,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_version_update_is_rejected() {
+    fn test_out_of_order_commit_preserves_latest_version() {
         let collector = StateCollector::new(2);
         let obj_id = ObjectID::random();
 
@@ -697,5 +705,38 @@ mod tests {
             Some(SequenceNumber::from(4)),
             "Stale version v3 should have been rejected"
         );
+    }
+
+    #[test]
+    fn test_late_duplicate_snapshot_is_ignored() {
+        let collector = StateCollector::new(1);
+        let obj_id = ObjectID::random();
+        let obj_v5 = create_test_object_with_version(obj_id, 5);
+        let mut snapshot_5 = EpochObjectStates::new();
+        snapshot_5.insert(obj_id, obj_v5);
+
+        // 1. Process a snapshot for epoch 5.
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(0, 5, snapshot_5, 1, None);
+
+        // Assert that the proxy's index is 5 and epoch 5 was committed.
+        assert_eq!(collector.get_proxy_persist_index(0), 5);
+        assert_eq!(collector.last_committed_epoch.load(Ordering::SeqCst), 5);
+        assert!(collector.temp_state_by_epoch.is_empty()); // Should be cleaned up after commit.
+
+        // 2. Process a late/duplicate snapshot for epoch 4.
+        let obj_v4 = create_test_object_with_version(obj_id, 4);
+        let mut snapshot_4 = EpochObjectStates::new();
+        snapshot_4.insert(obj_id, obj_v4);
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(0, 4, snapshot_4, 1, None);
+
+        // 3. Assert that the state has not changed.
+        // The proxy's index should NOT regress to 4.
+        assert_eq!(collector.get_proxy_persist_index(0), 5);
+        // The last committed epoch should still be 5.
+        assert_eq!(collector.last_committed_epoch.load(Ordering::SeqCst), 5);
+        // No new temp state for epoch 4 should have been created.
+        assert!(!collector.temp_state_by_epoch.contains_key(&EpochId(4)));
     }
 }

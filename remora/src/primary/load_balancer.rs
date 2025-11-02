@@ -137,14 +137,6 @@ where
             // Use the failed proxy's own persist_index as epoch_id
             let persist_epoch = EpochId(self.collector.get_proxy_persist_index(failed_proxy));
 
-            // TODO: Replace the sleep with a proper synchronization mechanism (e.g., worker pool flush or epoch barrier).
-            tracing::info!(
-                failed_proxy,
-                "Waiting for in-flight forwarding tasks to complete epoch logger appends..."
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            tracing::info!(failed_proxy, "Delay complete, capturing atomic snapshot");
-
             // Collect all uncommitted transactions from the epoch logger.
             let uncommitted_txns = self
                 .recovery_coordinator
@@ -173,8 +165,9 @@ where
             );
 
             // Start replay process for the replacement proxy.
-            self.start_replay_process(failed_proxy, standby_proxy, uncommitted_txns);
-            tracing::info!(failed_proxy, standby_proxy, "Replay initiation requested");
+            self.start_replay_process(failed_proxy, standby_proxy, uncommitted_txns)
+                .await;
+            tracing::info!(failed_proxy, standby_proxy, "Replay finished");
 
             Some(standby_proxy)
         } else {
@@ -371,7 +364,7 @@ where
     /// 4. Finally, promote the standby proxy to active service.
     ///
     /// This function orchestrates the replay process by calling helper methods for each step.
-    fn start_replay_process(
+    async fn start_replay_process(
         &self,
         failed_proxy: ProxyId,
         replacement_proxy: ProxyId,
@@ -383,54 +376,51 @@ where
         let chunking_config = self.chunking_config.clone();
         let states_to_proxy = self.states_to_proxy.clone();
 
-        tokio::spawn(async move {
+        tracing::info!(
+            failed_proxy,
+            replacement_proxy,
+            uncommitted_count = uncommitted_txns.len(),
+            "Replay task spawned."
+        );
+
+        if uncommitted_txns.is_empty() {
             tracing::info!(
                 failed_proxy,
-                replacement_proxy,
-                uncommitted_count = uncommitted_txns.len(),
-                "Replay task spawned."
+                "No transactions to replay. Promoting standby immediately."
             );
-
-            if uncommitted_txns.is_empty() {
-                tracing::info!(
-                    failed_proxy,
-                    "No transactions to replay. Promoting standby immediately."
-                );
-                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
-                return;
-            }
-
-            let replay_chunks =
-                Self::prepare_replay_batches(&uncommitted_txns, &collector, &chunking_config);
-
-            if let Err(e) =
-                Self::send_replay_batches(replacement_proxy, replay_chunks, &proxy_connections)
-                    .await
-            {
-                tracing::error!(
-                    "Failed to send replay batches to replacement proxy {}: {:?}",
-                    replacement_proxy,
-                    e
-                );
-                // Promote standby anyway to avoid system deadlock.
-                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
-                return;
-            }
-
-            tracing::info!(
-                "Completed replay transmission to replacement proxy {}",
-                replacement_proxy
-            );
-
-            Self::update_ownership_after_replay(
-                &uncommitted_txns,
-                replacement_proxy,
-                &states_to_proxy,
-                &proxy_connections,
-            );
-
             Self::promote_standby_proxy(standby_excluded, replacement_proxy);
-        });
+            return;
+        }
+
+        let replay_chunks =
+            Self::prepare_replay_batches(&uncommitted_txns, &collector, &chunking_config);
+
+        if let Err(e) =
+            Self::send_replay_batches(replacement_proxy, replay_chunks, &proxy_connections).await
+        {
+            tracing::error!(
+                "Failed to send replay batches to replacement proxy {}: {:?}",
+                replacement_proxy,
+                e
+            );
+            // Promote standby anyway to avoid system deadlock.
+            Self::promote_standby_proxy(standby_excluded, replacement_proxy);
+            return;
+        }
+
+        tracing::info!(
+            "Completed replay transmission to replacement proxy {}",
+            replacement_proxy
+        );
+
+        Self::update_ownership_after_replay(
+            &uncommitted_txns,
+            replacement_proxy,
+            &states_to_proxy,
+            &proxy_connections,
+        );
+
+        Self::promote_standby_proxy(standby_excluded, replacement_proxy);
     }
 
     /// Prepares and chunks replay batches from uncommitted transactions.
@@ -547,10 +537,11 @@ where
         for record in uncommitted_txns {
             let produced_version = record.produced_version();
             for ((obj_id, _req_version), _) in &record.required_states {
-                states_to_proxy
+                let mut entry = states_to_proxy
                     .entry((*obj_id, produced_version))
-                    .or_insert_with(std::collections::HashSet::new)
-                    .insert(replacement_proxy_index);
+                    .or_insert_with(std::collections::HashSet::new);
+                entry.value_mut().clear();
+                entry.value_mut().insert(replacement_proxy_index);
                 versions_added += 1;
             }
         }

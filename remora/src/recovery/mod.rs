@@ -145,6 +145,14 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                     completed_epoch_id = completed_epoch_id.0,
                     "Collected epoch for uncommitted transactions"
                 );
+
+                for record in records {
+                    tracing::info!(
+                        epoch = epoch.0,
+                        txn_digest = ?record.txn_digest,
+                        "add uncommitted transaction"
+                    );
+                }
             }
         }
 

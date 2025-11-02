@@ -480,7 +480,11 @@ where
 
     /// Spawn a task to commit state updates and notify dependencies
     fn spawn_state_updates(&self, state_blobs: BTreeMap<ObjectID, Object>) {
-        spawn_state_updates_helper::<E>(state_blobs, self.store.clone(), self.stateful_controller.clone());
+        spawn_state_updates_helper::<E>(
+            state_blobs,
+            self.store.clone(),
+            self.stateful_controller.clone(),
+        );
     }
 
     pub async fn spawn_stateful_txn(
@@ -865,7 +869,11 @@ where
             self.id,
             objects.keys()
         );
-        spawn_state_updates_helper::<E>(objects, self.store.clone(), self.stateful_controller.clone());
+        spawn_state_updates_helper::<E>(
+            objects,
+            self.store.clone(),
+            self.stateful_controller.clone(),
+        );
     }
 
     async fn handle_stateless_reply(&mut self, digest: TransactionDigest, result: bool) {
