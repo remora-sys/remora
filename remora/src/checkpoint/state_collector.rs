@@ -232,19 +232,11 @@ impl StateCollector {
 
     /// Get the current primary persist index (replay cut).
     ///
-    /// This returns the minimum persist_index across all proxies, which is
-    /// the safe point for pruning - we can only prune transactions that all
-    /// proxies have completed and acknowledged.
+    /// This returns the last epoch that was successfully committed to merged_state,
+    /// which represents the stable "commit point" for the entire system. It is the
+    /// safe point for pruning or recovery.
     pub fn get_persist_index(&self) -> u64 {
-        if self.per_proxy_persist_index.is_empty() {
-            return 0;
-        }
-
-        self.per_proxy_persist_index
-            .iter()
-            .map(|entry| entry.value().load(Ordering::SeqCst))
-            .min()
-            .unwrap_or(0)
+        self.last_committed_epoch.load(Ordering::SeqCst)
     }
 
     /// Get the persist index for a specific proxy (for debugging/diagnostics).

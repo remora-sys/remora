@@ -385,13 +385,6 @@ where
         let chunking_config = self.chunking_config.clone();
         let states_to_proxy = self.states_to_proxy.clone();
 
-        tracing::info!(
-            failed_proxy,
-            replacement_proxy,
-            uncommitted_count = uncommitted_txns.len(),
-            "Replay task spawned."
-        );
-
         if uncommitted_txns.is_empty() {
             tracing::info!(
                 failed_proxy,
