@@ -70,7 +70,7 @@ impl StateCollector {
             let epoch = EpochId(completed_up_to);
             let epoch_state = self.temp_state_by_epoch.entry(epoch).or_default();
             for (obj_id, obj) in snapshot.into_iter() {
-                tracing::info!(
+                tracing::debug!(
                     "Storing temp snapshot for proxy {} in epoch {} with obj_id {}: {}",
                     proxy_id,
                     epoch.0,
@@ -167,7 +167,7 @@ impl StateCollector {
                         continue; // Skip insertion
                     }
                 }
-                tracing::info!(
+                tracing::debug!(
                     "Inserting new latest version for obj_id {}: {}",
                     obj_id,
                     version.value()

@@ -82,7 +82,7 @@ impl ModifiedObjectTracker {
         if let Some((_, epoch_map)) = self.modified.remove(&epoch) {
             for entry in epoch_map.into_iter() {
                 let (obj_id, obj) = entry;
-                tracing::info!(
+                tracing::debug!(
                     "taking epoch {} snapshot for obj_id {}: version {}",
                     epoch.0,
                     obj_id,

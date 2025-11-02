@@ -147,7 +147,7 @@ impl<T: ExecutableTransaction + Clone> RecoveryCoordinator<T> {
                 );
 
                 for record in records {
-                    tracing::info!(
+                    tracing::debug!(
                         epoch = epoch.0,
                         txn_digest = ?record.txn_digest,
                         "add uncommitted transaction"

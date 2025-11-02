@@ -350,7 +350,7 @@ where
             let produced_version = record.produced_version();
             for ((obj_id, _), _) in &record.required_states {
                 replay_produced_versions.insert((*obj_id, produced_version));
-                tracing::info!(
+                tracing::debug!(
                     "Marked {:?} v{} as will-be-produced by replay txn {:?}",
                     obj_id,
                     produced_version.value(),
