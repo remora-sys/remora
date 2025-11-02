@@ -7,6 +7,7 @@ mod load_balancer;
 pub mod mock_consensus;
 pub mod node;
 pub mod owned_obj_txn_forwarder;
+pub mod pause_barrier;
 pub mod shared_obj_txn_forwarder;
 
 pub use load_balancer::LoadBalancer;

@@ -10,6 +10,7 @@ use crate::{
     checkpoint::EpochId,
     config::ProxyMode,
     executor::api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
+    primary::pause_barrier::PauseBarrier,
     proxy::core::ProxyId,
 };
 
@@ -24,6 +25,8 @@ where
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) index: usize,
     pub(crate) proxy_mode: ProxyMode,
+    /// Barrier to pause this worker during recovery.
+    pub(crate) pause_barrier: Arc<PauseBarrier>,
 }
 
 impl<E> OwnedObjTxnForwarder<E>
@@ -36,6 +39,8 @@ where
         mut owned_txn_receiver: Receiver<(EpochId, Vec<RemoraTransaction<E>>)>,
     ) {
         while let Some((epoch_id, owned_txns)) = owned_txn_receiver.recv().await {
+            // Enter the barrier, pausing if recovery is in progress.
+            let _ticket = self.pause_barrier.enter().await;
             self.forward_owned_txns_in_parallel(epoch_id, owned_txns)
                 .await;
         }

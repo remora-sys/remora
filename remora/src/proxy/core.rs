@@ -1283,6 +1283,7 @@ mod tests {
             sui::SuiExecutor,
         },
         metrics::Metrics,
+        primary::pause_barrier::PauseBarrier,
         primary::shared_obj_txn_forwarder::VersionAssignmentTask,
         proxy::core::ProxyCore,
     };
@@ -1362,6 +1363,7 @@ mod tests {
             shared_object_versions: rustc_hash::FxHashMap::default(),
             epoch_logger: None,
             _phantom: std::marker::PhantomData,
+            pause_barrier: PauseBarrier::new(),
         };
 
         // Send all transactions to proxy

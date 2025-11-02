@@ -22,6 +22,7 @@ use crate::{
     networking::chunking::{chunk_replay_batch, ChunkingConfig},
     primary::{
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
+        pause_barrier::PauseBarrier,
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
     proxy::core::ProxyId,
@@ -69,6 +70,8 @@ pub struct LoadBalancer<E: Executor> {
     collector: Arc<StateCollector>,
     /// Configuration for message chunking to handle large recovery messages
     chunking_config: ChunkingConfig,
+    /// Barrier to pause workers during recovery snapshotting.
+    pause_barrier: Arc<PauseBarrier>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -114,6 +117,7 @@ where
             states_to_proxy,
             collector,
             chunking_config,
+            pause_barrier: PauseBarrier::new(),
         }
     }
 
@@ -136,6 +140,11 @@ where
         if standby_proxy != failed_proxy {
             // Use the failed proxy's own persist_index as epoch_id
             let persist_epoch = EpochId(self.collector.get_proxy_persist_index(failed_proxy));
+
+            // Pause all forwarder tasks before taking a snapshot of uncommitted transactions.
+            // The guard will automatically resume tasks when it's dropped.
+            let _guard = self.pause_barrier.pause_and_wait().await;
+            tracing::info!("Paused all workers to take recovery snapshot.");
 
             // Collect all uncommitted transactions from the epoch logger.
             let uncommitted_txns = self
@@ -592,12 +601,14 @@ where
             proxy_connections: self.proxy_connections.clone(),
             index: 0,
             proxy_mode: self.proxy_mode.clone(),
+            pause_barrier: self.pause_barrier.clone(),
         };
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
             epoch_logger: Some(self.epoch_logger.clone()),
             _phantom: PhantomData,
+            pause_barrier: self.pause_barrier.clone(),
         };
         version_assignment_processor
             .shared_object_versions
@@ -617,6 +628,7 @@ where
                 .collect(),
             self.standby_excluded.clone(),
             self.collector.clone(),
+            self.pause_barrier.clone(),
         );
 
         thread::spawn(move || {

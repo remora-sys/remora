@@ -10,7 +10,7 @@ use crate::{
         worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
-    primary::load_balancer::PRIMARY_FETCH_SENTINEL,
+    primary::{load_balancer::PRIMARY_FETCH_SENTINEL, pause_barrier::PauseBarrier},
     proxy::core::ProxyId,
     recovery::EpochLogger,
 };
@@ -52,6 +52,7 @@ where
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
     pub standby_excluded: Arc<AtomicBool>,
     pub collector: Arc<StateCollector>,
+    pub pause_barrier: Arc<PauseBarrier>,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -65,6 +66,8 @@ where
     pub(crate) epoch_logger: Option<Arc<EpochLogger<E::Transaction>>>,
     // PhantomData to indicate we're using the generic parameter
     pub(crate) _phantom: PhantomData<E>,
+    // Barrier to pause this worker during recovery.
+    pub(crate) pause_barrier: Arc<PauseBarrier>,
 }
 
 impl<E> VersionAssignmentTask<E>
@@ -82,6 +85,9 @@ where
         )>,
     ) {
         while let Some((epoch_id, mut transaction)) = shared_txn_receiver.recv().await {
+            // Enter the barrier, pausing if recovery is in progress.
+            let _ticket = self.pause_barrier.enter().await;
+
             let required_versions = self.assign_shared_object_versions(&mut transaction);
 
             tracing::debug!(
@@ -214,6 +220,8 @@ where
     type Context = ForwardingContext<E>;
 
     async fn process(self, context: &Self::Context) {
+        // Enter the barrier, pausing if recovery is in progress.
+        let _ticket = context.pause_barrier.enter().await;
         SharedObjTxnForwarder::<E>::process_forwarding_task(self, context).await;
     }
 }
@@ -258,6 +266,7 @@ where
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
         standby_excluded: Arc<AtomicBool>,
         collector: Arc<StateCollector>,
+        pause_barrier: Arc<PauseBarrier>,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -270,6 +279,7 @@ where
             proxy_access_histories: proxy_access_histories.clone(),
             standby_excluded,
             collector,
+            pause_barrier,
         };
 
         let config = WorkerPoolConfig {
