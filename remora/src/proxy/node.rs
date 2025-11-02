@@ -246,7 +246,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             if sampled_results_count % 10 == 0 {
                 let now_secs = Metrics::now().as_secs_f64();
                 let latency_ms = (now_secs - submit_timestamp) * 1000.0;
-                tracing::debug!("ts={:.6} latency_ms={:.2}", now_secs, latency_ms);
+                tracing::info!("ts={:.6} latency_ms={:.2}", now_secs, latency_ms);
             }
         }
 
