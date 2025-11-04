@@ -438,12 +438,16 @@ where
                     states
                 );
                 let request = InterProxyRequest::Stateful(self.id, vec![*states]);
-                ProxyMessageProcessor::<E>::send_msg_to_proxy(
+                if let Err(e) = ProxyMessageProcessor::<E>::send_msg_to_proxy(
                     self.tx_inter_proxy_replies.clone(),
                     *proxy_id,
                     ProxyToProxyMessage::Request(request),
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!("Skip scheduling transaction {:?} due to state request failed to proxy {}: {:?}", transaction.digest(), proxy_id, e);
+                    return;
+                }
             }
         }
 
@@ -950,7 +954,7 @@ where
             }
 
             let reply = InterProxyReply::Stateful(objects);
-            Self::send_msg_to_proxy(
+            let _ = Self::send_msg_to_proxy(
                 tx_inter_proxy_replies,
                 proxy_id,
                 ProxyToProxyMessage::Reply(reply),
@@ -984,7 +988,7 @@ where
             stateless_controller.remove_dependency(&txn_digest);
 
             let reply = InterProxyReply::Stateless(txn_digest, verification_result);
-            Self::send_msg_to_proxy(
+            let _ = Self::send_msg_to_proxy(
                 tx_inter_proxy_replies.clone(),
                 proxy_id,
                 ProxyToProxyMessage::Reply(reply),
@@ -997,7 +1001,7 @@ where
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
         proxy_id: ProxyId,
         message: ProxyToProxyMessage,
-    ) {
+    ) -> NodeResult<()> {
         let message_type = match &message {
             ProxyToProxyMessage::Request(req) => match req {
                 InterProxyRequest::Stateful(_, _) => "Stateful request",
@@ -1019,123 +1023,13 @@ where
                     proxy_id,
                     e
                 );
-
-                // If this is a stateful request and send failed, redirect to standby proxy
-                if let ProxyToProxyMessage::Request(InterProxyRequest::Stateful(
-                    requester_id,
-                    states,
-                )) = &message
-                {
-                    // Find the standby proxy (highest ProxyId in connections)
-                    let standby_proxy = tx_inter_proxy_replies
-                        .iter()
-                        .map(|entry| *entry.key())
-                        .max();
-
-                    if let Some(standby_id) = standby_proxy {
-                        if standby_id != proxy_id {
-                            tracing::debug!(
-                                "Redirecting stateful request from proxy {} to standby proxy {} (failed proxy: {}) with states: {:?}",
-                                requester_id,
-                                standby_id,
-                                proxy_id,
-                                states.clone(),
-                            );
-
-                            // Send the request to the standby proxy instead
-                            if let Some(standby_tx) = tx_inter_proxy_replies.get(&standby_id) {
-                                let redirect_request =
-                                    InterProxyRequest::Stateful(*requester_id, states.clone());
-                                if let Err(e) = standby_tx
-                                    .send(ProxyToProxyMessage::Request(redirect_request))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        "Failed to send redirected stateful request to standby proxy {}: {:?}",
-                                        standby_id,
-                                        e
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "Successfully redirected stateful request to standby proxy {}",
-                                        standby_id
-                                    );
-                                }
-                            } else {
-                                tracing::error!(
-                                    "Standby proxy {} not found in connections",
-                                    standby_id
-                                );
-                            }
-                        } else {
-                            tracing::error!(
-                                "Cannot redirect to standby - failed proxy {} is the standby",
-                                proxy_id
-                            );
-                        }
-                    } else {
-                        tracing::error!("No standby proxy available for redirection");
-                    }
-                }
+                return Err(NodeError::FailedToSendMessage(proxy_id));
             }
         } else {
             tracing::warn!("No connection found for proxy {}", proxy_id);
-
-            // If this is a stateful request and no connection exists, redirect to standby proxy
-            if let ProxyToProxyMessage::Request(InterProxyRequest::Stateful(requester_id, states)) =
-                &message
-            {
-                // Find the standby proxy (highest ProxyId in connections)
-                let standby_proxy = tx_inter_proxy_replies
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .max();
-
-                if let Some(standby_id) = standby_proxy {
-                    if standby_id != proxy_id {
-                        tracing::debug!(
-                            "Redirecting stateful request from proxy {} to standby proxy {} (no connection to proxy: {})",
-                            requester_id,
-                            standby_id,
-                            proxy_id
-                        );
-
-                        // Send the request to the standby proxy instead
-                        if let Some(standby_tx) = tx_inter_proxy_replies.get(&standby_id) {
-                            let redirect_request =
-                                InterProxyRequest::Stateful(*requester_id, states.clone());
-                            if let Err(e) = standby_tx
-                                .send(ProxyToProxyMessage::Request(redirect_request))
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to send redirected stateful request to standby proxy {}: {:?}",
-                                    standby_id,
-                                    e
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "Successfully redirected stateful request to standby proxy {}",
-                                    standby_id
-                                );
-                            }
-                        } else {
-                            tracing::error!(
-                                "Standby proxy {} not found in connections",
-                                standby_id
-                            );
-                        }
-                    } else {
-                        tracing::error!(
-                            "Cannot redirect to standby - failed proxy {} is the standby",
-                            proxy_id
-                        );
-                    }
-                } else {
-                    tracing::error!("No standby proxy available for redirection");
-                }
-            }
+            return Err(NodeError::FailedToSendMessage(proxy_id));
         }
+        Ok(())
     }
 }
 

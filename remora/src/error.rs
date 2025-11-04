@@ -13,4 +13,6 @@ pub enum NodeError {
     ProxyConnectionNotFound(ProxyId),
     #[error("Failed to send replay batches: {0}")]
     FailedToReplayBatches(String),
+    #[error("Failed to send message to proxy {0}")]
+    FailedToSendMessage(ProxyId),
 }
