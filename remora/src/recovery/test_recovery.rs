@@ -47,8 +47,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn test_recovery_coordinator_persist_index_updates() {
+    #[tokio::test]
+    async fn test_recovery_coordinator_persist_index_updates() {
         let logger = EpochLogger::<TestTransaction>::new();
         let coordinator = RecoveryCoordinator::new(logger.clone());
         let state_collector = StateCollector::new(3);
@@ -59,7 +59,9 @@ mod tests {
         // Simulate all proxies reporting epoch 500
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(proxy_id, 500, snapshot, 3, None);
+            state_collector
+                .process_snapshot::<TestTransaction>(proxy_id, 500, snapshot, 3, None)
+                .await;
         }
         assert_eq!(
             coordinator.get_persist_epoch(&state_collector),
@@ -69,7 +71,9 @@ mod tests {
         // Simulate all proxies reporting epoch 1000
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
-            state_collector.process_snapshot::<TestTransaction>(proxy_id, 1000, snapshot, 3, None);
+            state_collector
+                .process_snapshot::<TestTransaction>(proxy_id, 1000, snapshot, 3, None)
+                .await;
         }
         assert_eq!(
             coordinator.get_persist_epoch(&state_collector),

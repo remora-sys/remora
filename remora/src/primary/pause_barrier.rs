@@ -73,6 +73,7 @@ impl PauseBarrier {
 
     /// Resume the barrier and notify any waiting tasks.
     fn resume(&self) {
+        tracing::debug!("Resuming barrier");
         self.paused.store(false, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
@@ -112,6 +113,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pause_waits_for_yielded_task() {
+        // This test confirms that `pause_and_wait` correctly waits for a task
+        // that has acquired a ticket and then yields execution (e.g. via .await).
+        // The ticket's lifetime spans the entire async task, so the barrier
+        // should wait until the task is fully complete.
+        let barrier = PauseBarrier::new();
+        let state = Arc::new(AtomicUsize::new(0)); // 0: initial, 1: work done, 2: commit done
+
+        // Worker task, analogous to `process_snapshot`
+        let barrier_clone = barrier.clone();
+        let state_clone = state.clone();
+        let worker = tokio::spawn(async move {
+            let _ticket = barrier_clone.enter().await;
+            // This task is now "active". It does some work, then yields.
+            state_clone.store(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            // It does more work after resuming.
+            state_clone.store(2, Ordering::SeqCst);
+        });
+
+        // Pauser task, analogous to `begin_recovery`
+        let pauser = tokio::spawn(async move {
+            // Yield to give the worker a chance to start and get its ticket.
+            tokio::task::yield_now().await;
+            let _guard = barrier.pause_and_wait().await;
+            // The snapshot is taken here. We read the state.
+            state.load(Ordering::SeqCst)
+        });
+
+        let (worker_res, pauser_res) = tokio::join!(worker, pauser);
+        worker_res.unwrap();
+        let state_at_pause = pauser_res.unwrap();
+
+        // `pause_and_wait` should only complete AFTER the worker task has finished
+        // and dropped its ticket. Therefore, the final state should be 2.
+        // If it were 1, it would mean `pause_and_wait` did not wait for the
+        // yielded task to complete, which would be a bug.
+        assert_eq!(state_at_pause, 2, "Snapshot was taken mid-task.");
+    }
+
+    #[tokio::test]
     async fn test_tasks_are_paused_and_resumed() {
         let barrier = PauseBarrier::new();
         let completion_counter = Arc::new(AtomicUsize::new(0));
@@ -147,5 +189,85 @@ mod tests {
             10,
             "Tasks should resume and complete after the guard is dropped."
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_enter_pause_race_condition() {
+        // This is a probabilistic test to expose a race condition in `enter()`.
+        // The race occurs if `pause_and_wait` sets `paused = true` *after* a
+        // worker task does `active.fetch_add(1)` but *before* it checks
+        // `paused.load()`. In this case, the worker will see the paused flag,
+        // decrement `active` back to 0, and loop. `pause_and_wait` will then
+        // see `active == 0` and return, even though the worker task is still
+        // "in-flight" inside the `enter` method, about to be blocked.
+        const NUM_ITERATIONS: usize = 100;
+        const NUM_WORKERS: usize = 4;
+
+        for i in 0..NUM_ITERATIONS {
+            let barrier = PauseBarrier::new();
+            let tasks_completed = Arc::new(AtomicUsize::new(0));
+            let pause_completed = Arc::new(Notify::new());
+
+            // Spawn a task that will immediately try to pause the barrier.
+            let barrier_clone = barrier.clone();
+            let tasks_completed_clone = tasks_completed.clone();
+            let pause_completed_clone = pause_completed.clone();
+            let pauser = tokio::spawn(async move {
+                let guard = barrier_clone.pause_and_wait().await;
+
+                // At this point, `pause_and_wait` has returned. It believes no tasks are active.
+                let active_count = barrier_clone.active.load(Ordering::SeqCst);
+                let completed_count = tasks_completed_clone.load(Ordering::SeqCst);
+
+                // The invariant that `pause_and_wait` should guarantee is that no tasks
+                // are running when it returns. Any task that successfully got a ticket
+                // should have been waited for. Any task that was trying to enter should
+                // now be blocked.
+                assert_eq!(
+                    active_count, 0,
+                    "Iteration {}: Active count should be 0 after pause",
+                    i
+                );
+                assert_eq!(
+                    completed_count, 0,
+                    "Iteration {}: No tasks should have completed before pause returns",
+                    i
+                );
+
+                // Signal to the main thread that assertions have passed and the guard is held.
+                pause_completed_clone.notify_one();
+
+                // Now, resume the barrier by dropping the guard.
+                drop(guard);
+            });
+
+            // Spawn worker tasks that will contend to enter the barrier.
+            let mut worker_handles = Vec::new();
+            for _ in 0..NUM_WORKERS {
+                let barrier_clone = barrier.clone();
+                let tasks_completed_clone = tasks_completed.clone();
+                worker_handles.push(tokio::spawn(async move {
+                    let _ticket = barrier_clone.enter().await;
+                    tasks_completed_clone.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+
+            // Wait for the pauser to acquire the lock and run its assertions.
+            pause_completed.notified().await;
+
+            // All workers should now be able to complete as the pauser task will drop the guard.
+            for handle in worker_handles {
+                handle.await.unwrap();
+            }
+            pauser.await.unwrap(); // Make sure pauser task completes.
+
+            // Check that all workers eventually completed.
+            assert_eq!(
+                tasks_completed.load(Ordering::SeqCst),
+                NUM_WORKERS,
+                "Iteration {}: All workers should complete after resume",
+                i
+            );
+        }
     }
 }

@@ -91,6 +91,7 @@ where
         epoch_logger: Arc<EpochLogger<E::Transaction>>,
         collector: Arc<StateCollector>,
         max_message_size: usize,
+        pause_barrier: Arc<PauseBarrier>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
@@ -117,7 +118,7 @@ where
             states_to_proxy,
             collector,
             chunking_config,
-            pause_barrier: PauseBarrier::new(),
+            pause_barrier,
         }
     }
 
@@ -138,12 +139,13 @@ where
             .unwrap_or(failed_proxy);
 
         if standby_proxy != failed_proxy {
-            // Use the failed proxy's own persist_index as epoch_id
-            let persist_epoch = EpochId(self.collector.get_proxy_persist_index(failed_proxy));
-
+            tracing::info!("attempt to wait on draining ongoing tasks");
             // Pause all forwarder tasks before taking a snapshot of uncommitted transactions.
-            // The guard will automatically resume tasks when it's dropped.
             let _guard = self.pause_barrier.pause_and_wait().await;
+            tracing::info!("finished wait on draining ongoing tasks");
+            let persist_epoch = EpochId(self.collector.get_persist_index());
+
+            // The guard will automatically resume tasks when it's dropped.
             tracing::info!("Paused all workers to take recovery snapshot.");
 
             // Collect all uncommitted transactions from the epoch logger.
@@ -808,7 +810,7 @@ mod tests {
 
     // Helper to add object to collector for a specific proxy
     // Using the public API, each proxy can have different versions in temp_state
-    fn add_object_to_collector(
+    async fn add_object_to_collector(
         collector: &StateCollector,
         proxy_id: usize,
         obj_id: ObjectID,
@@ -824,25 +826,29 @@ mod tests {
         let completed_up_to = counter;
 
         // Add the snapshot for this proxy
-        collector.process_snapshot::<FakeTransaction>(
-            proxy_id,
-            completed_up_to,
-            snapshot.clone(),
-            3,
-            None,
-        );
+        collector
+            .process_snapshot::<FakeTransaction>(
+                proxy_id,
+                completed_up_to,
+                snapshot.clone(),
+                3,
+                None,
+            )
+            .await;
 
         // Also add empty snapshots for other proxies to trigger commit
         // StateCollector needs all 3 proxies to report before committing
         for other_proxy in 0..3 {
             if other_proxy != proxy_id {
-                collector.process_snapshot::<FakeTransaction>(
-                    other_proxy,
-                    completed_up_to,
-                    std::collections::BTreeMap::new(),
-                    3,
-                    None,
-                );
+                collector
+                    .process_snapshot::<FakeTransaction>(
+                        other_proxy,
+                        completed_up_to,
+                        std::collections::BTreeMap::new(),
+                        3,
+                        None,
+                    )
+                    .await;
             }
         }
     }
@@ -893,8 +899,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_skip_v2_initial_versions() {
+    #[tokio::test]
+    async fn test_build_replay_messages_skip_v2_initial_versions() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn_digest = TransactionDigest::random();
@@ -919,14 +925,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_attach_v3_state() {
+    #[tokio::test]
+    async fn test_build_replay_messages_attach_v3_state() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn_digest = TransactionDigest::random();
 
         // Add object A v3 to collector for proxy 0
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // Transaction requires object A version 3
         let uncommitted_txns = vec![create_test_log_record(
@@ -946,15 +952,15 @@ mod tests {
         assert_eq!(result[0].1[&obj_a].version(), SequenceNumber::from(3));
     }
 
-    #[test]
-    fn test_build_replay_messages_skip_produced_versions() {
+    #[tokio::test]
+    async fn test_build_replay_messages_skip_produced_versions() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn1_digest = TransactionDigest::random();
         let txn2_digest = TransactionDigest::random();
 
         // Add object A v3 to collector for proxy 0
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // Transaction 1: requires A v3, will produce A v4
         // Transaction 2: requires A v4 (produced by txn 1)
@@ -977,8 +983,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_chain_of_dependencies() {
+    #[tokio::test]
+    async fn test_build_replay_messages_chain_of_dependencies() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn1_digest = TransactionDigest::random();
@@ -986,7 +992,7 @@ mod tests {
         let txn3_digest = TransactionDigest::random();
 
         // Add object A v3 to collector for proxy 0
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // Chain: Txn1 (requires v3) → v4, Txn2 (requires v4) → v5, Txn3 (requires v5) → v6
         let uncommitted_txns = vec![
@@ -1006,16 +1012,16 @@ mod tests {
         assert_eq!(result[2].1.len(), 0, "Txn 3 should skip A v5");
     }
 
-    #[test]
-    fn test_build_replay_messages_multiple_objects() {
+    #[tokio::test]
+    async fn test_build_replay_messages_multiple_objects() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
         let txn_digest = TransactionDigest::random();
 
         // Add objects to collector - both on proxy 0 (same proxy as transaction)
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
-        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(5));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(5)).await;
 
         // Transaction on proxy 0 requires both A v3 and B v5
         let uncommitted_txns = vec![create_test_log_record(
@@ -1038,15 +1044,15 @@ mod tests {
         assert!(result[0].1.contains_key(&obj_b), "Should contain object B");
     }
 
-    #[test]
-    fn test_build_replay_messages_mixed_v2_and_higher() {
+    #[tokio::test]
+    async fn test_build_replay_messages_mixed_v2_and_higher() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
         let txn_digest = TransactionDigest::random();
 
         // Add object A v3 to collector
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // Transaction requires A v3 (should attach) and B v2 (should skip)
         let uncommitted_txns = vec![create_test_log_record(
@@ -1076,8 +1082,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_missing_state_in_collector() {
+    #[tokio::test]
+    async fn test_build_replay_messages_missing_state_in_collector() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn_digest = TransactionDigest::random();
@@ -1104,15 +1110,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_cross_proxy_dependencies() {
+    #[tokio::test]
+    async fn test_build_replay_messages_cross_proxy_dependencies() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let txn1_digest = TransactionDigest::random();
         let txn2_digest = TransactionDigest::random();
 
         // Proxy 0 produces A v3
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // Txn1 (proxy 0): requires A v3, produces A v4
         // Txn2 (proxy 1): requires A v4 (cross-proxy dependency)
@@ -1135,14 +1141,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_preserves_consensus_order() {
+    #[tokio::test]
+    async fn test_build_replay_messages_preserves_consensus_order() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
 
         // Add objects to collector
         for v in 3..=6 {
-            add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(v));
+            add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(v)).await;
         }
 
         // Create transactions in consensus order
@@ -1176,8 +1182,8 @@ mod tests {
         assert_eq!(result[2].0.epoch.0, 10);
     }
 
-    #[test]
-    fn test_build_replay_messages_same_batch_out_of_order_versions() {
+    #[tokio::test]
+    async fn test_build_replay_messages_same_batch_out_of_order_versions() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
@@ -1186,9 +1192,8 @@ mod tests {
         // Different objects with different version numbers
         // Txn 1: requires A v4 → produces A v5
         // Txn 2: requires B v3 → produces B v4
-        // This shows that same-epoch txns can have "out of order" version numbers for different objects
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(4));
-        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(4)).await;
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(3)).await;
 
         let uncommitted_txns = vec![
             create_test_log_record(
@@ -1225,13 +1230,13 @@ mod tests {
         assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(3));
     }
 
-    #[test]
-    fn test_build_replay_messages_same_batch_dependency_chain() {
+    #[tokio::test]
+    async fn test_build_replay_messages_same_batch_dependency_chain() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
 
         // Add initial version to collector
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
 
         // SAME epoch (same batch), with dependency chain
         // Txn 1: requires v3, will produce v4
@@ -1275,8 +1280,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_replay_messages_same_batch_interleaved_objects() {
+    #[tokio::test]
+    async fn test_build_replay_messages_same_batch_interleaved_objects() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
@@ -1284,8 +1289,8 @@ mod tests {
         // Simplified scenario: Each proxy has ONE object
         // Proxy 1: A v5
         // Proxy 0: B v6
-        add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(5));
-        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(6));
+        add_object_to_collector(&collector, 1, obj_a, SequenceNumber::from(5)).await;
+        add_object_to_collector(&collector, 0, obj_b, SequenceNumber::from(6)).await;
 
         // SAME epoch, each txn needs a state from a different proxy
         // Txn 1 (from Proxy 1): requires A v5 (own proxy), will produce A v6
@@ -1328,8 +1333,8 @@ mod tests {
         assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(6));
     }
 
-    #[test]
-    fn test_build_replay_messages_same_batch_partial_production() {
+    #[tokio::test]
+    async fn test_build_replay_messages_same_batch_partial_production() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
         let obj_b = ObjectID::random();
@@ -1338,9 +1343,9 @@ mod tests {
         // Realistic scenario: different proxies have different objects
         // Proxy 0 has A v3 and C v5
         // Proxy 1 has B v4
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3));
-        add_object_to_collector(&collector, 0, obj_c, SequenceNumber::from(5));
-        add_object_to_collector(&collector, 1, obj_b, SequenceNumber::from(4));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(3)).await;
+        add_object_to_collector(&collector, 0, obj_c, SequenceNumber::from(5)).await;
+        add_object_to_collector(&collector, 1, obj_b, SequenceNumber::from(4)).await;
 
         // SAME epoch
         // Txn 1: requires A v3, C v5 → produces A v6, C v6 (max(3,5)+1=6)
@@ -1394,14 +1399,14 @@ mod tests {
         assert_eq!(result[1].1[&obj_b].version(), SequenceNumber::from(4));
     }
 
-    #[test]
-    fn test_build_replay_messages_detects_version_ordering_violation() {
+    #[tokio::test]
+    async fn test_build_replay_messages_detects_version_ordering_violation() {
         let collector = StateCollector::new(3);
         let obj_a = ObjectID::random();
 
         // Add version 5 to merged_state (latest committed version)
         // In the new implementation, merged_state only keeps the latest version
-        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(5));
+        add_object_to_collector(&collector, 0, obj_a, SequenceNumber::from(5)).await;
 
         // VIOLATION: Txn 1 (from proxy 0) requires v5, then Txn 2 (from proxy 1) requires v3
         // This violates partial dependency ordering - we're going backwards in version numbers

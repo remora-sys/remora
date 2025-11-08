@@ -25,6 +25,7 @@ use crate::{
     executor::api::{Executor, PrimaryToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
+    primary::pause_barrier::PauseBarrier,
     recovery::EpochLogger,
 };
 
@@ -102,6 +103,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         // Spawn the state collector task
         // Exclude the standby proxy from snapshot collection (same as transaction dispatch)
         let expected_proxies = config.proxies.len() - 1;
+        let pause_barrier = PauseBarrier::new();
 
         // persistent storage
         /*let snapshot_path = std::path::PathBuf::from("./data/primary/snapshots");
@@ -119,7 +121,8 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         if let Some(store) = snapshot_store {
             collector = collector.with_store(store);
         }*/
-        let collector = Arc::new(StateCollector::new(expected_proxies));
+        let collector =
+            Arc::new(StateCollector::new(expected_proxies).with_barrier(pause_barrier.clone()));
 
         // Start a server on the primary to accept proxy->primary snapshots
         let (tx_snapshot_conn, mut rx_snapshot_conn) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -181,8 +184,16 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                                         completed_up_to,
                                         snapshot.len()
                                     );
-                                    collector_ctx.collector
-                                        .process_snapshot(proxy_id, completed_up_to, snapshot, collector_ctx.expected_proxies, Some(&logger));
+                                    collector_ctx
+                                        .collector
+                                        .process_snapshot(
+                                            proxy_id,
+                                            completed_up_to,
+                                            snapshot,
+                                            collector_ctx.expected_proxies,
+                                            Some(&logger),
+                                        )
+                                        .await;
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -215,6 +226,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             epoch_logger.clone(),
             collector.clone(),
             config.validator_parameters.max_message_size,
+            pause_barrier,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
