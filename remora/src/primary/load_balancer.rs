@@ -639,6 +639,7 @@ where
             self.standby_excluded.clone(),
             self.collector.clone(),
             self.pause_barrier.clone(),
+            self.elastic_scaler.active_nodes_handle(), // Pass active_nodes for elastic routing
         );
 
         thread::spawn(move || {

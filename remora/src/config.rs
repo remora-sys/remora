@@ -416,9 +416,12 @@ impl Error for ConfigErrorType {}
 /// The configuration for the benchmark.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BenchmarkParameters {
-    /// The load to generate in transactions per second.
+    /// The load to generate in transactions per second (used when load_config is Static or absent).
     #[serde(default = "default_benchmark_config::default_load")]
     pub load: u64,
+    /// Dynamic load configuration (overrides 'load' if present).
+    #[serde(default)]
+    pub load_config: LoadConfig,
     /// The duration to run the benchmark for.
     #[serde(default = "default_benchmark_config::default_duration")]
     pub duration: Duration,
@@ -444,6 +447,7 @@ impl BenchmarkParameters {
     pub fn new_for_tests() -> Self {
         BenchmarkParameters {
             load: 10,
+            load_config: LoadConfig::default(),
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
@@ -458,6 +462,7 @@ impl BenchmarkParameters {
     pub fn new_for_contention_tests() -> Self {
         BenchmarkParameters {
             load: 10,
+            load_config: LoadConfig::default(),
             duration: Duration::from_secs(1),
             workload: WorkloadType::SharedObjects {
                 txs_per_counter: default_cont_level_for_shared_obj(),
@@ -474,6 +479,7 @@ impl BenchmarkParameters {
     pub fn new_for_ethereum_tests() -> Self {
         BenchmarkParameters {
             load: 100,
+            load_config: LoadConfig::default(),
             duration: Duration::from_secs(5),
             workload: WorkloadType::EthereumTransfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
@@ -488,6 +494,7 @@ impl BenchmarkParameters {
     pub fn new_for_fake_tests() -> Self {
         BenchmarkParameters {
             load: 10,
+            load_config: LoadConfig::default(),
             duration: Duration::from_secs(1),
             workload: WorkloadType::FakeZipfian {
                 execution_duration: default_fake_execution_duration(),
@@ -506,6 +513,7 @@ impl BenchmarkParameters {
     pub fn new_for_fake_contention_tests() -> Self {
         BenchmarkParameters {
             load: 10,
+            load_config: LoadConfig::default(),
             duration: Duration::from_secs(1),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
             workload: WorkloadType::FakeZipfian {
@@ -551,6 +559,7 @@ impl Default for BenchmarkParameters {
     fn default() -> Self {
         BenchmarkParameters {
             load: default_benchmark_config::default_load(),
+            load_config: LoadConfig::default(),
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),

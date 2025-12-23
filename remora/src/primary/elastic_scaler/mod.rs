@@ -175,11 +175,12 @@ impl ElasticScaler {
             return false;
         }
 
-        let capacity_with_one_less = self
-            .per_node_capacity_tps
-            .map(|cap| cap * (active - 1) as f64)
-            .unwrap_or(f64::MAX);
+        // Need capacity to be set for scaling decisions
+        let Some(per_node_cap) = self.per_node_capacity_tps else {
+            return false;
+        };
 
+        let capacity_with_one_less = per_node_cap * (active - 1) as f64;
         current_rate <= capacity_with_one_less * SCALE_IN_THRESHOLD
     }
 
@@ -196,11 +197,12 @@ impl ElasticScaler {
             return false;
         }
 
-        let total_current_capacity = self
-            .per_node_capacity_tps
-            .map(|cap| cap * active as f64)
-            .unwrap_or(f64::MAX);
+        // Need capacity to be set for scaling decisions
+        let Some(per_node_cap) = self.per_node_capacity_tps else {
+            return false;
+        };
 
+        let total_current_capacity = per_node_cap * active as f64;
         current_rate > total_current_capacity * SCALE_OUT_THRESHOLD
     }
 
@@ -237,7 +239,27 @@ impl ElasticScaler {
         }
         self.last_scale_check = now;
 
+        // Auto-initialize capacity if not set (hardcoded for 1ms workload as in elastic branch)
+        if self.per_node_capacity_tps.is_none() {
+            self.per_node_capacity_tps = Some(27000.0);
+            tracing::info!("ElasticScaler: auto-initialized per-node capacity to 27000 TPS");
+        }
+
         let current_rate = self.calculate_current_rate();
+        let active = self.active_nodes.load(Ordering::Relaxed);
+        let capacity = self.per_node_capacity_tps.unwrap_or(0.0) * active as f64;
+
+        // Log scaling check every few seconds for visibility
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 5000 {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "ElasticScaler check: rate={:.0} TPS, capacity={:.0} TPS ({}×{:.0}), active={}/{}, threshold={:.0}%",
+                current_rate, capacity, active, self.per_node_capacity_tps.unwrap_or(0.0),
+                active, self.max_nodes, SCALE_OUT_THRESHOLD * 100.0
+            );
+        }
 
         if self.should_scale_out(current_rate) {
             Some(ScalingDecision::ScaleOut)

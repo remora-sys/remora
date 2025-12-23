@@ -17,7 +17,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
@@ -53,6 +53,8 @@ where
     pub standby_excluded: Arc<AtomicBool>,
     pub collector: Arc<StateCollector>,
     pub pause_barrier: Arc<PauseBarrier>,
+    /// Number of active nodes for elastic scaling (only routes to first N proxies)
+    pub active_nodes: Arc<AtomicUsize>,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -267,6 +269,7 @@ where
         standby_excluded: Arc<AtomicBool>,
         collector: Arc<StateCollector>,
         pause_barrier: Arc<PauseBarrier>,
+        active_nodes: Arc<AtomicUsize>,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -280,6 +283,7 @@ where
             standby_excluded,
             collector,
             pause_barrier,
+            active_nodes,
         };
 
         let config = WorkerPoolConfig {
@@ -335,6 +339,7 @@ where
             proxy_loads,
             proxy_access_histories,
             &txn_duration,
+            &context.active_nodes,
         ) {
             // Resolve proxy ids to actual connection keys
             let resolved_stateful =
@@ -515,12 +520,14 @@ where
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
         txn_duration: &Duration,
+        active_nodes: &Arc<AtomicUsize>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => Self::get_proxy_for_shared_objects_round_robin(
                 proxy_connections,
                 standby_excluded,
                 txn_cnt,
+                active_nodes,
             ),
             LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
                 proxy_connections,
@@ -575,19 +582,24 @@ where
     }
 
     /// Get assigned proxy for shared objects using round-robin.
+    /// Uses active_nodes to limit routing to only active proxies for elastic scaling.
     fn get_proxy_for_shared_objects_round_robin(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         standby_excluded: &Arc<AtomicBool>,
         txn_cnt: usize,
+        active_nodes: &Arc<AtomicUsize>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
-        if proxy_count == 0 {
+        let total_proxy_count = Self::effective_proxy_count(proxy_connections, standby_excluded);
+        if total_proxy_count == 0 {
             return None;
         }
 
-        let proxy_index = txn_cnt % proxy_count;
+        // Use active_nodes for elastic scaling - only route to first N active proxies
+        let active_node_count = active_nodes.load(Ordering::Relaxed);
+        let effective_count = active_node_count.min(total_proxy_count).max(1);
+        let proxy_index = txn_cnt % effective_count;
 
         Some((proxy_index, proxy_index))
     }
