@@ -18,9 +18,10 @@ use crate::{
 /// Used only for load balancing policy selection.
 pub(crate) struct OwnedObjTxnForwarder<E>
 where
-    E: Executor + Clone + Send + Sync + 'static,
+    E: Executor,
     E::Transaction: Send + Sync + 'static,
 {
+    pub(crate) active_nodes: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) index: usize,
@@ -41,6 +42,13 @@ where
         let mut keys: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
         keys.retain(|id| !self.retiring_proxies.contains_key(id));
+
+        // Enforce active_nodes limit
+        let active_count = self.active_nodes.load(std::sync::atomic::Ordering::Relaxed);
+        if active_count < keys.len() {
+            keys.truncate(active_count);
+        }
+
         keys
     }
 
@@ -86,8 +94,12 @@ where
                 if let Some(proxy_conn) = proxy_connections.get(&proxy_id) {
                     if proxy_mode == ProxyMode::Separation {
                         let msg1 = PrimaryToProxyMessage::StatelessTxn(epoch_id, tx.clone());
-                        let msg2 =
-                            PrimaryToProxyMessage::Txn(epoch_id, tx.clone(), proxy_id, BTreeMap::new());
+                        let msg2 = PrimaryToProxyMessage::Txn(
+                            epoch_id,
+                            tx.clone(),
+                            proxy_id,
+                            BTreeMap::new(),
+                        );
 
                         if proxy_conn.send(msg1).await.is_err() {
                             tracing::warn!("Failed to send stateless txn to proxy {}", proxy_id);
@@ -169,6 +181,7 @@ mod tests {
             retiring_proxies.insert(retiring_proxy, ());
 
             let forwarder = OwnedObjTxnForwarder::<FakeExecutor> {
+                active_nodes: Arc::new(std::sync::atomic::AtomicUsize::new(proxy_count)),
                 proxy_connections,
                 index: 0,
                 proxy_mode: ProxyMode::Separation,

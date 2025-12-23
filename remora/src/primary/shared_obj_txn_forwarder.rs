@@ -17,7 +17,7 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::object::Object;
@@ -50,7 +50,6 @@ where
     pub metrics: Arc<Metrics>,
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-    pub standby_excluded: Arc<AtomicBool>,
     pub collector: Arc<StateCollector>,
     pub pause_barrier: Arc<PauseBarrier>,
     /// Number of active nodes for elastic scaling (only routes to first N proxies)
@@ -240,13 +239,12 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
         idx: ExecutorIndex,
     ) -> Option<ProxyId> {
         // This is the core fix: always resolve the index against the *current* set of active proxies.
-        let keys =
-            Self::effective_proxy_ids(proxy_connections, standby_excluded, retiring_proxies);
+        let keys = Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies);
         keys.get(idx).copied()
     }
 
@@ -255,17 +253,20 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
     ) -> Vec<ProxyId> {
         let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
 
-        if standby_excluded.load(Ordering::SeqCst) && keys.len() > 1 {
-            keys.pop();
+        keys.retain(|id| !retiring_proxies.contains_key(id));
+
+        // Enforce active_nodes limit
+        let active_count = active_nodes.load(Ordering::Relaxed);
+        if active_count < keys.len() {
+            keys.truncate(active_count);
         }
 
-        keys.retain(|id| !retiring_proxies.contains_key(id));
         keys
     }
 
@@ -283,7 +284,6 @@ where
         metrics: Arc<Metrics>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
-        standby_excluded: Arc<AtomicBool>,
         collector: Arc<StateCollector>,
         pause_barrier: Arc<PauseBarrier>,
         active_nodes: Arc<AtomicUsize>,
@@ -298,7 +298,6 @@ where
             metrics: metrics.clone(),
             proxy_loads: proxy_loads.clone(),
             proxy_access_histories: proxy_access_histories.clone(),
-            standby_excluded,
             collector,
             pause_barrier,
             active_nodes,
@@ -351,7 +350,6 @@ where
         if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
             policy,
             proxy_connections,
-            &context.standby_excluded,
             states_to_proxy,
             task.txn_cnt,
             &task.required_versions,
@@ -365,13 +363,13 @@ where
             // Resolve proxy ids to actual connection keys
             let resolved_stateful = Self::resolve_proxy_id(
                 proxy_connections,
-                &context.standby_excluded,
+                &context.active_nodes,
                 retiring_proxies,
                 proxy_index,
             );
             let resolved_stateless = Self::resolve_proxy_id(
                 proxy_connections,
-                &context.standby_excluded,
+                &context.active_nodes,
                 retiring_proxies,
                 stateless_proxy_id,
             );
@@ -418,7 +416,7 @@ where
             let stateful_missing_states = Self::resolve_required_states_to_proxy_ids(
                 missing_states_result.required_states,
                 proxy_connections,
-                &context.standby_excluded,
+                &context.active_nodes,
                 retiring_proxies,
             );
 
@@ -491,13 +489,13 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
         let mut resolved = BTreeMap::new();
         for ((obj_id, seq_num), maybe_idx) in required_states {
             let resolved_proxy_id = maybe_idx.and_then(|idx| {
-                Self::resolve_proxy_id(proxy_connections, standby_excluded, retiring_proxies, idx)
+                Self::resolve_proxy_id(proxy_connections, active_nodes, retiring_proxies, idx)
             });
             resolved.insert((obj_id, seq_num), resolved_proxy_id);
         }
@@ -539,7 +537,6 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
         states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
@@ -555,26 +552,23 @@ where
         match policy {
             LoadBalancingPolicy::RoundRobin => Self::get_proxy_for_shared_objects_round_robin(
                 proxy_connections,
-                standby_excluded,
-                txn_cnt,
                 active_nodes,
+                txn_cnt,
                 retiring_proxies,
             ),
             LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
                 proxy_connections,
-                standby_excluded,
+                active_nodes,
                 retiring_proxies,
                 states_to_proxy,
                 required_versions,
                 txn_cnt,
             ),
-            LoadBalancingPolicy::Random => {
-                Self::get_proxy_for_shared_objects_random(
-                    proxy_connections,
-                    standby_excluded,
-                    retiring_proxies,
-                )
-            }
+            LoadBalancingPolicy::Random => Self::get_proxy_for_shared_objects_random(
+                proxy_connections,
+                active_nodes,
+                retiring_proxies,
+            ),
             LoadBalancingPolicy::Hermes => {
                 destination.and_then(|dest| {
                     if retiring_proxies.contains_key(&dest) {
@@ -586,7 +580,7 @@ where
             }
             LoadBalancingPolicy::LocalityLoad => Self::get_proxy_for_shared_objects_locality_load(
                 proxy_connections,
-                standby_excluded,
+                active_nodes,
                 retiring_proxies,
                 states_to_proxy,
                 required_versions,
@@ -597,7 +591,7 @@ where
             LoadBalancingPolicy::AffinityAware => {
                 Self::get_proxy_for_shared_objects_affinity_aware(
                     proxy_connections,
-                    standby_excluded,
+                    active_nodes,
                     retiring_proxies,
                     states_to_proxy,
                     required_versions,
@@ -615,10 +609,10 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
     ) -> usize {
-        Self::effective_proxy_ids(proxy_connections, standby_excluded, retiring_proxies).len()
+        Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies).len()
     }
 
     /// Get assigned proxy for shared objects using round-robin.
@@ -627,21 +621,18 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
-        txn_cnt: usize,
         active_nodes: &Arc<AtomicUsize>,
+        txn_cnt: usize,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let total_proxy_count =
-            Self::effective_proxy_count(proxy_connections, standby_excluded, retiring_proxies);
+            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
         if total_proxy_count == 0 {
             return None;
         }
 
         // Use active_nodes for elastic scaling - only route to first N active proxies
-        let active_node_count = active_nodes.load(Ordering::Relaxed);
-        let effective_count = active_node_count.min(total_proxy_count).max(1);
-        let proxy_index = txn_cnt % effective_count;
+        let proxy_index = txn_cnt % total_proxy_count;
 
         Some((proxy_index, proxy_index))
     }
@@ -650,11 +641,11 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count =
-            Self::effective_proxy_count(proxy_connections, standby_excluded, retiring_proxies);
+            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
         if proxy_count == 0 {
             return None;
         }
@@ -668,7 +659,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
         states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
@@ -677,7 +668,7 @@ where
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count =
-            Self::effective_proxy_count(proxy_connections, standby_excluded, retiring_proxies);
+            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
         if proxy_count == 0 {
             return None;
         }
@@ -732,7 +723,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
         states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
@@ -743,7 +734,7 @@ where
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count =
-            Self::effective_proxy_count(proxy_connections, standby_excluded, retiring_proxies);
+            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
         if proxy_count == 0 {
             return None;
         }
@@ -776,7 +767,7 @@ where
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
-        standby_excluded: &Arc<AtomicBool>,
+        active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
         _states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
@@ -788,7 +779,7 @@ where
         txn_cnt: usize,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count =
-            Self::effective_proxy_count(proxy_connections, standby_excluded, retiring_proxies);
+            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
         if proxy_count == 0 {
             return None;
         }
@@ -1042,7 +1033,6 @@ mod tests {
     use crate::executor::fake::FakeExecutor;
     use rand::Rng;
     use std::sync::{atomic::AtomicUsize, Arc};
-    use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc::channel;
 
     const NUM_ITERATIONS: usize = 100;
@@ -1066,25 +1056,23 @@ mod tests {
             let proxy_count = rng.gen_range(2..10);
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
-            let standby_excluded = Arc::new(AtomicBool::new(false));
             let retiring_proxies = Arc::new(DashMap::new());
             retiring_proxies.insert(retiring_proxy, ());
-            let active_nodes = Arc::new(AtomicUsize::new(rng.gen_range(1..=proxy_count)));
+            let active_nodes = Arc::new(AtomicUsize::new(proxy_count)); // Assume full capacity for this test
 
             let txn_cnt = rng.gen_range(0..1000);
             let (proxy_index, _) =
                 SharedObjTxnForwarder::<FakeExecutor>::get_proxy_for_shared_objects_round_robin(
                     &proxy_connections,
-                    &standby_excluded,
-                    txn_cnt,
                     &active_nodes,
+                    txn_cnt,
                     &retiring_proxies,
                 )
                 .expect("Expected a proxy selection");
 
             let resolved = SharedObjTxnForwarder::<FakeExecutor>::resolve_proxy_id(
                 &proxy_connections,
-                &standby_excluded,
+                &active_nodes,
                 &retiring_proxies,
                 proxy_index,
             )
@@ -1104,13 +1092,13 @@ mod tests {
             let proxy_count = rng.gen_range(2..12);
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
-            let standby_excluded = Arc::new(AtomicBool::new(false));
             let retiring_proxies = Arc::new(DashMap::new());
             retiring_proxies.insert(retiring_proxy, ());
+            let active_nodes = Arc::new(AtomicUsize::new(proxy_count));
 
             let effective_count = SharedObjTxnForwarder::<FakeExecutor>::effective_proxy_count(
                 &proxy_connections,
-                &standby_excluded,
+                &active_nodes,
                 &retiring_proxies,
             );
             assert!(effective_count > 0);
@@ -1118,7 +1106,7 @@ mod tests {
             for idx in 0..effective_count {
                 let resolved = SharedObjTxnForwarder::<FakeExecutor>::resolve_proxy_id(
                     &proxy_connections,
-                    &standby_excluded,
+                    &active_nodes,
                     &retiring_proxies,
                     idx,
                 )

@@ -20,8 +20,6 @@ use std::time::SystemTime;
 const SCALE_IN_THRESHOLD: f64 = 0.8;
 /// Threshold multiplier for scale-out: add node if load > capacity * threshold
 const SCALE_OUT_THRESHOLD: f64 = 0.8;
-/// Interval between scaling checks in milliseconds
-const SCALE_CHECK_INTERVAL_MS: u64 = 500;
 /// Rate calculation window in milliseconds
 const RATE_WINDOW_MS: u64 = 1000;
 

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -65,8 +64,7 @@ pub struct LoadBalancer<E: Executor> {
     epoch_logger: Arc<EpochLogger<E::Transaction>>,
     /// Recovery coordinator for failure handling
     recovery_coordinator: Arc<RecoveryCoordinator<E::Transaction>>,
-    /// Standby exclusion toggle: when true, exclude the last proxy index from dispatch
-    standby_excluded: Arc<AtomicBool>,
+
     /// Shared mapping of (object, version) -> set of proxy indices that own this version
     /// Multiple proxies can own the same version (e.g., after uncommitted transaction replay during recovery)
     states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<usize>>>,
@@ -131,7 +129,7 @@ where
             epoch_tx,
             epoch_logger,
             recovery_coordinator,
-            standby_excluded: Arc::new(AtomicBool::new(true)),
+
             states_to_proxy,
             collector,
             chunking_config,
@@ -141,12 +139,6 @@ where
             retiring_proxies,
             rx_retirement_events,
         }
-    }
-
-    /// Promote the reserved standby proxy to active dispatch.
-    pub fn promote_standby(&self) {
-        self.standby_excluded.store(false, Ordering::SeqCst);
-        tracing::info!("Standby proxy promoted to active; exclusion disabled");
     }
 
     /// Begin recovery for a failed proxy and promote standby.
@@ -410,9 +402,7 @@ where
     ) {
         let proxy_connections = self.proxy_connections.clone();
         let collector = self.collector.clone();
-        let standby_excluded = self.standby_excluded.clone();
         let chunking_config = self.chunking_config.clone();
-        let states_to_proxy = self.states_to_proxy.clone();
 
         tokio::spawn(async move {
             if uncommitted_txns.is_empty() {
@@ -420,7 +410,6 @@ where
                     failed_proxy,
                     "No transactions to replay. Promoting standby immediately."
                 );
-                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
                 return;
             }
 
@@ -437,7 +426,6 @@ where
                     e
                 );
                 // Promote standby anyway to avoid system deadlock.
-                Self::promote_standby_proxy(standby_excluded, replacement_proxy);
                 return;
             }
 
@@ -445,8 +433,6 @@ where
                 "Completed replay transmission to replacement proxy {}",
                 replacement_proxy
             );
-
-            Self::promote_standby_proxy(standby_excluded, replacement_proxy);
         });
     }
 
@@ -581,15 +567,6 @@ where
         );
     }
 
-    /// Promotes the standby proxy to active service.
-    fn promote_standby_proxy(standby_excluded: Arc<AtomicBool>, replacement_proxy: ProxyId) {
-        standby_excluded.store(false, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(
-            replacement_proxy,
-            "Standby proxy promoted to active after replay completion"
-        );
-    }
-
     /// Initialize transaction processors and return the senders
     fn initialize_processors(
         &self,
@@ -616,6 +593,7 @@ where
 
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
+            active_nodes: self.elastic_scaler.active_nodes_handle(),
             proxy_connections: self.proxy_connections.clone(),
             index: 0,
             proxy_mode: self.proxy_mode.clone(),
@@ -645,7 +623,6 @@ where
             (0..self.proxy_connections.len())
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))
                 .collect(),
-            self.standby_excluded.clone(),
             self.collector.clone(),
             self.pause_barrier.clone(),
             self.elastic_scaler.active_nodes_handle(), // Pass active_nodes for elastic routing
@@ -900,17 +877,8 @@ where
 
         // Clone keys to avoid holding references while mutating map
         let proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
-        let proxy_count = proxy_ids.len();
 
         for proxy_id in proxy_ids {
-            // Exclude standby proxy if standby_excluded is true
-            if self.standby_excluded.load(Ordering::SeqCst) && proxy_count > 0 {
-                let last_proxy_index = proxy_count - 1;
-                if proxy_id == last_proxy_index {
-                    continue; // Skip the standby proxy
-                }
-            }
-
             let tx_opt = self
                 .proxy_connections
                 .get(&proxy_id)
