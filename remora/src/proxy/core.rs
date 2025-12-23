@@ -250,6 +250,23 @@ where
                         }
                     }
                 }
+                PrimaryToProxyMessage::RetirementSignal(epoch) => {
+                    tracing::info!(
+                        "Proxy {} received RetirementSignal at epoch {}: preparing for graceful shutdown",
+                        self.id,
+                        epoch.0
+                    );
+                    // Stop accepting new transactions (handled by primary not dispatching)
+                    // Continue serving inter-proxy requests until ShutdownConfirmation
+                }
+                PrimaryToProxyMessage::ShutdownConfirmation => {
+                    tracing::info!(
+                        "Proxy {} received ShutdownConfirmation: initiating shutdown",
+                        self.id
+                    );
+                    // Graceful shutdown - the receiver loop will exit when channel closes
+                    return;
+                }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
                 }
@@ -328,6 +345,23 @@ where
                             );
                         }
                     }
+                }
+                PrimaryToProxyMessage::RetirementSignal(epoch) => {
+                    tracing::info!(
+                        "Proxy {} received RetirementSignal at epoch {}: preparing for graceful shutdown",
+                        self.id,
+                        epoch.0
+                    );
+                    // Stop accepting new transactions (handled by primary not dispatching)
+                    // Continue serving inter-proxy requests until ShutdownConfirmation
+                }
+                PrimaryToProxyMessage::ShutdownConfirmation => {
+                    tracing::info!(
+                        "Proxy {} received ShutdownConfirmation: initiating shutdown",
+                        self.id
+                    );
+                    // Graceful shutdown - the receiver loop will exit when channel closes
+                    return;
                 }
                 // Replay handling already covered above in separation mode; no duplicate here.
                 _ => {

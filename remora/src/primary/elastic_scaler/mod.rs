@@ -15,8 +15,8 @@ use std::time::SystemTime;
 
 /// Threshold multiplier for scale-in: retire if load < capacity * threshold
 const SCALE_IN_THRESHOLD: f64 = 0.8;
-/// Threshold multiplier for scale-up: add node if load > capacity * threshold
-const SCALE_UP_THRESHOLD: f64 = 0.8;
+/// Threshold multiplier for scale-out: add node if load > capacity * threshold
+const SCALE_OUT_THRESHOLD: f64 = 0.8;
 /// Interval between scaling checks in milliseconds
 const SCALE_CHECK_INTERVAL_MS: u64 = 500;
 /// Rate calculation window in milliseconds
@@ -26,7 +26,7 @@ const RATE_WINDOW_MS: u64 = 1000;
 ///
 /// Ported from the elastic branch with scale-in additions.
 pub struct ElasticScaler {
-    /// Number of active nodes (can scale up/down based on load)
+    /// Number of active nodes (can scale out/in based on load)
     active_nodes: Arc<AtomicUsize>,
     /// Minimum number of nodes (cannot scale below this, typically 1)
     min_nodes: usize,
@@ -45,7 +45,7 @@ pub struct ElasticScaler {
 impl ElasticScaler {
     /// Create a new elastic scaler starting at minimum nodes.
     ///
-    /// Use this for truly elastic behavior where we start small and scale up.
+    /// Use this for truly elastic behavior where we start small and scale out.
     ///
     /// # Arguments
     /// * `max_nodes` - Maximum number of available nodes
@@ -85,7 +85,7 @@ impl ElasticScaler {
     ) -> Self {
         // Calculate minimum nodes needed for the expected load
         let nodes_needed =
-            (expected_load_tps / (per_node_capacity * SCALE_UP_THRESHOLD)).ceil() as usize;
+            (expected_load_tps / (per_node_capacity * SCALE_OUT_THRESHOLD)).ceil() as usize;
         let initial_nodes = nodes_needed.clamp(1, max_nodes);
 
         tracing::info!(
@@ -183,12 +183,12 @@ impl ElasticScaler {
         current_rate <= capacity_with_one_less * SCALE_IN_THRESHOLD
     }
 
-    /// Check if we should scale up: current load exceeds capacity threshold.
+    /// Check if we should scale out: current load exceeds capacity threshold.
     ///
     /// Returns true if:
     /// - We have room to add more nodes
-    /// - Current rate exceeds SCALE_UP_THRESHOLD of current capacity
-    pub fn should_scale_up(&self, current_rate: f64) -> bool {
+    /// - Current rate exceeds SCALE_OUT_THRESHOLD of current capacity
+    pub fn should_scale_out(&self, current_rate: f64) -> bool {
         let active = self.active_nodes.load(Ordering::Relaxed);
 
         // Cannot scale beyond max nodes
@@ -201,7 +201,7 @@ impl ElasticScaler {
             .map(|cap| cap * active as f64)
             .unwrap_or(f64::MAX);
 
-        current_rate > total_current_capacity * SCALE_UP_THRESHOLD
+        current_rate > total_current_capacity * SCALE_OUT_THRESHOLD
     }
 
     /// Increase active node count (scale-out).
@@ -209,7 +209,7 @@ impl ElasticScaler {
         let current = self.active_nodes.load(Ordering::Relaxed);
         if current < self.max_nodes {
             self.active_nodes.store(current + 1, Ordering::Relaxed);
-            tracing::info!("SCALE UP: Active nodes {} -> {}", current, current + 1);
+            tracing::info!("SCALE OUT: Active nodes {} -> {}", current, current + 1);
         }
     }
 
@@ -222,10 +222,10 @@ impl ElasticScaler {
         }
     }
 
-    /// Main scaling check: determine if we need to scale up or down.
+    /// Main scaling check: determine if we need to scale out or in.
     ///
     /// Returns:
-    /// - `Some(ScalingDecision::ScaleUp)` if we should add a node
+    /// - `Some(ScalingDecision::ScaleOut)` if we should add a node
     /// - `Some(ScalingDecision::ScaleIn)` if we should retire a node
     /// - `None` if no scaling action needed
     pub fn check_scaling(&mut self) -> Option<ScalingDecision> {
@@ -239,8 +239,8 @@ impl ElasticScaler {
 
         let current_rate = self.calculate_current_rate();
 
-        if self.should_scale_up(current_rate) {
-            Some(ScalingDecision::ScaleUp)
+        if self.should_scale_out(current_rate) {
+            Some(ScalingDecision::ScaleOut)
         } else if self.should_scale_in(current_rate) {
             Some(ScalingDecision::ScaleIn)
         } else {
@@ -253,7 +253,7 @@ impl ElasticScaler {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalingDecision {
     /// Add a new active node (scale-out)
-    ScaleUp,
+    ScaleOut,
     /// Retire the highest-ID node (scale-in)
     ScaleIn,
 }
@@ -293,25 +293,25 @@ mod tests {
     }
 
     #[test]
-    fn test_should_scale_up_with_high_load() {
+    fn test_should_scale_out_with_high_load() {
         let mut scaler = ElasticScaler::with_initial_nodes(2, 5);
         scaler.set_capacity(10000.0); // 10k TPS per node
 
         // 2 nodes = 20k capacity
-        // Scale-up threshold = 20k * 0.8 = 16k
-        // So if load > 16k, should scale up
+        // Scale-out threshold = 20k * 0.8 = 16k
+        // So if load > 16k, should scale out
 
-        assert!(scaler.should_scale_up(18000.0)); // 18k > 16k
-        assert!(!scaler.should_scale_up(15000.0)); // 15k < 16k
+        assert!(scaler.should_scale_out(18000.0)); // 18k > 16k
+        assert!(!scaler.should_scale_out(15000.0)); // 15k < 16k
     }
 
     #[test]
-    fn test_should_not_scale_up_at_max_nodes() {
+    fn test_should_not_scale_out_at_max_nodes() {
         let mut scaler = ElasticScaler::with_initial_nodes(5, 5);
         scaler.set_capacity(10000.0);
 
-        // Cannot scale up when at max nodes
-        assert!(!scaler.should_scale_up(100000.0));
+        // Cannot scale out when at max nodes
+        assert!(!scaler.should_scale_out(100000.0));
     }
 
     #[test]

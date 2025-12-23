@@ -76,7 +76,7 @@ pub struct LoadBalancer<E: Executor> {
     chunking_config: ChunkingConfig,
     /// Barrier to pause workers during recovery snapshotting.
     pause_barrier: Arc<PauseBarrier>,
-    /// Elastic scaler for scale-up and scale-in decisions
+    /// Elastic scaler for scale-out and scale-in decisions
     elastic_scaler: ElasticScaler,
     /// Retirement coordinator for graceful proxy shutdown during scale-in
     retirement_coordinator: RetirementCoordinator,
@@ -111,7 +111,7 @@ where
             chunking_config.effective_max_size(),
         );
         let proxy_count = proxy_connections.len();
-        let elastic_scaler = ElasticScaler::new(proxy_count); // Start at 1 node, scale up to max
+        let elastic_scaler = ElasticScaler::new(proxy_count); // Start at 1 node, scale out to max
         let retirement_coordinator = RetirementCoordinator::new(collector.clone());
         Self {
             _phantom: PhantomData,
@@ -689,6 +689,11 @@ where
         // Initialize processors and get the transaction senders
         let (owned_txn_sender, shared_txn_sender) = self.initialize_processors();
 
+        // Scaling check interval (e.g., every 500ms)
+        let mut scaling_check_interval =
+            tokio::time::interval(tokio::time::Duration::from_millis(500));
+        scaling_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut txn_cnt = 0;
         loop {
             tokio::select! {
@@ -697,6 +702,9 @@ where
                     if txn_cnt == 1 {
                         self.metrics.register_start_time();
                     }
+
+                    // Record transaction for rate tracking
+                    self.elastic_scaler.record_transaction();
 
                     for transaction in transactions {
                         // Calculate current epoch per transaction to ensure precise 10k transaction epochs
@@ -742,7 +750,45 @@ where
                     }
                 }
 
+                _ = scaling_check_interval.tick() => {
+                    // Periodic scaling check
+                    self.check_and_handle_scaling().await;
+                }
+
                 else => Err(NodeError::ShuttingDown)?,
+            }
+        }
+    }
+
+    /// Check scaling decision and initiate scale-out or scale-in.
+    async fn check_and_handle_scaling(&mut self) {
+        use crate::primary::elastic_scaler::ScalingDecision;
+
+        if let Some(decision) = self.elastic_scaler.check_scaling() {
+            match decision {
+                ScalingDecision::ScaleOut => {
+                    // Scale-out: activate a new proxy
+                    let current = self.elastic_scaler.active_node_count();
+                    if current < self.proxy_connections.len() {
+                        self.elastic_scaler.increase_active_nodes();
+                        tracing::info!("Scaling out: {} -> {} active nodes", current, current + 1);
+                    }
+                }
+                ScalingDecision::ScaleIn => {
+                    // Scale-in: initiate retirement if not already in progress
+                    if !self.retirement_coordinator.is_retiring() {
+                        if let Some(proxy_id) = self.get_highest_active_proxy_id() {
+                            // Don't retire if only 1 proxy left
+                            if self.elastic_scaler.active_node_count() > 1 {
+                                tracing::info!(
+                                    "Scaling in: initiating retirement of proxy {}",
+                                    proxy_id
+                                );
+                                self.retirement_coordinator.initiate(proxy_id);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

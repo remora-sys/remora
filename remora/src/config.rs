@@ -322,6 +322,82 @@ impl Debug for WorkloadType {
     }
 }
 
+// ==================== Dynamic Load Configuration ====================
+
+/// A single time interval with a target load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadInterval {
+    /// Start time in seconds from benchmark start.
+    pub start_time_secs: u64,
+    /// End time in seconds from benchmark start.
+    pub end_time_secs: u64,
+    /// Target load in transactions per second for this interval.
+    pub target_load: u64,
+}
+
+/// Load configuration: either static or dynamic time-based intervals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LoadConfig {
+    /// Static load: constant TPS throughout the benchmark.
+    Static {
+        /// Target load in transactions per second.
+        target_load: u64,
+    },
+    /// Dynamic load: time-based intervals with different TPS targets.
+    /// Useful for testing scale-in/scale-out behavior.
+    Dynamic {
+        /// Total duration of the benchmark in seconds.
+        total_duration_secs: u64,
+        /// Time-based load intervals.
+        intervals: Vec<LoadInterval>,
+    },
+}
+
+impl Default for LoadConfig {
+    fn default() -> Self {
+        LoadConfig::Static {
+            target_load: 10_000,
+        }
+    }
+}
+
+impl LoadConfig {
+    /// Get the target load for a specific time in seconds from start.
+    pub fn get_load_at(&self, elapsed_secs: u64) -> u64 {
+        match self {
+            LoadConfig::Static { target_load } => *target_load,
+            LoadConfig::Dynamic { intervals, .. } => {
+                // Find the interval that contains the elapsed time
+                for interval in intervals {
+                    if elapsed_secs >= interval.start_time_secs
+                        && elapsed_secs < interval.end_time_secs
+                    {
+                        return interval.target_load;
+                    }
+                }
+                // If no interval matches, return 0 (stop sending)
+                0
+            }
+        }
+    }
+
+    /// Get total duration in seconds.
+    pub fn total_duration_secs(&self) -> u64 {
+        match self {
+            LoadConfig::Static { .. } => 0, // Use BenchmarkParameters duration instead
+            LoadConfig::Dynamic {
+                total_duration_secs,
+                ..
+            } => *total_duration_secs,
+        }
+    }
+
+    /// Check if this is a dynamic load config.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, LoadConfig::Dynamic { .. })
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigErrorType {
     InvalidWorkload,
