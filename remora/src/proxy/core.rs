@@ -128,6 +128,7 @@ struct PrimaryMessageProcessor<E: Executor> {
     batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
     completed_up_to: Arc<AtomicU64>,
     batch_size: usize,
+    retiring: bool,
 }
 
 impl<E: Executor + Send + Sync + 'static> PrimaryMessageProcessor<E>
@@ -164,6 +165,20 @@ where
         &mut self,
         message: PrimaryToProxyMessage<<E as Executor>::Transaction>,
     ) {
+        if self.retiring {
+            match message {
+                PrimaryToProxyMessage::StatelessTxn(..)
+                | PrimaryToProxyMessage::Txn(..)
+                | PrimaryToProxyMessage::CombinedTxn(..) => {
+                    tracing::debug!(
+                        "Proxy {} ignoring new transaction while retiring",
+                        self.id
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.mode == ProxyMode::Separation {
             match message {
                 PrimaryToProxyMessage::StatelessTxn(epoch_id, transaction) => {
@@ -258,6 +273,7 @@ where
                     );
                     // Stop accepting new transactions (handled by primary not dispatching)
                     // Continue serving inter-proxy requests until ShutdownConfirmation
+                    self.retiring = true;
                 }
                 PrimaryToProxyMessage::ShutdownConfirmation => {
                     tracing::info!(
@@ -354,6 +370,7 @@ where
                     );
                     // Stop accepting new transactions (handled by primary not dispatching)
                     // Continue serving inter-proxy requests until ShutdownConfirmation
+                    self.retiring = true;
                 }
                 PrimaryToProxyMessage::ShutdownConfirmation => {
                     tracing::info!(
@@ -1167,6 +1184,7 @@ where
             batch_completion_count: self.batch_completion_count.clone(),
             completed_up_to: self.completed_up_to.clone(),
             batch_size: self.batch_size,
+            retiring: false,
         };
 
         let mut proxy_processor = ProxyMessageProcessor::<E> {

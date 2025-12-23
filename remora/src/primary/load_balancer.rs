@@ -80,6 +80,8 @@ pub struct LoadBalancer<E: Executor> {
     elastic_scaler: ElasticScaler,
     /// Retirement coordinator for graceful proxy shutdown during scale-in
     retirement_coordinator: RetirementCoordinator,
+    /// Proxies that are in retirement and must not receive new transactions.
+    retiring_proxies: Arc<DashMap<ProxyId, ()>>,
     /// Receiver for retirement events from PrimaryNode (snapshots and epoch seals)
     rx_retirement_events: Receiver<RetirementEvent>,
 }
@@ -116,6 +118,7 @@ where
         let proxy_count = proxy_connections.len();
         let elastic_scaler = ElasticScaler::new(proxy_count); // Start at 1 node, scale out to max
         let retirement_coordinator = RetirementCoordinator::new(collector.clone());
+        let retiring_proxies = Arc::new(DashMap::new());
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -135,6 +138,7 @@ where
             pause_barrier,
             elastic_scaler,
             retirement_coordinator,
+            retiring_proxies,
             rx_retirement_events,
         }
     }
@@ -615,6 +619,7 @@ where
             proxy_connections: self.proxy_connections.clone(),
             index: 0,
             proxy_mode: self.proxy_mode.clone(),
+            retiring_proxies: self.retiring_proxies.clone(),
             pause_barrier: self.pause_barrier.clone(),
         };
 
@@ -644,6 +649,7 @@ where
             self.collector.clone(),
             self.pause_barrier.clone(),
             self.elastic_scaler.active_nodes_handle(), // Pass active_nodes for elastic routing
+            self.retiring_proxies.clone(),
         );
 
         thread::spawn(move || {
@@ -845,6 +851,7 @@ where
         match action {
             RetirementAction::SendRetirementSignal { proxy_id, epoch } => {
                 tracing::info!(proxy_id, epoch = epoch.0, "Sending retirement signal");
+                self.retiring_proxies.insert(proxy_id, ());
                 if let Some(tx) = self.proxy_connections.get(&proxy_id) {
                     let msg = PrimaryToProxyMessage::RetirementSignal(epoch);
                     if let Err(e) = tx.value().send(msg).await {
@@ -859,6 +866,7 @@ where
             }
             RetirementAction::CompleteRetirement { proxy_id } => {
                 tracing::info!(proxy_id, "Completing retirement");
+                self.retiring_proxies.remove(&proxy_id);
                 // Send shutdown confirmation
                 if let Some(tx) = self.proxy_connections.get(&proxy_id) {
                     let msg = PrimaryToProxyMessage::ShutdownConfirmation;

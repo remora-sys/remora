@@ -25,6 +25,8 @@ where
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) index: usize,
     pub(crate) proxy_mode: ProxyMode,
+    /// Proxies that are in retirement and must not receive new transactions.
+    pub(crate) retiring_proxies: Arc<DashMap<ProxyId, ()>>,
     /// Barrier to pause this worker during recovery.
     pub(crate) pause_barrier: Arc<PauseBarrier>,
 }
@@ -34,6 +36,14 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    #[inline]
+    fn effective_proxy_ids(&self) -> Vec<ProxyId> {
+        let mut keys: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+        keys.retain(|id| !self.retiring_proxies.contains_key(id));
+        keys
+    }
+
     pub(crate) async fn process_owned_txns(
         &mut self,
         mut owned_txn_receiver: Receiver<(EpochId, Vec<RemoraTransaction<E>>)>,
@@ -52,7 +62,8 @@ where
         epoch_id: EpochId,
         transactions: Vec<RemoraTransaction<E>>,
     ) {
-        let proxy_count = self.proxy_connections.len();
+        let effective_proxies = self.effective_proxy_ids();
+        let proxy_count = effective_proxies.len();
         if proxy_count == 0 {
             tracing::warn!("No proxies available for transactions");
             return;
@@ -68,30 +79,31 @@ where
 
         for (i, tx) in transactions.into_iter().enumerate() {
             let idx = (start + i) % proxy_count;
+            let proxy_id = effective_proxies[idx];
             let tx = Arc::new(tx);
             let proxy_connections = self.proxy_connections.clone();
             let fut = async move {
-                if let Some(proxy_conn) = proxy_connections.get(&idx) {
+                if let Some(proxy_conn) = proxy_connections.get(&proxy_id) {
                     if proxy_mode == ProxyMode::Separation {
                         let msg1 = PrimaryToProxyMessage::StatelessTxn(epoch_id, tx.clone());
                         let msg2 =
-                            PrimaryToProxyMessage::Txn(epoch_id, tx.clone(), idx, BTreeMap::new());
+                            PrimaryToProxyMessage::Txn(epoch_id, tx.clone(), proxy_id, BTreeMap::new());
 
                         if proxy_conn.send(msg1).await.is_err() {
-                            tracing::warn!("Failed to send stateless txn to proxy {}", idx);
+                            tracing::warn!("Failed to send stateless txn to proxy {}", proxy_id);
                         }
                         if proxy_conn.send(msg2).await.is_err() {
-                            tracing::warn!("Failed to send stateful txn to proxy {}", idx);
+                            tracing::warn!("Failed to send stateful txn to proxy {}", proxy_id);
                         }
                     } else {
                         let msg = PrimaryToProxyMessage::CombinedTxn(
                             epoch_id,
                             tx.clone(),
-                            idx,
+                            proxy_id,
                             BTreeMap::new(),
                         );
                         if proxy_conn.send(msg).await.is_err() {
-                            tracing::warn!("Failed to send combined txn to proxy {}", idx);
+                            tracing::warn!("Failed to send combined txn to proxy {}", proxy_id);
                         }
                     }
                 }
@@ -127,5 +139,49 @@ where
             .take(count)
             .map(|tx| RemoraTransaction::<E>::new_for_tests(tx))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProxyMode;
+    use crate::executor::fake::FakeExecutor;
+    use crate::primary::pause_barrier::PauseBarrier;
+    use rand::Rng;
+    use std::sync::Arc;
+    use tokio::sync::mpsc::channel;
+
+    const NUM_ITERATIONS: usize = 100;
+
+    #[test]
+    fn prop_effective_proxy_ids_excludes_retiring() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_count = rng.gen_range(2..12);
+            let retiring_proxy = proxy_count - 1;
+            let proxy_connections = Arc::new(DashMap::new());
+            for id in 0..proxy_count {
+                let (tx, _rx) = channel(1);
+                proxy_connections.insert(id, tx);
+            }
+            let retiring_proxies = Arc::new(DashMap::new());
+            retiring_proxies.insert(retiring_proxy, ());
+
+            let forwarder = OwnedObjTxnForwarder::<FakeExecutor> {
+                proxy_connections,
+                index: 0,
+                proxy_mode: ProxyMode::Separation,
+                retiring_proxies,
+                pause_barrier: PauseBarrier::new(),
+            };
+
+            let effective = forwarder.effective_proxy_ids();
+            assert!(!effective.is_empty());
+            assert!(
+                !effective.contains(&retiring_proxy),
+                "effective_proxy_ids returned retiring proxy"
+            );
+        }
     }
 }
