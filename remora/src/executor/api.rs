@@ -321,6 +321,16 @@ where
     Checkpoint(EpochId),
     /// Replay batch: primary sends transactions with required states to commit-then-execute
     Replay(ReplayBatch<T>),
+    /// Retirement signal: primary notifies proxy to gracefully shut down.
+    /// The proxy should:
+    /// 1. Continue serving inter-proxy requests until snapshot is acknowledged
+    /// 2. Send final snapshot to primary
+    /// 3. Wait for shutdown confirmation
+    /// Fields: epoch at which retirement was initiated
+    RetirementSignal(EpochId),
+    /// Shutdown confirmation: primary confirms proxy can fully shut down
+    /// (sent after next epoch is sealed)
+    ShutdownConfirmation,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod elastic_scaler;
 #[cfg(test)]
 pub mod forwarder_test;
 mod load_balancer;

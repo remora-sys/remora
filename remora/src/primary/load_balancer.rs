@@ -21,6 +21,10 @@ use crate::{
     metrics::Metrics,
     networking::chunking::{chunk_replay_batch, ChunkingConfig},
     primary::{
+        elastic_scaler::{
+            retirement_coordinator::{RetirementAction, RetirementCoordinator},
+            ElasticScaler,
+        },
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         pause_barrier::PauseBarrier,
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
@@ -72,6 +76,10 @@ pub struct LoadBalancer<E: Executor> {
     chunking_config: ChunkingConfig,
     /// Barrier to pause workers during recovery snapshotting.
     pause_barrier: Arc<PauseBarrier>,
+    /// Elastic scaler for scale-up and scale-in decisions
+    elastic_scaler: ElasticScaler,
+    /// Retirement coordinator for graceful proxy shutdown during scale-in
+    retirement_coordinator: RetirementCoordinator,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -102,6 +110,9 @@ where
             chunking_config.max_message_size,
             chunking_config.effective_max_size(),
         );
+        let proxy_count = proxy_connections.len();
+        let elastic_scaler = ElasticScaler::new(proxy_count); // Start at 1 node, scale up to max
+        let retirement_coordinator = RetirementCoordinator::new(collector.clone());
         Self {
             _phantom: PhantomData,
             proxy_connections,
@@ -119,6 +130,8 @@ where
             collector,
             chunking_config,
             pause_barrier,
+            elastic_scaler,
+            retirement_coordinator,
         }
     }
 
@@ -734,7 +747,64 @@ where
         }
     }
 
+    // ==================== Scale-In Methods ====================
+
+    /// Get the highest active proxy ID (for retirement selection).
+    /// Always retire the highest to minimize round-robin disruption.
+    fn get_highest_active_proxy_id(&self) -> Option<ProxyId> {
+        self.proxy_connections.iter().map(|e| *e.key()).max()
+    }
+
+    /// Execute a retirement action from the RetirementCoordinator.
+    async fn execute_retirement_action(&mut self, action: RetirementAction) {
+        match action {
+            RetirementAction::SendRetirementSignal { proxy_id, epoch } => {
+                tracing::info!(proxy_id, epoch = epoch.0, "Sending retirement signal");
+                if let Some(tx) = self.proxy_connections.get(&proxy_id) {
+                    let msg = PrimaryToProxyMessage::RetirementSignal(epoch);
+                    if let Err(e) = tx.value().send(msg).await {
+                        tracing::error!(proxy_id, "Failed to send retirement signal: {:?}", e);
+                    }
+                }
+            }
+            RetirementAction::UpdateOwnership { proxy_id } => {
+                tracing::info!(proxy_id, "Updating ownership after retirement snapshot");
+                // Mark states owned by retired proxy for primary fetch
+                self.update_ownership_for_retirement(proxy_id);
+            }
+            RetirementAction::CompleteRetirement { proxy_id } => {
+                tracing::info!(proxy_id, "Completing retirement");
+                // Send shutdown confirmation
+                if let Some(tx) = self.proxy_connections.get(&proxy_id) {
+                    let msg = PrimaryToProxyMessage::ShutdownConfirmation;
+                    let _ = tx.value().send(msg).await;
+                }
+                // Remove from connections
+                self.proxy_connections.remove(&proxy_id);
+                self.elastic_scaler.decrease_active_nodes();
+            }
+        }
+    }
+
+    /// Update ownership map for retired proxy's states.
+    fn update_ownership_for_retirement(&self, retired_proxy: ProxyId) {
+        self.states_to_proxy.iter_mut().for_each(|mut entry| {
+            let owners = entry.value_mut();
+            if owners.remove(&retired_proxy) {
+                if owners.is_empty() {
+                    // Mark for primary fetch
+                    owners.insert(PRIMARY_FETCH_SENTINEL);
+                }
+            }
+        });
+    }
+
     async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
+        // Handle retirement state machine at epoch boundary
+        if let Some(action) = self.retirement_coordinator.on_epoch_boundary(epoch) {
+            self.execute_retirement_action(action).await;
+        }
+
         // Clone keys to avoid holding references while mutating map
         let proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
         let proxy_count = proxy_ids.len();
