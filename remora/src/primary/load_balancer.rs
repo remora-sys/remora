@@ -714,8 +714,8 @@ where
                         self.metrics.register_start_time();
                     }
 
-                    // Record transaction for rate tracking
-                    self.elastic_scaler.record_transaction();
+                    // Record transactions for rate tracking
+                    self.elastic_scaler.record_transactions(transactions.len());
 
                     for transaction in transactions {
                         // Calculate current epoch per transaction to ensure precise 10k transaction epochs
