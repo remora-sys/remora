@@ -17,6 +17,8 @@ use tokio::{
 use super::{load_balancer::LoadBalancer, mock_consensus::MockConsensus};
 use crate::checkpoint::primary::EpochManager;
 use crate::checkpoint::state_collector::StateCollector;
+use crate::checkpoint::EpochId;
+use crate::primary::elastic_scaler::RetirementEvent;
 // Removed unused import
 use crate::executor::api::ProxyToPrimaryMessage;
 use crate::{
@@ -160,6 +162,12 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let mut rx_epochs = rx_epoch_notify;
         let mut rx_snapshots = rx_proxy_snapshots;
         let collector_logger = epoch_logger.clone();
+
+        // Create channel for retirement events from collector to load balancer
+        let (tx_retirement_events, rx_retirement_events) =
+            mpsc::channel::<RetirementEvent>(DEFAULT_CHANNEL_SIZE);
+        let tx_retirement_for_collector = tx_retirement_events.clone();
+
         let collector_handle = tokio::spawn(async move {
             let _collector_inner = collector_for_worker;
             let logger = collector_logger;
@@ -175,6 +183,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                         tracing::info!("Received snapshot bytes: {} bytes", bytes.len());
                         let collector_ctx = collector_ctx.clone();
                         let logger = logger.clone();
+                        let tx_retirement = tx_retirement_for_collector.clone();
                         tokio::spawn(async move {
                             match bincode::deserialize::<ProxyToPrimaryMessage>(&bytes) {
                                 Ok(ProxyToPrimaryMessage::StateSnapshot(proxy_id, completed_up_to, snapshot)) => {
@@ -184,16 +193,44 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                                         completed_up_to,
                                         snapshot.len()
                                     );
+
+                                    // Track persist index before and after to detect epoch commits
+                                    let persist_before = collector_ctx.collector.get_persist_index();
+
                                     collector_ctx
                                         .collector
                                         .process_snapshot(
                                             proxy_id,
                                             completed_up_to,
-                                            snapshot,
+                                            snapshot.clone(),
                                             collector_ctx.expected_proxies,
                                             Some(&logger),
                                         )
                                         .await;
+
+                                    let persist_after = collector_ctx.collector.get_persist_index();
+
+                                    // Forward snapshot to retirement coordinator
+                                    let retirement_event = RetirementEvent::Snapshot {
+                                        proxy_id,
+                                        epoch: EpochId(completed_up_to),
+                                        snapshot,
+                                    };
+                                    if tx_retirement.send(retirement_event).await.is_err() {
+                                        tracing::debug!("Retirement events channel closed");
+                                    }
+
+                                    // Send EpochSealed events for any epochs that were committed
+                                    for sealed_epoch in (persist_before + 1)..=persist_after {
+                                        let epoch_sealed_event = RetirementEvent::EpochSealed {
+                                            epoch: EpochId(sealed_epoch),
+                                        };
+                                        if tx_retirement.send(epoch_sealed_event).await.is_err() {
+                                            tracing::debug!("Retirement events channel closed");
+                                            break;
+                                        }
+                                        tracing::debug!("Sent EpochSealed event for epoch {}", sealed_epoch);
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -227,6 +264,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             collector.clone(),
             config.validator_parameters.max_message_size,
             pause_barrier,
+            rx_retirement_events,
         )
         .spawn();
         primary_handles.push(load_balancer_handle);

@@ -155,7 +155,7 @@ impl RetirementCoordinator {
         &mut self,
         proxy_id: ProxyId,
         epoch: EpochId,
-        snapshot: EpochObjectStates,
+        snapshot: &EpochObjectStates,
     ) -> Option<RetirementAction> {
         if let RetirementPhase::AwaitingSnapshot {
             proxy_id: expected_id,
@@ -225,7 +225,7 @@ impl RetirementCoordinator {
         &self,
         proxy_id: ProxyId,
         epoch: EpochId,
-        snapshot: EpochObjectStates,
+        snapshot: &EpochObjectStates,
     ) {
         // For each object in snapshot, update StateCollector only if newer
         for (object_id, object) in snapshot.iter() {
@@ -244,9 +244,10 @@ impl RetirementCoordinator {
                 }
             }
 
-            // TODO: Actually insert into merged_state
-            // This would require extending StateCollector with a method like:
-            // self.collector.insert_object(object_id.clone(), object.clone());
+            // Update merged_state with the newer snapshot object
+            self.collector
+                .merged_state
+                .insert(*object_id, object.clone());
             tracing::debug!(
                 ?object_id,
                 version = snapshot_version.value(),
@@ -333,7 +334,7 @@ mod tests {
         coordinator.on_epoch_boundary(EpochId(5));
 
         let snapshot = EpochObjectStates::new();
-        let action = coordinator.on_snapshot_received(2, EpochId(5), snapshot);
+        let action = coordinator.on_snapshot_received(2, EpochId(5), &snapshot);
 
         assert!(matches!(
             action,
@@ -352,7 +353,7 @@ mod tests {
 
         coordinator.initiate(2);
         coordinator.on_epoch_boundary(EpochId(5));
-        coordinator.on_snapshot_received(2, EpochId(5), EpochObjectStates::new());
+        coordinator.on_snapshot_received(2, EpochId(5), &EpochObjectStates::new());
 
         let action = coordinator.on_epoch_sealed(EpochId(6));
 
@@ -380,7 +381,7 @@ mod tests {
         assert!(action1.is_some());
 
         // Phase 3: Snapshot received
-        let action2 = coordinator.on_snapshot_received(2, EpochId(10), EpochObjectStates::new());
+        let action2 = coordinator.on_snapshot_received(2, EpochId(10), &EpochObjectStates::new());
         assert!(action2.is_some());
 
         // Phase 4: Next epoch sealed
@@ -389,5 +390,239 @@ mod tests {
 
         // Back to idle
         assert!(!coordinator.is_retiring());
+    }
+}
+
+/// Property-based tests for the retirement state machine using rand.
+/// These tests verify invariants hold across randomly generated inputs.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use rand::Rng;
+
+    fn create_test_collector() -> Arc<StateCollector> {
+        Arc::new(StateCollector::new(3))
+    }
+
+    const NUM_ITERATIONS: usize = 100;
+
+    #[test]
+    fn prop_initiate_always_sets_retiring() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            assert!(
+                coordinator.is_retiring(),
+                "Failed for proxy_id={}",
+                proxy_id
+            );
+        }
+    }
+
+    #[test]
+    fn prop_double_initiation_fails() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id1: ProxyId = rng.gen_range(0..100);
+            let proxy_id2: ProxyId = rng.gen_range(0..100);
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            let first = coordinator.initiate(proxy_id1);
+            let second = coordinator.initiate(proxy_id2);
+            assert!(first, "First initiation should succeed");
+            assert!(!second, "Second initiation should fail");
+        }
+    }
+
+    #[test]
+    fn prop_cancel_always_returns_to_idle() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.cancel();
+            assert!(!coordinator.is_retiring());
+            assert_eq!(*coordinator.phase(), RetirementPhase::Idle);
+        }
+    }
+
+    #[test]
+    fn prop_full_flow_terminates_in_idle() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let epoch1 = EpochId(rng.gen_range(1..500));
+            let epoch2 = EpochId(epoch1.0 + rng.gen_range(1..10));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(epoch1);
+            coordinator.on_snapshot_received(proxy_id, epoch1, &EpochObjectStates::new());
+            coordinator.on_epoch_sealed(epoch2);
+
+            assert!(
+                !coordinator.is_retiring(),
+                "Failed for proxy={}, epoch1={:?}, epoch2={:?}",
+                proxy_id,
+                epoch1,
+                epoch2
+            );
+        }
+    }
+
+    #[test]
+    fn prop_epoch_boundary_on_idle_is_noop() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let epoch = EpochId(rng.gen_range(1..1000));
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            let action = coordinator.on_epoch_boundary(epoch);
+            assert!(action.is_none());
+            assert!(!coordinator.is_retiring());
+        }
+    }
+
+    #[test]
+    fn prop_snapshot_from_wrong_proxy_ignored() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let retiring_proxy: ProxyId = rng.gen_range(0..50);
+            let wrong_proxy: ProxyId = rng.gen_range(50..100);
+            let epoch = EpochId(rng.gen_range(1..1000));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(retiring_proxy);
+            coordinator.on_epoch_boundary(epoch);
+
+            let action =
+                coordinator.on_snapshot_received(wrong_proxy, epoch, &EpochObjectStates::new());
+            assert!(
+                action.is_none(),
+                "Snapshot from wrong proxy should be ignored"
+            );
+            assert!(coordinator.is_retiring(), "Should still be retiring");
+        }
+    }
+
+    #[test]
+    fn prop_snapshot_wrong_epoch_ignored() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let signal_epoch = EpochId(rng.gen_range(1..500));
+            let wrong_epoch = EpochId(signal_epoch.0 + rng.gen_range(1..100));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(signal_epoch);
+
+            let action =
+                coordinator.on_snapshot_received(proxy_id, wrong_epoch, &EpochObjectStates::new());
+            assert!(
+                action.is_none(),
+                "Snapshot with wrong epoch should be ignored"
+            );
+            assert!(coordinator.is_retiring());
+        }
+    }
+
+    #[test]
+    fn prop_state_advances_monotonically() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let epoch1 = EpochId(rng.gen_range(1..500));
+            let epoch2 = EpochId(epoch1.0 + 1);
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+
+            coordinator.initiate(proxy_id);
+            assert!(matches!(
+                coordinator.phase(),
+                RetirementPhase::PendingEpochBoundary { .. }
+            ));
+
+            coordinator.on_epoch_boundary(epoch1);
+            assert!(matches!(
+                coordinator.phase(),
+                RetirementPhase::AwaitingSnapshot { .. }
+            ));
+
+            coordinator.on_snapshot_received(proxy_id, epoch1, &EpochObjectStates::new());
+            assert!(matches!(
+                coordinator.phase(),
+                RetirementPhase::AwaitingNextEpochSeal { .. }
+            ));
+
+            coordinator.on_epoch_sealed(epoch2);
+            assert_eq!(*coordinator.phase(), RetirementPhase::Idle);
+        }
+    }
+
+    #[test]
+    fn prop_any_epoch_seal_completes_after_snapshot() {
+        // Note: The retirement coordinator completes on ANY epoch seal after snapshot,
+        // regardless of actual epoch number. This tests that behavior.
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let signal_epoch = EpochId(rng.gen_range(1..500));
+            let seal_epoch = EpochId(rng.gen_range(1..1000)); // Any epoch
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(signal_epoch);
+            coordinator.on_snapshot_received(proxy_id, signal_epoch, &EpochObjectStates::new());
+
+            // Any epoch seal should complete retirement when in AwaitingNextEpochSeal phase
+            let action = coordinator.on_epoch_sealed(seal_epoch);
+            assert!(
+                matches!(action, Some(RetirementAction::CompleteRetirement { .. })),
+                "Any epoch seal should complete retirement after snapshot"
+            );
+            assert!(!coordinator.is_retiring());
+        }
+    }
+
+    #[test]
+    fn prop_random_event_sequence_never_panics() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+
+            for _ in 0..20 {
+                let event_type = rng.gen_range(0..6);
+                let proxy_id: ProxyId = rng.gen_range(0..10);
+                let epoch = EpochId(rng.gen_range(1..100));
+
+                match event_type {
+                    0 => {
+                        coordinator.initiate(proxy_id);
+                    }
+                    1 => {
+                        coordinator.cancel();
+                    }
+                    2 => {
+                        coordinator.on_epoch_boundary(epoch);
+                    }
+                    3 => {
+                        coordinator.on_snapshot_received(
+                            proxy_id,
+                            epoch,
+                            &EpochObjectStates::new(),
+                        );
+                    }
+                    4 => {
+                        coordinator.on_epoch_sealed(epoch);
+                    }
+                    5 => {
+                        coordinator.is_retiring();
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }

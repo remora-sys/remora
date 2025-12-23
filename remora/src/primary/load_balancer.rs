@@ -23,7 +23,7 @@ use crate::{
     primary::{
         elastic_scaler::{
             retirement_coordinator::{RetirementAction, RetirementCoordinator},
-            ElasticScaler,
+            ElasticScaler, RetirementEvent,
         },
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         pause_barrier::PauseBarrier,
@@ -80,6 +80,8 @@ pub struct LoadBalancer<E: Executor> {
     elastic_scaler: ElasticScaler,
     /// Retirement coordinator for graceful proxy shutdown during scale-in
     retirement_coordinator: RetirementCoordinator,
+    /// Receiver for retirement events from PrimaryNode (snapshots and epoch seals)
+    rx_retirement_events: Receiver<RetirementEvent>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -100,6 +102,7 @@ where
         collector: Arc<StateCollector>,
         max_message_size: usize,
         pause_barrier: Arc<PauseBarrier>,
+        rx_retirement_events: Receiver<RetirementEvent>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         let states_to_proxy = Arc::new(DashMap::with_capacity(10000000));
@@ -132,6 +135,7 @@ where
             pause_barrier,
             elastic_scaler,
             retirement_coordinator,
+            rx_retirement_events,
         }
     }
 
@@ -751,6 +755,10 @@ where
                     }
                 }
 
+                Some(retirement_event) = self.rx_retirement_events.recv() => {
+                    self.handle_retirement_event(retirement_event).await;
+                }
+
                 _ = scaling_check_interval.tick() => {
                     // Periodic scaling check
                     self.check_and_handle_scaling().await;
@@ -789,6 +797,36 @@ where
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle retirement events from PrimaryNode (snapshots and epoch seals).
+    async fn handle_retirement_event(&mut self, event: RetirementEvent) {
+        match event {
+            RetirementEvent::Snapshot {
+                proxy_id,
+                epoch,
+                snapshot,
+            } => {
+                tracing::info!(
+                    proxy_id,
+                    epoch = epoch.0,
+                    snapshot_size = snapshot.len(),
+                    "Received retirement snapshot event"
+                );
+                if let Some(action) = self
+                    .retirement_coordinator
+                    .on_snapshot_received(proxy_id, epoch, &snapshot)
+                {
+                    self.execute_retirement_action(action).await;
+                }
+            }
+            RetirementEvent::EpochSealed { epoch } => {
+                tracing::info!(epoch = epoch.0, "Received epoch sealed event");
+                if let Some(action) = self.retirement_coordinator.on_epoch_sealed(epoch) {
+                    self.execute_retirement_action(action).await;
                 }
             }
         }

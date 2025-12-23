@@ -8,6 +8,9 @@
 //! aligned retirement.
 
 pub mod retirement_coordinator;
+pub mod retirement_event;
+
+pub use retirement_event::RetirementEvent;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
