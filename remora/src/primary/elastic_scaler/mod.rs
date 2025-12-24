@@ -26,6 +26,8 @@ const RATE_WINDOW_MS: u64 = 1000;
 /// Encapsulates elastic scaling logic for both scale-out and scale-in.
 ///
 /// Ported from the elastic branch with scale-in additions.
+/// Scale-out decisions are queued and activated at epoch boundaries to ensure
+/// the primary knows exactly which proxies are participating in each epoch.
 pub struct ElasticScaler {
     /// Number of active nodes (can scale out/in based on load)
     active_nodes: Arc<AtomicUsize>,
@@ -41,6 +43,19 @@ pub struct ElasticScaler {
     rate_window_start: u64,
     /// Last time a scaling check was performed (milliseconds since epoch)
     last_scale_check: u64,
+    /// Pending scale-out: new node will become active at next epoch boundary.
+    /// This ensures epoch-aligned scaling so the primary knows exactly which
+    /// proxies are participating in each epoch.
+    pending_scale_out: bool,
+}
+
+/// Result of activating a pending scale-out at epoch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleOutActivation {
+    /// Previous active node count
+    pub previous_count: usize,
+    /// New active node count after scale-out
+    pub new_count: usize,
 }
 
 impl ElasticScaler {
@@ -70,6 +85,7 @@ impl ElasticScaler {
             incoming_rate_count: 0,
             rate_window_start: now,
             last_scale_check: now,
+            pending_scale_out: false,
         }
     }
 
@@ -265,6 +281,81 @@ impl ElasticScaler {
             None
         }
     }
+
+    // ==================== Epoch-Aligned Scale-Out ====================
+
+    /// Queue a scale-out decision to take effect at the next epoch boundary.
+    ///
+    /// This ensures the primary knows exactly which proxies are participating
+    /// in each epoch, preventing empty snapshots from newly-activated proxies
+    /// that didn't receive any transactions for the current epoch.
+    ///
+    /// Returns false if:
+    /// - A scale-out is already pending
+    /// - Already at maximum nodes
+    pub fn queue_scale_out(&mut self) -> bool {
+        if self.pending_scale_out {
+            tracing::debug!("Scale-out already pending, ignoring duplicate request");
+            return false;
+        }
+
+        let active = self.active_nodes.load(Ordering::Relaxed);
+        if active >= self.max_nodes {
+            tracing::debug!(
+                "Cannot queue scale-out: already at max nodes ({}/{})",
+                active,
+                self.max_nodes
+            );
+            return false;
+        }
+
+        self.pending_scale_out = true;
+        tracing::info!(
+            "SCALE OUT queued: will activate at next epoch boundary ({} -> {} nodes)",
+            active,
+            active + 1
+        );
+        true
+    }
+
+    /// Called at epoch boundary to activate any pending scale-out.
+    ///
+    /// Returns `Some(ScaleOutActivation)` if a scale-out was activated,
+    /// `None` if no scale-out was pending.
+    pub fn on_epoch_boundary(&mut self) -> Option<ScaleOutActivation> {
+        if !self.pending_scale_out {
+            return None;
+        }
+
+        self.pending_scale_out = false;
+        let previous = self.active_nodes.load(Ordering::Relaxed);
+
+        if previous < self.max_nodes {
+            self.active_nodes.store(previous + 1, Ordering::Relaxed);
+            let activation = ScaleOutActivation {
+                previous_count: previous,
+                new_count: previous + 1,
+            };
+            tracing::info!(
+                "SCALE OUT activated at epoch boundary: {} -> {} active nodes",
+                previous,
+                previous + 1
+            );
+            Some(activation)
+        } else {
+            tracing::warn!(
+                "Pending scale-out cancelled: already at max nodes ({}/{})",
+                previous,
+                self.max_nodes
+            );
+            None
+        }
+    }
+
+    /// Check if there is a pending scale-out waiting for epoch boundary.
+    pub fn is_scale_out_pending(&self) -> bool {
+        self.pending_scale_out
+    }
 }
 
 /// Scaling decision from the ElasticScaler.
@@ -351,5 +442,266 @@ mod tests {
         // Mock time passage by manipulating the window start (hacky but effective for unit test if rate_window_start was pub or we wait, simpler to just trust the logic update or add a better test infrastructure later)
         // Since we can't easily mock time here without refactoring, we'll just check that count increased.
         assert_eq!(scaler.incoming_rate_count, 100);
+    }
+
+    // ==================== Epoch-Aligned Scale-Out Tests ====================
+
+    #[test]
+    fn test_queue_scale_out_sets_pending() {
+        let mut scaler = ElasticScaler::with_initial_nodes(2, 5);
+
+        assert!(!scaler.is_scale_out_pending());
+        assert!(scaler.queue_scale_out());
+        assert!(scaler.is_scale_out_pending());
+        // Active nodes should NOT change yet
+        assert_eq!(scaler.active_node_count(), 2);
+    }
+
+    #[test]
+    fn test_queue_scale_out_idempotent() {
+        let mut scaler = ElasticScaler::with_initial_nodes(2, 5);
+
+        assert!(scaler.queue_scale_out()); // First call succeeds
+        assert!(!scaler.queue_scale_out()); // Duplicate call fails
+        assert!(scaler.is_scale_out_pending());
+    }
+
+    #[test]
+    fn test_queue_scale_out_at_max_fails() {
+        let mut scaler = ElasticScaler::with_initial_nodes(5, 5);
+
+        assert!(!scaler.queue_scale_out()); // Already at max
+        assert!(!scaler.is_scale_out_pending());
+    }
+
+    #[test]
+    fn test_on_epoch_boundary_activates_pending() {
+        let mut scaler = ElasticScaler::with_initial_nodes(2, 5);
+
+        scaler.queue_scale_out();
+        let activation = scaler.on_epoch_boundary();
+
+        assert!(activation.is_some());
+        let activation = activation.unwrap();
+        assert_eq!(activation.previous_count, 2);
+        assert_eq!(activation.new_count, 3);
+        assert_eq!(scaler.active_node_count(), 3);
+        assert!(!scaler.is_scale_out_pending());
+    }
+
+    #[test]
+    fn test_on_epoch_boundary_no_pending() {
+        let mut scaler = ElasticScaler::with_initial_nodes(2, 5);
+
+        // No pending scale-out
+        let activation = scaler.on_epoch_boundary();
+        assert!(activation.is_none());
+        assert_eq!(scaler.active_node_count(), 2);
+    }
+
+    #[test]
+    fn test_epoch_aligned_scale_out_full_flow() {
+        let mut scaler = ElasticScaler::with_initial_nodes(1, 3);
+
+        // Epoch 1: queue scale-out mid-epoch
+        assert!(scaler.queue_scale_out());
+        assert_eq!(scaler.active_node_count(), 1); // Still 1
+
+        // Epoch 2: boundary activates scale-out
+        let activation = scaler.on_epoch_boundary();
+        assert!(activation.is_some());
+        assert_eq!(scaler.active_node_count(), 2); // Now 2
+
+        // Queue another
+        assert!(scaler.queue_scale_out());
+
+        // Epoch 3: boundary activates again
+        let activation = scaler.on_epoch_boundary();
+        assert!(activation.is_some());
+        assert_eq!(scaler.active_node_count(), 3); // Now 3
+
+        // Cannot queue more (at max)
+        assert!(!scaler.queue_scale_out());
+    }
+}
+
+/// Property-based tests for epoch-aligned scale-out using rand.
+/// These tests verify invariants hold across randomly generated inputs.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use rand::Rng;
+
+    const NUM_ITERATIONS: usize = 100;
+
+    /// Invariant: queue_scale_out should be idempotent (second call always fails)
+    #[test]
+    fn prop_queue_scale_out_is_idempotent() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..5);
+            let max: usize = rng.gen_range(initial..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            let first = scaler.queue_scale_out();
+            let second = scaler.queue_scale_out();
+
+            // If first succeeded, second must fail (idempotent)
+            if first {
+                assert!(!second, "Duplicate queue_scale_out should fail");
+            }
+        }
+    }
+
+    /// Invariant: on_epoch_boundary without pending always returns None
+    #[test]
+    fn prop_epoch_boundary_no_pending_is_noop() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..5);
+            let max: usize = rng.gen_range(initial..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            // No queued scale-out
+            let activation = scaler.on_epoch_boundary();
+            assert!(activation.is_none());
+            assert_eq!(scaler.active_node_count(), initial);
+        }
+    }
+
+    /// Invariant: queue_scale_out should never exceed max_nodes
+    #[test]
+    fn prop_active_nodes_never_exceed_max() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..5);
+            let max: usize = rng.gen_range(initial..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            // Queue and activate multiple times
+            for _ in 0..20 {
+                scaler.queue_scale_out();
+                scaler.on_epoch_boundary();
+            }
+
+            assert!(
+                scaler.active_node_count() <= max,
+                "Active nodes {} exceeded max {}",
+                scaler.active_node_count(),
+                max
+            );
+        }
+    }
+
+    /// Invariant: on_epoch_boundary clears pending state
+    #[test]
+    fn prop_epoch_boundary_clears_pending() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..4);
+            let max: usize = rng.gen_range(initial + 1..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            scaler.queue_scale_out();
+            assert!(scaler.is_scale_out_pending());
+
+            scaler.on_epoch_boundary();
+            assert!(
+                !scaler.is_scale_out_pending(),
+                "Pending should be cleared after epoch boundary"
+            );
+        }
+    }
+
+    /// Invariant: after successful queue + boundary, active_nodes increases by 1
+    #[test]
+    fn prop_scale_out_increases_by_one() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..4);
+            let max: usize = rng.gen_range(initial + 1..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            let before = scaler.active_node_count();
+            let queued = scaler.queue_scale_out();
+            let activation = scaler.on_epoch_boundary();
+            let after = scaler.active_node_count();
+
+            if queued && activation.is_some() {
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "Scale-out should increase active nodes by 1"
+                );
+            }
+        }
+    }
+
+    /// Invariant: ScaleOutActivation contains correct previous/new counts
+    #[test]
+    fn prop_activation_counts_are_consistent() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..4);
+            let max: usize = rng.gen_range(initial + 1..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            scaler.queue_scale_out();
+            if let Some(activation) = scaler.on_epoch_boundary() {
+                assert_eq!(
+                    activation.new_count,
+                    activation.previous_count + 1,
+                    "new_count should be previous_count + 1"
+                );
+                assert_eq!(
+                    scaler.active_node_count(),
+                    activation.new_count,
+                    "active_node_count should equal new_count"
+                );
+            }
+        }
+    }
+
+    /// Invariant: random sequence of operations never panics and maintains invariants
+    #[test]
+    fn prop_random_operations_maintain_invariants() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let initial: usize = rng.gen_range(1..5);
+            let max: usize = rng.gen_range(initial..10);
+            let mut scaler = ElasticScaler::with_initial_nodes(initial, max);
+
+            for _ in 0..50 {
+                let op = rng.gen_range(0..5);
+                match op {
+                    0 => {
+                        scaler.queue_scale_out();
+                    }
+                    1 => {
+                        scaler.on_epoch_boundary();
+                    }
+                    2 => {
+                        scaler.is_scale_out_pending();
+                    }
+                    3 => {
+                        scaler.active_node_count();
+                    }
+                    4 => {
+                        // Simulate decrease (scale-in)
+                        scaler.decrease_active_nodes();
+                    }
+                    _ => {}
+                }
+
+                // Invariants must hold after every operation
+                assert!(scaler.active_node_count() >= 1, "Active nodes must be >= 1");
+                assert!(
+                    scaler.active_node_count() <= max,
+                    "Active nodes {} exceeded max {}",
+                    scaler.active_node_count(),
+                    max
+                );
+            }
+        }
     }
 }

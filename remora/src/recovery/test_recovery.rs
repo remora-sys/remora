@@ -56,29 +56,32 @@ mod tests {
         // Initial persist epoch should be 0
         assert_eq!(coordinator.get_persist_epoch(&state_collector), EpochId(0));
 
-        // Simulate all proxies reporting epoch 500
+        // Simulate all proxies reporting epoch 1 (sequential commits required)
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
             state_collector
-                .process_snapshot::<TestTransaction>(proxy_id, 500, snapshot, 3, None)
+                .process_snapshot::<TestTransaction>(proxy_id, 1, snapshot, 3, None)
                 .await;
         }
-        assert_eq!(
-            coordinator.get_persist_epoch(&state_collector),
-            EpochId(500)
-        );
+        assert_eq!(coordinator.get_persist_epoch(&state_collector), EpochId(1));
 
-        // Simulate all proxies reporting epoch 1000
+        // Simulate all proxies reporting epoch 2
         for proxy_id in 0..3 {
             let snapshot = BTreeMap::new();
             state_collector
-                .process_snapshot::<TestTransaction>(proxy_id, 1000, snapshot, 3, None)
+                .process_snapshot::<TestTransaction>(proxy_id, 2, snapshot, 3, None)
                 .await;
         }
-        assert_eq!(
-            coordinator.get_persist_epoch(&state_collector),
-            EpochId(1000)
-        );
+        assert_eq!(coordinator.get_persist_epoch(&state_collector), EpochId(2));
+
+        // Simulate all proxies reporting epoch 3
+        for proxy_id in 0..3 {
+            let snapshot = BTreeMap::new();
+            state_collector
+                .process_snapshot::<TestTransaction>(proxy_id, 3, snapshot, 3, None)
+                .await;
+        }
+        assert_eq!(coordinator.get_persist_epoch(&state_collector), EpochId(3));
     }
 
     #[test]

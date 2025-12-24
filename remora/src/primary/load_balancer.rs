@@ -753,18 +753,21 @@ where
     }
 
     /// Check scaling decision and initiate scale-out or scale-in.
+    ///
+    /// Scale-out decisions are queued and activated at epoch boundaries to ensure
+    /// the primary knows exactly which proxies are participating in each epoch.
+    /// Scale-in uses the RetirementCoordinator state machine which is already
+    /// epoch-aligned.
     async fn check_and_handle_scaling(&mut self) {
         use crate::primary::elastic_scaler::ScalingDecision;
 
         if let Some(decision) = self.elastic_scaler.check_scaling() {
             match decision {
                 ScalingDecision::ScaleOut => {
-                    // Scale-out: activate a new proxy
-                    let current = self.elastic_scaler.active_node_count();
-                    if current < self.proxy_connections.len() {
-                        self.elastic_scaler.increase_active_nodes();
-                        tracing::info!("Scaling out: {} -> {} active nodes", current, current + 1);
-                    }
+                    // Queue scale-out to take effect at next epoch boundary.
+                    // This ensures the new proxy is included in checkpoint broadcasts
+                    // from the start of the epoch, preventing empty snapshots.
+                    self.elastic_scaler.queue_scale_out();
                 }
                 ScalingDecision::ScaleIn => {
                     // Scale-in: initiate retirement if not already in progress
@@ -881,13 +884,36 @@ where
     }
 
     async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
+        // Activate any pending scale-out at epoch boundary BEFORE broadcasting.
+        // This ensures the newly-activated proxy receives the checkpoint for this epoch
+        // and will be included in the snapshot collection.
+        if let Some(activation) = self.elastic_scaler.on_epoch_boundary() {
+            tracing::info!(
+                "Scale-out activated at epoch {}: {} -> {} active nodes",
+                epoch.0,
+                activation.previous_count,
+                activation.new_count
+            );
+        }
+
         // Handle retirement state machine at epoch boundary
         if let Some(action) = self.retirement_coordinator.on_epoch_boundary(epoch) {
             self.execute_retirement_action(action).await;
         }
 
-        // Clone keys to avoid holding references while mutating map
-        let proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        // Only broadcast checkpoints to ACTIVE proxies to prevent empty snapshots
+        // from inactive/standby proxies that didn't receive any transactions.
+        let mut proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
+        proxy_ids.sort_unstable();
+        let active_count = self.elastic_scaler.active_node_count();
+        proxy_ids.truncate(active_count);
+
+        tracing::debug!(
+            "Broadcasting checkpoint for epoch {} to {} active proxies (of {} connected)",
+            epoch.0,
+            proxy_ids.len(),
+            self.proxy_connections.len()
+        );
 
         for proxy_id in proxy_ids {
             let tx_opt = self
@@ -908,7 +934,11 @@ where
                 }
             }
         }
-        tracing::info!("Broadcasted checkpoint for epoch {}", epoch.0);
+        tracing::info!(
+            "Broadcasted checkpoint for epoch {} to {} active proxies",
+            epoch.0,
+            active_count
+        );
     }
 
     /// Spawn the load balancer in a new task.
