@@ -106,7 +106,10 @@ pub struct SuiExecutor {
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
-    let pre_generation = config.load * config.duration.as_secs();
+    let pre_generation = config.calculate_total_transactions();
+
+    // Create genesis.
+    tracing::debug!("Creating genesis for {pre_generation} transactions...");
 
     // Determine the workload.
     let workload_type = match config.workload {
@@ -138,8 +141,6 @@ pub fn init_workload(config: &BenchmarkParameters) -> Workload {
         _ => Err(ConfigErrorType::InvalidWorkload),
     };
 
-    // Create genesis.
-    tracing::debug!("Creating genesis for {pre_generation} transactions...");
     Workload::new(pre_generation, workload_type.unwrap())
 }
 
