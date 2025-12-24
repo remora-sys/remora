@@ -793,6 +793,17 @@ where
                 epoch,
                 snapshot,
             } => {
+                // Only process snapshots for proxies that are actually in retirement.
+                // Normal epoch snapshots are sent by all proxies but should not be routed
+                // to the retirement coordinator.
+                if !self.retirement_coordinator.is_proxy_retiring(proxy_id) {
+                    tracing::debug!(
+                        proxy_id,
+                        epoch = epoch.0,
+                        "Ignoring snapshot: proxy not in retirement"
+                    );
+                    return;
+                }
                 tracing::info!(
                     proxy_id,
                     epoch = epoch.0,

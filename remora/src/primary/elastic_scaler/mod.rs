@@ -247,21 +247,19 @@ impl ElasticScaler {
         let active = self.active_nodes.load(Ordering::Relaxed);
         let capacity = self.per_node_capacity_tps.unwrap_or(0.0) * active as f64;
 
-        // Log scaling check every few seconds for visibility
-        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(last) >= 5000 {
-            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+        if self.should_scale_out(current_rate) {
             tracing::info!(
-                "ElasticScaler check: rate={:.0} TPS, capacity={:.0} TPS ({}×{:.0}), active={}/{}, threshold={:.0}%",
+                "ElasticScaler: SCALE OUT triggered - rate={:.0} TPS, capacity={:.0} TPS ({}×{:.0}), active={}/{}, threshold={:.0}%",
                 current_rate, capacity, active, self.per_node_capacity_tps.unwrap_or(0.0),
                 active, self.max_nodes, SCALE_OUT_THRESHOLD * 100.0
             );
-        }
-
-        if self.should_scale_out(current_rate) {
             Some(ScalingDecision::ScaleOut)
         } else if self.should_scale_in(current_rate) {
+            tracing::info!(
+                "ElasticScaler: SCALE IN triggered - rate={:.0} TPS, capacity={:.0} TPS ({}×{:.0}), active={}/{}, threshold={:.0}%",
+                current_rate, capacity, active, self.per_node_capacity_tps.unwrap_or(0.0),
+                active, self.max_nodes, SCALE_IN_THRESHOLD * 100.0
+            );
             Some(ScalingDecision::ScaleIn)
         } else {
             None
