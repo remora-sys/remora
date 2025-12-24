@@ -175,20 +175,9 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
 
         let store = executor.init_store();
 
-        // Calculate per-proxy expected batch size
-        // The global batch has consensus_batch_size transactions, but each proxy
-        // only executes a fraction based on load balancing policy.
-        // Exclude the standby proxy (last one) from active count.
-        let num_active_proxies = config.proxies.len().saturating_sub(1).max(1);
-        let per_proxy_batch_size = benchmark_config.consensus_batch_size / num_active_proxies;
-
-        tracing::info!(
-            "Proxy {}: Global batch size = {}, Active proxies = {}, Expected per-proxy batch size = {}",
-            id,
-            benchmark_config.consensus_batch_size,
-            num_active_proxies,
-            per_proxy_batch_size
-        );
+        // Note: With EpochCompletionTracker, we no longer need to pre-calculate batch sizes.
+        // The proxy now dynamically tracks received/completed transactions per epoch,
+        // which works correctly with elastic scaling.
 
         let core_handle = ProxyCore::new(
             id,
@@ -201,7 +190,6 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_primary_replies,
             config.validator_parameters.proxy_mode,
             metrics.clone(),
-            per_proxy_batch_size,
         )
         .spawn();
         core_handles.push(core_handle);

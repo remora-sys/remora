@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     ops::Deref,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -27,7 +27,7 @@ use tokio::{
 use crate::executor::api::PreExecuteCheckResult;
 use crate::{
     checkpoint::{
-        proxy::{EpochTracker, ModifiedObjectTracker},
+        proxy::{EpochCompletionTracker, EpochTracker, ModifiedObjectTracker},
         EpochId,
     },
     config::ProxyMode,
@@ -124,10 +124,10 @@ struct PrimaryMessageProcessor<E: Executor> {
     // Phase 1 checkpoint trackers
     epoch_tracker: EpochTracker,
     modified_tracker: ModifiedObjectTracker,
-    // Epoch completion tracking
-    batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+    // Epoch completion tracking for elastic scaling
+    epoch_completion_tracker: EpochCompletionTracker,
+    // Highest epoch that has been snapshotted
     completed_up_to: Arc<AtomicU64>,
-    batch_size: usize,
     retiring: bool,
 }
 
@@ -170,10 +170,7 @@ where
                 PrimaryToProxyMessage::StatelessTxn(..)
                 | PrimaryToProxyMessage::Txn(..)
                 | PrimaryToProxyMessage::CombinedTxn(..) => {
-                    tracing::debug!(
-                        "Proxy {} ignoring new transaction while retiring",
-                        self.id
-                    );
+                    tracing::debug!("Proxy {} ignoring new transaction while retiring", self.id);
                     return;
                 }
                 _ => {}
@@ -206,6 +203,9 @@ where
                         stateless_res_proxy_id
                     );
 
+                    // Track that we received a transaction for this epoch
+                    self.epoch_completion_tracker.record_received(epoch_id);
+
                     self.process_stateful_transaction(
                         epoch_id,
                         transaction,
@@ -217,6 +217,32 @@ where
                 PrimaryToProxyMessage::Checkpoint(epoch_id) => {
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
+
+                    // Checkpoint(N) means epoch N just finished dispatching.
+                    // Seal epoch N so the proxy knows no more transactions will arrive for it.
+                    if epoch_id.0 > 0 {
+                        let sealed_epoch = EpochId(epoch_id.0);
+                        if self.epoch_completion_tracker.seal_epoch(sealed_epoch) {
+                            // All transactions for this epoch are already complete, trigger snapshot
+                            let id = self.id;
+                            let epoch_completion_tracker = self.epoch_completion_tracker.clone();
+                            let completed_up_to = self.completed_up_to.clone();
+                            let modified_tracker = self.modified_tracker.clone();
+                            let tx_primary_replies = self.tx_primary_replies.clone();
+
+                            tokio::spawn(async move {
+                                Self::try_advance_watermark(
+                                    id,
+                                    sealed_epoch,
+                                    epoch_completion_tracker,
+                                    completed_up_to,
+                                    modified_tracker,
+                                    tx_primary_replies,
+                                )
+                                .await;
+                            });
+                        }
+                    }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
                     tracing::debug!(
@@ -302,6 +328,10 @@ where
                         epoch_id.0,
                         stateless_res_proxy_id
                     );
+
+                    // Track that we received a transaction for this epoch
+                    self.epoch_completion_tracker.record_received(epoch_id);
+
                     self.process_stateful_transaction(
                         epoch_id,
                         transaction,
@@ -313,6 +343,31 @@ where
                 PrimaryToProxyMessage::Checkpoint(epoch_id) => {
                     tracing::debug!("Proxy {} received Checkpoint {:?}", self.id, epoch_id);
                     self.epoch_tracker.update_epoch(epoch_id);
+
+                    // Checkpoint(N) means epoch N just finished dispatching
+                    if epoch_id.0 > 0 {
+                        let sealed_epoch = EpochId(epoch_id.0);
+                        if self.epoch_completion_tracker.seal_epoch(sealed_epoch) {
+                            // All transactions for this epoch are already complete
+                            let id = self.id;
+                            let epoch_completion_tracker = self.epoch_completion_tracker.clone();
+                            let completed_up_to = self.completed_up_to.clone();
+                            let modified_tracker = self.modified_tracker.clone();
+                            let tx_primary_replies = self.tx_primary_replies.clone();
+
+                            tokio::spawn(async move {
+                                Self::try_advance_watermark(
+                                    id,
+                                    sealed_epoch,
+                                    epoch_completion_tracker,
+                                    completed_up_to,
+                                    modified_tracker,
+                                    tx_primary_replies,
+                                )
+                                .await;
+                            });
+                        }
+                    }
                 }
                 PrimaryToProxyMessage::Replay(batch) => {
                     tracing::info!(
@@ -567,9 +622,8 @@ where
         let mode = self.mode.clone();
         let tx_primary_replies = self.tx_primary_replies.clone();
         let modified_tracker = self.modified_tracker.clone();
-        let batch_completion_count = self.batch_completion_count.clone();
+        let epoch_completion_tracker = self.epoch_completion_tracker.clone();
         let completed_up_to = self.completed_up_to.clone();
-        let batch_size = self.batch_size;
         let epoch_id_for_tracking = epoch_id;
 
         tokio::spawn(async move {
@@ -694,13 +748,12 @@ where
 
             metrics.decrease_proxy_load(&id);
 
-            // Track batch completion
+            // Track transaction completion and trigger snapshot if ready
             Self::record_transaction_complete(
                 id,
-                epoch_id_for_tracking.0,
-                batch_completion_count,
+                epoch_id_for_tracking,
+                epoch_completion_tracker,
                 completed_up_to,
-                batch_size,
                 modified_tracker,
                 tx_primary_replies,
             )
@@ -713,38 +766,26 @@ where
     }
 
     /// Static helper to record transaction completion from spawned tasks.
+    ///
+    /// Uses EpochCompletionTracker to handle dynamic transaction counts per epoch
+    /// (works correctly with elastic scaling where proxy receives varying tx counts).
     async fn record_transaction_complete(
         id: ProxyId,
-        epoch_id: u64,
-        batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+        epoch_id: EpochId,
+        epoch_completion_tracker: EpochCompletionTracker,
         completed_up_to: Arc<AtomicU64>,
-        batch_size: usize,
         modified_tracker: ModifiedObjectTracker,
         tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     ) {
-        // Increment completion count for this epoch atomically
-        let count = {
-            let counter = batch_completion_count
-                .entry(epoch_id)
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
-            counter.fetch_add(1, Ordering::SeqCst) + 1
-        }; // counter is dropped here, releasing the DashMap lock
+        // Record completion and check if epoch is ready for snapshot
+        let is_ready = epoch_completion_tracker.record_completed(epoch_id);
 
-        tracing::debug!(
-            "Proxy {} epoch {} completion: {}/{} transactions done",
-            id,
-            epoch_id,
-            count,
-            batch_size
-        );
-
-        // If epoch batch is fully complete, try to advance watermark
-        if count == batch_size {
-            Self::advance_watermark(
+        if is_ready {
+            Self::try_advance_watermark(
                 id,
-                batch_completion_count.clone(),
+                epoch_id,
+                epoch_completion_tracker,
                 completed_up_to,
-                batch_size,
                 modified_tracker,
                 tx_primary_replies,
             )
@@ -752,92 +793,73 @@ where
         }
     }
 
-    /// Static helper to advance the watermark from spawned tasks.
-    async fn advance_watermark(
+    /// Try to advance the snapshot watermark for this epoch.
+    /// Called when an epoch is detected as ready (sealed + all completed).
+    async fn try_advance_watermark(
         id: ProxyId,
-        batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+        epoch_id: EpochId,
+        epoch_completion_tracker: EpochCompletionTracker,
         completed_up_to: Arc<AtomicU64>,
-        batch_size: usize,
         modified_tracker: ModifiedObjectTracker,
         tx_primary_replies: Sender<ProxyToPrimaryMessage>,
     ) {
-        // Keep advancing the watermark as long as the next sequential batch is complete
+        // Epochs must be snapshotted in order. Check if we can advance.
         loop {
             let current = completed_up_to.load(Ordering::SeqCst);
             let next_epoch = current + 1;
 
-            tracing::info!(
-                "Proxy {} advance_watermark loop: current={}, next_epoch={}, batch_size={}",
+            tracing::debug!(
+                "Proxy {} try_advance_watermark: current={}, next_epoch={}, requesting_epoch={}",
                 id,
                 current,
                 next_epoch,
-                batch_size
+                epoch_id.0
             );
 
-            // Check if the next sequential epoch is complete
-            if let Some(counter) = batch_completion_count.get(&next_epoch) {
-                let count_value = counter.load(Ordering::SeqCst);
+            // Check if next epoch in sequence is ready
+            if !epoch_completion_tracker.is_ready(EpochId(next_epoch)) {
                 tracing::debug!(
-                    "Proxy {} epoch {} counter: {}/{}",
-                    id,
-                    next_epoch,
-                    count_value,
-                    batch_size
-                );
-
-                if count_value == batch_size {
-                    // Next epoch is complete, try to advance the watermark
-                    if completed_up_to
-                        .compare_exchange(current, next_epoch, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        tracing::info!(
-                            "Proxy {} ✓ Epoch {} fully completed, advanced watermark to {}",
-                            id,
-                            next_epoch,
-                            next_epoch
-                        );
-
-                        // Take snapshot and send to primary
-                        let snapshot = modified_tracker.take_epoch_snapshot(EpochId(next_epoch));
-                        tracing::info!(
-                            "Proxy {} epoch {:?} snapshot objects: {}, completed_up_to: {}",
-                            id,
-                            next_epoch,
-                            snapshot.len(),
-                            next_epoch
-                        );
-                        let reply = ProxyToPrimaryMessage::StateSnapshot(id, next_epoch, snapshot);
-                        if let Err(e) = tx_primary_replies.send(reply).await {
-                            tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
-                        }
-
-                        // Successfully advanced, continue to check subsequent epochs
-                        continue;
-                    }
-                    tracing::debug!(
-                        "Proxy {} epoch {} CAS failed, retrying (watermark changed)",
-                        id,
-                        next_epoch
-                    );
-                    // Someone else advanced it, retry from the top
-                    continue;
-                }
-            } else {
-                tracing::info!(
-                    "Proxy {} epoch {} not found in map or not complete, stopping",
+                    "Proxy {} epoch {} not ready yet, stopping advancement",
                     id,
                     next_epoch
                 );
+                break;
             }
 
-            // Next batch is not complete, stop advancing
-            break;
-        }
+            // Next epoch is ready, try to advance the watermark
+            if completed_up_to
+                .compare_exchange(current, next_epoch, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                tracing::info!(
+                    "Proxy {} ✓ Epoch {} fully completed, taking snapshot",
+                    id,
+                    next_epoch
+                );
 
-        // Clean up old tracking data
-        let final_watermark = completed_up_to.load(Ordering::SeqCst);
-        batch_completion_count.retain(|batch, _| *batch > final_watermark);
+                // Take snapshot and send to primary
+                let snapshot = modified_tracker.take_epoch_snapshot(EpochId(next_epoch));
+                tracing::info!(
+                    "Proxy {} epoch {} snapshot: {} objects",
+                    id,
+                    next_epoch,
+                    snapshot.len()
+                );
+                let reply = ProxyToPrimaryMessage::StateSnapshot(id, next_epoch, snapshot);
+                if let Err(e) = tx_primary_replies.send(reply).await {
+                    tracing::warn!("Failed to send state snapshot to primary: {:?}", e);
+                }
+
+                // Clean up old tracking data
+                epoch_completion_tracker.cleanup_up_to(EpochId(next_epoch));
+
+                // Continue to check if subsequent epochs are also ready
+                continue;
+            }
+
+            // Someone else advanced it, retry
+            continue;
+        }
     }
 }
 
@@ -1113,10 +1135,9 @@ pub struct ProxyCore<E: Executor> {
     /// Phase 1 checkpoint trackers
     epoch_tracker: EpochTracker,
     modified_tracker: ModifiedObjectTracker,
-    /// Epoch completion tracking
-    batch_completion_count: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+    /// Epoch completion tracking for elastic scaling
+    epoch_completion_tracker: EpochCompletionTracker,
     completed_up_to: Arc<AtomicU64>,
-    batch_size: usize,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
@@ -1140,7 +1161,6 @@ where
         tx_primary_replies: Sender<ProxyToPrimaryMessage>,
         mode: ProxyMode,
         metrics: Arc<Metrics>,
-        batch_size: usize,
     ) -> Self {
         Self {
             id,
@@ -1157,9 +1177,8 @@ where
             metrics,
             epoch_tracker: EpochTracker::new(crate::checkpoint::EpochId(1)),
             modified_tracker: ModifiedObjectTracker::new(),
-            batch_completion_count: Arc::new(DashMap::new()),
+            epoch_completion_tracker: EpochCompletionTracker::new(),
             completed_up_to: Arc::new(AtomicU64::new(0)),
-            batch_size,
         }
     }
 
@@ -1181,9 +1200,8 @@ where
             metrics: self.metrics.clone(),
             epoch_tracker: self.epoch_tracker,
             modified_tracker: self.modified_tracker,
-            batch_completion_count: self.batch_completion_count.clone(),
+            epoch_completion_tracker: self.epoch_completion_tracker.clone(),
             completed_up_to: self.completed_up_to.clone(),
-            batch_size: self.batch_size,
             retiring: false,
         };
 
@@ -1273,7 +1291,6 @@ mod tests {
             tx_primary_replies,
             ProxyMode::Separation,
             metrics,
-            10_000, // batch_size for tests
         );
 
         (
