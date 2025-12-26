@@ -841,6 +841,19 @@ where
     async fn execute_retirement_action(&mut self, action: RetirementAction) {
         match action {
             RetirementAction::SendRetirementSignal { proxy_id, epoch } => {
+                // Drain all in-flight transactions before marking proxy as retiring.
+                // This ensures transactions routed to this proxy before this point
+                // complete successfully before we exclude it from routing.
+                tracing::info!(
+                    proxy_id,
+                    epoch = epoch.0,
+                    "Draining in-flight transactions before retirement signal"
+                );
+                {
+                    let _guard = self.pause_barrier.pause_and_wait().await;
+                    // All in-flight transactions have completed at this point.
+                    // Guard is dropped here, resuming new transaction processing.
+                }
                 tracing::info!(proxy_id, epoch = epoch.0, "Sending retirement signal");
                 self.retiring_proxies.insert(proxy_id, ());
                 if let Some(tx) = self.proxy_connections.get(&proxy_id) {
@@ -940,12 +953,9 @@ where
         proxy_ids.retain(|id| !self.retiring_proxies.contains_key(id));
 
         // Calculate expected proxies for this epoch.
-        // Include the pending retirement proxy (they will report for THIS epoch).
-        let expected_for_epoch = if pending_retirement_proxy.is_some() {
-            proxy_ids.len() + 1 // +1 for the proxy about to be retired
-        } else {
-            proxy_ids.len()
-        };
+        // The pending retirement proxy is still in proxy_ids (not yet in retiring_proxies),
+        // so we should NOT add +1 here - it's already counted.
+        let expected_for_epoch = proxy_ids.len();
 
         // Record expected proxies for this epoch in the collector
         self.collector
@@ -954,12 +964,7 @@ where
         tracing::info!(
             "Broadcasting checkpoint for epoch {} to {} proxies (expected reports: {})",
             epoch.0,
-            proxy_ids.len()
-                + if pending_retirement_proxy.is_some() {
-                    1
-                } else {
-                    0
-                },
+            proxy_ids.len(),
             expected_for_epoch
         );
 
