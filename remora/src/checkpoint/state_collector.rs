@@ -22,8 +22,14 @@ pub struct StateCollector {
     /// Key: ProxyId, Value: last acknowledged epoch ID
     pub(crate) per_proxy_persist_index: DashMap<ProxyId, AtomicU64>,
 
-    /// Number of expected proxies (for determining when all have acknowledged)
+    /// Number of expected proxies (default, for determining when all have acknowledged)
     expected_proxies: usize,
+
+    /// Per-epoch expected proxies: tracks the number of active proxies for each epoch.
+    /// This supports elastic scaling where the number of proxies changes at epoch boundaries.
+    /// Key: epoch number, Value: expected proxy count for that epoch
+    expected_proxies_per_epoch: DashMap<u64, usize>,
+
     /// The last epoch that was successfully committed to merged_state.
     last_committed_epoch: AtomicU64,
     /// Barrier to pause this worker during recovery.
@@ -37,6 +43,7 @@ impl StateCollector {
             temp_state_by_epoch: DashMap::new(),
             per_proxy_persist_index: DashMap::new(),
             expected_proxies,
+            expected_proxies_per_epoch: DashMap::new(),
             last_committed_epoch: AtomicU64::new(0),
             pause_barrier: None,
         }
@@ -239,8 +246,18 @@ impl StateCollector {
 
     /// Check if an epoch is complete (all proxies have reported at least this epoch).
     /// Returns true if ALL proxies (including failed ones) have a persist_index >= the epoch.
-    pub fn is_epoch_complete(&self, epoch: EpochId, expected_proxies: usize) -> bool {
-        if self.per_proxy_persist_index.len() < expected_proxies {
+    /// Uses per-epoch expected proxy count if available, otherwise falls back to default.
+    pub fn is_epoch_complete(&self, epoch: EpochId, _expected_proxies: usize) -> bool {
+        // Use per-epoch expected proxies if available, otherwise fall back to default
+        let expected = self.get_expected_proxies_for_epoch(epoch);
+
+        if self.per_proxy_persist_index.len() < expected {
+            tracing::debug!(
+                "Epoch {} not complete: only {}/{} proxies have reported",
+                epoch.0,
+                self.per_proxy_persist_index.len(),
+                expected
+            );
             return false;
         }
 
@@ -254,9 +271,10 @@ impl StateCollector {
         let complete = min_persist_index >= epoch.0;
 
         tracing::debug!(
-            "Epoch {} completion check: min_persist_index={}, complete={}",
+            "Epoch {} completion check: min_persist_index={}, expected_proxies={}, complete={}",
             epoch.0,
             min_persist_index,
+            expected,
             complete
         );
         complete
@@ -277,6 +295,30 @@ impl StateCollector {
             .get(&proxy_id)
             .map(|atomic| atomic.load(Ordering::SeqCst))
             .unwrap_or(0)
+    }
+
+    /// Set the expected number of proxies for a specific epoch.
+    /// Called by the load balancer at epoch boundaries when scaling happens.
+    pub fn set_expected_proxies_for_epoch(&self, epoch: EpochId, count: usize) {
+        tracing::debug!("Setting expected proxies for epoch {}: {}", epoch.0, count);
+        self.expected_proxies_per_epoch.insert(epoch.0, count);
+    }
+
+    /// Get the expected number of proxies for a specific epoch.
+    /// Returns the per-epoch count if set, otherwise falls back to the default.
+    pub fn get_expected_proxies_for_epoch(&self, epoch: EpochId) -> usize {
+        self.expected_proxies_per_epoch
+            .get(&epoch.0)
+            .map(|v| *v)
+            .unwrap_or(self.expected_proxies)
+    }
+
+    /// Clean up per-epoch expected proxy count for committed epochs.
+    /// Called after epoch commit to free memory.
+    pub fn cleanup_expected_proxies_up_to(&self, epoch: EpochId) {
+        for e in 1..=epoch.0 {
+            self.expected_proxies_per_epoch.remove(&e);
+        }
     }
 }
 

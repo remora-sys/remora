@@ -229,6 +229,37 @@ impl EpochCompletionTracker {
     pub fn cleanup_up_to(&self, epoch: EpochId) {
         self.epoch_state.retain(|e, _| *e > epoch.0);
     }
+
+    /// Initialize the tracker for proxy activation during elastic scaling.
+    ///
+    /// When a proxy is activated at epoch N, it needs to have epoch states for
+    /// epochs 1 through N-1 marked as sealed with 0 transactions. This allows
+    /// the try_advance_watermark logic to advance past epochs the proxy didn't
+    /// participate in.
+    ///
+    /// # Arguments
+    /// * `first_active_epoch` - The first epoch this proxy will actively participate in
+    pub fn initialize_for_activation(&self, first_active_epoch: EpochId) {
+        // Mark all epochs before first_active_epoch as sealed with 0 transactions
+        // This allows is_ready() to return true for these epochs
+        for epoch in 1..first_active_epoch.0 {
+            if !self.epoch_state.contains_key(&epoch) {
+                self.epoch_state.insert(
+                    epoch,
+                    EpochState {
+                        received: AtomicUsize::new(0),
+                        completed: AtomicUsize::new(0),
+                        sealed: std::sync::atomic::AtomicBool::new(true),
+                    },
+                );
+                tracing::debug!(
+                    "Initialized epoch {} as sealed (prior to activation epoch {})",
+                    epoch,
+                    first_active_epoch.0
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

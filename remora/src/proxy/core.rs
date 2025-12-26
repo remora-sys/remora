@@ -309,6 +309,27 @@ where
                     // Graceful shutdown - the receiver loop will exit when channel closes
                     return;
                 }
+                PrimaryToProxyMessage::ActivateProxy {
+                    first_active_epoch,
+                    completed_up_to,
+                } => {
+                    tracing::info!(
+                        "Proxy {} activated: first_active_epoch={}, completed_up_to={}",
+                        self.id,
+                        first_active_epoch.0,
+                        completed_up_to
+                    );
+
+                    // Initialize the completed_up_to watermark to the value sent by primary
+                    // This allows the proxy to advance past epochs it didn't participate in
+                    self.completed_up_to
+                        .store(completed_up_to, Ordering::SeqCst);
+
+                    // Initialize epoch completion tracker for all epochs before first_active_epoch
+                    // by marking them as sealed with 0 transactions (since we weren't active)
+                    self.epoch_completion_tracker
+                        .initialize_for_activation(first_active_epoch);
+                }
                 _ => {
                     panic!("Proxy {} received unexpected message", self.id);
                 }
@@ -434,6 +455,27 @@ where
                     );
                     // Graceful shutdown - the receiver loop will exit when channel closes
                     return;
+                }
+                PrimaryToProxyMessage::ActivateProxy {
+                    first_active_epoch,
+                    completed_up_to,
+                } => {
+                    tracing::info!(
+                        "Proxy {} activated: first_active_epoch={}, completed_up_to={}",
+                        self.id,
+                        first_active_epoch.0,
+                        completed_up_to
+                    );
+
+                    // Initialize the completed_up_to watermark to the value sent by primary
+                    // This allows the proxy to advance past epochs it didn't participate in
+                    self.completed_up_to
+                        .store(completed_up_to, Ordering::SeqCst);
+
+                    // Initialize epoch completion tracker for all epochs before first_active_epoch
+                    // by marking them as sealed with 0 transactions (since we weren't active)
+                    self.epoch_completion_tracker
+                        .initialize_for_activation(first_active_epoch);
                 }
                 // Replay handling already covered above in separation mode; no duplicate here.
                 _ => {

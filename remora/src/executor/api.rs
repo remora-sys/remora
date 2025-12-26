@@ -331,6 +331,15 @@ where
     /// Shutdown confirmation: primary confirms proxy can fully shut down
     /// (sent after next epoch is sealed)
     ShutdownConfirmation,
+    /// Activation message: primary notifies a standby proxy that it is now active.
+    /// Fields: first_active_epoch (the epoch at which this proxy becomes active),
+    ///         completed_up_to (the epoch watermark to initialize)
+    /// The proxy should set its completed_up_to to this value so it can advance
+    /// past epochs it didn't participate in.
+    ActivateProxy {
+        first_active_epoch: EpochId,
+        completed_up_to: u64,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -884,6 +884,9 @@ where
     }
 
     async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
+        // Track proxies that were just activated this epoch
+        let mut newly_activated_proxies: Vec<ProxyId> = Vec::new();
+
         // Activate any pending scale-out at epoch boundary BEFORE broadcasting.
         // This ensures the newly-activated proxy receives the checkpoint for this epoch
         // and will be included in the snapshot collection.
@@ -894,6 +897,16 @@ where
                 activation.previous_count,
                 activation.new_count
             );
+
+            // Determine which proxies are newly activated
+            let mut all_proxy_ids: Vec<ProxyId> =
+                self.proxy_connections.iter().map(|e| *e.key()).collect();
+            all_proxy_ids.sort_unstable();
+            for i in activation.previous_count..activation.new_count {
+                if i < all_proxy_ids.len() {
+                    newly_activated_proxies.push(all_proxy_ids[i]);
+                }
+            }
         }
 
         // Handle retirement state machine at epoch boundary
@@ -908,6 +921,11 @@ where
         let active_count = self.elastic_scaler.active_node_count();
         proxy_ids.truncate(active_count);
 
+        // Record expected proxies for this epoch in the collector
+        // This is the number of proxies that should report snapshots for this epoch
+        self.collector
+            .set_expected_proxies_for_epoch(epoch, active_count);
+
         tracing::debug!(
             "Broadcasting checkpoint for epoch {} to {} active proxies (of {} connected)",
             epoch.0,
@@ -915,6 +933,37 @@ where
             self.proxy_connections.len()
         );
 
+        // First, send ActivateProxy message to newly-activated proxies
+        // The completed_up_to is epoch.0 - 1 (the last epoch before this one)
+        let completed_up_to = if epoch.0 > 0 { epoch.0 - 1 } else { 0 };
+        for proxy_id in &newly_activated_proxies {
+            if let Some(tx) = self
+                .proxy_connections
+                .get(proxy_id)
+                .map(|e| e.value().clone())
+            {
+                let activate_msg = PrimaryToProxyMessage::ActivateProxy {
+                    first_active_epoch: epoch,
+                    completed_up_to,
+                };
+                if let Err(e) = tx.send(activate_msg).await {
+                    tracing::error!(
+                        "Failed to send ActivateProxy to proxy {}: {:?}",
+                        proxy_id,
+                        e
+                    );
+                } else {
+                    tracing::info!(
+                        "Sent ActivateProxy to proxy {}: first_active_epoch={}, completed_up_to={}",
+                        proxy_id,
+                        epoch.0,
+                        completed_up_to
+                    );
+                }
+            }
+        }
+
+        // Then broadcast checkpoints to all active proxies
         for proxy_id in proxy_ids {
             let tx_opt = self
                 .proxy_connections
