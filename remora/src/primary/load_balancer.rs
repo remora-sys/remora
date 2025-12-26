@@ -909,28 +909,58 @@ where
             }
         }
 
-        // Handle retirement state machine at epoch boundary
-        if let Some(action) = self.retirement_coordinator.on_epoch_boundary(epoch) {
-            self.execute_retirement_action(action).await;
-        }
+        // Check if retirement state machine will transition at this epoch boundary.
+        // We need to know BEFORE calling on_epoch_boundary so we can:
+        // 1. Include the retiring proxy in THIS epoch's checkpoint (they need to snapshot)
+        // 2. Send retirement signal AFTER checkpoint broadcast
+        let pending_retirement_proxy = if matches!(
+            self.retirement_coordinator.phase(),
+            crate::primary::elastic_scaler::retirement_coordinator::RetirementPhase::PendingEpochBoundary { .. }
+        ) {
+            // Get the proxy ID that's pending retirement
+            if let crate::primary::elastic_scaler::retirement_coordinator::RetirementPhase::PendingEpochBoundary { proxy_id } = self.retirement_coordinator.phase() {
+                Some(*proxy_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        // Only broadcast checkpoints to ACTIVE proxies to prevent empty snapshots
-        // from inactive/standby proxies that didn't receive any transactions.
+        // Build the list of proxies to receive checkpoints for THIS epoch.
+        // Include retiring proxy for their retirement epoch (they still need to snapshot Di).
         let mut proxy_ids: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
         proxy_ids.sort_unstable();
         let active_count = self.elastic_scaler.active_node_count();
         proxy_ids.truncate(active_count);
 
-        // Record expected proxies for this epoch in the collector
-        // This is the number of proxies that should report snapshots for this epoch
-        self.collector
-            .set_expected_proxies_for_epoch(epoch, active_count);
+        // Exclude proxies that are ALREADY in retirement (i.e., past their retirement epoch).
+        // These are proxies in AwaitingSnapshot or AwaitingNextEpochSeal phases.
+        // But include proxies in PendingEpochBoundary (they're retiring THIS epoch and need checkpoint).
+        proxy_ids.retain(|id| !self.retiring_proxies.contains_key(id));
 
-        tracing::debug!(
-            "Broadcasting checkpoint for epoch {} to {} active proxies (of {} connected)",
+        // Calculate expected proxies for this epoch.
+        // Include the pending retirement proxy (they will report for THIS epoch).
+        let expected_for_epoch = if pending_retirement_proxy.is_some() {
+            proxy_ids.len() + 1 // +1 for the proxy about to be retired
+        } else {
+            proxy_ids.len()
+        };
+
+        // Record expected proxies for this epoch in the collector
+        self.collector
+            .set_expected_proxies_for_epoch(epoch, expected_for_epoch);
+
+        tracing::info!(
+            "Broadcasting checkpoint for epoch {} to {} proxies (expected reports: {})",
             epoch.0,
-            proxy_ids.len(),
-            self.proxy_connections.len()
+            proxy_ids.len()
+                + if pending_retirement_proxy.is_some() {
+                    1
+                } else {
+                    0
+                },
+            expected_for_epoch
         );
 
         // First, send ActivateProxy message to newly-activated proxies
@@ -963,17 +993,17 @@ where
             }
         }
 
-        // Then broadcast checkpoints to all active proxies
-        for proxy_id in proxy_ids {
+        // Broadcast checkpoints to all eligible proxies (excluding already-retiring ones)
+        for proxy_id in &proxy_ids {
             let tx_opt = self
                 .proxy_connections
-                .get(&proxy_id)
+                .get(proxy_id)
                 .map(|e| e.value().clone());
             if let Some(tx) = tx_opt {
                 let msg = PrimaryToProxyMessage::Checkpoint(epoch);
                 if let Err(_e) = tx.send(msg).await {
                     tracing::warn!("Proxy {} send failed; beginning recovery", proxy_id);
-                    if let Some(replacement) = self.begin_recovery(proxy_id).await {
+                    if let Some(replacement) = self.begin_recovery(*proxy_id).await {
                         tracing::info!(
                             "Proxy {} replaced by {} during recovery",
                             proxy_id,
@@ -983,10 +1013,43 @@ where
                 }
             }
         }
+
+        // Also send checkpoint to the pending retirement proxy (if any).
+        // They need this checkpoint to trigger their final snapshot for epoch Di.
+        if let Some(retiring_id) = pending_retirement_proxy {
+            if let Some(tx) = self
+                .proxy_connections
+                .get(&retiring_id)
+                .map(|e| e.value().clone())
+            {
+                let msg = PrimaryToProxyMessage::Checkpoint(epoch);
+                if let Err(e) = tx.send(msg).await {
+                    tracing::error!(
+                        "Failed to send checkpoint to retiring proxy {}: {:?}",
+                        retiring_id,
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        "Sent checkpoint for epoch {} to retiring proxy {}",
+                        epoch.0,
+                        retiring_id
+                    );
+                }
+            }
+        }
+
+        // NOW handle retirement state machine at epoch boundary.
+        // This sends the RetirementSignal and adds proxy to retiring_proxies.
+        // We do this AFTER checkpoint broadcast so the proxy receives checkpoint first.
+        if let Some(action) = self.retirement_coordinator.on_epoch_boundary(epoch) {
+            self.execute_retirement_action(action).await;
+        }
+
         tracing::info!(
-            "Broadcasted checkpoint for epoch {} to {} active proxies",
+            "Completed checkpoint broadcast for epoch {} to {} proxies",
             epoch.0,
-            active_count
+            expected_for_epoch
         );
     }
 
