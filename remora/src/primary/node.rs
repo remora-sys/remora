@@ -210,16 +210,6 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
                                     let persist_after = collector_ctx.collector.get_persist_index();
 
-                                    // Forward snapshot to retirement coordinator
-                                    let retirement_event = RetirementEvent::Snapshot {
-                                        proxy_id,
-                                        epoch: EpochId(completed_up_to),
-                                        snapshot,
-                                    };
-                                    if tx_retirement.send(retirement_event).await.is_err() {
-                                        tracing::debug!("Retirement events channel closed");
-                                    }
-
                                     // Send EpochSealed events for any epochs that were committed
                                     for sealed_epoch in (persist_before + 1)..=persist_after {
                                         let epoch_sealed_event = RetirementEvent::EpochSealed {

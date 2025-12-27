@@ -788,37 +788,14 @@ where
         }
     }
 
-    /// Handle retirement events from PrimaryNode (snapshots and epoch seals).
+    /// Handle retirement events from PrimaryNode (epoch seals only).
+    /// Note: Snapshot events are no longer needed - retirement triggers on epoch commit,
+    /// which ensures all proxies (including retiring) have reported their snapshots.
     async fn handle_retirement_event(&mut self, event: RetirementEvent) {
         match event {
-            RetirementEvent::Snapshot {
-                proxy_id,
-                epoch,
-                snapshot,
-            } => {
-                // Only process snapshots for proxies that are actually in retirement.
-                // Normal epoch snapshots are sent by all proxies but should not be routed
-                // to the retirement coordinator.
-                if !self.retirement_coordinator.is_proxy_retiring(proxy_id) {
-                    tracing::debug!(
-                        proxy_id,
-                        epoch = epoch.0,
-                        "Ignoring snapshot: proxy not in retirement"
-                    );
-                    return;
-                }
-                tracing::info!(
-                    proxy_id,
-                    epoch = epoch.0,
-                    snapshot_size = snapshot.len(),
-                    "Received retirement snapshot event"
-                );
-                if let Some(action) = self
-                    .retirement_coordinator
-                    .on_snapshot_received(proxy_id, epoch, &snapshot)
-                {
-                    self.execute_retirement_action(action).await;
-                }
+            RetirementEvent::Snapshot { .. } => {
+                // Snapshot events are ignored - retirement triggers on epoch seal.
+                // The retiring proxy's snapshot is committed via the normal path.
             }
             RetirementEvent::EpochSealed { epoch } => {
                 tracing::info!(epoch = epoch.0, "Received epoch sealed event");

@@ -77,7 +77,7 @@ impl RetirementCoordinator {
         !matches!(self.phase, RetirementPhase::Idle)
     }
 
-    /// Check if a specific proxy is in the retirement process.
+    /// Check if a specific proxy is in the retirement process (including pending).
     pub fn is_proxy_retiring(&self, proxy_id: ProxyId) -> bool {
         match &self.phase {
             RetirementPhase::Idle => false,
@@ -148,113 +148,51 @@ impl RetirementCoordinator {
         }
     }
 
-    /// Called when snapshot is received from the retiring proxy.
-    ///
-    /// Returns action for LoadBalancer to execute, if any.
-    pub fn on_snapshot_received(
-        &mut self,
-        proxy_id: ProxyId,
-        epoch: EpochId,
-        snapshot: &EpochObjectStates,
-    ) -> Option<RetirementAction> {
-        if let RetirementPhase::AwaitingSnapshot {
-            proxy_id: expected_id,
-            epoch: expected_epoch,
-        } = &self.phase
-        {
-            if proxy_id != *expected_id {
-                tracing::warn!(
-                    proxy_id,
-                    expected = expected_id,
-                    "Received snapshot from unexpected proxy"
-                );
-                return None;
-            }
-            if epoch != *expected_epoch {
-                tracing::warn!(
-                    epoch = epoch.0,
-                    expected = expected_epoch.0,
-                    "Received snapshot for unexpected epoch"
-                );
-                return None;
-            }
-
-            tracing::info!(
-                proxy_id,
-                epoch = epoch.0,
-                object_count = snapshot.len(),
-                "Received retirement snapshot"
-            );
-
-            // Merge snapshot into StateCollector (versioned)
-            self.merge_retirement_snapshot(proxy_id, epoch, snapshot);
-
-            // Transition to AwaitingNextEpochSeal
-            self.phase = RetirementPhase::AwaitingNextEpochSeal { proxy_id };
-
-            Some(RetirementAction::UpdateOwnership { proxy_id })
-        } else {
-            tracing::warn!(
-                proxy_id,
-                epoch = epoch.0,
-                "Received snapshot but not in AwaitingSnapshot phase"
-            );
-            None
-        }
-    }
-
     /// Called when an epoch is sealed (persisted).
     ///
-    /// If we're awaiting next epoch seal after snapshot, complete the retirement.
-    pub fn on_epoch_sealed(&mut self, _epoch: EpochId) -> Option<RetirementAction> {
-        if let RetirementPhase::AwaitingNextEpochSeal { proxy_id } = &self.phase {
-            let proxy_id = *proxy_id;
-            tracing::info!(proxy_id, "Epoch sealed: completing retirement");
-
-            // Reset to Idle
-            self.phase = RetirementPhase::Idle;
-
-            Some(RetirementAction::CompleteRetirement { proxy_id })
-        } else {
-            None
-        }
-    }
-
-    /// Merge retirement snapshot into StateCollector with versioned check.
-    fn merge_retirement_snapshot(
-        &self,
-        proxy_id: ProxyId,
-        epoch: EpochId,
-        snapshot: &EpochObjectStates,
-    ) {
-        // For each object in snapshot, update StateCollector only if newer
-        for (object_id, object) in snapshot.iter() {
-            let snapshot_version = object.version();
-
-            // Check if we already have a newer version
-            if let Some(existing_version) = self.collector.get_persisted_version(object_id) {
-                if existing_version >= snapshot_version {
-                    tracing::debug!(
-                        ?object_id,
-                        existing = existing_version.value(),
-                        snapshot = snapshot_version.value(),
-                        "Skipping snapshot object: existing version is not older"
+    /// Handles two phase transitions:
+    /// 1. `AwaitingSnapshot` + sealed == retirement_epoch → `AwaitingNextEpochSeal`
+    ///    (The retiring proxy's snapshot was committed as part of the epoch)
+    /// 2. `AwaitingNextEpochSeal` + any sealed → `CompleteRetirement`
+    ///    (Durability confirmed, safe to shut down)
+    pub fn on_epoch_sealed(&mut self, epoch: EpochId) -> Option<RetirementAction> {
+        match &self.phase {
+            RetirementPhase::AwaitingSnapshot {
+                proxy_id,
+                epoch: expected_epoch,
+            } => {
+                if epoch == *expected_epoch {
+                    let proxy_id = *proxy_id;
+                    tracing::info!(
+                        proxy_id,
+                        epoch = epoch.0,
+                        "Retirement epoch sealed: retiring proxy snapshot committed"
                     );
-                    continue;
+
+                    // Transition to awaiting next epoch seal for durability
+                    self.phase = RetirementPhase::AwaitingNextEpochSeal { proxy_id };
+
+                    // Return UpdateOwnership action (ownership transfer)
+                    Some(RetirementAction::UpdateOwnership { proxy_id })
+                } else {
+                    // Not the expected epoch yet
+                    None
                 }
             }
+            RetirementPhase::AwaitingNextEpochSeal { proxy_id } => {
+                let proxy_id = *proxy_id;
+                tracing::info!(
+                    proxy_id,
+                    epoch = epoch.0,
+                    "Epoch sealed: completing retirement"
+                );
 
-            // Update merged_state with the newer snapshot object
-            self.collector
-                .merged_state
-                .insert(*object_id, object.clone());
-            tracing::debug!(
-                ?object_id,
-                version = snapshot_version.value(),
-                proxy_id,
-                epoch = epoch.0,
-                "Merged retirement snapshot object"
-            );
+                // Reset to Idle
+                self.phase = RetirementPhase::Idle;
+
+                Some(RetirementAction::CompleteRetirement { proxy_id })
+            }
+            _ => None,
         }
     }
 }
@@ -327,14 +265,14 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_received_transitions_state() {
+    fn test_epoch_sealed_transitions_to_awaiting_next() {
         let mut coordinator = RetirementCoordinator::new(create_test_collector());
 
         coordinator.initiate(2);
         coordinator.on_epoch_boundary(EpochId(5));
 
-        let snapshot = EpochObjectStates::new();
-        let action = coordinator.on_snapshot_received(2, EpochId(5), &snapshot);
+        // Sealing the retirement epoch triggers UpdateOwnership
+        let action = coordinator.on_epoch_sealed(EpochId(5));
 
         assert!(matches!(
             action,
@@ -353,8 +291,10 @@ mod tests {
 
         coordinator.initiate(2);
         coordinator.on_epoch_boundary(EpochId(5));
-        coordinator.on_snapshot_received(2, EpochId(5), &EpochObjectStates::new());
+        // First seal: transitions to AwaitingNextEpochSeal
+        coordinator.on_epoch_sealed(EpochId(5));
 
+        // Second seal: completes retirement
         let action = coordinator.on_epoch_sealed(EpochId(6));
 
         assert!(matches!(
@@ -380,11 +320,11 @@ mod tests {
         let action1 = coordinator.on_epoch_boundary(EpochId(10));
         assert!(action1.is_some());
 
-        // Phase 3: Snapshot received
-        let action2 = coordinator.on_snapshot_received(2, EpochId(10), &EpochObjectStates::new());
+        // Phase 3: Retirement epoch sealed (transitions to AwaitingNextEpochSeal)
+        let action2 = coordinator.on_epoch_sealed(EpochId(10));
         assert!(action2.is_some());
 
-        // Phase 4: Next epoch sealed
+        // Phase 4: Next epoch sealed (completes retirement)
         let action3 = coordinator.on_epoch_sealed(EpochId(11));
         assert!(action3.is_some());
 
@@ -459,7 +399,9 @@ mod property_tests {
             let mut coordinator = RetirementCoordinator::new(create_test_collector());
             coordinator.initiate(proxy_id);
             coordinator.on_epoch_boundary(epoch1);
-            coordinator.on_snapshot_received(proxy_id, epoch1, &EpochObjectStates::new());
+            // First epoch seal transitions from AwaitingSnapshot to AwaitingNextEpochSeal
+            coordinator.on_epoch_sealed(epoch1);
+            // Second epoch seal completes retirement
             coordinator.on_epoch_sealed(epoch2);
 
             assert!(
@@ -485,46 +427,31 @@ mod property_tests {
     }
 
     #[test]
-    fn prop_snapshot_from_wrong_proxy_ignored() {
+    fn prop_wrong_epoch_seal_ignored_in_awaiting_snapshot() {
+        // Sealing the wrong epoch should not trigger phase transition
         let mut rng = rand::thread_rng();
         for _ in 0..NUM_ITERATIONS {
             let retiring_proxy: ProxyId = rng.gen_range(0..50);
-            let wrong_proxy: ProxyId = rng.gen_range(50..100);
-            let epoch = EpochId(rng.gen_range(1..1000));
+            let expected_epoch = EpochId(rng.gen_range(10..1000));
+            let wrong_epoch = EpochId(expected_epoch.0 - rng.gen_range(1..10));
 
             let mut coordinator = RetirementCoordinator::new(create_test_collector());
             coordinator.initiate(retiring_proxy);
-            coordinator.on_epoch_boundary(epoch);
+            coordinator.on_epoch_boundary(expected_epoch);
 
-            let action =
-                coordinator.on_snapshot_received(wrong_proxy, epoch, &EpochObjectStates::new());
+            // Sealing a wrong/earlier epoch should not trigger transition
+            let action = coordinator.on_epoch_sealed(wrong_epoch);
             assert!(
                 action.is_none(),
-                "Snapshot from wrong proxy should be ignored"
+                "Sealing wrong epoch should not trigger action"
             );
-            assert!(coordinator.is_retiring(), "Should still be retiring");
-        }
-    }
-
-    #[test]
-    fn prop_snapshot_wrong_epoch_ignored() {
-        let mut rng = rand::thread_rng();
-        for _ in 0..NUM_ITERATIONS {
-            let proxy_id: ProxyId = rng.gen_range(0..100);
-            let signal_epoch = EpochId(rng.gen_range(1..500));
-            let wrong_epoch = EpochId(signal_epoch.0 + rng.gen_range(1..100));
-
-            let mut coordinator = RetirementCoordinator::new(create_test_collector());
-            coordinator.initiate(proxy_id);
-            coordinator.on_epoch_boundary(signal_epoch);
-
-            let action =
-                coordinator.on_snapshot_received(proxy_id, wrong_epoch, &EpochObjectStates::new());
             assert!(
-                action.is_none(),
-                "Snapshot with wrong epoch should be ignored"
+                matches!(
+                    coordinator.phase(),
+                    RetirementPhase::AwaitingSnapshot { .. }
+                ),
+                "Should still be in AwaitingSnapshot phase"
             );
-            assert!(coordinator.is_retiring());
         }
     }
 
@@ -550,34 +477,36 @@ mod property_tests {
                 RetirementPhase::AwaitingSnapshot { .. }
             ));
 
-            coordinator.on_snapshot_received(proxy_id, epoch1, &EpochObjectStates::new());
+            // Sealing the retirement epoch transitions to AwaitingNextEpochSeal
+            coordinator.on_epoch_sealed(epoch1);
             assert!(matches!(
                 coordinator.phase(),
                 RetirementPhase::AwaitingNextEpochSeal { .. }
             ));
 
+            // Any subsequent epoch seal completes retirement
             coordinator.on_epoch_sealed(epoch2);
             assert_eq!(*coordinator.phase(), RetirementPhase::Idle);
         }
     }
 
     #[test]
-    fn prop_any_epoch_seal_completes_after_snapshot() {
-        // Note: The retirement coordinator completes on ANY epoch seal after snapshot,
-        // regardless of actual epoch number. This tests that behavior.
+    fn prop_any_epoch_seal_completes_after_retirement_epoch() {
+        // Note: The retirement coordinator completes on ANY epoch seal after the retirement epoch is sealed.
         let mut rng = rand::thread_rng();
         for _ in 0..NUM_ITERATIONS {
             let proxy_id: ProxyId = rng.gen_range(0..100);
             let signal_epoch = EpochId(rng.gen_range(1..500));
-            let seal_epoch = EpochId(rng.gen_range(1..1000)); // Any epoch
+            let next_epoch = EpochId(signal_epoch.0 + rng.gen_range(1..100)); // Any subsequent epoch
 
             let mut coordinator = RetirementCoordinator::new(create_test_collector());
             coordinator.initiate(proxy_id);
             coordinator.on_epoch_boundary(signal_epoch);
-            coordinator.on_snapshot_received(proxy_id, signal_epoch, &EpochObjectStates::new());
+            // Sealing the retirement epoch transitions to AwaitingNextEpochSeal
+            coordinator.on_epoch_sealed(signal_epoch);
 
-            // Any epoch seal should complete retirement when in AwaitingNextEpochSeal phase
-            let action = coordinator.on_epoch_sealed(seal_epoch);
+            // Any subsequent epoch seal should complete retirement
+            let action = coordinator.on_epoch_sealed(next_epoch);
             assert!(
                 matches!(action, Some(RetirementAction::CompleteRetirement { .. })),
                 "Any epoch seal should complete retirement after snapshot"
@@ -587,6 +516,70 @@ mod property_tests {
     }
 
     #[test]
+    fn prop_retirement_epoch_seal_returns_update_ownership() {
+        // Spec: Sealing the retirement epoch Di should return UpdateOwnership action
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let retirement_epoch = EpochId(rng.gen_range(1..500));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(retirement_epoch);
+
+            // Sealing retirement epoch should return UpdateOwnership
+            let action = coordinator.on_epoch_sealed(retirement_epoch);
+            assert!(
+                matches!(action, Some(RetirementAction::UpdateOwnership { proxy_id: pid }) if pid == proxy_id),
+                "Sealing retirement epoch should return UpdateOwnership for correct proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_epoch_seal_on_idle_is_noop() {
+        // Spec: Epoch seal on Idle phase should be a no-op
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let epoch = EpochId(rng.gen_range(1..1000));
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+
+            let action = coordinator.on_epoch_sealed(epoch);
+            assert!(action.is_none(), "Epoch seal on Idle should return None");
+            assert_eq!(
+                *coordinator.phase(),
+                RetirementPhase::Idle,
+                "Should stay in Idle"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_epoch_seal_on_pending_boundary_is_noop() {
+        // Spec: Epoch seal on PendingEpochBoundary phase should be a no-op
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let epoch = EpochId(rng.gen_range(1..1000));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+
+            let action = coordinator.on_epoch_sealed(epoch);
+            assert!(
+                action.is_none(),
+                "Epoch seal on PendingEpochBoundary should return None"
+            );
+            assert!(
+                matches!(
+                    coordinator.phase(),
+                    RetirementPhase::PendingEpochBoundary { .. }
+                ),
+                "Should stay in PendingEpochBoundary"
+            );
+        }
+    }
+
     fn prop_random_event_sequence_never_panics() {
         let mut rng = rand::thread_rng();
         for _ in 0..NUM_ITERATIONS {
@@ -608,11 +601,8 @@ mod property_tests {
                         coordinator.on_epoch_boundary(epoch);
                     }
                     3 => {
-                        coordinator.on_snapshot_received(
-                            proxy_id,
-                            epoch,
-                            &EpochObjectStates::new(),
-                        );
+                        // on_snapshot_received removed - on_epoch_sealed handles both transitions
+                        coordinator.on_epoch_sealed(epoch);
                     }
                     4 => {
                         coordinator.on_epoch_sealed(epoch);
