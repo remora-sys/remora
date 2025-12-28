@@ -16,7 +16,7 @@
 //! - Ownership transfer is versioned (only update if newer)
 //! - Always retire highest proxy ID to minimize round-robin disruption
 
-use crate::checkpoint::{state_collector::StateCollector, EpochId, EpochObjectStates};
+use crate::checkpoint::{state_collector::StateCollector, EpochId};
 use crate::proxy::core::ProxyId;
 use std::sync::Arc;
 
@@ -151,8 +151,11 @@ impl RetirementCoordinator {
     /// Called when an epoch is sealed (persisted).
     ///
     /// Handles two phase transitions:
-    /// 1. `AwaitingSnapshot` + sealed == retirement_epoch → `AwaitingNextEpochSeal`
-    ///    (The retiring proxy's snapshot was committed as part of the epoch)
+    /// 1. `AwaitingSnapshot` + sealed >= retirement_epoch → `AwaitingNextEpochSeal`
+    ///    (The retiring proxy's snapshot was committed as part of the epoch.
+    ///     We accept >= because epoch commit proves ALL proxies, including the
+    ///     retiring one, have submitted snapshots. This handles the race where
+    ///     spawned snapshot tasks send EpochSealed before we see the snapshot event.)
     /// 2. `AwaitingNextEpochSeal` + any sealed → `CompleteRetirement`
     ///    (Durability confirmed, safe to shut down)
     pub fn on_epoch_sealed(&mut self, epoch: EpochId) -> Option<RetirementAction> {
@@ -161,11 +164,17 @@ impl RetirementCoordinator {
                 proxy_id,
                 epoch: expected_epoch,
             } => {
-                if epoch == *expected_epoch {
+                // Accept seal for the retirement epoch or any later epoch.
+                // Epoch commit requires ALL proxies to have submitted snapshots,
+                // so a seal event proves the retiring proxy's snapshot was received.
+                // This handles the race condition where parallel tokio::spawn tasks
+                // can cause EpochSealed to arrive before we explicitly see the snapshot.
+                if epoch >= *expected_epoch {
                     let proxy_id = *proxy_id;
                     tracing::info!(
                         proxy_id,
-                        epoch = epoch.0,
+                        sealed_epoch = epoch.0,
+                        expected_epoch = expected_epoch.0,
                         "Retirement epoch sealed: retiring proxy snapshot committed"
                     );
 
@@ -175,7 +184,12 @@ impl RetirementCoordinator {
                     // Return UpdateOwnership action (ownership transfer)
                     Some(RetirementAction::UpdateOwnership { proxy_id })
                 } else {
-                    // Not the expected epoch yet
+                    // Earlier epoch sealed - not relevant yet
+                    tracing::debug!(
+                        epoch = epoch.0,
+                        expected_epoch = expected_epoch.0,
+                        "Ignoring seal for epoch before retirement epoch"
+                    );
                     None
                 }
             }
@@ -613,6 +627,111 @@ mod property_tests {
                     _ => {}
                 }
             }
+        }
+    }
+
+    #[test]
+    fn prop_later_epoch_seal_in_awaiting_snapshot_triggers_transition() {
+        // Test fix for event ordering race: sealing a later epoch should also
+        // trigger transition from AwaitingSnapshot, since epoch commit proves
+        // all snapshots (including the retiring proxy's) were received.
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let retirement_epoch = EpochId(rng.gen_range(5..500));
+            // Seal a later epoch (simulating race where parallel task commits later)
+            let sealed_epoch = EpochId(retirement_epoch.0 + rng.gen_range(0..10));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(retirement_epoch);
+
+            // Verify we're in AwaitingSnapshot
+            assert!(matches!(
+                coordinator.phase(),
+                RetirementPhase::AwaitingSnapshot { .. }
+            ));
+
+            // Sealing the retirement epoch or later should trigger transition
+            let action = coordinator.on_epoch_sealed(sealed_epoch);
+            assert!(
+                matches!(action, Some(RetirementAction::UpdateOwnership { proxy_id: pid }) if pid == proxy_id),
+                "Sealing epoch {} (>= retirement epoch {}) should trigger UpdateOwnership",
+                sealed_epoch.0,
+                retirement_epoch.0
+            );
+            assert!(
+                matches!(
+                    coordinator.phase(),
+                    RetirementPhase::AwaitingNextEpochSeal { .. }
+                ),
+                "Should transition to AwaitingNextEpochSeal"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_earlier_epoch_seal_in_awaiting_snapshot_is_ignored() {
+        // Sealing an epoch BEFORE the retirement epoch should not trigger transition
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let retirement_epoch = EpochId(rng.gen_range(10..500));
+            // Seal an earlier epoch
+            let earlier_epoch = EpochId(rng.gen_range(1..retirement_epoch.0));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(retirement_epoch);
+
+            // Sealing an earlier epoch should NOT trigger transition
+            let action = coordinator.on_epoch_sealed(earlier_epoch);
+            assert!(
+                action.is_none(),
+                "Sealing earlier epoch {} should not trigger action (retirement at {})",
+                earlier_epoch.0,
+                retirement_epoch.0
+            );
+            assert!(
+                matches!(
+                    coordinator.phase(),
+                    RetirementPhase::AwaitingSnapshot { .. }
+                ),
+                "Should remain in AwaitingSnapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_full_flow_with_late_seal_completes() {
+        // Test complete retirement flow when seal arrives for a later epoch
+        // This simulates the race condition where parallel snapshot processing
+        // causes a later epoch to commit before the retirement epoch is seen
+        let mut rng = rand::thread_rng();
+        for _ in 0..NUM_ITERATIONS {
+            let proxy_id: ProxyId = rng.gen_range(0..100);
+            let retirement_epoch = EpochId(rng.gen_range(5..500));
+            let late_seal_epoch = EpochId(retirement_epoch.0 + rng.gen_range(1..5));
+            let final_seal_epoch = EpochId(late_seal_epoch.0 + rng.gen_range(1..5));
+
+            let mut coordinator = RetirementCoordinator::new(create_test_collector());
+            coordinator.initiate(proxy_id);
+            coordinator.on_epoch_boundary(retirement_epoch);
+
+            // Late seal (later epoch) should trigger transition
+            let action1 = coordinator.on_epoch_sealed(late_seal_epoch);
+            assert!(matches!(
+                action1,
+                Some(RetirementAction::UpdateOwnership { .. })
+            ));
+
+            // Next seal completes retirement
+            let action2 = coordinator.on_epoch_sealed(final_seal_epoch);
+            assert!(matches!(
+                action2,
+                Some(RetirementAction::CompleteRetirement { .. })
+            ));
+            assert!(!coordinator.is_retiring());
         }
     }
 }

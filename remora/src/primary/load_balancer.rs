@@ -851,6 +851,10 @@ where
             RetirementAction::CompleteRetirement { proxy_id } => {
                 tracing::info!(proxy_id, "Completing retirement");
                 self.retiring_proxies.remove(&proxy_id);
+                // Remove from persist index tracking to prevent blocking future epochs.
+                // This is critical: without this, the retired proxy's frozen persist index
+                // would cause is_epoch_complete() to return false forever.
+                self.collector.remove_proxy_persist_index(proxy_id);
                 // Send shutdown confirmation
                 if let Some(tx) = self.proxy_connections.get(&proxy_id) {
                     let msg = PrimaryToProxyMessage::ShutdownConfirmation;

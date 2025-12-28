@@ -320,6 +320,25 @@ impl StateCollector {
             self.expected_proxies_per_epoch.remove(&e);
         }
     }
+
+    /// Remove a proxy from persist index tracking after retirement completes.
+    ///
+    /// This is critical for scale-in: without removal, the retired proxy's frozen
+    /// persist index would cause `is_epoch_complete()` to return false forever,
+    /// blocking all future epoch commits.
+    pub fn remove_proxy_persist_index(&self, proxy_id: ProxyId) {
+        if self.per_proxy_persist_index.remove(&proxy_id).is_some() {
+            tracing::info!(
+                proxy_id,
+                "Removed retired proxy from persist index tracking"
+            );
+        } else {
+            tracing::warn!(
+                proxy_id,
+                "Attempted to remove non-existent proxy from persist index"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -907,6 +926,154 @@ mod tests {
             persist_index_at_pause.unwrap(),
             1,
             "Snapshot was taken before commit operation completed."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_proxy_persist_index_basic() {
+        // Test that removing a proxy from persist index tracking works correctly
+        let collector = StateCollector::new(3);
+        let snapshot = EpochObjectStates::new();
+
+        // Simulate 3 proxies reporting epoch 1
+        for proxy_id in 0..3 {
+            collector
+                .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                    proxy_id,
+                    1,
+                    snapshot.clone(),
+                    3,
+                    None,
+                )
+                .await;
+        }
+
+        // Epoch 1 should be committed
+        assert_eq!(collector.get_persist_index(), 1);
+        assert_eq!(collector.per_proxy_persist_index.len(), 3);
+
+        // Remove proxy 2 (simulating retirement)
+        collector.remove_proxy_persist_index(2);
+
+        // Should now only have 2 proxies tracked
+        assert_eq!(collector.per_proxy_persist_index.len(), 2);
+        assert!(collector.per_proxy_persist_index.get(&0).is_some());
+        assert!(collector.per_proxy_persist_index.get(&1).is_some());
+        assert!(collector.per_proxy_persist_index.get(&2).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_proxy_allows_epoch_completion() {
+        // Test that removing a retired proxy allows future epochs to commit
+        // without waiting for the (now frozen) retired proxy
+        let collector = StateCollector::new(3);
+        let snapshot = EpochObjectStates::new();
+
+        // Epoch 1: all 3 proxies report
+        for proxy_id in 0..3 {
+            collector
+                .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                    proxy_id,
+                    1,
+                    snapshot.clone(),
+                    3,
+                    None,
+                )
+                .await;
+        }
+        assert_eq!(collector.get_persist_index(), 1);
+
+        // Proxy 2 retires after epoch 1 - remove from tracking
+        collector.remove_proxy_persist_index(2);
+
+        // Set expected proxies for epoch 2 to reflect the new count
+        collector.set_expected_proxies_for_epoch(EpochId(2), 2);
+
+        // Epoch 2: only remaining 2 proxies report
+        for proxy_id in 0..2 {
+            collector
+                .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                    proxy_id,
+                    2,
+                    snapshot.clone(),
+                    2,
+                    None,
+                )
+                .await;
+        }
+
+        // Epoch 2 should now be committed (only 2 proxies needed)
+        assert_eq!(
+            collector.get_persist_index(),
+            2,
+            "Epoch 2 should commit with only the remaining 2 proxies"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retired_proxy_blocks_without_removal() {
+        // Test that without removing the retired proxy, epoch completion is blocked
+        let collector = StateCollector::new(3);
+        let snapshot = EpochObjectStates::new();
+
+        // Epoch 1: all 3 proxies report
+        for proxy_id in 0..3 {
+            collector
+                .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                    proxy_id,
+                    1,
+                    snapshot.clone(),
+                    3,
+                    None,
+                )
+                .await;
+        }
+        assert_eq!(collector.get_persist_index(), 1);
+
+        // Proxy 2 retires but is NOT removed (bug scenario)
+        // Set expected proxies for epoch 2, but DON'T remove proxy 2
+        collector.set_expected_proxies_for_epoch(EpochId(2), 2);
+
+        // Epoch 2: only remaining 2 proxies report
+        for proxy_id in 0..2 {
+            collector
+                .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                    proxy_id,
+                    2,
+                    snapshot.clone(),
+                    2,
+                    None,
+                )
+                .await;
+        }
+
+        // Epoch 2 should NOT be committed because min(persist_indices) still includes
+        // proxy 2 at epoch 1
+        assert_eq!(
+            collector.get_persist_index(),
+            1,
+            "Bug confirmed: retired proxy blocks epoch commit when not removed"
+        );
+
+        // Now remove the retired proxy
+        collector.remove_proxy_persist_index(2);
+
+        // Re-trigger epoch check by processing a no-op snapshot
+        collector
+            .process_snapshot::<crate::executor::fake::FakeTransaction>(
+                0,
+                2,
+                snapshot.clone(),
+                2,
+                None,
+            )
+            .await;
+
+        // Now epoch 2 should be committed
+        assert_eq!(
+            collector.get_persist_index(),
+            2,
+            "Epoch 2 should commit after removing retired proxy"
         );
     }
 }
