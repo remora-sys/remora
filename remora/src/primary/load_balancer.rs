@@ -844,13 +844,21 @@ where
                 }
             }
             RetirementAction::UpdateOwnership { proxy_id } => {
-                tracing::info!(proxy_id, "Updating ownership after retirement snapshot");
-                // Mark states owned by retired proxy for primary fetch
-                self.update_ownership_for_retirement(proxy_id);
+                // LAZY OWNERSHIP: Instead of iterating all states (which takes 800ms+),
+                // we keep the proxy in retiring_proxies. The forwarder checks this set
+                // when resolving state ownership and treats states owned only by retired
+                // proxies as needing lazy fetch from primary's merged_state.
+                tracing::info!(
+                    proxy_id,
+                    "Ownership update skipped (lazy mode): states will be fetched on-demand"
+                );
             }
             RetirementAction::CompleteRetirement { proxy_id } => {
                 tracing::info!(proxy_id, "Completing retirement");
-                self.retiring_proxies.remove(&proxy_id);
+                // NOTE: We intentionally do NOT remove from retiring_proxies here.
+                // The forwarder uses this set to detect states owned by retired proxies
+                // and lazily fetch them from primary's merged_state.
+                // self.retiring_proxies.remove(&proxy_id);  // Keep for lazy lookup
                 // Remove from persist index tracking to prevent blocking future epochs.
                 // This is critical: without this, the retired proxy's frozen persist index
                 // would cause is_epoch_complete() to return false forever.
@@ -867,18 +875,11 @@ where
         }
     }
 
-    /// Update ownership map for retired proxy's states.
-    fn update_ownership_for_retirement(&self, retired_proxy: ProxyId) {
-        self.states_to_proxy.iter_mut().for_each(|mut entry| {
-            let owners = entry.value_mut();
-            if owners.remove(&retired_proxy) {
-                if owners.is_empty() {
-                    // Mark for primary fetch
-                    owners.insert(PRIMARY_FETCH_SENTINEL);
-                }
-            }
-        });
-    }
+    // NOTE: update_ownership_for_retirement has been removed.
+    // We now use lazy ownership mode: states owned by retired proxies are
+    // lazily fetched from primary's merged_state when needed, rather than
+    // iterating all states synchronously (which took 800ms+).
+    // See get_missing_states_for_transaction in shared_obj_txn_forwarder.rs.
 
     async fn broadcast_checkpoint(&mut self, epoch: EpochId) {
         // Track proxies that were just activated this epoch

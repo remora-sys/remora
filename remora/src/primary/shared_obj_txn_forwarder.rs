@@ -383,6 +383,7 @@ where
                 proxy_index,
                 states_to_proxy.clone(),
                 collector.clone(),
+                retiring_proxies.clone(),
             )
             .await;
 
@@ -935,6 +936,7 @@ where
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
         collector: Arc<StateCollector>,
+        retiring_proxies: Arc<DashMap<ProxyId, ()>>,
     ) -> MissingStatesResult {
         let mut required_states = BTreeMap::new();
         let mut lazy_fetched_blobs = BTreeMap::new();
@@ -965,6 +967,14 @@ where
                     }
                 });
 
+            // Check if owner is a retired proxy (in retiring_proxies set).
+            // Retired proxies are no longer active, so treat their states
+            // the same as PRIMARY_FETCH_SENTINEL: lazy fetch from primary.
+            let owner_is_retired = owner
+                .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
+                .map(|o| retiring_proxies.contains_key(&o))
+                .unwrap_or(false);
+
             match owner {
                 Some(PRIMARY_FETCH_SENTINEL) => {
                     if let Some(blob) = collector.get_object(&object_id) {
@@ -972,6 +982,27 @@ where
                     } else {
                         tracing::warn!(
                             "Lazy fetch failed for {:?} v{} in txn {:?}",
+                            object_id,
+                            seq_num.value(),
+                            transaction.digest()
+                        );
+                    }
+                    required_states.insert((object_id, seq_num), None);
+                }
+                Some(owner_idx) if owner_is_retired => {
+                    // Owner is a retired proxy - lazy fetch from primary
+                    if let Some(blob) = collector.get_object(&object_id) {
+                        lazy_fetched_blobs.insert(object_id, blob);
+                        tracing::debug!(
+                            "Lazy fetch for retired proxy {} state {:?} v{}",
+                            owner_idx,
+                            object_id,
+                            seq_num.value()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Lazy fetch failed for retired proxy {} state {:?} v{} in txn {:?}",
+                            owner_idx,
                             object_id,
                             seq_num.value(),
                             transaction.digest()
