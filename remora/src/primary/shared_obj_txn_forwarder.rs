@@ -249,6 +249,28 @@ where
     }
 
     #[inline]
+    fn resolve_proxy_id_for_missing_state(
+        proxy_connections: &Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        active_nodes: &Arc<AtomicUsize>,
+        idx: ExecutorIndex,
+    ) -> Option<ProxyId> {
+        // Resolve against active proxies WITHOUT excluding retiring ones, since they may
+        // still serve inter-proxy state fetches during graceful retirement.
+        let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable();
+
+        // Enforce active_nodes limit (do not filter retiring here)
+        let active_count = active_nodes.load(Ordering::Relaxed);
+        if active_count < keys.len() {
+            keys.truncate(active_count);
+        }
+
+        keys.get(idx).copied()
+    }
+
+    #[inline]
     fn effective_proxy_ids(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
@@ -418,7 +440,6 @@ where
                 missing_states_result.required_states,
                 proxy_connections,
                 &context.active_nodes,
-                retiring_proxies,
             );
 
             if proxy_mode == ProxyMode::Separation {
@@ -491,12 +512,11 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
         let mut resolved = BTreeMap::new();
         for ((obj_id, seq_num), maybe_idx) in required_states {
             let resolved_proxy_id = maybe_idx.and_then(|idx| {
-                Self::resolve_proxy_id(proxy_connections, active_nodes, retiring_proxies, idx)
+                Self::resolve_proxy_id_for_missing_state(proxy_connections, active_nodes, idx)
             });
             resolved.insert((obj_id, seq_num), resolved_proxy_id);
         }
@@ -971,6 +991,11 @@ where
             // Lazy fetch is only safe after the retirement epoch is committed to merged_state.
             // Before that, we must use inter-proxy transfer (fall through to default case).
             let persist_index = collector.get_persist_index();
+            let persisted_version = collector.get_persisted_version(&object_id);
+            let persisted_ok = persisted_version
+                .map(|version| version >= seq_num)
+                .unwrap_or(false);
+            let persisted_version_value = persisted_version.map(|version| version.value());
             let (owner_is_retired, retirement_epoch_committed) = owner
                 .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
                 .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
@@ -983,29 +1008,61 @@ where
 
             match owner {
                 Some(PRIMARY_FETCH_SENTINEL) => {
-                    if let Some(blob) = collector.get_object(&object_id) {
-                        lazy_fetched_blobs.insert(object_id, blob);
+                    if persisted_ok {
+                        if let Some(blob) = collector.get_object(&object_id) {
+                            if blob.version() >= seq_num {
+                                lazy_fetched_blobs.insert(object_id, blob);
+                            } else {
+                                tracing::warn!(
+                                    "Lazy fetch got stale version for {:?} v{} (persisted_v={}) in txn {:?}",
+                                    object_id,
+                                    seq_num.value(),
+                                    blob.version().value(),
+                                    transaction.digest()
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Lazy fetch failed for {:?} v{} in txn {:?}",
+                                object_id,
+                                seq_num.value(),
+                                transaction.digest()
+                            );
+                        }
                     } else {
                         tracing::warn!(
-                            "Lazy fetch failed for {:?} v{} in txn {:?}",
+                            "Lazy fetch not ready for {:?} v{} (persisted_v={:?}) in txn {:?}",
                             object_id,
                             seq_num.value(),
+                            persisted_version_value,
                             transaction.digest()
                         );
                     }
                     required_states.insert((object_id, seq_num), None);
                 }
-                Some(owner_idx) if owner_is_retired && retirement_epoch_committed => {
+                Some(owner_idx) if owner_is_retired && retirement_epoch_committed && persisted_ok => {
                     // Owner is a retired proxy AND retirement epoch is committed - safe to lazy fetch
                     if let Some(blob) = collector.get_object(&object_id) {
-                        lazy_fetched_blobs.insert(object_id, blob);
-                        tracing::debug!(
-                            "Lazy fetch for retired proxy {} state {:?} v{} (persist_index={})",
-                            owner_idx,
-                            object_id,
-                            seq_num.value(),
-                            persist_index
-                        );
+                        if blob.version() >= seq_num {
+                            lazy_fetched_blobs.insert(object_id, blob);
+                            tracing::debug!(
+                                "Lazy fetch for retired proxy {} state {:?} v{} (persist_index={})",
+                                owner_idx,
+                                object_id,
+                                seq_num.value(),
+                                persist_index
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Lazy fetch got stale version for retired proxy {} state {:?} v{} (persisted_v={}) in txn {:?}",
+                                owner_idx,
+                                object_id,
+                                seq_num.value(),
+                                blob.version().value(),
+                                transaction.digest()
+                            );
+                            required_states.insert((object_id, seq_num), Some(owner_idx));
+                        }
                     } else {
                         tracing::warn!(
                             "Lazy fetch failed for retired proxy {} state {:?} v{} in txn {:?}",
@@ -1014,18 +1071,22 @@ where
                             seq_num.value(),
                             transaction.digest()
                         );
+                        required_states.insert((object_id, seq_num), Some(owner_idx));
                     }
-                    required_states.insert((object_id, seq_num), None);
+                    if !required_states.contains_key(&(object_id, seq_num)) {
+                        required_states.insert((object_id, seq_num), None);
+                    }
                 }
-                Some(owner_idx) if owner_is_retired && !retirement_epoch_committed => {
+                Some(owner_idx) if owner_is_retired && (!retirement_epoch_committed || !persisted_ok) => {
                     // Owner is retiring but retirement epoch not yet committed - use inter-proxy
                     // This prevents the race condition where merged_state doesn't have the state yet
                     tracing::debug!(
-                        "Retiring proxy {} state {:?} v{} not ready for lazy fetch (persist_index={}, waiting for retirement epoch)",
+                        "Retiring proxy {} state {:?} v{} not ready for lazy fetch (persist_index={}, persisted_v={:?})",
                         owner_idx,
                         object_id,
                         seq_num.value(),
-                        persist_index
+                        persist_index,
+                        persisted_version_value
                     );
                     required_states.insert((object_id, seq_num), Some(owner_idx));
                 }
@@ -1080,9 +1141,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::fake::FakeExecutor;
+    use crate::checkpoint::state_collector::StateCollector;
+    use crate::executor::fake::{FakeExecutor, FakeTransaction};
     use rand::Rng;
+    use std::collections::HashSet;
     use std::sync::{atomic::AtomicUsize, Arc};
+    use sui_types::base_types::ObjectID;
+    use sui_types::transaction::InputObjectKind;
     use tokio::sync::mpsc::channel;
 
     const NUM_ITERATIONS: usize = 100;
@@ -1170,11 +1235,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_lazy_fetch_falls_back_when_state_not_persisted() {
+        let collector = Arc::new(StateCollector::new(1));
+        let retirement_epoch = EpochId(5);
+
+        for epoch in 1..=retirement_epoch.0 {
+            collector
+                .process_snapshot(
+                    0,
+                    epoch,
+                    crate::checkpoint::EpochObjectStates::new(),
+                    1,
+                    None::<&crate::recovery::EpochLogger<<FakeExecutor as Executor>::Transaction>>,
+                )
+                .await;
+        }
+
+        assert_eq!(collector.get_persist_index(), retirement_epoch.0);
+
+        let object_id = ObjectID::random();
+        let seq_num = SequenceNumber::from(3);
+        let mut owners = HashSet::new();
+        let retiring_proxy = 2usize;
+        owners.insert(retiring_proxy);
+
+        let states_to_proxy = Arc::new(DashMap::new());
+        states_to_proxy.insert((object_id, seq_num), owners);
+
+        let retiring_proxies = Arc::new(DashMap::new());
+        retiring_proxies.insert(retiring_proxy, retirement_epoch);
+
+        let tx = FakeTransaction::new(vec![InputObjectKind::SharedMoveObject {
+            id: object_id,
+            initial_shared_version: SequenceNumber::from(1),
+            mutable: true,
+        }]);
+        let remora_tx = RemoraTransaction::<FakeExecutor>::new_for_tests(tx);
+
+        let result = SharedObjTxnForwarder::<FakeExecutor>::get_missing_states_for_transaction(
+            &remora_tx,
+            Some(vec![(object_id, seq_num)]),
+            0,
+            states_to_proxy,
+            collector,
+            retiring_proxies,
+        )
+        .await;
+
+        assert!(result.lazy_fetched_blobs.is_empty());
+        assert_eq!(
+            result.required_states.get(&(object_id, seq_num)),
+            Some(&Some(retiring_proxy))
+        );
+    }
+
     /// Property-based tests for epoch-gated lazy fetch
     /// These test the core fix for the scale-in race condition
     mod lazy_fetch_epoch_tests {
         use super::*;
-        use crate::checkpoint::state_collector::StateCollector;
 
         /// Test: When retirement epoch is NOT committed, lazy fetch should NOT be triggered.
         /// Instead, the transaction should use inter-proxy transfer to the retiring proxy.
