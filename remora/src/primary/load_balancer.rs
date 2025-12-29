@@ -78,7 +78,7 @@ pub struct LoadBalancer<E: Executor> {
     elastic_scaler: ElasticScaler,
     /// Retirement coordinator for graceful proxy shutdown during scale-in
     retirement_coordinator: RetirementCoordinator,
-    /// Proxies that are in retirement and must not receive new transactions.
+    /// Proxies that are in retirement; routing excludes them after their retirement epoch.
     /// The value is the retirement epoch - lazy fetch is only safe after this epoch seals.
     retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     /// Receiver for retirement events from PrimaryNode (snapshots and epoch seals)
@@ -819,31 +819,16 @@ where
     async fn execute_retirement_action(&mut self, action: RetirementAction) {
         match action {
             RetirementAction::SendRetirementSignal { proxy_id, epoch } => {
-                // Drain all in-flight transactions before marking proxy as retiring.
-                // This ensures transactions routed to this proxy before this point
-                // complete successfully before we exclude it from routing.
+                // Mark proxy as retiring; forwarders gate routing by epoch.
+                self.retiring_proxies.insert(proxy_id, epoch);
                 tracing::info!(
                     proxy_id,
                     epoch = epoch.0,
-                    "Draining in-flight transactions before retirement signal"
+                    "Marked proxy as retiring at epoch"
                 );
-                {
-                    let _guard = self.pause_barrier.pause_and_wait().await;
-                    // All in-flight transactions have completed at this point.
-                    // Mark proxy as retiring WHILE holding the guard, so when new
-                    // transactions resume they will immediately see it as excluded.
-                    self.retiring_proxies.insert(proxy_id, epoch);
-                    tracing::info!(
-                        proxy_id,
-                        epoch = epoch.0,
-                        "Marked proxy as retiring at epoch"
-                    );
-                    // Decrease active node count NOW, since this proxy is excluded from routing.
-                    // This ensures elastic scaler's load calculations reflect actual capacity.
-                    self.elastic_scaler.decrease_active_nodes();
-                    // Guard drops here, resuming new transaction processing.
-                    // New transactions will now skip proxy_id since it's in retiring_proxies.
-                }
+                // Decrease active node count NOW, since this proxy is excluded from routing.
+                // This ensures elastic scaler's load calculations reflect actual capacity.
+                self.elastic_scaler.decrease_active_nodes();
                 if let Some(tx) = self.proxy_connections.get(&proxy_id) {
                     let msg = PrimaryToProxyMessage::RetirementSignal(epoch);
                     if let Err(e) = tx.value().send(msg).await {
@@ -1784,13 +1769,11 @@ mod retirement_property_tests {
         }
     }
 
-    // NOTE: The drain-before-retirement fix (marking retiring_proxies inside the guard scope)
-    // cannot be meaningfully unit tested because it's about the *order* of operations inside
-    // `execute_retirement_action`. The best verification is integration testing:
+    // NOTE: Retirement routing is epoch-gated and relies on consistent proxy resolution.
+    // This can't be meaningfully unit tested because it's about cross-task timing.
+    // The best verification is integration testing:
     // Run with dynamic load and check logs for absence of:
     //   "Combined proxy index did not resolve to a live proxy"
-    // The fix ensures these warnings don't appear because the proxy is marked as retired
-    // BEFORE the guard drops (resuming new transactions).
 
     /// Invariant: Proxy count with one retiring should be N-1, not N
     #[test]

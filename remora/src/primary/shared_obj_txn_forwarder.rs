@@ -54,7 +54,7 @@ where
     pub pause_barrier: Arc<PauseBarrier>,
     /// Number of active nodes for elastic scaling (only routes to first N proxies)
     pub active_nodes: Arc<AtomicUsize>,
-    /// Proxies that are in retirement and must not receive new transactions.
+    /// Proxies that are in retirement; routing is gated by retirement epoch.
     pub retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
 }
 
@@ -235,16 +235,42 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     #[inline]
+    fn is_retired_for_epoch(
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        proxy_id: ProxyId,
+        epoch_id: EpochId,
+    ) -> bool {
+        retiring_proxies
+            .get(&proxy_id)
+            .map(|retire_epoch| retire_epoch.0 < epoch_id.0)
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn is_retiring_for_epoch(
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        proxy_id: ProxyId,
+        epoch_id: EpochId,
+    ) -> bool {
+        retiring_proxies
+            .get(&proxy_id)
+            .map(|retire_epoch| retire_epoch.0 >= epoch_id.0)
+            .unwrap_or(false)
+    }
+
+    #[inline]
     fn resolve_proxy_id(
         proxy_connections: &Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        epoch_id: EpochId,
         idx: ExecutorIndex,
     ) -> Option<ProxyId> {
         // This is the core fix: always resolve the index against the *current* set of active proxies.
-        let keys = Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies);
+        let keys =
+            Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies, epoch_id);
         keys.get(idx).copied()
     }
 
@@ -254,6 +280,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
         idx: ExecutorIndex,
     ) -> Option<ProxyId> {
         // Resolve against active proxies WITHOUT excluding retiring ones, since they may
@@ -261,13 +288,21 @@ where
         let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
 
-        // Enforce active_nodes limit (do not filter retiring here)
+        // Enforce active_nodes limit, but add back retiring proxies beyond the limit.
         let active_count = active_nodes.load(Ordering::Relaxed);
-        if active_count < keys.len() {
-            keys.truncate(active_count);
+        if active_count >= keys.len() {
+            return keys.get(idx).copied();
         }
 
-        keys.get(idx).copied()
+        let mut active: Vec<ProxyId> = keys.iter().take(active_count).copied().collect();
+        for id in keys.iter().skip(active_count) {
+            if retiring_proxies.contains_key(id) && !active.contains(id) {
+                active.push(*id);
+            }
+        }
+
+        active.sort_unstable();
+        active.get(idx).copied()
     }
 
     #[inline]
@@ -277,19 +312,35 @@ where
         >,
         active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        epoch_id: EpochId,
     ) -> Vec<ProxyId> {
         let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
 
-        keys.retain(|id| !retiring_proxies.contains_key(id));
+        let eligible: Vec<ProxyId> = keys
+            .into_iter()
+            .filter(|id| !Self::is_retired_for_epoch(retiring_proxies, *id, epoch_id))
+            .collect();
 
         // Enforce active_nodes limit
         let active_count = active_nodes.load(Ordering::Relaxed);
-        if active_count < keys.len() {
-            keys.truncate(active_count);
+        if active_count >= eligible.len() {
+            return eligible;
         }
 
-        keys
+        let mut active: Vec<ProxyId> = eligible.iter().take(active_count).copied().collect();
+
+        // Allow routing to a retiring proxy through its retirement epoch,
+        // even though active_nodes has already been decremented.
+        for id in eligible.iter().skip(active_count) {
+            if Self::is_retiring_for_epoch(retiring_proxies, *id, epoch_id) && !active.contains(id)
+            {
+                active.push(*id);
+            }
+        }
+
+        active.sort_unstable();
+        active
     }
 
     /// Create a new SharedObjTxnForwarder with worker pool
@@ -374,6 +425,7 @@ where
             proxy_connections,
             states_to_proxy,
             task.txn_cnt,
+            task.epoch_id,
             &task.required_versions,
             &transaction_arc.destination,
             proxy_loads,
@@ -387,12 +439,14 @@ where
                 proxy_connections,
                 &context.active_nodes,
                 retiring_proxies,
+                task.epoch_id,
                 proxy_index,
             );
             let resolved_stateless = Self::resolve_proxy_id(
                 proxy_connections,
                 &context.active_nodes,
                 retiring_proxies,
+                task.epoch_id,
                 stateless_proxy_id,
             );
 
@@ -440,6 +494,7 @@ where
                 missing_states_result.required_states,
                 proxy_connections,
                 &context.active_nodes,
+                retiring_proxies,
             );
 
             if proxy_mode == ProxyMode::Separation {
@@ -512,11 +567,17 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
         let mut resolved = BTreeMap::new();
         for ((obj_id, seq_num), maybe_idx) in required_states {
             let resolved_proxy_id = maybe_idx.and_then(|idx| {
-                Self::resolve_proxy_id_for_missing_state(proxy_connections, active_nodes, idx)
+                Self::resolve_proxy_id_for_missing_state(
+                    proxy_connections,
+                    active_nodes,
+                    retiring_proxies,
+                    idx,
+                )
             });
             resolved.insert((obj_id, seq_num), resolved_proxy_id);
         }
@@ -562,6 +623,7 @@ where
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
         txn_cnt: usize,
+        epoch_id: EpochId,
         required_versions: &[(ObjectID, SequenceNumber)],
         destination: &Option<ProxyId>,
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
@@ -576,6 +638,7 @@ where
                 active_nodes,
                 txn_cnt,
                 retiring_proxies,
+                epoch_id,
             ),
             LoadBalancingPolicy::Zeus => Self::get_proxy_for_shared_objects_most_states(
                 proxy_connections,
@@ -584,15 +647,17 @@ where
                 states_to_proxy,
                 required_versions,
                 txn_cnt,
+                epoch_id,
             ),
             LoadBalancingPolicy::Random => Self::get_proxy_for_shared_objects_random(
                 proxy_connections,
                 active_nodes,
                 retiring_proxies,
+                epoch_id,
             ),
             LoadBalancingPolicy::Hermes => {
                 destination.and_then(|dest| {
-                    if retiring_proxies.contains_key(&dest) {
+                    if Self::is_retired_for_epoch(retiring_proxies, dest, epoch_id) {
                         None
                     } else {
                         Some((dest, dest))
@@ -608,6 +673,7 @@ where
                 proxy_loads,
                 txn_duration,
                 txn_cnt,
+                epoch_id,
             ),
             LoadBalancingPolicy::AffinityAware => {
                 Self::get_proxy_for_shared_objects_affinity_aware(
@@ -620,6 +686,7 @@ where
                     proxy_access_histories,
                     txn_duration,
                     txn_cnt,
+                    epoch_id,
                 )
             }
         }
@@ -632,8 +699,9 @@ where
         >,
         active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        epoch_id: EpochId,
     ) -> usize {
-        Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies).len()
+        Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies, epoch_id).len()
     }
 
     /// Get assigned proxy for shared objects using round-robin.
@@ -645,9 +713,14 @@ where
         active_nodes: &Arc<AtomicUsize>,
         txn_cnt: usize,
         retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        epoch_id: EpochId,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let total_proxy_count =
-            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
+        let total_proxy_count = Self::effective_proxy_count(
+            proxy_connections,
+            active_nodes,
+            retiring_proxies,
+            epoch_id,
+        );
         if total_proxy_count == 0 {
             return None;
         }
@@ -664,9 +737,14 @@ where
         >,
         active_nodes: &Arc<AtomicUsize>,
         retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
+        epoch_id: EpochId,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count =
-            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
+        let proxy_count = Self::effective_proxy_count(
+            proxy_connections,
+            active_nodes,
+            retiring_proxies,
+            epoch_id,
+        );
         if proxy_count == 0 {
             return None;
         }
@@ -687,9 +765,14 @@ where
         >,
         required_versions: &[(ObjectID, SequenceNumber)],
         txn_cnt: usize,
+        epoch_id: EpochId,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count =
-            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
+        let proxy_count = Self::effective_proxy_count(
+            proxy_connections,
+            active_nodes,
+            retiring_proxies,
+            epoch_id,
+        );
         if proxy_count == 0 {
             return None;
         }
@@ -753,9 +836,14 @@ where
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         txn_duration: &Duration,
         txn_cnt: usize,
+        epoch_id: EpochId,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count =
-            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
+        let proxy_count = Self::effective_proxy_count(
+            proxy_connections,
+            active_nodes,
+            retiring_proxies,
+            epoch_id,
+        );
         if proxy_count == 0 {
             return None;
         }
@@ -798,9 +886,14 @@ where
         proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
         txn_duration: &Duration,
         txn_cnt: usize,
+        epoch_id: EpochId,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
-        let proxy_count =
-            Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
+        let proxy_count = Self::effective_proxy_count(
+            proxy_connections,
+            active_nodes,
+            retiring_proxies,
+            epoch_id,
+        );
         if proxy_count == 0 {
             return None;
         }
@@ -1040,7 +1133,9 @@ where
                     }
                     required_states.insert((object_id, seq_num), None);
                 }
-                Some(owner_idx) if owner_is_retired && retirement_epoch_committed && persisted_ok => {
+                Some(owner_idx)
+                    if owner_is_retired && retirement_epoch_committed && persisted_ok =>
+                {
                     // Owner is a retired proxy AND retirement epoch is committed - safe to lazy fetch
                     if let Some(blob) = collector.get_object(&object_id) {
                         if blob.version() >= seq_num {
@@ -1077,7 +1172,9 @@ where
                         required_states.insert((object_id, seq_num), None);
                     }
                 }
-                Some(owner_idx) if owner_is_retired && (!retirement_epoch_committed || !persisted_ok) => {
+                Some(owner_idx)
+                    if owner_is_retired && (!retirement_epoch_committed || !persisted_ok) =>
+                {
                     // Owner is retiring but retirement epoch not yet committed - use inter-proxy
                     // This prevents the race condition where merged_state doesn't have the state yet
                     tracing::debug!(
@@ -1172,8 +1269,10 @@ mod tests {
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch for testing
-            let active_nodes = Arc::new(AtomicUsize::new(proxy_count)); // Assume full capacity for this test
+            let retirement_epoch = EpochId(1);
+            let epoch_id = EpochId(retirement_epoch.0 + 1);
+            retiring_proxies.insert(retiring_proxy, retirement_epoch);
+            let active_nodes = Arc::new(AtomicUsize::new(proxy_count - 1));
 
             let txn_cnt = rng.gen_range(0..1000);
             let (proxy_index, _) =
@@ -1182,6 +1281,7 @@ mod tests {
                     &active_nodes,
                     txn_cnt,
                     &retiring_proxies,
+                    epoch_id,
                 )
                 .expect("Expected a proxy selection");
 
@@ -1189,6 +1289,7 @@ mod tests {
                 &proxy_connections,
                 &active_nodes,
                 &retiring_proxies,
+                epoch_id,
                 proxy_index,
             )
             .expect("Expected a resolved proxy");
@@ -1208,13 +1309,16 @@ mod tests {
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch for testing
-            let active_nodes = Arc::new(AtomicUsize::new(proxy_count));
+            let retirement_epoch = EpochId(1);
+            let epoch_id = EpochId(retirement_epoch.0 + 1);
+            retiring_proxies.insert(retiring_proxy, retirement_epoch);
+            let active_nodes = Arc::new(AtomicUsize::new(proxy_count - 1));
 
             let effective_count = SharedObjTxnForwarder::<FakeExecutor>::effective_proxy_count(
                 &proxy_connections,
                 &active_nodes,
                 &retiring_proxies,
+                epoch_id,
             );
             assert!(effective_count > 0);
 
@@ -1223,6 +1327,7 @@ mod tests {
                     &proxy_connections,
                     &active_nodes,
                     &retiring_proxies,
+                    epoch_id,
                     idx,
                 )
                 .expect("Expected a resolved proxy");
@@ -1233,6 +1338,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn resolve_proxy_id_includes_retiring_for_retirement_epoch() {
+        let proxy_count = 4;
+        let retiring_proxy = proxy_count - 1;
+        let proxy_connections = build_proxy_connections(proxy_count);
+        let retiring_proxies = Arc::new(DashMap::new());
+        let retirement_epoch = EpochId(7);
+        retiring_proxies.insert(retiring_proxy, retirement_epoch);
+        let active_nodes = Arc::new(AtomicUsize::new(proxy_count - 1));
+
+        let resolved = SharedObjTxnForwarder::<FakeExecutor>::resolve_proxy_id(
+            &proxy_connections,
+            &active_nodes,
+            &retiring_proxies,
+            retirement_epoch,
+            proxy_count - 1,
+        )
+        .expect("Expected a resolved proxy");
+
+        assert_eq!(
+            resolved, retiring_proxy,
+            "Retiring proxy should be routable for its retirement epoch"
+        );
     }
 
     #[tokio::test]

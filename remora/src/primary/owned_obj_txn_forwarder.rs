@@ -26,8 +26,8 @@ where
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) index: usize,
     pub(crate) proxy_mode: ProxyMode,
-    /// Proxies that are in retirement and must not receive new transactions.
-    /// The value is the retirement epoch (only used for type consistency with shared forwarder).
+    /// Proxies that are in retirement; routing is gated by retirement epoch.
+    /// The value is the retirement epoch used to decide per-epoch eligibility.
     pub(crate) retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     /// Barrier to pause this worker during recovery.
     pub(crate) pause_barrier: Arc<PauseBarrier>,
@@ -39,18 +39,43 @@ where
     E::Transaction: Send + Sync + 'static,
 {
     #[inline]
-    fn effective_proxy_ids(&self) -> Vec<ProxyId> {
+    fn effective_proxy_ids(&self, epoch_id: EpochId) -> Vec<ProxyId> {
         let mut keys: Vec<ProxyId> = self.proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
-        keys.retain(|id| !self.retiring_proxies.contains_key(id));
+        let eligible: Vec<ProxyId> = keys
+            .into_iter()
+            .filter(|id| {
+                self.retiring_proxies
+                    .get(id)
+                    .map(|retire_epoch| retire_epoch.0 >= epoch_id.0)
+                    .unwrap_or(true)
+            })
+            .collect();
 
         // Enforce active_nodes limit
         let active_count = self.active_nodes.load(std::sync::atomic::Ordering::Relaxed);
-        if active_count < keys.len() {
-            keys.truncate(active_count);
+        if active_count >= eligible.len() {
+            return eligible;
         }
 
-        keys
+        let mut active: Vec<ProxyId> = eligible.iter().take(active_count).copied().collect();
+
+        // Allow routing to a retiring proxy through its retirement epoch,
+        // even though active_nodes has already been decremented.
+        for id in eligible.iter().skip(active_count) {
+            if self
+                .retiring_proxies
+                .get(id)
+                .map(|retire_epoch| retire_epoch.0 >= epoch_id.0)
+                .unwrap_or(false)
+                && !active.contains(id)
+            {
+                active.push(*id);
+            }
+        }
+
+        active.sort_unstable();
+        active
     }
 
     pub(crate) async fn process_owned_txns(
@@ -71,7 +96,7 @@ where
         epoch_id: EpochId,
         transactions: Vec<RemoraTransaction<E>>,
     ) {
-        let effective_proxies = self.effective_proxy_ids();
+        let effective_proxies = self.effective_proxy_ids(epoch_id);
         let proxy_count = effective_proxies.len();
         if proxy_count == 0 {
             tracing::warn!("No proxies available for transactions");
@@ -168,7 +193,7 @@ mod tests {
     const NUM_ITERATIONS: usize = 100;
 
     #[test]
-    fn prop_effective_proxy_ids_excludes_retiring() {
+    fn prop_effective_proxy_ids_gates_retiring_by_epoch() {
         let mut rng = rand::thread_rng();
         for _ in 0..NUM_ITERATIONS {
             let proxy_count = rng.gen_range(2..12);
@@ -179,10 +204,11 @@ mod tests {
                 proxy_connections.insert(id, tx);
             }
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch doesn't matter for this test
+            let retirement_epoch = EpochId(5);
+            retiring_proxies.insert(retiring_proxy, retirement_epoch);
 
             let forwarder = OwnedObjTxnForwarder::<FakeExecutor> {
-                active_nodes: Arc::new(std::sync::atomic::AtomicUsize::new(proxy_count)),
+                active_nodes: Arc::new(std::sync::atomic::AtomicUsize::new(proxy_count - 1)),
                 proxy_connections,
                 index: 0,
                 proxy_mode: ProxyMode::Separation,
@@ -190,11 +216,17 @@ mod tests {
                 pause_barrier: PauseBarrier::new(),
             };
 
-            let effective = forwarder.effective_proxy_ids();
-            assert!(!effective.is_empty());
+            let effective_at_retire = forwarder.effective_proxy_ids(retirement_epoch);
+            assert!(!effective_at_retire.is_empty());
             assert!(
-                !effective.contains(&retiring_proxy),
-                "effective_proxy_ids returned retiring proxy"
+                effective_at_retire.contains(&retiring_proxy),
+                "expected retiring proxy for retirement epoch"
+            );
+
+            let effective_after = forwarder.effective_proxy_ids(EpochId(retirement_epoch.0 + 1));
+            assert!(
+                !effective_after.contains(&retiring_proxy),
+                "effective_proxy_ids returned retiring proxy after retirement epoch"
             );
         }
     }
