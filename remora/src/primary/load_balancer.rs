@@ -838,6 +838,9 @@ where
                         epoch = epoch.0,
                         "Marked proxy as retiring at epoch"
                     );
+                    // Decrease active node count NOW, since this proxy is excluded from routing.
+                    // This ensures elastic scaler's load calculations reflect actual capacity.
+                    self.elastic_scaler.decrease_active_nodes();
                     // Guard drops here, resuming new transaction processing.
                     // New transactions will now skip proxy_id since it's in retiring_proxies.
                 }
@@ -874,8 +877,8 @@ where
                     let _ = tx.value().send(msg).await;
                 }
                 // Remove from connections
+                // Note: active_nodes was already decreased in SendRetirementSignal
                 self.proxy_connections.remove(&proxy_id);
-                self.elastic_scaler.decrease_active_nodes();
             }
         }
     }
