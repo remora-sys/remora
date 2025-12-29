@@ -27,7 +27,8 @@ where
     pub(crate) index: usize,
     pub(crate) proxy_mode: ProxyMode,
     /// Proxies that are in retirement and must not receive new transactions.
-    pub(crate) retiring_proxies: Arc<DashMap<ProxyId, ()>>,
+    /// The value is the retirement epoch (only used for type consistency with shared forwarder).
+    pub(crate) retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     /// Barrier to pause this worker during recovery.
     pub(crate) pause_barrier: Arc<PauseBarrier>,
 }
@@ -178,7 +179,7 @@ mod tests {
                 proxy_connections.insert(id, tx);
             }
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, ());
+            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch doesn't matter for this test
 
             let forwarder = OwnedObjTxnForwarder::<FakeExecutor> {
                 active_nodes: Arc::new(std::sync::atomic::AtomicUsize::new(proxy_count)),

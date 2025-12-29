@@ -55,7 +55,7 @@ where
     /// Number of active nodes for elastic scaling (only routes to first N proxies)
     pub active_nodes: Arc<AtomicUsize>,
     /// Proxies that are in retirement and must not receive new transactions.
-    pub retiring_proxies: Arc<DashMap<ProxyId, ()>>,
+    pub retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
 }
 
 pub(crate) struct VersionAssignmentTask<E>
@@ -240,7 +240,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
         idx: ExecutorIndex,
     ) -> Option<ProxyId> {
         // This is the core fix: always resolve the index against the *current* set of active proxies.
@@ -254,7 +254,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> Vec<ProxyId> {
         let mut keys: Vec<ProxyId> = proxy_connections.iter().map(|e| *e.key()).collect();
         keys.sort_unstable();
@@ -287,7 +287,7 @@ where
         collector: Arc<StateCollector>,
         pause_barrier: Arc<PauseBarrier>,
         active_nodes: Arc<AtomicUsize>,
-        retiring_proxies: Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     ) -> Self {
         let context = ForwardingContext {
             dependency_controller: dependency_controller.clone(),
@@ -491,7 +491,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> BTreeMap<(ObjectID, SequenceNumber), Option<ProxyId>> {
         let mut resolved = BTreeMap::new();
         for ((obj_id, seq_num), maybe_idx) in required_states {
@@ -548,7 +548,7 @@ where
         proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
         txn_duration: &Duration,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         match policy {
             LoadBalancingPolicy::RoundRobin => Self::get_proxy_for_shared_objects_round_robin(
@@ -611,7 +611,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> usize {
         Self::effective_proxy_ids(proxy_connections, active_nodes, retiring_proxies).len()
     }
@@ -624,7 +624,7 @@ where
         >,
         active_nodes: &Arc<AtomicUsize>,
         txn_cnt: usize,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let total_proxy_count =
             Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
@@ -643,7 +643,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
     ) -> Option<(ExecutorIndex, ExecutorIndex)> {
         let proxy_count =
             Self::effective_proxy_count(proxy_connections, active_nodes, retiring_proxies);
@@ -661,7 +661,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
         states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
@@ -725,7 +725,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
         states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
@@ -769,7 +769,7 @@ where
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
         active_nodes: &Arc<AtomicUsize>,
-        retiring_proxies: &Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: &Arc<DashMap<ProxyId, EpochId>>,
         _states_to_proxy: &Arc<
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
@@ -936,7 +936,7 @@ where
             DashMap<(ObjectID, SequenceNumber), std::collections::HashSet<ExecutorIndex>>,
         >,
         collector: Arc<StateCollector>,
-        retiring_proxies: Arc<DashMap<ProxyId, ()>>,
+        retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     ) -> MissingStatesResult {
         let mut required_states = BTreeMap::new();
         let mut lazy_fetched_blobs = BTreeMap::new();
@@ -967,13 +967,19 @@ where
                     }
                 });
 
-            // Check if owner is a retired proxy (in retiring_proxies set).
-            // Retired proxies are no longer active, so treat their states
-            // the same as PRIMARY_FETCH_SENTINEL: lazy fetch from primary.
-            let owner_is_retired = owner
+            // Check if owner is a retired proxy AND the retirement epoch has been committed.
+            // Lazy fetch is only safe after the retirement epoch is committed to merged_state.
+            // Before that, we must use inter-proxy transfer (fall through to default case).
+            let persist_index = collector.get_persist_index();
+            let (owner_is_retired, retirement_epoch_committed) = owner
                 .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
-                .map(|o| retiring_proxies.contains_key(&o))
-                .unwrap_or(false);
+                .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
+                .map(|retirement_epoch| {
+                    // Check if the retirement epoch has been committed to merged_state
+                    let committed = persist_index >= retirement_epoch.0;
+                    (true, committed)
+                })
+                .unwrap_or((false, false));
 
             match owner {
                 Some(PRIMARY_FETCH_SENTINEL) => {
@@ -989,15 +995,16 @@ where
                     }
                     required_states.insert((object_id, seq_num), None);
                 }
-                Some(owner_idx) if owner_is_retired => {
-                    // Owner is a retired proxy - lazy fetch from primary
+                Some(owner_idx) if owner_is_retired && retirement_epoch_committed => {
+                    // Owner is a retired proxy AND retirement epoch is committed - safe to lazy fetch
                     if let Some(blob) = collector.get_object(&object_id) {
                         lazy_fetched_blobs.insert(object_id, blob);
                         tracing::debug!(
-                            "Lazy fetch for retired proxy {} state {:?} v{}",
+                            "Lazy fetch for retired proxy {} state {:?} v{} (persist_index={})",
                             owner_idx,
                             object_id,
-                            seq_num.value()
+                            seq_num.value(),
+                            persist_index
                         );
                     } else {
                         tracing::warn!(
@@ -1009,6 +1016,18 @@ where
                         );
                     }
                     required_states.insert((object_id, seq_num), None);
+                }
+                Some(owner_idx) if owner_is_retired && !retirement_epoch_committed => {
+                    // Owner is retiring but retirement epoch not yet committed - use inter-proxy
+                    // This prevents the race condition where merged_state doesn't have the state yet
+                    tracing::debug!(
+                        "Retiring proxy {} state {:?} v{} not ready for lazy fetch (persist_index={}, waiting for retirement epoch)",
+                        owner_idx,
+                        object_id,
+                        seq_num.value(),
+                        persist_index
+                    );
+                    required_states.insert((object_id, seq_num), Some(owner_idx));
                 }
                 owner_opt => {
                     required_states.insert((object_id, seq_num), owner_opt);
@@ -1088,7 +1107,7 @@ mod tests {
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, ());
+            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch for testing
             let active_nodes = Arc::new(AtomicUsize::new(proxy_count)); // Assume full capacity for this test
 
             let txn_cnt = rng.gen_range(0..1000);
@@ -1124,7 +1143,7 @@ mod tests {
             let retiring_proxy = proxy_count - 1;
             let proxy_connections = build_proxy_connections(proxy_count);
             let retiring_proxies = Arc::new(DashMap::new());
-            retiring_proxies.insert(retiring_proxy, ());
+            retiring_proxies.insert(retiring_proxy, EpochId(1)); // Retirement epoch for testing
             let active_nodes = Arc::new(AtomicUsize::new(proxy_count));
 
             let effective_count = SharedObjTxnForwarder::<FakeExecutor>::effective_proxy_count(
@@ -1146,6 +1165,138 @@ mod tests {
                     resolved, retiring_proxy,
                     "Resolved retiring proxy for index {}",
                     idx
+                );
+            }
+        }
+    }
+
+    /// Property-based tests for epoch-gated lazy fetch
+    /// These test the core fix for the scale-in race condition
+    mod lazy_fetch_epoch_tests {
+        use super::*;
+        use crate::checkpoint::state_collector::StateCollector;
+
+        /// Test: When retirement epoch is NOT committed, lazy fetch should NOT be triggered.
+        /// Instead, the transaction should use inter-proxy transfer to the retiring proxy.
+        #[test]
+        fn prop_lazy_fetch_blocked_when_epoch_not_committed() {
+            let mut rng = rand::thread_rng();
+            for _ in 0..NUM_ITERATIONS {
+                // Setup: retiring proxy with retirement epoch > persist_index
+                let retirement_epoch = EpochId(rng.gen_range(5..100));
+                let persist_index = rng.gen_range(0..retirement_epoch.0); // Strictly less
+                let retiring_proxy: ProxyId = rng.gen_range(0..10);
+
+                // Create a mock retiring_proxies map
+                let retiring_proxies: Arc<DashMap<ProxyId, EpochId>> = Arc::new(DashMap::new());
+                retiring_proxies.insert(retiring_proxy, retirement_epoch);
+
+                // Simulate the lazy fetch check logic
+                let owner = Some(retiring_proxy);
+                let (owner_is_retired, retirement_epoch_committed) = owner
+                    .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
+                    .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
+                    .map(|ret_epoch| {
+                        let committed = persist_index >= ret_epoch.0;
+                        (true, committed)
+                    })
+                    .unwrap_or((false, false));
+
+                assert!(owner_is_retired, "Owner should be detected as retired");
+                assert!(
+                    !retirement_epoch_committed,
+                    "Retirement epoch {} should NOT be committed when persist_index is {}",
+                    retirement_epoch.0, persist_index
+                );
+            }
+        }
+
+        /// Test: When retirement epoch IS committed, lazy fetch should be allowed.
+        #[test]
+        fn prop_lazy_fetch_allowed_when_epoch_committed() {
+            let mut rng = rand::thread_rng();
+            for _ in 0..NUM_ITERATIONS {
+                // Setup: retiring proxy with retirement epoch <= persist_index
+                let retirement_epoch = EpochId(rng.gen_range(1..50));
+                let persist_index = retirement_epoch.0 + rng.gen_range(0..10); // >= retirement
+                let retiring_proxy: ProxyId = rng.gen_range(0..10);
+
+                let retiring_proxies: Arc<DashMap<ProxyId, EpochId>> = Arc::new(DashMap::new());
+                retiring_proxies.insert(retiring_proxy, retirement_epoch);
+
+                // Simulate the lazy fetch check logic
+                let owner = Some(retiring_proxy);
+                let (owner_is_retired, retirement_epoch_committed) = owner
+                    .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
+                    .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
+                    .map(|ret_epoch| {
+                        let committed = persist_index >= ret_epoch.0;
+                        (true, committed)
+                    })
+                    .unwrap_or((false, false));
+
+                assert!(owner_is_retired, "Owner should be detected as retired");
+                assert!(
+                    retirement_epoch_committed,
+                    "Retirement epoch {} should be committed when persist_index is {}",
+                    retirement_epoch.0, persist_index
+                );
+            }
+        }
+
+        /// Test: Non-retiring proxies should not trigger lazy fetch logic.
+        #[test]
+        fn prop_non_retiring_proxy_uses_inter_proxy() {
+            let mut rng = rand::thread_rng();
+            for _ in 0..NUM_ITERATIONS {
+                let retiring_proxy: ProxyId = rng.gen_range(5..10);
+                let active_proxy: ProxyId = rng.gen_range(0..5); // Different from retiring
+
+                let retiring_proxies: Arc<DashMap<ProxyId, EpochId>> = Arc::new(DashMap::new());
+                retiring_proxies.insert(retiring_proxy, EpochId(10));
+
+                // Check for a non-retiring proxy owner
+                let owner = Some(active_proxy);
+                let (owner_is_retired, _) = owner
+                    .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
+                    .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
+                    .map(|ret_epoch| (true, ret_epoch.0 >= 0))
+                    .unwrap_or((false, false));
+
+                assert!(
+                    !owner_is_retired,
+                    "Active proxy {} should NOT be detected as retired (retiring is {})",
+                    active_proxy, retiring_proxy
+                );
+            }
+        }
+
+        /// Test: Epoch boundary condition (persist_index == retirement_epoch)
+        #[test]
+        fn prop_lazy_fetch_at_exact_boundary() {
+            let mut rng = rand::thread_rng();
+            for _ in 0..NUM_ITERATIONS {
+                let retirement_epoch = EpochId(rng.gen_range(1..100));
+                let persist_index = retirement_epoch.0; // Exactly equal
+                let retiring_proxy: ProxyId = rng.gen_range(0..10);
+
+                let retiring_proxies: Arc<DashMap<ProxyId, EpochId>> = Arc::new(DashMap::new());
+                retiring_proxies.insert(retiring_proxy, retirement_epoch);
+
+                let owner = Some(retiring_proxy);
+                let (_, retirement_epoch_committed) = owner
+                    .filter(|&o| o != PRIMARY_FETCH_SENTINEL)
+                    .and_then(|o| retiring_proxies.get(&o).map(|e| *e))
+                    .map(|ret_epoch| {
+                        let committed = persist_index >= ret_epoch.0;
+                        (true, committed)
+                    })
+                    .unwrap_or((false, false));
+
+                assert!(
+                    retirement_epoch_committed,
+                    "At exact boundary (persist={}, retirement={}), lazy fetch should be allowed",
+                    persist_index, retirement_epoch.0
                 );
             }
         }

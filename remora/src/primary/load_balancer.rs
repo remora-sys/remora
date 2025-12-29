@@ -79,7 +79,8 @@ pub struct LoadBalancer<E: Executor> {
     /// Retirement coordinator for graceful proxy shutdown during scale-in
     retirement_coordinator: RetirementCoordinator,
     /// Proxies that are in retirement and must not receive new transactions.
-    retiring_proxies: Arc<DashMap<ProxyId, ()>>,
+    /// The value is the retirement epoch - lazy fetch is only safe after this epoch seals.
+    retiring_proxies: Arc<DashMap<ProxyId, EpochId>>,
     /// Receiver for retirement events from PrimaryNode (snapshots and epoch seals)
     rx_retirement_events: Receiver<RetirementEvent>,
 }
@@ -831,8 +832,12 @@ where
                     // All in-flight transactions have completed at this point.
                     // Mark proxy as retiring WHILE holding the guard, so when new
                     // transactions resume they will immediately see it as excluded.
-                    self.retiring_proxies.insert(proxy_id, ());
-                    tracing::info!(proxy_id, epoch = epoch.0, "Sending retirement signal");
+                    self.retiring_proxies.insert(proxy_id, epoch);
+                    tracing::info!(
+                        proxy_id,
+                        epoch = epoch.0,
+                        "Marked proxy as retiring at epoch"
+                    );
                     // Guard drops here, resuming new transaction processing.
                     // New transactions will now skip proxy_id since it's in retiring_proxies.
                 }
