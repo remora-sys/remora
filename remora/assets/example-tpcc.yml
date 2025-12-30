@@ -1,0 +1,6 @@
+load: 10000
+duration:
+  secs: 60
+  nanos: 0
+workload: !Tpcc
+  num_warehouses: 8

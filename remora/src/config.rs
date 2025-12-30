@@ -252,6 +252,11 @@ pub enum WorkloadType {
         #[serde(default = "default_number_of_inputs")]
         number_of_inputs: usize,
     },
+    /// TPC-C benchmark (NEW_ORDER and PAYMENT transactions only)
+    Tpcc {
+        #[serde(default = "default_tpcc_warehouses")]
+        num_warehouses: usize,
+    },
 }
 
 impl WorkloadType {
@@ -266,6 +271,10 @@ impl WorkloadType {
             _ => false,
         }
     }
+
+    pub fn is_tpcc(&self) -> bool {
+        matches!(self, WorkloadType::Tpcc { .. })
+    }
 }
 
 fn default_cont_level_for_shared_obj() -> usize {
@@ -278,6 +287,10 @@ pub fn default_fake_execution_duration() -> Duration {
 
 pub fn default_zipfian_alpha() -> f64 {
     0.5
+}
+
+pub fn default_tpcc_warehouses() -> usize {
+    1
 }
 
 pub fn default_number_of_inputs() -> usize {
@@ -301,6 +314,7 @@ impl Debug for WorkloadType {
             WorkloadType::FakeUniswapNormal { .. } => write!(f, "Fake Uniswap normal"),
             WorkloadType::FakeUniswapPeak { .. } => write!(f, "Fake Uniswap peak"),
             WorkloadType::FakeZipfian { .. } => write!(f, "Fake Zipfian"),
+            WorkloadType::Tpcc { .. } => write!(f, "TPC-C"),
         }
     }
 }
