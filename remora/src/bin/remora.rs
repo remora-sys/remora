@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use remora::{
     config::{BenchmarkParameters, ImportExport, ValidatorConfig},
-    executor::{api::Executor, fake::FakeExecutor, sui::SuiExecutor},
+    executor::{api::Executor, fake::FakeExecutor, sui::SuiExecutor, tpcc::TpccExecutor},
     metrics::{periodically_print_metrics, Metrics},
     primary::node::PrimaryNode,
     proxy::{core::ProxyId, node::ProxyNode},
@@ -70,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loading executor");
     if benchmark_config.workload.is_fake() {
         let executor = FakeExecutor::new(&benchmark_config).await;
+        start_node(args.role, executor, validator_config, metrics).await;
+    } else if benchmark_config.workload.is_tpcc() {
+        let executor = TpccExecutor::new(&benchmark_config).await;
         start_node(args.role, executor, validator_config, metrics).await;
     } else {
         let executor = SuiExecutor::new(&benchmark_config).await;

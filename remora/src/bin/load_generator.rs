@@ -12,6 +12,7 @@ use remora::{
     executor::api::Executor,
     executor::fake::FakeExecutor,
     executor::sui::SuiExecutor,
+    executor::tpcc::TpccExecutor,
 };
 
 #[derive(Parser, Debug)]
@@ -52,7 +53,19 @@ async fn main() -> anyhow::Result<()> {
     if benchmark_config.workload.is_fake() {
         let load_generator =
             LoadGenerator::<FakeExecutor>::new(benchmark_config.clone(), primary_address);
-        run_load_generator(load_generator).await?;
+        match args.command {
+            Some(Command::Run) => run_load_generator(load_generator).await?,
+            Some(Command::GenerateLog) => generate_log(load_generator).await?,
+            None => run_load_generator(load_generator).await?,
+        }
+    } else if benchmark_config.workload.is_tpcc() {
+        let load_generator =
+            LoadGenerator::<TpccExecutor>::new(benchmark_config.clone(), primary_address);
+        match args.command {
+            Some(Command::Run) => run_load_generator(load_generator).await?,
+            Some(Command::GenerateLog) => generate_log(load_generator).await?,
+            None => run_load_generator(load_generator).await?,
+        }
     } else {
         let load_generator =
             LoadGenerator::<SuiExecutor>::new(benchmark_config.clone(), primary_address);

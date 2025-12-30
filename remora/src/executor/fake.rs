@@ -370,7 +370,7 @@ impl Executor for FakeExecutor {
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
     {
-        // Simulate execution
+        // Simulate execution with synthetic spinning
         Calibration::calibrated_work(ctx.execution_spins);
 
         let mut modified_at_versions = Vec::new();
