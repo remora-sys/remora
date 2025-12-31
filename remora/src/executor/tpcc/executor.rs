@@ -364,9 +364,15 @@ impl TpccExecutor {
     fn update_object_with_version(input: Object, version: SequenceNumber) -> Object {
         let id = input.id();
         let obj = MoveObject::new_gas_coin(version, id, 10);
+        // Preserve the original initial_shared_version for shared objects
         let owner = if input.is_shared() {
-            Owner::Shared {
-                initial_shared_version: version,
+            match input.as_inner().owner {
+                Owner::Shared {
+                    initial_shared_version,
+                } => Owner::Shared {
+                    initial_shared_version,
+                },
+                _ => unreachable!("is_shared() returned true but owner is not Shared"),
             }
         } else {
             input
@@ -521,7 +527,7 @@ impl Executor for TpccExecutor {
 
         let next_version = max_version.next();
 
-        // Update all objects with consistent version
+        // Update all objects with consistent version (design choice: both reads and writes bump versions)
         for id in &transaction.input_ids {
             let input_object = store
                 .read_object(id)

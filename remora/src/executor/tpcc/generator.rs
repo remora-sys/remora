@@ -8,7 +8,6 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use super::constants::*;
-use super::data::TpccState;
 use super::transactions::{OrderItem, TpccTransaction};
 
 // =============================================================================
@@ -17,7 +16,7 @@ use super::transactions::{OrderItem, TpccTransaction};
 
 /// Generates TPC-C transactions following the specification
 pub struct TpccGenerator {
-    state: TpccState,
+    num_warehouses: usize,
     rng: StdRng,
 }
 
@@ -25,14 +24,9 @@ impl TpccGenerator {
     /// Create a new TPC-C generator
     pub fn new(num_warehouses: usize, seed: u64) -> Self {
         Self {
-            state: TpccState::new(num_warehouses),
+            num_warehouses,
             rng: StdRng::seed_from_u64(seed),
         }
-    }
-
-    /// Get a reference to the TPC-C state
-    pub fn state(&self) -> &TpccState {
-        &self.state
     }
 
     /// Generate a random transaction following TPC-C mix (50% NEW_ORDER, 50% PAYMENT)
@@ -56,7 +50,7 @@ impl TpccGenerator {
             .map(|_| {
                 let i_id = self.random_item();
                 let supply_w_id =
-                    if self.state.num_warehouses > 1 && self.rng.gen_bool(REMOTE_WAREHOUSE_PROB) {
+                    if self.num_warehouses > 1 && self.rng.gen_bool(REMOTE_WAREHOUSE_PROB) {
                         self.random_warehouse_excluding(w_id)
                     } else {
                         w_id
@@ -85,14 +79,14 @@ impl TpccGenerator {
         let d_id = self.random_district();
 
         // Determine if customer is from a remote warehouse
-        let (c_w_id, c_d_id) =
-            if self.state.num_warehouses > 1 && self.rng.gen_bool(REMOTE_CUSTOMER_PROB) {
-                let remote_w_id = self.random_warehouse_excluding(w_id);
-                let remote_d_id = self.random_district();
-                (remote_w_id, remote_d_id)
-            } else {
-                (w_id, d_id)
-            };
+        let (c_w_id, c_d_id) = if self.num_warehouses > 1 && self.rng.gen_bool(REMOTE_CUSTOMER_PROB)
+        {
+            let remote_w_id = self.random_warehouse_excluding(w_id);
+            let remote_d_id = self.random_district();
+            (remote_w_id, remote_d_id)
+        } else {
+            (w_id, d_id)
+        };
 
         let c_id = self.random_customer();
         let h_amount = self.rng.gen_range(MIN_PAYMENT..=MAX_PAYMENT);
@@ -112,7 +106,7 @@ impl TpccGenerator {
     // =========================================================================
 
     fn random_warehouse(&mut self) -> u32 {
-        self.rng.gen_range(1..=self.state.num_warehouses as u32)
+        self.rng.gen_range(1..=self.num_warehouses as u32)
     }
 
     fn random_warehouse_excluding(&mut self, exclude: u32) -> u32 {
@@ -144,7 +138,7 @@ mod tests {
     #[test]
     fn test_generator_creation() {
         let generator = TpccGenerator::new(2, 42);
-        assert_eq!(generator.state.num_warehouses, 2);
+        assert_eq!(generator.num_warehouses, 2);
     }
 
     #[test]
