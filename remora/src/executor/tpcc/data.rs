@@ -8,6 +8,8 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use sui_types::base_types::ObjectID;
 
 use super::constants::*;
@@ -83,6 +85,9 @@ pub struct TpccState {
     pub customers: HashMap<(u32, u32, u32), Customer>,
     pub stock: HashMap<(u32, u32), Stock>,
     pub items: HashMap<u32, Item>,
+    /// Per-district atomic counters for order IDs (FastIds optimization)
+    /// Key: (warehouse_id, district_id) -> atomic counter
+    order_id_counters: HashMap<(u32, u32), Arc<AtomicU32>>,
 }
 
 impl TpccState {
@@ -96,6 +101,7 @@ impl TpccState {
             customers: HashMap::new(),
             stock: HashMap::new(),
             items: HashMap::new(),
+            order_id_counters: HashMap::new(),
         };
 
         // Generate items (shared across all warehouses)
@@ -138,6 +144,11 @@ impl TpccState {
                     },
                 );
 
+                // Initialize atomic order ID counter for this district (FastIds)
+                state
+                    .order_id_counters
+                    .insert((w_id, d_id), Arc::new(AtomicU32::new(INITIAL_NEXT_O_ID)));
+
                 // Customers
                 for c_id in 1..=CUSTOMERS_PER_DISTRICT as u32 {
                     state.customers.insert(
@@ -174,6 +185,19 @@ impl TpccState {
         }
 
         state
+    }
+
+    // =========================================================================
+    // FastIds: Atomic Order ID Generation
+    // =========================================================================
+
+    /// Get the next order ID for a district using atomic fetch-and-add.
+    /// This is the "FastIds" optimization from Silo/Caracal.
+    pub fn next_order_id(&self, w_id: u32, d_id: u32) -> u32 {
+        self.order_id_counters
+            .get(&(w_id, d_id))
+            .expect("Order ID counter not found for district")
+            .fetch_add(1, Ordering::SeqCst)
     }
 
     // =========================================================================
