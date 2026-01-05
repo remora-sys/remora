@@ -84,6 +84,9 @@ impl TpccTransaction {
                 // Read warehouse (for tax)
                 reads.push(TpccState::object_id_for_warehouse(*w_id));
 
+                // Read district (for d_tax and d_next_o_id)
+                reads.push(TpccState::object_id_for_district(*w_id, *d_id));
+
                 // Read customer (for discount)
                 reads.push(TpccState::object_id_for_customer(*w_id, *d_id, *c_id));
 
@@ -188,8 +191,8 @@ mod tests {
         let reads = txn.read_set();
         let writes = txn.write_set();
 
-        // Reads: warehouse, customer, 2 items, 2 stocks = 6
-        assert_eq!(reads.len(), 6);
+        // Reads: warehouse, district, customer, 2 items, 2 stocks = 7
+        assert_eq!(reads.len(), 7);
 
         // Writes: district, 2 stocks = 3
         assert_eq!(writes.len(), 3);
