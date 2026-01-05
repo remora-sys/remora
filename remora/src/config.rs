@@ -256,6 +256,9 @@ pub enum WorkloadType {
     Tpcc {
         #[serde(default = "default_tpcc_warehouses")]
         num_warehouses: usize,
+        /// Ratio of PAYMENT transactions (0.0 = all NEW_ORDER, 1.0 = all PAYMENT)
+        #[serde(default = "default_tpcc_payment_ratio")]
+        payment_ratio: f64,
     },
 }
 
@@ -291,6 +294,10 @@ pub fn default_zipfian_alpha() -> f64 {
 
 pub fn default_tpcc_warehouses() -> usize {
     1
+}
+
+pub fn default_tpcc_payment_ratio() -> f64 {
+    0.5
 }
 
 pub fn default_number_of_inputs() -> usize {
