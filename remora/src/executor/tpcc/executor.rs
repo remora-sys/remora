@@ -20,6 +20,7 @@ use sui_types::effects::TransactionEffectsAPI;
 use sui_types::execution_status::ExecutionStatus;
 use sui_types::gas::GasCostSummary;
 use sui_types::object::{MoveObject, Object, Owner};
+use sui_types::transaction::InputObjectKind;
 
 use crate::config::{BenchmarkParameters, WorkloadType};
 use crate::executor::api::{
@@ -43,17 +44,25 @@ pub struct TpccExecutableTransaction {
     pub digest: TransactionDigest,
     /// The TPC-C transaction parameters
     pub txn: TpccTransaction,
-    /// Input object IDs for this transaction
-    pub input_ids: Vec<ObjectID>,
+    /// Input objects for this transaction (stored directly to avoid reconstruction)
+    pub inputs: Vec<InputObjectKind>,
 }
 
 impl TpccExecutableTransaction {
     pub fn new(txn: TpccTransaction) -> Self {
-        let input_ids = txn.access_set();
+        let inputs = txn
+            .access_set()
+            .into_iter()
+            .map(|id| InputObjectKind::SharedMoveObject {
+                id,
+                initial_shared_version: SequenceNumber::from(2),
+                mutable: true,
+            })
+            .collect();
         Self {
             digest: TransactionDigest::random(),
             txn,
-            input_ids,
+            inputs,
         }
     }
 }
@@ -63,20 +72,18 @@ impl ExecutableTransaction for TpccExecutableTransaction {
         &self.digest
     }
 
-    fn input_objects(&self) -> Vec<sui_types::transaction::InputObjectKind> {
-        use sui_types::transaction::InputObjectKind;
-        self.input_ids
-            .iter()
-            .map(|id| InputObjectKind::SharedMoveObject {
-                id: *id,
-                initial_shared_version: SequenceNumber::from(2),
-                mutable: true,
-            })
-            .collect()
+    fn input_objects(&self) -> Vec<InputObjectKind> {
+        self.inputs.clone()
     }
 
     fn shared_object_ids(&self) -> Vec<ObjectID> {
-        self.input_ids.clone()
+        self.inputs
+            .iter()
+            .filter_map(|kind| match kind {
+                InputObjectKind::SharedMoveObject { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -526,14 +533,15 @@ impl Executor for TpccExecutor {
         let next_version = max_version.next();
 
         // Update all objects with consistent version (design choice: both reads and writes bump versions)
-        for id in &transaction.input_ids {
+        for reference in &transaction.inputs {
+            let id = reference.object_id();
             let input_object = store
-                .read_object(id)
+                .read_object(&id)
                 .expect("Failed to access store")
                 .unwrap_or_else(|| panic!("Unknown object {id}"));
 
             let output_object = Self::update_object_with_version(input_object, next_version);
-            new_state.insert(*id, output_object);
+            new_state.insert(id, output_object);
         }
 
         let updates = TpccTransactionEffects {
@@ -550,8 +558,9 @@ impl Executor for TpccExecutor {
         store: Arc<Self::Store>,
         transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
-        for id in &transaction.input_ids {
-            if store.read_object(id).ok().flatten().is_none() {
+        for reference in &transaction.inputs {
+            let id = reference.object_id();
+            if store.read_object(&id).ok().flatten().is_none() {
                 return false;
             }
         }
@@ -653,7 +662,7 @@ mod tests {
         };
 
         let exec_txn = TpccExecutableTransaction::new(txn);
-        assert!(!exec_txn.input_ids.is_empty());
+        assert!(!exec_txn.inputs.is_empty());
         assert!(!exec_txn.shared_object_ids().is_empty());
     }
 
