@@ -332,7 +332,6 @@ where
             // check the version ID for shared objects
             // skip if versions don't match
 
-            let now = std::time::Instant::now();
             let ready_to_execute =
                 !transaction.input_objects().iter().any(|input_object| {
                     matches!(
@@ -364,8 +363,6 @@ where
                 ExecutionResults::<E>::new(transaction.deref().clone(), None, None)
             };
 
-            let elapsed = now.elapsed();
-            tracing::info!("Execution time: {}", elapsed.as_micros());
             tracing::debug!(
                 "Proxy {} completed execution for transaction {:?}, success: {}",
                 id,

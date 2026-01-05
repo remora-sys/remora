@@ -415,13 +415,13 @@ impl TpccExecutor {
         let warehouse = state.warehouses.get(&w_id).expect("Warehouse not found");
         let w_tax = warehouse.w_tax;
 
-        // 2. Read district tax and next_o_id
+        // 2. Read district tax (FastIds: order ID now comes from atomic counter)
         let district = state
             .districts
             .get(&(w_id, d_id))
             .expect("District not found");
         let d_tax = district.d_tax;
-        let _o_id = district.d_next_o_id;
+        let _o_id = state.next_order_id(w_id, d_id); // FastIds optimization
 
         // 3. Read customer discount
         let customer = state

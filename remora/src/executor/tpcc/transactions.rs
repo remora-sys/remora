@@ -120,12 +120,15 @@ impl TpccTransaction {
     pub fn write_set(&self) -> Vec<ObjectID> {
         match self {
             TpccTransaction::NewOrder {
-                w_id, d_id, items, ..
+                w_id: _,
+                d_id: _,
+                items,
+                ..
             } => {
                 let mut writes = Vec::new();
 
-                // Write district (increment next_o_id)
-                writes.push(TpccState::object_id_for_district(*w_id, *d_id));
+                // Note: District is no longer in write set due to FastIds optimization.
+                // Order IDs are generated via atomic counters, not by updating d_next_o_id.
 
                 // Write stock for each order line
                 for item in items {
@@ -194,8 +197,15 @@ mod tests {
         // Reads: warehouse, district, customer, 2 items, 2 stocks = 7
         assert_eq!(reads.len(), 7);
 
-        // Writes: district, 2 stocks = 3
-        assert_eq!(writes.len(), 3);
+        // Writes: 2 stocks = 2 (FastIds: district no longer in write set)
+        assert_eq!(writes.len(), 2);
+
+        // Verify district is NOT in write set (FastIds optimization)
+        let district_id = TpccState::object_id_for_district(1, 1);
+        assert!(
+            !writes.contains(&district_id),
+            "District should not be in write set due to FastIds"
+        );
     }
 
     #[test]
