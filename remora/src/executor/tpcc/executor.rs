@@ -580,14 +580,41 @@ impl Executor for TpccExecutor {
         let total_txns = config.load * config.duration.as_secs();
 
         async move {
-            let mut generator = super::generator::TpccGenerator::new(num_warehouses, 0);
+            // Parallelize transaction generation across multiple tasks
+            const NUM_GENERATOR_TASKS: u64 = 16;
+            let chunk_size = (total_txns + NUM_GENERATOR_TASKS - 1) / NUM_GENERATOR_TASKS;
 
-            (0..total_txns)
-                .map(|_| {
-                    let txn = generator.generate_transaction();
-                    TpccExecutableTransaction::new(txn)
+            let handles: Vec<_> = (0..NUM_GENERATOR_TASKS)
+                .map(|task_id| {
+                    let start_idx = task_id * chunk_size;
+                    let end_idx = ((task_id + 1) * chunk_size).min(total_txns);
+                    let count = end_idx.saturating_sub(start_idx);
+
+                    tokio::task::spawn_blocking(move || {
+                        // Each task gets a unique seed derived from task_id for reproducibility
+                        let mut generator =
+                            super::generator::TpccGenerator::new(num_warehouses, task_id);
+
+                        (0..count)
+                            .map(|_| {
+                                let txn = generator.generate_transaction();
+                                TpccExecutableTransaction::new(txn)
+                            })
+                            .collect::<Vec<_>>()
+                    })
                 })
-                .collect()
+                .collect();
+
+            // Join all tasks and flatten results
+            let mut transactions = Vec::with_capacity(total_txns as usize);
+            for handle in handles {
+                match handle.await {
+                    Ok(chunk) => transactions.extend(chunk),
+                    Err(e) => tracing::error!("Transaction generation task failed: {:?}", e),
+                }
+            }
+
+            transactions
         }
     }
 
