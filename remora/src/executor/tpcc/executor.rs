@@ -6,10 +6,12 @@
 //! Provides a standalone executor for TPC-C NEW_ORDER and PAYMENT transactions
 //! with real business logic execution.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use dashmap::DashMap;
 
 use serde::{Deserialize, Serialize};
 use sui_types::base_types::{ObjectID, SequenceNumber};
@@ -211,19 +213,18 @@ impl TransactionEffectsAPI for TpccTransactionEffects {
 /// Object store for TPC-C transactions
 #[derive(Clone)]
 pub struct TpccObjectStore {
-    objects: Arc<RwLock<HashMap<ObjectID, Object>>>,
+    objects: Arc<DashMap<ObjectID, Object>>,
 }
 
 impl TpccObjectStore {
     pub fn new() -> Self {
         Self {
-            objects: Arc::new(RwLock::new(HashMap::new())),
+            objects: Arc::new(DashMap::new()),
         }
     }
 
     pub fn write_object(&self, object: Object) {
-        let mut objects = self.objects.write().unwrap();
-        objects.insert(object.id(), object);
+        self.objects.insert(object.id(), object);
     }
 }
 
@@ -238,8 +239,7 @@ impl StateStore<TpccTransactionEffects> for TpccObjectStore {
         &self,
         id: &ObjectID,
     ) -> Result<Option<Object>, sui_types::storage::error::Error> {
-        let objects = self.objects.read().unwrap();
-        Ok(objects.get(id).cloned())
+        Ok(self.objects.get(id).map(|r| r.value().clone()))
     }
 
     fn commit_objects(
@@ -247,16 +247,14 @@ impl StateStore<TpccTransactionEffects> for TpccObjectStore {
         _updates: TpccTransactionEffects,
         new_state: BTreeMap<ObjectID, Object>,
     ) {
-        let mut objects = self.objects.write().unwrap();
         for (id, object) in new_state {
-            objects.insert(id, object);
+            self.objects.insert(id, object);
         }
     }
 
     fn commit_new_objects(&self, new_state: BTreeMap<ObjectID, Object>) {
-        let mut objects = self.objects.write().unwrap();
         for (id, object) in new_state {
-            objects.insert(id, object);
+            self.objects.insert(id, object);
         }
     }
 }
@@ -296,7 +294,7 @@ pub struct TpccExecutor {
 impl TpccExecutor {
     pub async fn new(config: &BenchmarkParameters) -> Self {
         let num_warehouses = match &config.workload {
-            WorkloadType::Tpcc { num_warehouses } => *num_warehouses,
+            WorkloadType::Tpcc { num_warehouses, .. } => *num_warehouses,
             _ => panic!("TpccExecutor requires Tpcc workload type"),
         };
 
@@ -572,9 +570,12 @@ impl Executor for TpccExecutor {
         config: &BenchmarkParameters,
         _working_directory: Option<PathBuf>,
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send {
-        let num_warehouses = match &config.workload {
-            WorkloadType::Tpcc { num_warehouses } => *num_warehouses,
-            _ => 1,
+        let (num_warehouses, payment_ratio) = match &config.workload {
+            WorkloadType::Tpcc {
+                num_warehouses,
+                payment_ratio,
+            } => (*num_warehouses, *payment_ratio),
+            _ => (1, 0.5),
         };
 
         let total_txns = config.load * config.duration.as_secs();
@@ -592,8 +593,11 @@ impl Executor for TpccExecutor {
 
                     tokio::task::spawn_blocking(move || {
                         // Each task gets a unique seed derived from task_id for reproducibility
-                        let mut generator =
-                            super::generator::TpccGenerator::new(num_warehouses, task_id);
+                        let mut generator = super::generator::TpccGenerator::new(
+                            num_warehouses,
+                            payment_ratio,
+                            task_id,
+                        );
 
                         (0..count)
                             .map(|_| {

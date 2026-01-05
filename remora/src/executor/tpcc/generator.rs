@@ -17,24 +17,27 @@ use super::transactions::{OrderItem, TpccTransaction};
 /// Generates TPC-C transactions following the specification
 pub struct TpccGenerator {
     num_warehouses: usize,
+    /// Ratio of PAYMENT transactions (0.0 = all NEW_ORDER, 1.0 = all PAYMENT)
+    payment_ratio: f64,
     rng: StdRng,
 }
 
 impl TpccGenerator {
     /// Create a new TPC-C generator
-    pub fn new(num_warehouses: usize, seed: u64) -> Self {
+    pub fn new(num_warehouses: usize, payment_ratio: f64, seed: u64) -> Self {
         Self {
             num_warehouses,
+            payment_ratio,
             rng: StdRng::seed_from_u64(seed),
         }
     }
 
-    /// Generate a random transaction following TPC-C mix (50% NEW_ORDER, 50% PAYMENT)
+    /// Generate a random transaction following configured payment ratio
     pub fn generate_transaction(&mut self) -> TpccTransaction {
-        if self.rng.gen_bool(0.5) {
-            self.generate_new_order()
-        } else {
+        if self.rng.gen_bool(self.payment_ratio) {
             self.generate_payment()
+        } else {
+            self.generate_new_order()
         }
     }
 
@@ -137,13 +140,13 @@ mod tests {
 
     #[test]
     fn test_generator_creation() {
-        let generator = TpccGenerator::new(2, 42);
+        let generator = TpccGenerator::new(2, 0.5, 42);
         assert_eq!(generator.num_warehouses, 2);
     }
 
     #[test]
     fn test_transaction_mix() {
-        let mut generator = TpccGenerator::new(1, 42);
+        let mut generator = TpccGenerator::new(1, 0.5, 42);
         let mut new_order_count = 0;
         let mut _payment_count = 0;
 
@@ -161,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_new_order_generation() {
-        let mut generator = TpccGenerator::new(1, 42);
+        let mut generator = TpccGenerator::new(1, 0.5, 42);
         let txn = generator.generate_new_order();
 
         match txn {
@@ -182,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_payment_generation() {
-        let mut generator = TpccGenerator::new(1, 42);
+        let mut generator = TpccGenerator::new(1, 0.5, 42);
         let txn = generator.generate_payment();
 
         match txn {
