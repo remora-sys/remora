@@ -5,6 +5,7 @@
 //!
 //! Maps TPC-C tables to Remora's Object model with deterministic ObjectIDs.
 
+use dashmap::DashMap;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,14 +78,15 @@ pub struct Item {
 // =============================================================================
 
 /// Complete TPC-C database state for a given number of warehouses.
+/// Uses DashMap for concurrent mutable access during transaction execution.
 #[derive(Clone, Debug)]
 pub struct TpccState {
     pub num_warehouses: usize,
-    pub warehouses: HashMap<u32, Warehouse>,
-    pub districts: HashMap<(u32, u32), District>,
-    pub customers: HashMap<(u32, u32, u32), Customer>,
-    pub stock: HashMap<(u32, u32), Stock>,
-    pub items: HashMap<u32, Item>,
+    pub warehouses: DashMap<u32, Warehouse>,
+    pub districts: DashMap<(u32, u32), District>,
+    pub customers: DashMap<(u32, u32, u32), Customer>,
+    pub stock: DashMap<(u32, u32), Stock>,
+    pub items: HashMap<u32, Item>, // Items are read-only, no need for DashMap
     /// Per-district atomic counters for order IDs (FastIds optimization)
     /// Key: (warehouse_id, district_id) -> atomic counter
     order_id_counters: HashMap<(u32, u32), Arc<AtomicU32>>,
@@ -96,10 +98,10 @@ impl TpccState {
         let mut rng = StdRng::seed_from_u64(42);
         let mut state = Self {
             num_warehouses,
-            warehouses: HashMap::new(),
-            districts: HashMap::new(),
-            customers: HashMap::new(),
-            stock: HashMap::new(),
+            warehouses: DashMap::new(),
+            districts: DashMap::new(),
+            customers: DashMap::new(),
+            stock: DashMap::new(),
             items: HashMap::new(),
             order_id_counters: HashMap::new(),
         };
@@ -263,24 +265,24 @@ impl TpccState {
     /// Get all district ObjectIDs
     pub fn all_district_ids(&self) -> Vec<ObjectID> {
         self.districts
-            .keys()
-            .map(|(w_id, d_id)| Self::object_id_for_district(*w_id, *d_id))
+            .iter()
+            .map(|entry| Self::object_id_for_district(entry.key().0, entry.key().1))
             .collect()
     }
 
     /// Get all customer ObjectIDs
     pub fn all_customer_ids(&self) -> Vec<ObjectID> {
         self.customers
-            .keys()
-            .map(|(w_id, d_id, c_id)| Self::object_id_for_customer(*w_id, *d_id, *c_id))
+            .iter()
+            .map(|entry| Self::object_id_for_customer(entry.key().0, entry.key().1, entry.key().2))
             .collect()
     }
 
     /// Get all stock ObjectIDs
     pub fn all_stock_ids(&self) -> Vec<ObjectID> {
         self.stock
-            .keys()
-            .map(|(w_id, i_id)| Self::object_id_for_stock(*w_id, *i_id))
+            .iter()
+            .map(|entry| Self::object_id_for_stock(entry.key().0, entry.key().1))
             .collect()
     }
 

@@ -369,15 +369,9 @@ impl TpccExecutor {
     fn update_object_with_version(input: Object, version: SequenceNumber) -> Object {
         let id = input.id();
         let obj = MoveObject::new_gas_coin(version, id, 10);
-        // Preserve the original initial_shared_version for shared objects
         let owner = if input.is_shared() {
-            match input.as_inner().owner {
-                Owner::Shared {
-                    initial_shared_version,
-                } => Owner::Shared {
-                    initial_shared_version,
-                },
-                _ => unreachable!("is_shared() returned true but owner is not Shared"),
+            Owner::Shared {
+                initial_shared_version: version,
             }
         } else {
             input
@@ -389,12 +383,8 @@ impl TpccExecutor {
         Object::new_move(obj, owner, TransactionDigest::genesis_marker())
     }
 
-    /// Execute TPC-C business logic
-    fn execute_tpcc_logic(
-        state: &TpccState,
-        txn: &TpccTransaction,
-        _modified_objects: &mut BTreeMap<ObjectID, Object>,
-    ) {
+    /// Execute TPC-C business logic and commit state changes
+    fn execute_tpcc_logic(state: &TpccState, txn: &TpccTransaction) {
         match txn {
             TpccTransaction::NewOrder {
                 w_id,
@@ -419,49 +409,59 @@ impl TpccExecutor {
 
     fn execute_new_order(state: &TpccState, w_id: u32, d_id: u32, c_id: u32, items: &[OrderItem]) {
         // 1. Read warehouse tax rate
-        let warehouse = state.warehouses.get(&w_id).expect("Warehouse not found");
-        let w_tax = warehouse.w_tax;
+        let w_tax = state
+            .warehouses
+            .get(&w_id)
+            .expect("Warehouse not found")
+            .w_tax;
 
         // 2. Read district tax (FastIds: order ID now comes from atomic counter)
-        let district = state
+        let d_tax = state
             .districts
             .get(&(w_id, d_id))
-            .expect("District not found");
-        let d_tax = district.d_tax;
+            .expect("District not found")
+            .d_tax;
         let _o_id = state.next_order_id(w_id, d_id); // FastIds optimization
 
         // 3. Read customer discount
-        let customer = state
+        let c_discount = state
             .customers
             .get(&(w_id, d_id, c_id))
-            .expect("Customer not found");
-        let c_discount = customer.c_discount;
+            .expect("Customer not found")
+            .c_discount;
 
-        // 4. Process each item
+        // 4. Process each item and update stock
         let mut total = 0.0;
         for order_item in items {
-            let item = state.items.get(&order_item.i_id).expect("Item not found");
-            let i_price = item.i_price;
+            let i_price = state
+                .items
+                .get(&order_item.i_id)
+                .expect("Item not found")
+                .i_price;
 
-            let stock = state
+            // Update stock quantity (mutable access via DashMap)
+            let mut stock = state
                 .stock
-                .get(&(order_item.supply_w_id, order_item.i_id))
+                .get_mut(&(order_item.supply_w_id, order_item.i_id))
                 .expect("Stock not found");
 
             // TPC-C stock update logic
-            let mut s_quantity = stock.s_quantity;
-            if s_quantity >= order_item.quantity as i32 + 10 {
-                s_quantity -= order_item.quantity as i32;
+            if stock.s_quantity >= order_item.quantity as i32 + 10 {
+                stock.s_quantity -= order_item.quantity as i32;
             } else {
-                s_quantity += 91 - order_item.quantity as i32;
+                stock.s_quantity += 91 - order_item.quantity as i32;
             }
-            let _ = s_quantity; // Updated value (would be written in real impl)
+            stock.s_ytd += order_item.quantity as u32;
+            stock.s_order_cnt += 1;
+            if order_item.supply_w_id != w_id {
+                stock.s_remote_cnt += 1;
+            }
 
             let ol_amount = i_price * order_item.quantity as f64;
             total += ol_amount;
         }
 
-        // 5. Apply tax and discount
+        // 5. Apply tax and discount (result computed for correctness)
         let _final_total = total * (1.0 - c_discount) * (1.0 + w_tax + d_tax);
     }
 
@@ -475,24 +475,33 @@ impl TpccExecutor {
         h_amount: f64,
     ) {
         // 1. Update warehouse YTD
-        let warehouse = state.warehouses.get(&w_id).expect("Warehouse not found");
-        let _w_ytd = warehouse.w_ytd + h_amount;
+        {
+            let mut warehouse = state
+                .warehouses
+                .get_mut(&w_id)
+                .expect("Warehouse not found");
+            warehouse.w_ytd += h_amount;
+        }
 
         // 2. Update district YTD
-        let district = state
-            .districts
-            .get(&(w_id, d_id))
-            .expect("District not found");
-        let _d_ytd = district.d_ytd + h_amount;
+        {
+            let mut district = state
+                .districts
+                .get_mut(&(w_id, d_id))
+                .expect("District not found");
+            district.d_ytd += h_amount;
+        }
 
-        // 3. Update customer
-        let customer = state
-            .customers
-            .get(&(c_w_id, c_d_id, c_id))
-            .expect("Customer not found");
-        let _c_balance = customer.c_balance - h_amount;
-        let _c_ytd_payment = customer.c_ytd_payment + h_amount;
-        let _c_payment_cnt = customer.c_payment_cnt + 1;
+        // 3. Update customer balance and payment info
+        {
+            let mut customer = state
+                .customers
+                .get_mut(&(c_w_id, c_d_id, c_id))
+                .expect("Customer not found");
+            customer.c_balance -= h_amount;
+            customer.c_ytd_payment += h_amount;
+            customer.c_payment_cnt += 1;
+        }
     }
 }
 
@@ -512,9 +521,8 @@ impl Executor for TpccExecutor {
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
     {
-        // Execute TPC-C business logic
-        let mut tpcc_modified = BTreeMap::new();
-        Self::execute_tpcc_logic(&ctx.tpcc_state, &transaction.txn, &mut tpcc_modified);
+        // Execute TPC-C business logic (CPU work simulation)
+        Self::execute_tpcc_logic(&ctx.tpcc_state, &transaction.txn);
 
         let mut modified_at_versions = Vec::new();
         let mut new_state = BTreeMap::new();
@@ -560,7 +568,29 @@ impl Executor for TpccExecutor {
     ) -> bool {
         for reference in &transaction.inputs {
             let id = reference.object_id();
-            if store.read_object(&id).ok().flatten().is_none() {
+            if let Some(object) = store.read_object(&id).ok().flatten() {
+                // Check shared object version matches expected version
+                if let InputObjectKind::SharedMoveObject { .. } = reference {
+                    if let Some((_, version)) = transaction
+                        .shared_objects
+                        .iter()
+                        .find(|(obj_id, _)| *obj_id == &id)
+                    {
+                        if let Some(expected_version) = version {
+                            if object.version() != *expected_version {
+                                tracing::debug!(
+                                    "Version mismatch for object {:?}: expected {:?}, actual {:?}",
+                                    id,
+                                    expected_version,
+                                    object.version()
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!("Object {:?} not found in store", id);
                 return false;
             }
         }
