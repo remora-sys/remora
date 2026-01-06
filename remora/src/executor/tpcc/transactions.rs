@@ -56,8 +56,8 @@ pub enum TpccTransaction {
         c_d_id: u32,
         /// Customer ID
         c_id: u32,
-        /// Payment amount
-        h_amount: f64,
+        /// Payment amount (cents)
+        h_amount: i64,
     },
 }
 
@@ -120,15 +120,15 @@ impl TpccTransaction {
     pub fn write_set(&self) -> Vec<ObjectID> {
         match self {
             TpccTransaction::NewOrder {
-                w_id: _,
-                d_id: _,
+                w_id,
+                d_id,
                 items,
                 ..
             } => {
                 let mut writes = Vec::new();
 
-                // Note: District is no longer in write set due to FastIds optimization.
-                // Order IDs are generated via atomic counters, not by updating d_next_o_id.
+                // District next order ID is updated as part of NEW_ORDER.
+                writes.push(TpccState::object_id_for_district(*w_id, *d_id));
 
                 // Write stock for each order line
                 for item in items {
@@ -197,14 +197,14 @@ mod tests {
         // Reads: warehouse, district, customer, 2 items, 2 stocks = 7
         assert_eq!(reads.len(), 7);
 
-        // Writes: 2 stocks = 2 (FastIds: district no longer in write set)
-        assert_eq!(writes.len(), 2);
+        // Writes: district + 2 stocks = 3
+        assert_eq!(writes.len(), 3);
 
-        // Verify district is NOT in write set (FastIds optimization)
+        // Verify district is in write set
         let district_id = TpccState::object_id_for_district(1, 1);
         assert!(
-            !writes.contains(&district_id),
-            "District should not be in write set due to FastIds"
+            writes.contains(&district_id),
+            "District should be in write set"
         );
     }
 
@@ -216,7 +216,7 @@ mod tests {
             c_w_id: 1,
             c_d_id: 1,
             c_id: 100,
-            h_amount: 100.0,
+            h_amount: 10_000,
         };
 
         let reads = txn.read_set();
@@ -237,7 +237,7 @@ mod tests {
             c_w_id: 1,
             c_d_id: 1,
             c_id: 100,
-            h_amount: 100.0,
+            h_amount: 10_000,
         };
 
         let access = txn.access_set();

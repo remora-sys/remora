@@ -13,13 +13,15 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::execution_status::ExecutionStatus;
 use sui_types::gas::GasCostSummary;
-use sui_types::object::{MoveObject, Object, Owner};
+use sui_types::object::{Object, Owner};
 use sui_types::transaction::InputObjectKind;
 
 use crate::config::{BenchmarkParameters, WorkloadType};
@@ -30,7 +32,10 @@ use crate::executor::api::{
 use crate::executor::calibration::Calibration;
 
 use super::constants::*;
-use super::data::TpccState;
+use super::data::{
+    decode_tpcc_data, encode_tpcc_object, Customer, District, Item, Stock, TpccObjectKind,
+    TpccState, Warehouse,
+};
 use super::transactions::{OrderItem, TpccTransaction};
 
 // =============================================================================
@@ -272,16 +277,13 @@ impl StateStore<TpccTransactionEffects> for TpccObjectStore {
 
 /// Execution context for TPC-C transactions
 pub struct TpccExecutionContext {
-    /// TPC-C database state for real execution
-    pub tpcc_state: TpccState,
     /// Verification spins for signature verification simulation
     pub verification_spins: u64,
 }
 
 impl TpccExecutionContext {
-    pub fn new(num_warehouses: usize, verification_duration: std::time::Duration) -> Self {
+    pub fn new(verification_duration: std::time::Duration) -> Self {
         Self {
-            tpcc_state: TpccState::new(num_warehouses),
             verification_spins: Calibration::calibrate(verification_duration),
         }
     }
@@ -305,7 +307,7 @@ impl TpccExecutor {
             _ => panic!("TpccExecutor requires Tpcc workload type"),
         };
 
-        let ctx = TpccExecutionContext::new(num_warehouses, config.verification_duration);
+        let ctx = TpccExecutionContext::new(config.verification_duration);
         let store = Arc::new(TpccObjectStore::new());
 
         // Initialize store with TPC-C objects
@@ -318,57 +320,113 @@ impl TpccExecutor {
     }
 
     fn init_objects(store: &TpccObjectStore, num_warehouses: usize) {
-        // Warehouses
+        let version = SequenceNumber::from_u64(2);
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Items (shared across all warehouses)
+        for i_id in 1..=NUM_ITEMS as u32 {
+            let item = Item {
+                i_id,
+                i_price: rng.gen_range(MIN_PRICE_CENTS..=MAX_PRICE_CENTS),
+                i_name: format!("Item_{}", i_id),
+                i_data: format!("ItemData_{}", i_id),
+            };
+            let id = TpccState::object_id_for_item(i_id);
+            store.write_object(encode_tpcc_object(
+                id,
+                version,
+                TpccObjectKind::Item,
+                item,
+            ));
+        }
+
         for w_id in 1..=num_warehouses as u32 {
+            // Warehouse
+            let warehouse = Warehouse {
+                w_id,
+                w_ytd: INITIAL_W_YTD_CENTS,
+                w_tax: rng.gen_range(MIN_TAX_BPS..=MAX_TAX_BPS),
+                w_name: format!("Warehouse_{}", w_id),
+            };
             let id = TpccState::object_id_for_warehouse(w_id);
-            store.write_object(Self::create_shared_object(id));
-        }
+            store.write_object(encode_tpcc_object(
+                id,
+                version,
+                TpccObjectKind::Warehouse,
+                warehouse,
+            ));
 
-        // Districts
-        for w_id in 1..=num_warehouses as u32 {
+            // Districts + Customers
             for d_id in 1..=DISTRICTS_PER_WAREHOUSE as u32 {
+                let district = District {
+                    d_id,
+                    d_w_id: w_id,
+                    d_ytd: INITIAL_D_YTD_CENTS,
+                    d_tax: rng.gen_range(MIN_TAX_BPS..=MAX_TAX_BPS),
+                    d_next_o_id: INITIAL_NEXT_O_ID,
+                    d_name: format!("District_{}_{}", w_id, d_id),
+                };
                 let id = TpccState::object_id_for_district(w_id, d_id);
-                store.write_object(Self::create_shared_object(id));
-            }
-        }
+                store.write_object(encode_tpcc_object(
+                    id,
+                    version,
+                    TpccObjectKind::District,
+                    district,
+                ));
 
-        // Customers
-        for w_id in 1..=num_warehouses as u32 {
-            for d_id in 1..=DISTRICTS_PER_WAREHOUSE as u32 {
                 for c_id in 1..=CUSTOMERS_PER_DISTRICT as u32 {
+                    let customer = Customer {
+                        c_id,
+                        c_d_id: d_id,
+                        c_w_id: w_id,
+                        c_balance: INITIAL_BALANCE_CENTS,
+                        c_ytd_payment: INITIAL_YTD_PAYMENT_CENTS,
+                        c_payment_cnt: INITIAL_PAYMENT_CNT,
+                        c_discount: rng.gen_range(MIN_DISCOUNT_BPS..=MAX_DISCOUNT_BPS),
+                        c_first: format!("First_{}", c_id),
+                        c_last: format!("Last_{}", c_id),
+                    };
                     let id = TpccState::object_id_for_customer(w_id, d_id, c_id);
-                    store.write_object(Self::create_shared_object(id));
+                    store.write_object(encode_tpcc_object(
+                        id,
+                        version,
+                        TpccObjectKind::Customer,
+                        customer,
+                    ));
                 }
             }
-        }
 
-        // Stock
-        for w_id in 1..=num_warehouses as u32 {
+            // Stock
             for i_id in 1..=STOCK_PER_WAREHOUSE as u32 {
+                let stock = Stock {
+                    s_i_id: i_id,
+                    s_w_id: w_id,
+                    s_quantity: rng.gen_range(MIN_QUANTITY..=MAX_QUANTITY),
+                    s_ytd: 0,
+                    s_order_cnt: 0,
+                    s_remote_cnt: 0,
+                };
                 let id = TpccState::object_id_for_stock(w_id, i_id);
-                store.write_object(Self::create_shared_object(id));
+                store.write_object(encode_tpcc_object(
+                    id,
+                    version,
+                    TpccObjectKind::Stock,
+                    stock,
+                ));
             }
         }
-
-        // Items
-        for i_id in 1..=NUM_ITEMS as u32 {
-            let id = TpccState::object_id_for_item(i_id);
-            store.write_object(Self::create_shared_object(id));
-        }
     }
 
-    fn create_shared_object(id: ObjectID) -> Object {
-        let version = SequenceNumber::from_u64(2);
-        let obj = MoveObject::new_gas_coin(version, id, 10);
-        let owner = Owner::Shared {
-            initial_shared_version: version,
-        };
-        Object::new_move(obj, owner, TransactionDigest::genesis_marker())
-    }
+    fn update_object_with_version(input: &Object, version: SequenceNumber) -> Object {
+        let move_obj = input
+            .as_inner()
+            .data
+            .try_as_move()
+            .expect("TPCC object must be a Move object")
+            .clone();
+        let mut updated = move_obj.clone();
+        updated.increment_version_to(version);
 
-    fn update_object_with_version(input: Object, version: SequenceNumber) -> Object {
-        let id = input.id();
-        let obj = MoveObject::new_gas_coin(version, id, 10);
         let owner = if input.is_shared() {
             Owner::Shared {
                 initial_shared_version: version,
@@ -380,20 +438,50 @@ impl TpccExecutor {
                 .expect("Should be single owner")
                 .0
         };
-        Object::new_move(obj, owner, TransactionDigest::genesis_marker())
+        Object::new_move(updated, owner, TransactionDigest::genesis_marker())
     }
 
-    /// Execute TPC-C business logic and commit state changes
-    fn execute_tpcc_logic(state: &TpccState, txn: &TpccTransaction) {
+    fn get_object(
+        store: &TpccObjectStore,
+        cache: &mut BTreeMap<ObjectID, Object>,
+        id: ObjectID,
+    ) -> Object {
+        if let Some(object) = cache.get(&id) {
+            return object.clone();
+        }
+
+        let object = store
+            .read_object(&id)
+            .expect("Failed to access store")
+            .unwrap_or_else(|| panic!("Unknown object {id}"));
+        cache.insert(id, object.clone());
+        object
+    }
+
+    fn read_tpcc_data<T: DeserializeOwned>(
+        store: &TpccObjectStore,
+        cache: &mut BTreeMap<ObjectID, Object>,
+        id: ObjectID,
+        kind: TpccObjectKind,
+    ) -> T {
+        let object = Self::get_object(store, cache, id);
+        decode_tpcc_data(&object, kind)
+    }
+
+    /// Execute TPC-C business logic and return updated objects.
+    fn execute_tpcc_logic(
+        store: &TpccObjectStore,
+        txn: &TpccTransaction,
+        next_version: SequenceNumber,
+        cache: &mut BTreeMap<ObjectID, Object>,
+    ) -> BTreeMap<ObjectID, Object> {
         match txn {
             TpccTransaction::NewOrder {
                 w_id,
                 d_id,
                 c_id,
                 items,
-            } => {
-                Self::execute_new_order(state, *w_id, *d_id, *c_id, items);
-            }
+            } => Self::execute_new_order(store, cache, next_version, *w_id, *d_id, *c_id, items),
             TpccTransaction::Payment {
                 w_id,
                 d_id,
@@ -401,107 +489,182 @@ impl TpccExecutor {
                 c_d_id,
                 c_id,
                 h_amount,
-            } => {
-                Self::execute_payment(state, *w_id, *d_id, *c_w_id, *c_d_id, *c_id, *h_amount);
-            }
+            } => Self::execute_payment(
+                store,
+                cache,
+                next_version,
+                *w_id,
+                *d_id,
+                *c_w_id,
+                *c_d_id,
+                *c_id,
+                *h_amount,
+            ),
         }
     }
 
-    fn execute_new_order(state: &TpccState, w_id: u32, d_id: u32, c_id: u32, items: &[OrderItem]) {
-        // 1. Read warehouse tax rate
-        let w_tax = state
-            .warehouses
-            .get(&w_id)
-            .expect("Warehouse not found")
-            .w_tax;
+    fn execute_new_order(
+        store: &TpccObjectStore,
+        cache: &mut BTreeMap<ObjectID, Object>,
+        next_version: SequenceNumber,
+        w_id: u32,
+        d_id: u32,
+        c_id: u32,
+        items: &[OrderItem],
+    ) -> BTreeMap<ObjectID, Object> {
+        let warehouse_id = TpccState::object_id_for_warehouse(w_id);
+        let warehouse: Warehouse = Self::read_tpcc_data(
+            store,
+            cache,
+            warehouse_id,
+            TpccObjectKind::Warehouse,
+        );
+        let w_tax = warehouse.w_tax;
 
-        // 2. Read district tax (FastIds: order ID now comes from atomic counter)
-        let d_tax = state
-            .districts
-            .get(&(w_id, d_id))
-            .expect("District not found")
-            .d_tax;
-        let _o_id = state.next_order_id(w_id, d_id); // FastIds optimization
+        let district_id = TpccState::object_id_for_district(w_id, d_id);
+        let mut district: District = Self::read_tpcc_data(
+            store,
+            cache,
+            district_id,
+            TpccObjectKind::District,
+        );
+        let d_tax = district.d_tax;
+        district.d_next_o_id += 1;
 
-        // 3. Read customer discount
-        let c_discount = state
-            .customers
-            .get(&(w_id, d_id, c_id))
-            .expect("Customer not found")
-            .c_discount;
+        let customer_id = TpccState::object_id_for_customer(w_id, d_id, c_id);
+        let customer: Customer = Self::read_tpcc_data(
+            store,
+            cache,
+            customer_id,
+            TpccObjectKind::Customer,
+        );
+        let c_discount = customer.c_discount;
 
-        // 4. Process each item and update stock
-        let mut total = 0.0;
+        let mut total_cents: i64 = 0;
+        let mut stock_updates: BTreeMap<ObjectID, Stock> = BTreeMap::new();
+
         for order_item in items {
-            let i_price = state
-                .items
-                .get(&order_item.i_id)
-                .expect("Item not found")
-                .i_price;
+            let item_id = TpccState::object_id_for_item(order_item.i_id);
+            let item: Item =
+                Self::read_tpcc_data(store, cache, item_id, TpccObjectKind::Item);
+            let i_price_cents = item.i_price as i64;
 
-            // Update stock quantity (mutable access via DashMap)
-            let mut stock = state
-                .stock
-                .get_mut(&(order_item.supply_w_id, order_item.i_id))
-                .expect("Stock not found");
+            let stock_id =
+                TpccState::object_id_for_stock(order_item.supply_w_id, order_item.i_id);
+            let stock_entry = stock_updates.entry(stock_id).or_insert_with(|| {
+                Self::read_tpcc_data(store, cache, stock_id, TpccObjectKind::Stock)
+            });
 
-            // TPC-C stock update logic
-            if stock.s_quantity >= order_item.quantity as i32 + 10 {
-                stock.s_quantity -= order_item.quantity as i32;
+            if stock_entry.s_quantity >= order_item.quantity as i32 + 10 {
+                stock_entry.s_quantity -= order_item.quantity as i32;
             } else {
-                stock.s_quantity += 91 - order_item.quantity as i32;
+                stock_entry.s_quantity += 91 - order_item.quantity as i32;
             }
-            stock.s_ytd += order_item.quantity as u32;
-            stock.s_order_cnt += 1;
+            stock_entry.s_ytd += order_item.quantity as u32;
+            stock_entry.s_order_cnt += 1;
             if order_item.supply_w_id != w_id {
-                stock.s_remote_cnt += 1;
+                stock_entry.s_remote_cnt += 1;
             }
 
-            let ol_amount = i_price * order_item.quantity as f64;
-            total += ol_amount;
+            let ol_amount_cents = i_price_cents * order_item.quantity as i64;
+            total_cents += ol_amount_cents;
         }
 
-        // 5. Apply tax and discount (result computed for correctness)
-        let _final_total = total * (1.0 - c_discount) * (1.0 + w_tax + d_tax);
+        let discount_factor = RATE_SCALE as i128 - c_discount as i128;
+        let tax_factor = RATE_SCALE as i128 + w_tax as i128 + d_tax as i128;
+        let _final_total_cents = total_cents as i128 * discount_factor * tax_factor
+            / (RATE_SCALE as i128 * RATE_SCALE as i128);
+
+        let mut updated_objects = BTreeMap::new();
+        updated_objects.insert(
+            district_id,
+            encode_tpcc_object(
+                district_id,
+                next_version,
+                TpccObjectKind::District,
+                district,
+            ),
+        );
+        for (stock_id, stock) in stock_updates {
+            updated_objects.insert(
+                stock_id,
+                encode_tpcc_object(stock_id, next_version, TpccObjectKind::Stock, stock),
+            );
+        }
+
+        updated_objects
     }
 
     fn execute_payment(
-        state: &TpccState,
+        store: &TpccObjectStore,
+        cache: &mut BTreeMap<ObjectID, Object>,
+        next_version: SequenceNumber,
         w_id: u32,
         d_id: u32,
         c_w_id: u32,
         c_d_id: u32,
         c_id: u32,
-        h_amount: f64,
-    ) {
-        // 1. Update warehouse YTD
-        {
-            let mut warehouse = state
-                .warehouses
-                .get_mut(&w_id)
-                .expect("Warehouse not found");
-            warehouse.w_ytd += h_amount;
-        }
+        h_amount: i64,
+    ) -> BTreeMap<ObjectID, Object> {
+        let warehouse_id = TpccState::object_id_for_warehouse(w_id);
+        let mut warehouse: Warehouse = Self::read_tpcc_data(
+            store,
+            cache,
+            warehouse_id,
+            TpccObjectKind::Warehouse,
+        );
+        warehouse.w_ytd += h_amount;
 
-        // 2. Update district YTD
-        {
-            let mut district = state
-                .districts
-                .get_mut(&(w_id, d_id))
-                .expect("District not found");
-            district.d_ytd += h_amount;
-        }
+        let district_id = TpccState::object_id_for_district(w_id, d_id);
+        let mut district: District = Self::read_tpcc_data(
+            store,
+            cache,
+            district_id,
+            TpccObjectKind::District,
+        );
+        district.d_ytd += h_amount;
 
-        // 3. Update customer balance and payment info
-        {
-            let mut customer = state
-                .customers
-                .get_mut(&(c_w_id, c_d_id, c_id))
-                .expect("Customer not found");
-            customer.c_balance -= h_amount;
-            customer.c_ytd_payment += h_amount;
-            customer.c_payment_cnt += 1;
-        }
+        let customer_id = TpccState::object_id_for_customer(c_w_id, c_d_id, c_id);
+        let mut customer: Customer = Self::read_tpcc_data(
+            store,
+            cache,
+            customer_id,
+            TpccObjectKind::Customer,
+        );
+        customer.c_balance -= h_amount;
+        customer.c_ytd_payment += h_amount;
+        customer.c_payment_cnt += 1;
+
+        let mut updated_objects = BTreeMap::new();
+        updated_objects.insert(
+            warehouse_id,
+            encode_tpcc_object(
+                warehouse_id,
+                next_version,
+                TpccObjectKind::Warehouse,
+                warehouse,
+            ),
+        );
+        updated_objects.insert(
+            district_id,
+            encode_tpcc_object(
+                district_id,
+                next_version,
+                TpccObjectKind::District,
+                district,
+            ),
+        );
+        updated_objects.insert(
+            customer_id,
+            encode_tpcc_object(
+                customer_id,
+                next_version,
+                TpccObjectKind::Customer,
+                customer,
+            ),
+        );
+
+        updated_objects
     }
 }
 
@@ -516,14 +679,11 @@ impl Executor for TpccExecutor {
     }
 
     fn execute(
-        ctx: Arc<TpccExecutionContext>,
+        _ctx: Arc<TpccExecutionContext>,
         store: Arc<TpccObjectStore>,
         transaction: TransactionWithTimestamp<Self::Transaction>,
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
     {
-        // Execute TPC-C business logic (CPU work simulation)
-        Self::execute_tpcc_logic(&ctx.tpcc_state, &transaction.txn);
-
         let mut modified_at_versions = Vec::new();
         let mut new_state = BTreeMap::new();
 
@@ -540,15 +700,19 @@ impl Executor for TpccExecutor {
 
         let next_version = max_version.next();
 
+        let mut object_cache = BTreeMap::new();
+        let updated_objects =
+            Self::execute_tpcc_logic(&store, &transaction.txn, next_version, &mut object_cache);
+
         // Update all objects with consistent version (design choice: both reads and writes bump versions)
         for reference in &transaction.inputs {
             let id = reference.object_id();
-            let input_object = store
-                .read_object(&id)
-                .expect("Failed to access store")
-                .unwrap_or_else(|| panic!("Unknown object {id}"));
-
-            let output_object = Self::update_object_with_version(input_object, next_version);
+            let output_object = if let Some(updated) = updated_objects.get(&id) {
+                updated.clone()
+            } else {
+                let input_object = Self::get_object(&store, &mut object_cache, id);
+                Self::update_object_with_version(&input_object, next_version)
+            };
             new_state.insert(id, output_object);
         }
 
@@ -677,6 +841,7 @@ impl Executor for TpccExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sui_types::base_types::SequenceNumber;
 
     #[test]
     fn test_tpcc_executable_transaction() {
@@ -700,7 +865,18 @@ mod tests {
     fn test_tpcc_object_store() {
         let store = TpccObjectStore::new();
         let id = ObjectID::random();
-        let obj = TpccExecutor::create_shared_object(id);
+        let warehouse = Warehouse {
+            w_id: 1,
+            w_ytd: INITIAL_W_YTD_CENTS,
+            w_tax: MIN_TAX_BPS,
+            w_name: "Warehouse_1".to_string(),
+        };
+        let obj = encode_tpcc_object(
+            id,
+            SequenceNumber::from_u64(2),
+            TpccObjectKind::Warehouse,
+            warehouse,
+        );
 
         store.write_object(obj.clone());
         let read = store.read_object(&id).unwrap();
