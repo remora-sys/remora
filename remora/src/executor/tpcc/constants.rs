@@ -64,11 +64,20 @@ pub const REMOTE_CUSTOMER_PROB: f64 = 0.15;
 // Price and Amount Ranges
 // =============================================================================
 
+/// Fixed-point scale for monetary values (cents)
+pub const MONEY_SCALE: i64 = 100;
+
 /// Minimum item price
 pub const MIN_PRICE: f64 = 1.00;
 
 /// Maximum item price
 pub const MAX_PRICE: f64 = 100.00;
+
+/// Minimum item price (cents)
+pub const MIN_PRICE_CENTS: u32 = 100;
+
+/// Maximum item price (cents)
+pub const MAX_PRICE_CENTS: u32 = 10_000;
 
 /// Minimum payment amount
 pub const MIN_PAYMENT: f64 = 1.00;
@@ -76,9 +85,18 @@ pub const MIN_PAYMENT: f64 = 1.00;
 /// Maximum payment amount
 pub const MAX_PAYMENT: f64 = 5000.00;
 
+/// Minimum payment amount (cents)
+pub const MIN_PAYMENT_CENTS: i64 = 100;
+
+/// Maximum payment amount (cents)
+pub const MAX_PAYMENT_CENTS: i64 = 500_000;
+
 // =============================================================================
 // Tax and Discount Ranges
 // =============================================================================
+
+/// Fixed-point scale for rates (basis points)
+pub const RATE_SCALE: u32 = 10_000;
 
 /// Minimum tax rate
 pub const MIN_TAX: f64 = 0.0;
@@ -86,11 +104,23 @@ pub const MIN_TAX: f64 = 0.0;
 /// Maximum tax rate
 pub const MAX_TAX: f64 = 0.2;
 
+/// Minimum tax rate (basis points)
+pub const MIN_TAX_BPS: u32 = 0;
+
+/// Maximum tax rate (basis points)
+pub const MAX_TAX_BPS: u32 = 2_000;
+
 /// Minimum discount
 pub const MIN_DISCOUNT: f64 = 0.0;
 
 /// Maximum discount
 pub const MAX_DISCOUNT: f64 = 0.5;
+
+/// Minimum discount (basis points)
+pub const MIN_DISCOUNT_BPS: u32 = 0;
+
+/// Maximum discount (basis points)
+pub const MAX_DISCOUNT_BPS: u32 = 5_000;
 
 // =============================================================================
 // Stock Quantity
@@ -117,6 +147,18 @@ pub const INITIAL_BALANCE: f64 = -10.00;
 
 /// Initial customer YTD payment
 pub const INITIAL_YTD_PAYMENT: f64 = 10.00;
+
+/// Initial warehouse YTD (cents)
+pub const INITIAL_W_YTD_CENTS: i64 = 30_000_000;
+
+/// Initial district YTD (cents)
+pub const INITIAL_D_YTD_CENTS: i64 = 3_000_000;
+
+/// Initial customer balance (cents)
+pub const INITIAL_BALANCE_CENTS: i64 = -1_000;
+
+/// Initial customer YTD payment (cents)
+pub const INITIAL_YTD_PAYMENT_CENTS: i64 = 1_000;
 
 /// Initial customer payment count
 pub const INITIAL_PAYMENT_CNT: u32 = 1;
