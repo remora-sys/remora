@@ -217,6 +217,7 @@ mod tests {
                         PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
+                        PrimaryToProxyMessage::TransactionBatch(_, _) => unreachable!(),
                     }
                 }
                 Some(msg) = rx_from_processor2.recv() => {
@@ -224,6 +225,7 @@ mod tests {
                         PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
+                        PrimaryToProxyMessage::TransactionBatch(_, _) => unreachable!(),
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
