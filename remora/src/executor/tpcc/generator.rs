@@ -92,7 +92,7 @@ impl TpccGenerator {
         };
 
         let c_id = self.random_customer();
-        let h_amount = self.rng.gen_range(MIN_PAYMENT..=MAX_PAYMENT);
+        let h_amount = self.rng.gen_range(MIN_PAYMENT_CENTS..=MAX_PAYMENT_CENTS);
 
         TpccTransaction::Payment {
             w_id,
@@ -202,7 +202,7 @@ mod tests {
                 assert_eq!(c_w_id, 1); // Single warehouse, so customer is local
                 assert!(c_d_id >= 1 && c_d_id <= DISTRICTS_PER_WAREHOUSE as u32);
                 assert!(c_id >= 1 && c_id <= CUSTOMERS_PER_DISTRICT as u32);
-                assert!(h_amount >= MIN_PAYMENT && h_amount <= MAX_PAYMENT);
+                assert!(h_amount >= MIN_PAYMENT_CENTS && h_amount <= MAX_PAYMENT_CENTS);
             }
             _ => panic!("Expected PAYMENT"),
         }
