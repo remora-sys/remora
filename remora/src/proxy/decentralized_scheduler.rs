@@ -3,7 +3,9 @@
 
 use crate::{
     config::{LoadBalancingPolicy, ProxyMode},
-    executor::api::{Executor, ExecutorIndex, RequiredStates, TransactionWithTimestamp},
+    executor::api::{
+        ExecutableTransaction, Executor, ExecutorIndex, RequiredStates, TransactionWithTimestamp,
+    },
     executor::versioned_dependency_controller::VersionedDependencyController,
     metrics::Metrics,
     proxy::core::{ProxyId, ScheduledTransaction},
@@ -127,10 +129,12 @@ where
         tx_to_primary_processor: tokio::sync::mpsc::Sender<ScheduledTransaction<E>>,
     ) {
         let mut txn_cnt = 0;
+        let deterministic_locality = matches!(self.policy, LoadBalancingPolicy::LocalityLoad);
 
         while let Some(transaction) = rx_from_version_assignment.recv().await {
             let dependency_controller = self.dependency_controller.clone();
             let proxy_count = self.proxy_count;
+            let proxy_id = self.proxy_id;
             let states_to_proxy = self.states_to_proxy.clone();
             let proxy_access_histories = self.proxy_access_histories.clone();
             let proxy_loads = self.proxy_loads.clone();
@@ -143,7 +147,7 @@ where
                 .filter_map(|(id, version_opt)| version_opt.map(|v| (*id, v)))
                 .collect();
 
-            tokio::spawn(async move {
+            if deterministic_locality {
                 let (prior_handles, current_handles) = match required_versions.is_empty() {
                     true => (Vec::new(), Vec::new()),
                     false => dependency_controller.get_prior_dependency_and_update(
@@ -153,15 +157,9 @@ where
                         false,
                     ),
                 };
-                // Wait for prior dependencies to complete
-                for prior_notify in prior_handles {
-                    prior_notify.notified().await;
-                }
+                let required_versions_for_dep = required_versions.clone();
 
-                // Remove the dependency when done
-                dependency_controller.remove_dependency(required_versions.clone());
-
-                if let Some(scheduled_txn) = Self::process_single_transaction(
+                let scheduled_txn = Self::process_single_transaction(
                     &policy,
                     proxy_count,
                     &states_to_proxy,
@@ -171,20 +169,87 @@ where
                     &proxy_access_histories,
                     &proxy_loads,
                 )
-                .await
-                {
-                    if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
-                        tracing::error!(
-                            "Failed to send scheduled transaction to primary processor: {}",
-                            e
-                        );
+                .await;
+
+                if let Some(ref scheduled_txn) = scheduled_txn {
+                    tracing::debug!(
+                        "LocalityLoad decision proxy={} txn_cnt={} assigned_proxy={} digest={:?} required_versions={}",
+                        proxy_id,
+                        txn_cnt,
+                        scheduled_txn.assigned_proxy,
+                        scheduled_txn.transaction.digest(),
+                        scheduled_txn.required_versions.len()
+                    );
+                }
+
+                // Serialize decisions, but allow dependency waiting and delivery to run in parallel.
+                tokio::spawn(async move {
+                    for prior_notify in prior_handles {
+                        prior_notify.notified().await;
                     }
-                }
-                // Notify any dependencies waiting on this transaction
-                for notify in current_handles {
-                    notify.notify_one();
-                }
-            });
+
+                    dependency_controller.remove_dependency(required_versions_for_dep);
+
+                    if let Some(scheduled_txn) = scheduled_txn {
+                        if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
+                            tracing::error!(
+                                "Failed to send scheduled transaction to primary processor: {}",
+                                e
+                            );
+                        }
+                    }
+
+                    // Notify any dependencies waiting on this transaction
+                    for notify in current_handles {
+                        notify.notify_one();
+                    }
+                });
+            } else {
+                let scheduling_task = async move {
+                    let (prior_handles, current_handles) = match required_versions.is_empty() {
+                        true => (Vec::new(), Vec::new()),
+                        false => dependency_controller.get_prior_dependency_and_update(
+                            0,
+                            required_versions.clone(),
+                            false,
+                            false,
+                        ),
+                    };
+                    // Wait for prior dependencies to complete
+                    for prior_notify in prior_handles {
+                        prior_notify.notified().await;
+                    }
+
+                    // Remove the dependency when done
+                    dependency_controller.remove_dependency(required_versions.clone());
+
+                    if let Some(scheduled_txn) = Self::process_single_transaction(
+                        &policy,
+                        proxy_count,
+                        &states_to_proxy,
+                        required_versions,
+                        transaction,
+                        txn_cnt,
+                        &proxy_access_histories,
+                        &proxy_loads,
+                    )
+                    .await
+                    {
+                        if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
+                            tracing::error!(
+                                "Failed to send scheduled transaction to primary processor: {}",
+                                e
+                            );
+                        }
+                    }
+                    // Notify any dependencies waiting on this transaction
+                    for notify in current_handles {
+                        notify.notify_one();
+                    }
+                };
+
+                tokio::spawn(scheduling_task);
+            }
 
             txn_cnt += 1;
         }
