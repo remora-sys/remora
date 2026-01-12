@@ -191,11 +191,13 @@ where
                     dependency_controller.remove_dependency(required_versions_for_dep);
 
                     if let Some(scheduled_txn) = scheduled_txn {
-                        if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
-                            tracing::error!(
-                                "Failed to send scheduled transaction to primary processor: {}",
-                                e
-                            );
+                        if scheduled_txn.assigned_proxy == proxy_id {
+                            if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
+                                tracing::error!(
+                                    "Failed to send scheduled transaction to primary processor: {}",
+                                    e
+                                );
+                            }
                         }
                     }
 
@@ -235,11 +237,13 @@ where
                     )
                     .await
                     {
-                        if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
-                            tracing::error!(
-                                "Failed to send scheduled transaction to primary processor: {}",
-                                e
-                            );
+                        if scheduled_txn.assigned_proxy == proxy_id {
+                            if let Err(e) = tx_to_primary_processor.send(scheduled_txn).await {
+                                tracing::error!(
+                                    "Failed to send scheduled transaction to primary processor: {}",
+                                    e
+                                );
+                            }
                         }
                     }
                     // Notify any dependencies waiting on this transaction

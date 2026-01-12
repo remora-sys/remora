@@ -481,4 +481,121 @@ mod tests {
             assert!(proxy_id < 3, "Proxy ID {} should be < 3", proxy_id);
         }
     }
+
+    #[test]
+    fn test_roundrobin_policy_all_objects_single_node() {
+        use super::super::data::TpccState;
+
+        // Test with 3 nodes, 96 warehouses (32 per node), cross_node_prob = 0.0
+        // Simulate round-robin policy that assigns transactions to different proxies
+        let mut generator = TpccGenerator::new(96, 0.0, 3, 0.0, 42);
+
+        let mut proxy_assignment = 0; // Round-robin counter
+
+        // Generate 100 NEW_ORDER transactions
+        for i in 0..100 {
+            let txn = generator.generate_new_order();
+
+            // Round-robin: assign to proxy i % 3
+            let assigned_proxy = proxy_assignment % 3;
+            proxy_assignment += 1;
+
+            match &txn {
+                TpccTransaction::NewOrder {
+                    w_id,
+                    d_id,
+                    c_id,
+                    items,
+                } => {
+                    // Calculate the node for the transaction's warehouse
+                    let transaction_node = ((w_id - 1) / 32) as usize;
+
+                    // Verify all accessed object IDs belong to warehouses on the same node
+                    let access_set = txn.access_set();
+
+                    // Track all warehouse IDs touched by this transaction
+                    let mut warehouse_ids = std::collections::HashSet::new();
+                    warehouse_ids.insert(*w_id);
+
+                    // Add supply warehouses from items
+                    for item in items {
+                        warehouse_ids.insert(item.supply_w_id);
+                    }
+
+                    // Calculate nodes for all touched warehouses
+                    let mut nodes = std::collections::HashSet::new();
+                    for &warehouse_id in &warehouse_ids {
+                        let node = ((warehouse_id - 1) / 32) as usize;
+                        nodes.insert(node);
+                    }
+
+                    // Assert that all warehouses belong to the same node
+                    assert_eq!(
+                        nodes.len(),
+                        1,
+                        "Transaction {} (proxy {}) touches warehouses from multiple nodes: {:?}. Warehouses: {:?}",
+                        i,
+                        assigned_proxy,
+                        nodes,
+                        warehouse_ids
+                    );
+
+                    let single_node = *nodes.iter().next().unwrap();
+                    assert_eq!(
+                        single_node, transaction_node,
+                        "All warehouses should belong to transaction node {}",
+                        transaction_node
+                    );
+
+                    // Verify specific objects in access_set:
+                    // - Warehouse w_id
+                    let warehouse_obj = TpccState::object_id_for_warehouse(*w_id);
+                    assert!(
+                        access_set.contains(&warehouse_obj),
+                        "Access set should contain warehouse object"
+                    );
+
+                    // - District (w_id, d_id)
+                    let district_obj = TpccState::object_id_for_district(*w_id, *d_id);
+                    assert!(
+                        access_set.contains(&district_obj),
+                        "Access set should contain district object"
+                    );
+
+                    // - Customer (w_id, d_id, c_id)
+                    let customer_obj = TpccState::object_id_for_customer(*w_id, *d_id, *c_id);
+                    assert!(
+                        access_set.contains(&customer_obj),
+                        "Access set should contain customer object"
+                    );
+
+                    // - Stock (supply_w_id, i_id) for each item
+                    for item in items {
+                        let stock_obj = TpccState::object_id_for_stock(item.supply_w_id, item.i_id);
+                        assert!(
+                            access_set.contains(&stock_obj),
+                            "Access set should contain stock object for item {} from warehouse {}",
+                            item.i_id,
+                            item.supply_w_id
+                        );
+
+                        // Verify stock warehouse belongs to same node
+                        let stock_node = ((item.supply_w_id - 1) / 32) as usize;
+                        assert_eq!(
+                            stock_node, transaction_node,
+                            "Stock from warehouse {} (node {}) should belong to transaction node {}",
+                            item.supply_w_id,
+                            stock_node,
+                            transaction_node
+                        );
+                    }
+                }
+                _ => panic!("Expected NEW_ORDER"),
+            }
+        }
+
+        // Summary: Even with round-robin assignment to different proxies,
+        // all objects (warehouse, district, customer, stock) accessed by each
+        // transaction belong to a single node when cross_node_prob = 0.0
+    }
 }
