@@ -119,10 +119,7 @@ impl TpccTransaction {
     pub fn write_set(&self) -> Vec<ObjectID> {
         match self {
             TpccTransaction::NewOrder {
-                w_id,
-                d_id,
-                items,
-                ..
+                w_id, d_id, items, ..
             } => {
                 let mut writes = Vec::new();
 

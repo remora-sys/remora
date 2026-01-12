@@ -259,6 +259,12 @@ pub enum WorkloadType {
         /// Ratio of PAYMENT transactions (0.0 = all NEW_ORDER, 1.0 = all PAYMENT)
         #[serde(default = "default_tpcc_payment_ratio")]
         payment_ratio: f64,
+        /// Number of nodes/proxies for warehouse partitioning
+        #[serde(default = "default_tpcc_num_nodes")]
+        num_nodes: usize,
+        /// Probability of cross-node multi-warehouse transactions (0.0 = no cross-node, 1.0 = always cross-node)
+        #[serde(default = "default_tpcc_cross_node_prob")]
+        cross_node_prob: f64,
     },
 }
 
@@ -298,6 +304,14 @@ pub fn default_tpcc_warehouses() -> usize {
 
 pub fn default_tpcc_payment_ratio() -> f64 {
     0.5
+}
+
+pub fn default_tpcc_num_nodes() -> usize {
+    1
+}
+
+pub fn default_tpcc_cross_node_prob() -> f64 {
+    0.0 // Node-local transactions by default
 }
 
 pub fn default_number_of_inputs() -> usize {
