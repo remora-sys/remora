@@ -6,7 +6,7 @@
 //! Provides a standalone executor for TPC-C NEW_ORDER and PAYMENT transactions
 //! with real business logic execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,13 +55,14 @@ pub struct TpccExecutableTransaction {
 
 impl TpccExecutableTransaction {
     pub fn new(txn: TpccTransaction) -> Self {
+        let write_set: HashSet<ObjectID> = txn.write_set().into_iter().collect();
         let inputs = txn
             .access_set()
             .into_iter()
             .map(|id| InputObjectKind::SharedMoveObject {
                 id,
                 initial_shared_version: SequenceNumber::from(2),
-                mutable: true,
+                mutable: write_set.contains(&id),
             })
             .collect();
         Self {
@@ -85,7 +86,9 @@ impl ExecutableTransaction for TpccExecutableTransaction {
         self.inputs
             .iter()
             .filter_map(|kind| match kind {
-                InputObjectKind::SharedMoveObject { id, .. } => Some(*id),
+                InputObjectKind::SharedMoveObject { id, mutable, .. } => {
+                    (*mutable).then_some(*id)
+                }
                 _ => None,
             })
             .collect()
@@ -654,7 +657,6 @@ impl Executor for TpccExecutor {
     ) -> impl Future<Output = ExecutionResultsAndEffects<Self::Transaction, Self::ExecutionResults>> + Send
     {
         let mut modified_at_versions = Vec::new();
-        let mut new_state = BTreeMap::new();
 
         // Find max version across input objects
         let mut max_version = SequenceNumber::from(2);
@@ -673,17 +675,8 @@ impl Executor for TpccExecutor {
         let updated_objects =
             Self::execute_tpcc_logic(&store, &transaction.txn, next_version, &mut object_cache);
 
-        // Update all objects with consistent version (design choice: both reads and writes bump versions)
-        for reference in &transaction.inputs {
-            let id = reference.object_id();
-            let output_object = if let Some(updated) = updated_objects.get(&id) {
-                updated.clone()
-            } else {
-                let input_object = Self::get_object(&store, &mut object_cache, id);
-                Self::update_object_with_version(&input_object, next_version)
-            };
-            new_state.insert(id, output_object);
-        }
+        // Only write objects that are mutated by the transaction.
+        let new_state = updated_objects;
 
         let updates = TpccTransactionEffects {
             transaction_digest: *transaction.digest(),
