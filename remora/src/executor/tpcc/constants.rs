@@ -32,10 +32,10 @@ pub const INITIAL_NEW_ORDERS_PER_DISTRICT: usize = 900;
 // =============================================================================
 
 /// Minimum number of order lines per order
-pub const MIN_OL_CNT: usize = 5;
+pub const MIN_OL_CNT: usize = 2;
 
 /// Maximum number of order lines per order
-pub const MAX_OL_CNT: usize = 15;
+pub const MAX_OL_CNT: usize = 4;
 
 /// Maximum quantity per order line
 pub const MAX_OL_QUANTITY: u32 = 10;
