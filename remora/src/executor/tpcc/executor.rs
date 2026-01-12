@@ -775,6 +775,11 @@ impl Executor for TpccExecutor {
                     let count = end_idx.saturating_sub(start_idx);
 
                     tokio::task::spawn_blocking(move || {
+                        // Calculate per-task TPS: each task generates count transactions over duration seconds
+                        // This ensures rotation timing is correct when workload is split across tasks
+                        let per_task_tps =
+                            (expected_tps + NUM_GENERATOR_TASKS - 1) / NUM_GENERATOR_TASKS;
+
                         // Each task gets a unique seed derived from task_id for reproducibility
                         let mut generator = super::generator::TpccGenerator::new(
                             num_warehouses,
@@ -782,7 +787,7 @@ impl Executor for TpccExecutor {
                             num_nodes,
                             hotspot_percentage,
                             rotation_interval_secs,
-                            expected_tps,
+                            per_task_tps,
                             task_id,
                         );
 
