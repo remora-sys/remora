@@ -332,12 +332,7 @@ impl TpccExecutor {
                 i_data: format!("ItemData_{}", i_id),
             };
             let id = TpccState::object_id_for_item(i_id);
-            store.write_object(encode_tpcc_object(
-                id,
-                version,
-                TpccObjectKind::Item,
-                item,
-            ));
+            store.write_object(encode_tpcc_object(id, version, TpccObjectKind::Item, item));
         }
 
         for w_id in 1..=num_warehouses as u32 {
@@ -513,31 +508,19 @@ impl TpccExecutor {
         items: &[OrderItem],
     ) -> BTreeMap<ObjectID, Object> {
         let warehouse_id = TpccState::object_id_for_warehouse(w_id);
-        let warehouse: Warehouse = Self::read_tpcc_data(
-            store,
-            cache,
-            warehouse_id,
-            TpccObjectKind::Warehouse,
-        );
+        let warehouse: Warehouse =
+            Self::read_tpcc_data(store, cache, warehouse_id, TpccObjectKind::Warehouse);
         let w_tax = warehouse.w_tax;
 
         let district_id = TpccState::object_id_for_district(w_id, d_id);
-        let mut district: District = Self::read_tpcc_data(
-            store,
-            cache,
-            district_id,
-            TpccObjectKind::District,
-        );
+        let mut district: District =
+            Self::read_tpcc_data(store, cache, district_id, TpccObjectKind::District);
         let d_tax = district.d_tax;
         district.d_next_o_id += 1;
 
         let customer_id = TpccState::object_id_for_customer(w_id, d_id, c_id);
-        let customer: Customer = Self::read_tpcc_data(
-            store,
-            cache,
-            customer_id,
-            TpccObjectKind::Customer,
-        );
+        let customer: Customer =
+            Self::read_tpcc_data(store, cache, customer_id, TpccObjectKind::Customer);
         let c_discount = customer.c_discount;
 
         let mut total_cents: i64 = 0;
@@ -545,12 +528,10 @@ impl TpccExecutor {
 
         for order_item in items {
             let item_id = TpccState::object_id_for_item(order_item.i_id);
-            let item: Item =
-                Self::read_tpcc_data(store, cache, item_id, TpccObjectKind::Item);
+            let item: Item = Self::read_tpcc_data(store, cache, item_id, TpccObjectKind::Item);
             let i_price_cents = item.i_price as i64;
 
-            let stock_id =
-                TpccState::object_id_for_stock(order_item.supply_w_id, order_item.i_id);
+            let stock_id = TpccState::object_id_for_stock(order_item.supply_w_id, order_item.i_id);
             let stock_entry = stock_updates.entry(stock_id).or_insert_with(|| {
                 Self::read_tpcc_data(store, cache, stock_id, TpccObjectKind::Stock)
             });
@@ -607,30 +588,18 @@ impl TpccExecutor {
         h_amount: i64,
     ) -> BTreeMap<ObjectID, Object> {
         let warehouse_id = TpccState::object_id_for_warehouse(w_id);
-        let mut warehouse: Warehouse = Self::read_tpcc_data(
-            store,
-            cache,
-            warehouse_id,
-            TpccObjectKind::Warehouse,
-        );
+        let mut warehouse: Warehouse =
+            Self::read_tpcc_data(store, cache, warehouse_id, TpccObjectKind::Warehouse);
         warehouse.w_ytd += h_amount;
 
         let district_id = TpccState::object_id_for_district(w_id, d_id);
-        let mut district: District = Self::read_tpcc_data(
-            store,
-            cache,
-            district_id,
-            TpccObjectKind::District,
-        );
+        let mut district: District =
+            Self::read_tpcc_data(store, cache, district_id, TpccObjectKind::District);
         district.d_ytd += h_amount;
 
         let customer_id = TpccState::object_id_for_customer(c_w_id, c_d_id, c_id);
-        let mut customer: Customer = Self::read_tpcc_data(
-            store,
-            cache,
-            customer_id,
-            TpccObjectKind::Customer,
-        );
+        let mut customer: Customer =
+            Self::read_tpcc_data(store, cache, customer_id, TpccObjectKind::Customer);
         customer.c_balance -= h_amount;
         customer.c_ytd_payment += h_amount;
         customer.c_payment_cnt += 1;
@@ -773,15 +742,26 @@ impl Executor for TpccExecutor {
         config: &BenchmarkParameters,
         _working_directory: Option<PathBuf>,
     ) -> impl Future<Output = Vec<Self::Transaction>> + Send {
-        let (num_warehouses, payment_ratio) = match &config.workload {
-            WorkloadType::Tpcc {
-                num_warehouses,
-                payment_ratio,
-            } => (*num_warehouses, *payment_ratio),
-            _ => (1, 0.5),
-        };
+        let (num_warehouses, payment_ratio, num_nodes, hotspot_percentage, rotation_interval_secs) =
+            match &config.workload {
+                WorkloadType::Tpcc {
+                    num_warehouses,
+                    payment_ratio,
+                    num_nodes,
+                    hotspot_percentage,
+                    rotation_interval_secs,
+                } => (
+                    *num_warehouses,
+                    *payment_ratio,
+                    *num_nodes,
+                    *hotspot_percentage,
+                    *rotation_interval_secs,
+                ),
+                _ => (1, 0.5, 1, 0.0, 20),
+            };
 
         let total_txns = config.load * config.duration.as_secs();
+        let expected_tps = config.load;
 
         async move {
             // Parallelize transaction generation across multiple tasks
@@ -799,6 +779,10 @@ impl Executor for TpccExecutor {
                         let mut generator = super::generator::TpccGenerator::new(
                             num_warehouses,
                             payment_ratio,
+                            num_nodes,
+                            hotspot_percentage,
+                            rotation_interval_secs,
+                            expected_tps,
                             task_id,
                         );
 

@@ -288,6 +288,17 @@ pub enum WorkloadType {
         /// Ratio of PAYMENT transactions (0.0 = all NEW_ORDER, 1.0 = all PAYMENT)
         #[serde(default = "default_tpcc_payment_ratio")]
         payment_ratio: f64,
+        /// Number of nodes in the cluster (for warehouse partitioning)
+        #[serde(default = "default_tpcc_num_nodes")]
+        num_nodes: usize,
+        /// Percentage of requests that target the hotspot node (0.0-1.0)
+        /// e.g., 0.5 = 50%, 0.8 = 80%, 0.9 = 90%
+        #[serde(default = "default_tpcc_hotspot_percentage")]
+        hotspot_percentage: f64,
+        /// Interval in seconds to rotate hotspot to next node
+        /// Set to 0 to disable rotation (static hotspot)
+        #[serde(default = "default_tpcc_rotation_interval")]
+        rotation_interval_secs: u64,
     },
 }
 
@@ -327,6 +338,18 @@ pub fn default_tpcc_warehouses() -> usize {
 
 pub fn default_tpcc_payment_ratio() -> f64 {
     0.5
+}
+
+pub fn default_tpcc_num_nodes() -> usize {
+    1 // Single node by default (no partitioning)
+}
+
+pub fn default_tpcc_hotspot_percentage() -> f64 {
+    0.0 // No hotspot by default (uniform distribution)
+}
+
+pub fn default_tpcc_rotation_interval() -> u64 {
+    20 // 20 seconds
 }
 
 pub fn default_number_of_inputs() -> usize {
