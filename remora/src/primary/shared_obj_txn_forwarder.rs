@@ -76,7 +76,7 @@ where
             pre_consensus_routing_plan,
             _phantom: PhantomData,
             proxy_loads,
-            object_last_proxy: vec![None; 10000000],
+            object_last_proxy: vec![None; 1 << 24], // 2^24 to match object_id_24bit_index range
         }
     }
 
