@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -820,7 +821,8 @@ impl Executor for TpccExecutor {
 
     fn verify_transaction(
         ctx: Arc<TpccExecutionContext>,
-        _transaction: &TransactionWithTimestamp<Self::Transaction>,
+        _digest: TransactionDigest,
+        _verification_duration: Duration,
     ) -> impl Future<Output = bool> + Send {
         Calibration::calibrated_work(ctx.verification_spins);
         async { true }
