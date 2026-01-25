@@ -71,9 +71,3 @@ tracing-test = "0.2.5"
 
 [features]
 benchmark = []
-
-[workspace]
-resolver = "2"
-members = [
-    "remora-orchestrator",
-]
