@@ -18,5 +18,10 @@
 .DS_Store
 Thumbs.db
 
+# Project data
+*.dat
+*.yml
+!assets/example-*.yml
+
 # Logs
 *.log
