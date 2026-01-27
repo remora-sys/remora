@@ -103,6 +103,7 @@ remora/
 
 Build the release version:
 
+```
 cargo build --release
 ```
 
@@ -111,6 +112,7 @@ The binaries will be in `target/release/`:
 - `load_generator` - Client
 
 Build for development (faster compilation, slower execution):
+```
 cargo build
 ```
 
