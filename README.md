@@ -90,9 +90,6 @@ remora/
 │   ├── config.rs                  # Configuration structures
 │   └── metrics.rs                 # Prometheus metrics
 ├── assets/                        # Configuration examples
-├── docs/                          # Research paper descriptions
-│   ├── design.tex                 # System design
-│   └── impl.tex                   # Implementation details
 └── tests/                         # Integration tests
 ```
 
@@ -295,11 +292,6 @@ Import [`assets/grafana-dashboard.json`](assets/grafana-dashboard.json) into Gra
 The primary also prints periodic metric summaries to stdout when run with `RUST_LOG=info`.
 
 ## Research Context
-
-This implementation corresponds to the system design described in:
-
-- **Design**: `docs/design.tex` - Architecture, determinism, scheduling policies, elasticity
-- **Implementation**: `docs/impl.tex` - Runtime details, metadata management, DAG execution
 
 Key concepts and their code locations:
 
