@@ -1,0 +1,27 @@
+{
+  "projectName": "remora",
+  "projectOwner": "remora-sys",
+  "repoType": "github",
+  "repoHost": "https://github.com",
+  "files": [
+    "README.md"
+  ],
+  "imageSize": 100,
+  "commit": false,
+  "commitConvention": "none",
+  "contributors": [
+    {
+      "login": "Scofield626",
+      "name": "Scofield Liu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/59379697",
+      "profile": "https://github.com/Scofield626",
+      "contributions": [
+        "code",
+        "doc"
+      ]
+    }
+  ],
+  "contributorsPerLine": 7,
+  "skipCi": true,
+  "contributorsSortAlphabetically": false
+}
