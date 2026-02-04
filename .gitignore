@@ -22,6 +22,7 @@ Thumbs.db
 *.dat
 *.yml
 !assets/example-*.yml
+!.github/**/*.yml
 
 # Logs
 *.log
