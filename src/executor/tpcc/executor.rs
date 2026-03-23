@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -27,10 +26,11 @@ use sui_types::transaction::InputObjectKind;
 
 use crate::config::{BenchmarkParameters, WorkloadType};
 use crate::executor::api::{
-    ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
-    TransactionWithTimestamp,
+    ExecutableTransaction, ExecutionResultsAndEffects, Executor, RemoraTransaction, StateStore,
+    StatelessVerificationRequest, TransactionWithTimestamp,
 };
 use crate::executor::calibration::Calibration;
+use crate::executor::stateless_crypto;
 
 use super::constants::*;
 use super::data::{
@@ -299,6 +299,7 @@ impl TpccExecutionContext {
 pub struct TpccExecutor {
     execution_context: Arc<TpccExecutionContext>,
     store: Arc<TpccObjectStore>,
+    stateless_mode: crate::config::StatelessVerificationMode,
 }
 
 impl TpccExecutor {
@@ -317,6 +318,7 @@ impl TpccExecutor {
         Self {
             execution_context: Arc::new(ctx),
             store,
+            stateless_mode: config.stateless_mode,
         }
     }
 
@@ -819,13 +821,32 @@ impl Executor for TpccExecutor {
         self.store.clone()
     }
 
+    fn make_verification_request(
+        &self,
+        transaction: &RemoraTransaction<Self>,
+    ) -> StatelessVerificationRequest {
+        stateless_crypto::make_verification_request(
+            self.stateless_mode,
+            *transaction.digest(),
+            transaction.verification_duration(),
+        )
+    }
+
     fn verify_transaction(
         ctx: Arc<TpccExecutionContext>,
-        _digest: TransactionDigest,
-        _verification_duration: Duration,
+        request: StatelessVerificationRequest,
     ) -> impl Future<Output = bool> + Send {
-        Calibration::calibrated_work(ctx.verification_spins);
-        async { true }
+        async move {
+            match request {
+                StatelessVerificationRequest::Synthetic { .. } => {
+                    Calibration::calibrated_work(ctx.verification_spins);
+                    true
+                }
+                StatelessVerificationRequest::Crypto { .. } => {
+                    stateless_crypto::verify_request(&request)
+                }
+            }
+        }
     }
 }
 

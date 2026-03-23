@@ -36,7 +36,7 @@ pub struct PrimaryNode<E: Executor> {
 
 impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
     /// Start the single machine validator.
-    pub async fn start(_executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
+    pub async fn start(executor: E, config: &ValidatorConfig, metrics: Arc<Metrics>) -> Self
     where
         <E as Executor>::Store: Sync + Send,
         <E as Executor>::Transaction: Send + Sync + 'static,
@@ -73,6 +73,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
 
         // Boot the load balancer. This component forwards transactions to the consensus and proxies.
         let load_balancer_handle = LoadBalancer::<E>::new(
+            executor.clone(),
             proxy_connections,
             rx_committed_txns,
             config.validator_parameters.load_balancing_policy.clone(),
@@ -85,6 +86,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         // Boot the (mock) consensus. This component delays transactions simulating consensus and
         // then forwards them to the primary executor.
         let consensus_handle = MockConsensus::<_, E>::new(
+            executor,
             config.validator_parameters.consensus_delay_model.clone(),
             config.validator_parameters.consensus_parameters.clone(),
             rx_client_transactions,

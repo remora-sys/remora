@@ -7,7 +7,6 @@ use std::{
     io::{BufReader, Read},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
 use sui_single_node_benchmark::{
@@ -27,10 +26,11 @@ use sui_types::{
 };
 use tokio::time::Instant;
 
-use super::{
-    api::{ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore},
-    calibration::Calibration,
+use super::api::{
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+    StatelessVerificationRequest, TransactionWithTimestamp,
 };
+use super::{calibration::Calibration, stateless_crypto};
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
 /// Represents a Sui transaction.
@@ -93,16 +93,12 @@ impl SuiExecutionContext {
     pub fn benchmark_ctx(&self) -> &BenchmarkContext {
         &self.benchmark_ctx
     }
-
-    /// Get the verification spins value
-    pub fn verification_spins(&self) -> u64 {
-        self.verification_spins
-    }
 }
 
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<SuiExecutionContext>,
+    stateless_mode: crate::config::StatelessVerificationMode,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -267,7 +263,6 @@ impl SuiExecutor {
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
         let mut ctx = BenchmarkContext::new(workload.clone(), component, false).await;
-        let verification_spins = Calibration::calibrate(config.verification_duration);
         let _ = workload.create_tx_generator(&mut ctx).await;
         let elapsed = start_time.elapsed();
         tracing::debug!(
@@ -278,11 +273,12 @@ impl SuiExecutor {
 
         let context = SuiExecutionContext {
             benchmark_ctx: ctx,
-            verification_spins,
+            verification_spins: Calibration::calibrate(config.verification_duration),
         };
 
         Self {
             ctx: Arc::new(context),
+            stateless_mode: config.stateless_mode,
         }
     }
 
@@ -395,7 +391,7 @@ impl Executor for SuiExecutor {
     fn pre_execute_check(
         ctx: Arc<SuiExecutionContext>,
         store: Arc<Self::Store>,
-        transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.benchmark_ctx().validator();
@@ -445,23 +441,39 @@ impl Executor for SuiExecutor {
         self.create_in_memory_store()
     }
 
+    fn make_verification_request(
+        &self,
+        transaction: &RemoraTransaction<Self>,
+    ) -> StatelessVerificationRequest {
+        stateless_crypto::make_verification_request(
+            self.stateless_mode,
+            *transaction.digest(),
+            transaction.verification_duration(),
+        )
+    }
+
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        digest: TransactionDigest,
-        _verification_duration: Duration,
+        request: StatelessVerificationRequest,
     ) -> bool {
         let start_time = Instant::now();
-        let tx_id = digest;
-        let spins = ctx.verification_spins();
-
-        Calibration::calibrated_work(spins);
+        let tx_id = *request.digest();
+        let verified = match request {
+            StatelessVerificationRequest::Synthetic { .. } => {
+                Calibration::calibrated_work(ctx.verification_spins);
+                true
+            }
+            StatelessVerificationRequest::Crypto { .. } => {
+                stateless_crypto::verify_request(&request)
+            }
+        };
 
         let elapsed = start_time.elapsed();
         tracing::debug!(
             "[{tx_id}] Transaction verification took {} us",
             elapsed.as_micros()
         );
-        true
+        verified
     }
 }
 

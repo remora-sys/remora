@@ -26,10 +26,11 @@ use sui_types::{
 use super::{
     super::config::{BenchmarkParameters, WorkloadType},
     api::{
-        ExecutableTransaction, ExecutionResultsAndEffects, Executor, StateStore,
-        TransactionWithTimestamp,
+        ExecutableTransaction, ExecutionResultsAndEffects, Executor, RemoraTransaction, StateStore,
+        StatelessVerificationRequest, TransactionWithTimestamp,
     },
     calibration::Calibration,
+    stateless_crypto,
 };
 
 /// A fake owned object for testing.
@@ -306,6 +307,7 @@ impl FakeExecutionContext {
 pub struct FakeExecutor {
     execution_context: Arc<FakeExecutionContext>,
     store: Arc<FakeObjectStore<FakeTransactionEffects>>,
+    stateless_mode: crate::config::StatelessVerificationMode,
 }
 
 impl FakeExecutor {
@@ -332,6 +334,7 @@ impl FakeExecutor {
         Self {
             execution_context: Arc::new(ctx),
             store,
+            stateless_mode: config.stateless_mode,
         }
     }
 
@@ -468,14 +471,30 @@ impl Executor for FakeExecutor {
         self.store.clone()
     }
 
+    fn make_verification_request(
+        &self,
+        transaction: &RemoraTransaction<Self>,
+    ) -> StatelessVerificationRequest {
+        stateless_crypto::make_verification_request(
+            self.stateless_mode,
+            *transaction.digest(),
+            transaction.verification_duration(),
+        )
+    }
+
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        _digest: TransactionDigest,
-        _verification_duration: Duration,
+        request: StatelessVerificationRequest,
     ) -> bool {
-        // Simulate verification
-        Calibration::calibrated_work(ctx.verification_spins);
-        true
+        match request {
+            StatelessVerificationRequest::Synthetic { .. } => {
+                Calibration::calibrated_work(ctx.verification_spins);
+                true
+            }
+            StatelessVerificationRequest::Crypto { .. } => {
+                stateless_crypto::verify_request(&request)
+            }
+        }
     }
 }
 

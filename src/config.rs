@@ -234,6 +234,47 @@ impl ValidatorConfig {
 
 impl ImportExport for ValidatorConfig {}
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StatelessVerificationMode {
+    #[serde(alias = "synthetic", alias = "SYNTHETIC")]
+    Synthetic,
+    #[serde(
+        rename = "ED25519",
+        alias = "Ed25519",
+        alias = "ed25519",
+        alias = "Ed25519Dalek"
+    )]
+    Ed25519,
+    #[serde(rename = "BLS", alias = "Bls", alias = "bls", alias = "Bls12381MinSig")]
+    Bls,
+    #[serde(
+        rename = "SECP256K1",
+        alias = "Secp256k1",
+        alias = "secp256k1",
+        alias = "Secp256k1Ecdsa",
+        alias = "SECP256K1_ECDSA"
+    )]
+    Secp256k1,
+    #[serde(
+        rename = "P256",
+        alias = "P-256",
+        alias = "p256",
+        alias = "P256Ecdsa",
+        alias = "Secp256r1",
+        alias = "secp256r1",
+        alias = "Prime256v1"
+    )]
+    P256,
+    #[serde(
+        rename = "SCHNORR",
+        alias = "Schnorr",
+        alias = "schnorr",
+        alias = "SchnorrSecp256k1",
+        alias = "SCHNORR_SECP256K1"
+    )]
+    Schnorr,
+}
+
 /// The workload type to generate.
 #[derive(Serialize, Deserialize, Clone)]
 pub enum WorkloadType {
@@ -408,6 +449,12 @@ pub struct BenchmarkParameters {
     /// The verification duration.
     #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
     pub verification_duration: Duration,
+    /// The stateless verification mode.
+    #[serde(
+        default = "default_benchmark_config::default_stateless_mode",
+        alias = "stateless_verification_mode"
+    )]
+    pub stateless_mode: StatelessVerificationMode,
     /// The expected stateful duration, used for LB.
     #[serde(default = "default_benchmark_config::default_fake_verification_duration")]
     pub expected_stateful_duration: Duration,
@@ -421,6 +468,7 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(1),
             workload: WorkloadType::Transfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
         }
@@ -435,6 +483,7 @@ impl BenchmarkParameters {
                 txs_per_counter: default_cont_level_for_shared_obj(),
             },
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
         }
@@ -447,6 +496,7 @@ impl BenchmarkParameters {
             duration: Duration::from_secs(5),
             workload: WorkloadType::EthereumTransfers,
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
         }
@@ -463,6 +513,7 @@ impl BenchmarkParameters {
                 number_of_inputs: 2,
             },
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
         }
@@ -474,6 +525,7 @@ impl BenchmarkParameters {
             load: 10,
             duration: Duration::from_secs(1),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             workload: WorkloadType::FakeZipfian {
                 execution_duration: default_fake_execution_duration(),
                 alpha: 0.5,
@@ -488,7 +540,7 @@ impl BenchmarkParameters {
 mod default_benchmark_config {
     use std::time::Duration;
 
-    use super::WorkloadType;
+    use super::{StatelessVerificationMode, WorkloadType};
 
     pub fn default_load() -> u64 {
         10_000
@@ -500,6 +552,10 @@ mod default_benchmark_config {
 
     pub fn default_workload() -> WorkloadType {
         WorkloadType::Transfers
+    }
+
+    pub fn default_stateless_mode() -> StatelessVerificationMode {
+        StatelessVerificationMode::Synthetic
     }
 
     pub fn default_fake_verification_duration() -> Duration {
@@ -514,6 +570,7 @@ impl Default for BenchmarkParameters {
             duration: default_benchmark_config::default_duration(),
             workload: default_benchmark_config::default_workload(),
             verification_duration: default_benchmark_config::default_fake_verification_duration(),
+            stateless_mode: default_benchmark_config::default_stateless_mode(),
             expected_stateful_duration:
                 default_benchmark_config::default_fake_verification_duration(),
         }

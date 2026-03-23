@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::{marker::PhantomData, sync::Arc, thread, time::Duration};
+use std::{marker::PhantomData, sync::Arc, thread};
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -12,7 +12,10 @@ use crate::{
     config::{LoadBalancingPolicy, SeparationMode, DEFAULT_CHANNEL_SIZE},
     error::{NodeError, NodeResult},
     executor::{
-        api::{ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction, Store},
+        api::{
+            ExecutionResults, Executor, PrimaryToProxyMessage, RemoraTransaction,
+            StatelessVerificationRequest, Store,
+        },
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
@@ -26,12 +29,10 @@ use crate::{
     proxy::core::ProxyId,
 };
 
-use sui_types::digests::TransactionDigest;
-
 /// A load balancer is responsible for distributing transactions to proxies.
 pub struct LoadBalancer<E: Executor> {
-    /// The executor trait
-    _phantom: PhantomData<E>,
+    /// The executor used to build stateless verification requests.
+    executor: E,
     /// The proxy connections.
     proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
@@ -51,6 +52,7 @@ where
 {
     /// Create a new load balancer.
     pub fn new(
+        executor: E,
         proxy_connections: Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
@@ -60,7 +62,7 @@ where
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            _phantom: PhantomData,
+            executor,
             proxy_connections,
             rx_committed_txns,
             policy,
@@ -73,7 +75,7 @@ where
     fn initialize_processors(
         &self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+        rx_stateless_txns: Receiver<StatelessVerificationRequest>,
     ) -> (
         Sender<Vec<RemoraTransaction<E>>>, // owned_txn_sender
         Sender<Vec<RemoraTransaction<E>>>, // shared_txn_sender
@@ -88,6 +90,7 @@ where
 
         // Initialize the OwnedTxnProcessor
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
+            executor: self.executor.clone(),
             proxy_connections: self.proxy_connections.clone(),
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -107,6 +110,7 @@ where
 
         // Initialize the SharedTxnProcessor
         let mut shared_txn_processor = SharedObjTxnForwarder::<E>::new(
+            self.executor.clone(),
             Arc::new(VersionedDependencyController::new()),
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
@@ -202,7 +206,7 @@ where
     pub async fn run(
         &mut self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+        rx_stateless_txns: Receiver<StatelessVerificationRequest>,
     ) -> NodeResult<()> {
         tracing::info!("Load balancer started");
 
@@ -257,7 +261,7 @@ where
     pub fn spawn(
         mut self,
         rx_pre_consensus_txns: Receiver<Vec<RemoraTransaction<E>>>,
-        rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+        rx_stateless_txns: Receiver<StatelessVerificationRequest>,
     ) -> JoinHandle<NodeResult<()>>
     where
         E: Send + 'static,

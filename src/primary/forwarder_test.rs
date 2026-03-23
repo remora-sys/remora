@@ -71,8 +71,10 @@ mod tests {
         let proxy_connections = Arc::new(DashMap::new());
         proxy_connections.insert(0, tx_benchmark.clone());
         proxy_connections.insert(1, tx_benchmark);
+        let executor = SuiExecutor::new(&BenchmarkParameters::new_for_tests()).await;
 
         let mut owned_txn_processor = OwnedObjTxnForwarder::<SuiExecutor> {
+            executor,
             proxy_connections: proxy_connections.clone(),
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -179,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_owned_processor_forwarding() {
         let config = BenchmarkParameters::new_for_tests();
-        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
+        let (executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup proxy channels
@@ -193,6 +195,7 @@ mod tests {
 
         // Create owned processor
         let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
+            executor,
             proxy_connections,
             policy: LoadBalancingPolicy::RoundRobin,
             index: 0,
@@ -215,14 +218,14 @@ mod tests {
             tokio::select! {
                 Some(msg) = rx_from_processor1.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
+                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
                 }
                 Some(msg) = rx_from_processor2.recv() => {
                     match msg {
-                        PrimaryToProxyMessage::StatelessTxn(_, _) => received_stateless += 1,
+                        PrimaryToProxyMessage::StatelessTxn(_) => received_stateless += 1,
                         PrimaryToProxyMessage::Txn(_, _, _) => received_stateful += 1,
                         PrimaryToProxyMessage::CombinedTxn(_, _, _) => unreachable!(),
                     }
@@ -247,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn test_dedicated_policy_forwarding() {
         let config = BenchmarkParameters::new_for_tests();
-        let (_executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
+        let (executor, _metrics, _tx_committed_txns, _rx_committed_txns, _rx_results) =
             setup_test_environment(&config).await;
 
         // Setup proxy channels
@@ -261,6 +264,7 @@ mod tests {
 
         // Create owned processor with Dedicated policy
         let mut owned_processor = OwnedObjTxnForwarder::<SuiExecutor> {
+            executor,
             proxy_connections,
             policy: LoadBalancingPolicy::Dedicated,
             index: 0,
@@ -352,7 +356,7 @@ mod tests {
         // Check messages received by proxy 1
         while let Ok(msg) = rx_from_processor1.try_recv() {
             match msg {
-                PrimaryToProxyMessage::StatelessTxn(_, _) => proxy1_stateless += 1,
+                PrimaryToProxyMessage::StatelessTxn(_) => proxy1_stateless += 1,
                 PrimaryToProxyMessage::Txn(_, _, _) => proxy1_stateful += 1,
                 _ => unreachable!(),
             }
@@ -361,7 +365,7 @@ mod tests {
         // Check messages received by proxy 2
         while let Ok(msg) = rx_from_processor2.try_recv() {
             match msg {
-                PrimaryToProxyMessage::StatelessTxn(_, _) => proxy2_stateless += 1,
+                PrimaryToProxyMessage::StatelessTxn(_) => proxy2_stateless += 1,
                 PrimaryToProxyMessage::Txn(_, _, _) => proxy2_stateful += 1,
                 _ => unreachable!(),
             }
@@ -566,6 +570,7 @@ mod tests {
         let tx_inter_proxy_replies = Arc::new(DashMap::new());
 
         let executor = SuiExecutor::new(&config).await;
+        let request_executor = executor.clone();
         let store = executor.init_store();
         let registry = Registry::new();
         let metrics = Arc::new(Metrics::new(&registry));
@@ -601,7 +606,9 @@ mod tests {
                 }
                 let tx = Arc::new(transaction);
                 (
-                    PrimaryToProxyMessage::StatelessTxn(*tx.digest(), tx.verification_duration()),
+                    PrimaryToProxyMessage::StatelessTxn(
+                        request_executor.make_verification_request(tx.as_ref()),
+                    ),
                     PrimaryToProxyMessage::Txn(tx, 0, required_states),
                 )
             })

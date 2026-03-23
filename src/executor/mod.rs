@@ -5,6 +5,7 @@ pub mod api;
 pub mod calibration;
 pub mod fake;
 pub mod oneshot_dependency_controller;
+pub mod stateless_crypto;
 pub mod sui;
 pub mod tpcc;
 pub mod versioned_dependency_controller;
