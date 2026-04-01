@@ -112,8 +112,11 @@ where
         // 3. Update data structures accordingly
         self.apply_sds_policy(&transactions, &graph);
         if let Some(batch_id) = batch_id {
-            self.batch_breakdown
-                .record_batch_scheduling(batch_id, total_start.elapsed());
+            self.batch_breakdown.record_batch_scheduling(
+                batch_id,
+                total_start,
+                total_start.elapsed(),
+            );
         }
     }
 
@@ -471,7 +474,7 @@ where
             }
             if let Some(batch_id) = batch_id {
                 self.batch_breakdown
-                    .record_version_assignment(batch_id, start.elapsed());
+                    .record_version_assignment(batch_id, start, start.elapsed());
             }
         }
     }
@@ -810,8 +813,11 @@ where
 
         Self::send_to_proxy(proxy_connections, proxy_id, msg).await;
         metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
-        batch_breakdown
-            .record_dispatch_forwarding(*transaction_arc.digest(), dispatch_start.elapsed());
+        batch_breakdown.record_dispatch_forwarding(
+            *transaction_arc.digest(),
+            dispatch_start,
+            dispatch_start.elapsed(),
+        );
 
         // Notify any dependencies waiting on this transaction
         for notify in current_handles {

@@ -132,8 +132,11 @@ where
                                 if let (Some(batch_breakdown), Some(digest)) =
                                     (batch_breakdown.as_ref(), item.measurement_digest())
                                 {
-                                    batch_breakdown
-                                        .record_network_rx_deser(digest, start.elapsed());
+                                    batch_breakdown.record_network_rx_deser(
+                                        digest,
+                                        start,
+                                        start.elapsed(),
+                                    );
                                 }
                                 if tx.send(item).await.is_err() {
                                     tracing::warn!("Incoming channel closed, stopping reader");
@@ -176,7 +179,7 @@ where
                 let start = Instant::now();
                 let serialized = bincode::serialize(transaction).expect("Infallible serialization");
                 if let (Some(batch_breakdown), Some(digest)) = (batch_breakdown.as_ref(), digest) {
-                    batch_breakdown.record_network_tx_serialize(digest, start.elapsed());
+                    batch_breakdown.record_network_tx_serialize(digest, start, start.elapsed());
                 }
 
                 let size = serialized.len() as u32;
