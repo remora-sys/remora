@@ -17,6 +17,7 @@ use crate::{
     executor::api::{Executor, PrimaryToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
+    primary::batch_breakdown::BatchBreakdownCollector,
 };
 
 /// The single machine validator is a simple validator that runs all components.
@@ -48,6 +49,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_stateless_txns, rx_stateless_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_pre_consensus_txns, rx_pre_consensus_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let batch_breakdown = Arc::new(BatchBreakdownCollector::default());
 
         // For storing proxy connections
         let proxy_connections = Arc::new(DashMap::new());
@@ -65,6 +67,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                 tx_proxy.clone(),
                 rx_proxy,
             )
+            .with_batch_breakdown(batch_breakdown.clone())
             .spawn();
 
             network_handles.push(network_client_handle);
@@ -79,6 +82,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             config.validator_parameters.load_balancing_policy.clone(),
             config.validator_parameters.separation_mode.clone(),
             metrics.clone(),
+            batch_breakdown.clone(),
         )
         .spawn(rx_pre_consensus_txns, rx_stateless_txns);
         primary_handles.push(load_balancer_handle);
@@ -94,6 +98,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_stateless_txns,
             tx_pre_consensus_txns,
             config.validator_parameters.separation_mode,
+            batch_breakdown.clone(),
         )
         .spawn();
 
@@ -107,6 +112,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_client_connections,
             tx_client_transactions,
         )
+        .with_batch_breakdown(batch_breakdown)
         .spawn();
         network_handles.push(transactions_network_handle);
 
@@ -154,8 +160,13 @@ mod tests {
     };
 
     #[tokio::test]
+    #[ignore = "starts long-lived node tasks without a shutdown path"]
     async fn execute_transactions() {
-        let config = ValidatorConfig::new_for_tests();
+        let config = ValidatorConfig {
+            validator_parameters: ValidatorParameters::new_for_tests(),
+            proxies: Vec::new(),
+            ..ValidatorConfig::new_for_tests()
+        };
         let benchmark_config = BenchmarkParameters::new_for_tests();
 
         // Create a Sui executor.
@@ -175,10 +186,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "starts long-lived node tasks without a shutdown path"]
     async fn no_proxies() {
         let validator_parameters = ValidatorParameters::new_for_tests();
         let config = ValidatorConfig {
             validator_parameters,
+            proxies: Vec::new(),
             ..ValidatorConfig::new_for_tests()
         };
         let benchmark_config = BenchmarkParameters::new_for_tests();

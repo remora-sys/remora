@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
+use std::{io, sync::Arc, time::Instant};
 
 use futures::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -15,6 +15,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage};
+
 /// A worker that handles a bidirectional connection with a peer.
 pub struct ConnectionWorker<I, O> {
     /// The TCP stream.
@@ -23,12 +25,14 @@ pub struct ConnectionWorker<I, O> {
     tx_incoming: Sender<I>,
     /// The receiver for messages to send to the network.
     rx_outgoing: Receiver<O>,
+    /// Batch-level latency breakdown collector used by primary-side measurements.
+    batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
 }
 
 impl<I, O> ConnectionWorker<I, O>
 where
-    I: Send + DeserializeOwned + 'static,
-    O: Send + Serialize,
+    I: Send + DeserializeOwned + MeasuredMessage + 'static,
+    O: Send + Serialize + MeasuredMessage,
 {
     /// The maximum size of a network message.
     const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -36,19 +40,28 @@ where
     const MAX_BATCH_SIZE: usize = 16;
 
     /// Create a new worker.
-    pub fn new(stream: TcpStream, tx_incoming: Sender<I>, rx_outgoing: Receiver<O>) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        tx_incoming: Sender<I>,
+        rx_outgoing: Receiver<O>,
+        batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+    ) -> Self {
         Self {
             stream,
             tx_incoming,
             rx_outgoing,
+            batch_breakdown,
         }
     }
 
     /// Run the worker.
     pub async fn run(self) {
         let (reader, writer) = self.stream.into_split();
-        let read_stream_handle = Self::handle_read_stream(reader, self.tx_incoming).boxed();
-        let write_stream_handle = Self::handle_write_stream(writer, self.rx_outgoing).boxed();
+        let read_stream_handle =
+            Self::handle_read_stream(reader, self.tx_incoming, self.batch_breakdown.clone())
+                .boxed();
+        let write_stream_handle =
+            Self::handle_write_stream(writer, self.rx_outgoing, self.batch_breakdown).boxed();
 
         // Use join! instead of select! to keep the read stream going even if write stream stops
         let (read_result, write_result) = tokio::join!(read_stream_handle, write_stream_handle,);
@@ -66,6 +79,7 @@ where
     async fn handle_read_stream(
         mut reader: OwnedReadHalf,
         tx_incoming: Sender<I>,
+        batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
     ) -> io::Result<()> {
         use byteorder::{BigEndian, ByteOrder};
         use bytes::{Buf, BytesMut};
@@ -110,9 +124,17 @@ where
             futures::stream::iter(frames)
                 .for_each_concurrent(Some(Self::MAX_BATCH_SIZE), |frame| {
                     let tx = tx_incoming.clone();
+                    let batch_breakdown = batch_breakdown.clone();
                     async move {
+                        let start = Instant::now();
                         match bincode::deserialize::<I>(&frame) {
                             Ok(item) => {
+                                if let (Some(batch_breakdown), Some(digest)) =
+                                    (batch_breakdown.as_ref(), item.measurement_digest())
+                                {
+                                    batch_breakdown
+                                        .record_network_rx_deser(digest, start.elapsed());
+                                }
                                 if tx.send(item).await.is_err() {
                                     tracing::warn!("Incoming channel closed, stopping reader");
                                 }
@@ -131,6 +153,7 @@ where
     async fn handle_write_stream(
         mut writer: OwnedWriteHalf,
         mut rx_outgoing: Receiver<O>,
+        batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
     ) -> io::Result<()> {
         let mut buffer: Vec<O> = Vec::with_capacity(Self::MAX_BATCH_SIZE);
         let mut serialized_buffer: Vec<u8> = Vec::new();
@@ -149,7 +172,12 @@ where
 
             // Batching writes
             for transaction in &buffer {
+                let digest = transaction.measurement_digest();
+                let start = Instant::now();
                 let serialized = bincode::serialize(transaction).expect("Infallible serialization");
+                if let (Some(batch_breakdown), Some(digest)) = (batch_breakdown.as_ref(), digest) {
+                    batch_breakdown.record_network_tx_serialize(digest, start.elapsed());
+                }
 
                 let size = serialized.len() as u32;
                 serialized_buffer.extend_from_slice(&size.to_be_bytes());

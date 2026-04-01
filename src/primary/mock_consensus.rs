@@ -1,10 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{marker::PhantomData, num::NonZeroUsize};
+use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
 use crate::config::SeparationMode;
 use crate::executor::api::{Executor, RemoraTransaction, StatelessVerificationRequest};
+use crate::primary::batch_breakdown::BatchBreakdownCollector;
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -71,6 +72,8 @@ pub struct MockConsensus<M, E: Executor + Send + 'static> {
     current_inflight_batches: usize,
     /// The proxy mode.
     separation_mode: SeparationMode,
+    /// Batch-level latency breakdown collector.
+    batch_breakdown: Arc<BatchBreakdownCollector>,
     /// The phantom data for the executor.
     _phantom: PhantomData<E>,
 }
@@ -80,7 +83,7 @@ where
     <E as Executor>::Transaction: Send + Sync + 'static,
 {
     /// Create a new mock consensus engine.
-    pub fn new(
+    pub(crate) fn new(
         executor: E,
         model: M,
         parameters: MockConsensusParameters,
@@ -89,6 +92,7 @@ where
         tx_stateless_txns: Sender<StatelessVerificationRequest>,
         tx_pre_consensus_scheduling: Sender<ConsensusCommit<RemoraTransaction<E>>>,
         separation_mode: SeparationMode,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
@@ -102,6 +106,7 @@ where
             current_batch: Vec::with_capacity(batch_size),
             current_inflight_batches: 0,
             separation_mode,
+            batch_breakdown,
             _phantom: PhantomData,
         }
     }
@@ -138,6 +143,7 @@ where
                     if self.current_batch.len() >= batch_size {
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
+                        self.batch_breakdown.register_shared_batch(&batch);
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
                         self.tx_pre_consensus_scheduling.send(batch).await.unwrap();
@@ -150,6 +156,7 @@ where
                     if !self.current_batch.is_empty() {
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
+                        self.batch_breakdown.register_shared_batch(&batch);
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch.clone()));
                         self.tx_pre_consensus_scheduling.send(batch).await.unwrap();

@@ -9,6 +9,7 @@ use crate::{
         worker_pool::{GenericWorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
+    primary::batch_breakdown::BatchBreakdownCollector,
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
@@ -31,6 +32,7 @@ where
     pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
     pub pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
     pub metrics: Arc<Metrics>,
+    pub batch_breakdown: Arc<BatchBreakdownCollector>,
     pub states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
     pub stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
     pub separation_mode: SeparationMode,
@@ -57,6 +59,7 @@ where
     pub(crate) _phantom: PhantomData<E>,
     pub(crate) proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub(crate) object_last_proxy: Vec<Option<ExecutorIndex>>,
+    pub(crate) batch_breakdown: Arc<BatchBreakdownCollector>,
 }
 
 impl<E> PreConsensusSchedTask<E>
@@ -71,6 +74,7 @@ where
         >,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         Self {
             proxy_connections,
@@ -78,6 +82,7 @@ where
             _phantom: PhantomData,
             proxy_loads,
             object_last_proxy: vec![None; 1 << 24], // 2^24 to match object_id_24bit_index range
+            batch_breakdown,
         }
     }
 
@@ -97,16 +102,19 @@ where
             return;
         }
 
-        // 1. Build dependency graph
-        let start = std::time::Instant::now();
+        let batch_id = self
+            .batch_breakdown
+            .batch_id_for_transactions(&transactions);
+        let total_start = std::time::Instant::now();
         let (graph, _digest_to_node) = self.build_dependency_graph(&transactions);
-        tracing::debug!("Dependency graph building took {:?}", start.elapsed());
 
         // 2. Decide assignment based on policy
         // 3. Update data structures accordingly
-        let start = std::time::Instant::now();
         self.apply_sds_policy(&transactions, &graph);
-        tracing::debug!("Pre-consensus scheduling policy took {:?}", start.elapsed());
+        if let Some(batch_id) = batch_id {
+            self.batch_breakdown
+                .record_batch_scheduling(batch_id, total_start.elapsed());
+        }
     }
 
     fn apply_sds_policy(
@@ -433,6 +441,8 @@ where
 {
     // Mapping of object ID to its current version for shared objects
     pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    // Batch-level latency breakdown collector.
+    pub(crate) batch_breakdown: Arc<BatchBreakdownCollector>,
     // PhantomData to indicate we're using the generic parameter
     pub(crate) _phantom: PhantomData<E>,
 }
@@ -448,17 +458,20 @@ where
         sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
         while let Some(transactions) = shared_txn_receiver.recv().await {
+            let batch_id = self
+                .batch_breakdown
+                .batch_id_for_transactions(&transactions);
+            let start = std::time::Instant::now();
             for mut transaction in transactions {
                 let required_versions = self.assign_shared_object_versions(&mut transaction);
-
-                tracing::debug!(
-                    "Version assignment task received transaction {:?}",
-                    transaction.digest()
-                );
 
                 if sender.send((transaction, required_versions)).await.is_err() {
                     tracing::error!("Failed to send transaction to SharedObjTxnForwarder");
                 }
+            }
+            if let Some(batch_id) = batch_id {
+                self.batch_breakdown
+                    .record_version_assignment(batch_id, start.elapsed());
             }
         }
     }
@@ -539,6 +552,7 @@ where
             &context.proxy_connections,
             &context.pre_consensus_routing_plan,
             &context.metrics,
+            &context.batch_breakdown,
             &context.states_to_proxy,
             &context.stateless_forwarding_table,
             context.separation_mode,
@@ -558,6 +572,7 @@ where
     pub transaction: RemoraTransaction<E>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub counter: usize,
+    pub enqueue_time: std::time::Instant,
 }
 
 /// Context for stateless forwarding tasks
@@ -630,6 +645,7 @@ where
         proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
         metrics: Arc<Metrics>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
         states_to_proxy: Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         stateless_forwarding_table: Arc<DashMap<TransactionDigest, ExecutorIndex>>,
         separation_mode: SeparationMode,
@@ -642,6 +658,7 @@ where
             proxy_connections,
             pre_consensus_routing_plan,
             metrics,
+            batch_breakdown,
             states_to_proxy,
             stateless_forwarding_table,
             separation_mode,
@@ -668,6 +685,7 @@ where
                 transaction,
                 required_versions,
                 counter,
+                enqueue_time: std::time::Instant::now(),
             };
 
             if let Err(e) = self.worker_pool.send_task(task).await {
@@ -686,12 +704,14 @@ where
         proxy_connections: &Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
         pre_consensus_routing_plan: &Arc<DashMap<TransactionDigest, ProxyId>>,
         metrics: &Arc<Metrics>,
+        batch_breakdown: &Arc<BatchBreakdownCollector>,
         states_to_proxy: &Arc<DashMap<(ObjectID, SequenceNumber), ExecutorIndex>>,
         stateless_forwarding_table: &Arc<DashMap<TransactionDigest, ExecutorIndex>>,
         separation_mode: SeparationMode,
         policy: &PreConsensusSchedulingPolicy,
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
     ) {
+        let dispatch_start = task.enqueue_time;
         let (prior_handles, current_handles) = match task.required_versions.is_empty() {
             true => (Vec::new(), Vec::new()),
             false => dependency_controller.get_prior_dependency_and_update(
@@ -790,6 +810,8 @@ where
 
         Self::send_to_proxy(proxy_connections, proxy_id, msg).await;
         metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
+        batch_breakdown
+            .record_dispatch_forwarding(*transaction_arc.digest(), dispatch_start.elapsed());
 
         // Notify any dependencies waiting on this transaction
         for notify in current_handles {

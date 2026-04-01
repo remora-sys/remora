@@ -854,18 +854,15 @@ mod tests {
         // Set up version assignment
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(
+                crate::primary::batch_breakdown::BatchBreakdownCollector::default(),
+            ),
             _phantom: std::marker::PhantomData,
         };
 
         // Send all transactions to proxy
         for tx in transactions {
             let transaction = RemoraTransaction::<E>::new_for_tests(tx.clone());
-
-            // First send the stateless transaction
-            let stateless_message = PrimaryToProxyMessage::StatelessTxn(
-                executor.make_verification_request(&transaction),
-            );
-            tx_to_proxy.send(stateless_message).await.unwrap();
 
             use crate::executor::api::TransactionWithTimestamp;
             use std::time::Duration;
@@ -892,13 +889,9 @@ mod tests {
                     Vec::new()
                 };
 
-            // Then send the stateful transaction with required_states (empty or not)
-            let stateful_message = PrimaryToProxyMessage::Txn(
-                Arc::new(RemoraTransaction::<E>::new_for_tests(tx)),
-                0,
-                required_states,
-            );
-            tx_to_proxy.send(stateful_message).await.unwrap();
+            let combined_message =
+                PrimaryToProxyMessage::CombinedTxn(Arc::new(transaction), 0, required_states);
+            tx_to_proxy.send(combined_message).await.unwrap();
         }
 
         // Receive and check results - wait for at least one successful result

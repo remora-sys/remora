@@ -20,6 +20,7 @@ use crate::{
     },
     metrics::Metrics,
     primary::{
+        batch_breakdown::BatchBreakdownCollector,
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         shared_obj_txn_forwarder::{
             PreConsensusSchedTask, PreConsensusSchedulingPolicy, SharedObjTxnForwarder,
@@ -44,6 +45,8 @@ pub struct LoadBalancer<E: Executor> {
     separation_mode: SeparationMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
+    /// Batch-level latency breakdown collector.
+    batch_breakdown: Arc<BatchBreakdownCollector>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -51,7 +54,7 @@ where
     <E as Executor>::Transaction: Send + Sync + 'static,
 {
     /// Create a new load balancer.
-    pub fn new(
+    pub(crate) fn new(
         executor: E,
         proxy_connections: Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
@@ -60,6 +63,7 @@ where
         policy: PreConsensusSchedulingPolicy,
         separation_mode: SeparationMode,
         metrics: Arc<Metrics>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         Self {
             executor,
@@ -68,6 +72,7 @@ where
             policy,
             separation_mode,
             metrics,
+            batch_breakdown,
         }
     }
 
@@ -98,6 +103,7 @@ where
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: self.batch_breakdown.clone(),
             _phantom: PhantomData,
         };
         version_assignment_processor
@@ -115,6 +121,7 @@ where
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
             self.metrics.clone(),
+            self.batch_breakdown.clone(),
             Arc::new(DashMap::with_capacity(10000000)),
             stateless_forwarding_table.clone(),
             self.separation_mode,
@@ -125,6 +132,7 @@ where
             self.proxy_connections.clone(),
             pre_consensus_routing_plan.clone(),
             proxy_loads.clone(),
+            self.batch_breakdown.clone(),
         );
 
         thread::spawn(move || {

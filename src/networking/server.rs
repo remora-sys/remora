@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -10,7 +10,11 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{config::DEFAULT_CHANNEL_SIZE, networking::worker::ConnectionWorker};
+use crate::{
+    config::DEFAULT_CHANNEL_SIZE,
+    networking::worker::ConnectionWorker,
+    primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage},
+};
 
 /// A server run by the primary machine that listens for connections from proxies
 /// and transactions from clients. When a new client connects, a new worker is spawned.
@@ -26,12 +30,14 @@ pub struct NetworkServer<I, O> {
     tx_connections: Sender<Sender<O>>,
     /// The sender for messages received from the network to send to the application layer.
     tx_incoming: Sender<I>,
+    /// Optional batch-level measurement collector for primary-side experiments.
+    batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
 }
 
 impl<I, O> NetworkServer<I, O>
 where
-    I: Send + DeserializeOwned + 'static,
-    O: Send + Serialize + 'static,
+    I: Send + DeserializeOwned + MeasuredMessage + 'static,
+    O: Send + Serialize + MeasuredMessage + 'static,
 {
     /// Create a new server.
     pub fn new(
@@ -43,7 +49,16 @@ where
             server_address,
             tx_connections,
             tx_incoming,
+            batch_breakdown: None,
         }
+    }
+
+    pub(crate) fn with_batch_breakdown(
+        mut self,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
+    ) -> Self {
+        self.batch_breakdown = Some(batch_breakdown);
+        self
     }
 
     /// Run the server.
@@ -58,7 +73,12 @@ where
 
             // Spawn a worker to handle the connection.
             let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            let worker = ConnectionWorker::new(stream, self.tx_incoming.clone(), rx);
+            let worker = ConnectionWorker::new(
+                stream,
+                self.tx_incoming.clone(),
+                rx,
+                self.batch_breakdown.clone(),
+            );
             let _handle = worker.spawn();
 
             // Notify the application layer that a new client has connected.

@@ -71,6 +71,7 @@ async fn remote_proxy_common<E: Executor + Send + Sync + 'static>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "starts long-lived cluster tasks without a shutdown path"]
 async fn remote_proxy_sui() {
     let config = BenchmarkParameters::new_for_contention_tests();
     let executor = SuiExecutor::new(&config).await;

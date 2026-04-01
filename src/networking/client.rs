@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
@@ -11,7 +11,10 @@ use tokio::{
     time::sleep,
 };
 
-use crate::networking::worker::ConnectionWorker;
+use crate::{
+    networking::worker::ConnectionWorker,
+    primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage},
+};
 
 /// A client ran by the proxy (and the load generator) to connects to the server on the
 /// primary machine and receive messages to process. The client can also leverage the
@@ -23,12 +26,14 @@ pub struct NetworkClient<I, O> {
     tx_incoming: Sender<I>,
     /// The receiver for messages to send through the network.
     rx_outgoing: Receiver<O>,
+    /// Optional batch-level measurement collector for primary-side experiments.
+    batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
 }
 
 impl<I, O> NetworkClient<I, O>
 where
-    I: Send + DeserializeOwned + 'static,
-    O: Send + Serialize,
+    I: Send + DeserializeOwned + MeasuredMessage + 'static,
+    O: Send + Serialize + MeasuredMessage,
 {
     /// Create a new client.
     pub fn new(
@@ -40,7 +45,16 @@ where
             server_address,
             tx_incoming,
             rx_outgoing,
+            batch_breakdown: None,
         }
+    }
+
+    pub(crate) fn with_batch_breakdown(
+        mut self,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
+    ) -> Self {
+        self.batch_breakdown = Some(batch_breakdown);
+        self
     }
 
     /// Run the client.
@@ -64,7 +78,12 @@ where
         };
         tracing::info!("Connected to {}", self.server_address);
 
-        let worker = ConnectionWorker::new(stream, self.tx_incoming, self.rx_outgoing);
+        let worker = ConnectionWorker::new(
+            stream,
+            self.tx_incoming,
+            self.rx_outgoing,
+            self.batch_breakdown,
+        );
         worker.run().await;
         Ok(())
     }
@@ -109,7 +128,12 @@ where
         O: 'static,
     {
         tokio::spawn(async move {
-            let worker = ConnectionWorker::new(stream, self.tx_incoming, self.rx_outgoing);
+            let worker = ConnectionWorker::new(
+                stream,
+                self.tx_incoming,
+                self.rx_outgoing,
+                self.batch_breakdown,
+            );
             worker.run().await;
             Ok(())
         })

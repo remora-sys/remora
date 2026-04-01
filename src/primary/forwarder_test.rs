@@ -147,6 +147,7 @@ mod tests {
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(crate::primary::batch_breakdown::BatchBreakdownCollector::default()),
             _phantom: std::marker::PhantomData,
         };
 
@@ -497,6 +498,7 @@ mod tests {
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(crate::primary::batch_breakdown::BatchBreakdownCollector::default()),
             _phantom: std::marker::PhantomData,
         };
 
