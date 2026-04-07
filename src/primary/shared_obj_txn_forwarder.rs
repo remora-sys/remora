@@ -15,9 +15,16 @@ use crate::{
 use dashmap::DashMap;
 use rand::Rng;
 use rustc_hash::FxHashMap;
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use sui_types::base_types::{ObjectID, SequenceNumber};
 use tokio::sync::mpsc::{Receiver, Sender};
+
+const FORWARDING_TRACE_SAMPLE_EVERY_TASKS: usize = 100;
 
 /// Context for forwarding tasks containing all necessary dependencies
 #[derive(Clone)]
@@ -260,6 +267,9 @@ where
         let txn_duration = task.transaction.expected_stateful_duration()
             + task.transaction.verification_duration();
         let transaction_arc = Arc::new(task.transaction);
+        let required_versions_len = task.required_versions.len();
+        let sample_forwarding_trace = task.txn_cnt % FORWARDING_TRACE_SAMPLE_EVERY_TASKS == 0;
+        let scheduling_start = sample_forwarding_trace.then(Instant::now);
 
         if let Some((proxy_index, stateless_proxy_id)) = Self::get_proxy_for_shared_objects(
             policy,
@@ -272,6 +282,8 @@ where
             proxy_access_histories,
             &txn_duration,
         ) {
+            let scheduling_elapsed = scheduling_start.map(|start| start.elapsed());
+            let metadata_lookup_start = sample_forwarding_trace.then(Instant::now);
             let stateful_missing_states = Self::get_missing_states_for_transaction(
                 &transaction_arc,
                 Some(task.required_versions),
@@ -279,6 +291,8 @@ where
                 states_to_proxy.clone(),
             )
             .await;
+            let metadata_lookup_elapsed = metadata_lookup_start.map(|start| start.elapsed());
+            let missing_states_len = stateful_missing_states.len();
 
             if proxy_mode == ProxyMode::Separation {
                 let stateless_msg =
@@ -306,8 +320,38 @@ where
                 dispatch_start,
                 dispatch_start.elapsed(),
             );
+            if let (true, Some(scheduling_elapsed), Some(metadata_lookup_elapsed)) = (
+                sample_forwarding_trace,
+                scheduling_elapsed,
+                metadata_lookup_elapsed,
+            ) {
+                tracing::info!(
+                    "[primary-forwarding-sample] task_id={} digest={} policy={:?} required_versions={} missing_states={} proxy_index={} stateless_proxy_id={} scheduling_ms={:.3} metadata_lookup_ms={:.3} dispatch_total_ms={:.3}",
+                    task.txn_cnt,
+                    transaction_arc.digest(),
+                    policy,
+                    required_versions_len,
+                    missing_states_len,
+                    proxy_index,
+                    stateless_proxy_id,
+                    scheduling_elapsed.as_secs_f64() * 1_000.0,
+                    metadata_lookup_elapsed.as_secs_f64() * 1_000.0,
+                    dispatch_start.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
         } else {
             tracing::warn!("No proxies available for transaction with shared objects");
+            if let (true, Some(scheduling_elapsed)) = (sample_forwarding_trace, scheduling_start) {
+                tracing::info!(
+                    "[primary-forwarding-sample] task_id={} digest={} policy={:?} required_versions={} proxy_selected=false scheduling_ms={:.3} dispatch_total_ms={:.3}",
+                    task.txn_cnt,
+                    transaction_arc.digest(),
+                    policy,
+                    required_versions_len,
+                    scheduling_elapsed.elapsed().as_secs_f64() * 1_000.0,
+                    dispatch_start.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
         }
 
         // Notify any dependencies waiting on this transaction
