@@ -17,6 +17,7 @@ use crate::{
     executor::api::{Executor, PrimaryToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
+    primary::batch_breakdown::BatchBreakdownCollector,
 };
 
 /// The single machine validator is a simple validator that runs all components.
@@ -46,6 +47,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
         let (tx_client_connections, rx_client_connections) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_client_transactions, rx_client_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (tx_committed_txns, rx_committed_txns) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let batch_breakdown = Arc::new(BatchBreakdownCollector::default());
 
         // For storing proxy connections
         let proxy_connections = Arc::new(DashMap::new());
@@ -63,6 +65,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
                 tx_proxy.clone(),
                 rx_proxy,
             )
+            .with_batch_breakdown(batch_breakdown.clone())
             .spawn();
 
             network_handles.push(network_client_handle);
@@ -74,8 +77,9 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             proxy_connections,
             rx_committed_txns,
             config.validator_parameters.load_balancing_policy.clone(),
-            config.validator_parameters.proxy_mode.clone(),
+            config.validator_parameters.proxy_mode,
             metrics.clone(),
+            batch_breakdown.clone(),
         )
         .spawn();
         primary_handles.push(load_balancer_handle);
@@ -87,6 +91,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             config.validator_parameters.consensus_parameters.clone(),
             rx_client_transactions,
             tx_committed_txns,
+            batch_breakdown.clone(),
         )
         .spawn();
 
@@ -100,6 +105,7 @@ impl<E: Executor + Sync + Send + 'static> PrimaryNode<E> {
             tx_client_connections,
             tx_client_transactions,
         )
+        .with_batch_breakdown(batch_breakdown)
         .spawn();
         network_handles.push(transactions_network_handle);
 

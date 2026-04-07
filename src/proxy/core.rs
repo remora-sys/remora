@@ -829,6 +829,9 @@ mod tests {
         // Set up version assignment
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(
+                crate::primary::batch_breakdown::BatchBreakdownCollector::default(),
+            ),
             _phantom: std::marker::PhantomData,
         };
 

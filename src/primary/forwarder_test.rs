@@ -28,7 +28,7 @@ mod tests {
         Receiver<Vec<RemoraTransaction<SuiExecutor>>>,
         Receiver<ExecutionResults<SuiExecutor>>,
     ) {
-        let executor = SuiExecutor::new(&config).await;
+        let executor = SuiExecutor::new(config).await;
 
         // Create channels for load balancer
         let (tx_committed_txns, rx_committed_txns) = channel(100);
@@ -55,7 +55,7 @@ mod tests {
         transactions
             .into_iter()
             .take(count)
-            .map(|tx| RemoraTransaction::<SuiExecutor>::new_for_tests(tx))
+            .map(RemoraTransaction::<SuiExecutor>::new_for_tests)
             .collect()
     }
 
@@ -144,6 +144,9 @@ mod tests {
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(
+                crate::primary::batch_breakdown::BatchBreakdownCollector::default(),
+            ),
             _phantom: std::marker::PhantomData,
         };
 
@@ -275,6 +278,7 @@ mod tests {
             proxy_connections.clone(),
             ProxyMode::Separation,
             Arc::new(Metrics::new_for_tests()),
+            Arc::new(crate::primary::batch_breakdown::BatchBreakdownCollector::default()),
             Arc::new(DashMap::new()),
             (0..proxy_connections.len())
                 .map(|_| Arc::new(DashMap::new()))
@@ -387,6 +391,9 @@ mod tests {
         // Create the version assignment task
         let mut version_assignment_task = VersionAssignmentTask::<SuiExecutor> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: Arc::new(
+                crate::primary::batch_breakdown::BatchBreakdownCollector::default(),
+            ),
             _phantom: std::marker::PhantomData,
         };
 

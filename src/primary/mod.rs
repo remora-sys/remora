@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod batch_breakdown;
 #[cfg(test)]
 pub mod forwarder_test;
 mod load_balancer;

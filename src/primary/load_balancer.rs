@@ -17,6 +17,7 @@ use crate::{
     },
     metrics::Metrics,
     primary::{
+        batch_breakdown::BatchBreakdownCollector,
         owned_obj_txn_forwarder::OwnedObjTxnForwarder,
         shared_obj_txn_forwarder::{SharedObjTxnForwarder, VersionAssignmentTask},
     },
@@ -38,6 +39,8 @@ pub struct LoadBalancer<E: Executor> {
     proxy_mode: ProxyMode,
     /// The metrics for the validator.
     metrics: Arc<Metrics>,
+    /// Batch-level latency breakdown collector.
+    batch_breakdown: Arc<BatchBreakdownCollector>,
 }
 
 impl<E: Executor + Send + Sync + 'static> LoadBalancer<E>
@@ -45,7 +48,7 @@ where
     <E as Executor>::Transaction: Send + Sync + 'static,
 {
     /// Create a new load balancer.
-    pub fn new(
+    pub(crate) fn new(
         proxy_connections: Arc<
             DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
         >,
@@ -53,6 +56,7 @@ where
         policy: LoadBalancingPolicy,
         proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         tracing::info!("LB: proxy_mode: {:?}", proxy_mode);
         Self {
@@ -62,6 +66,7 @@ where
             policy,
             proxy_mode,
             metrics,
+            batch_breakdown,
         }
     }
 
@@ -84,11 +89,12 @@ where
         let mut owned_txn_processor = OwnedObjTxnForwarder::<E> {
             proxy_connections: self.proxy_connections.clone(),
             index: 0,
-            proxy_mode: self.proxy_mode.clone(),
+            proxy_mode: self.proxy_mode,
         };
 
         let mut version_assignment_processor = VersionAssignmentTask::<E> {
             shared_object_versions: rustc_hash::FxHashMap::default(),
+            batch_breakdown: self.batch_breakdown.clone(),
             _phantom: PhantomData,
         };
         version_assignment_processor
@@ -101,8 +107,9 @@ where
             Arc::new(DashMap::with_capacity(10000000)),
             self.policy.clone(),
             self.proxy_connections.clone(),
-            self.proxy_mode.clone(),
+            self.proxy_mode,
             self.metrics.clone(),
+            self.batch_breakdown.clone(),
             Arc::new(DashMap::with_capacity(self.proxy_connections.len())),
             (0..self.proxy_connections.len())
                 .map(|_| Arc::new(DashMap::with_capacity(10000)))

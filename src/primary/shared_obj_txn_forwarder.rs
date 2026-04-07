@@ -9,6 +9,7 @@ use crate::{
         worker_pool::{WorkerPool, WorkerPoolConfig, WorkerTask},
     },
     metrics::Metrics,
+    primary::batch_breakdown::BatchBreakdownCollector,
     proxy::core::ProxyId,
 };
 use dashmap::DashMap;
@@ -31,6 +32,7 @@ where
     pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
     pub proxy_mode: ProxyMode,
     pub metrics: Arc<Metrics>,
+    pub batch_breakdown: Arc<BatchBreakdownCollector>,
     pub proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     pub proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
 }
@@ -42,6 +44,7 @@ where
 {
     // Mapping of object ID to its current version for shared objects
     pub(crate) shared_object_versions: FxHashMap<ObjectID, SequenceNumber>,
+    pub(crate) batch_breakdown: Arc<BatchBreakdownCollector>,
     // PhantomData to indicate we're using the generic parameter
     pub(crate) _phantom: PhantomData<E>,
 }
@@ -57,6 +60,8 @@ where
         sender: Sender<(RemoraTransaction<E>, Vec<(ObjectID, SequenceNumber)>)>,
     ) {
         while let Some(transactions) = shared_txn_receiver.recv().await {
+            let batch_id = self.batch_breakdown.batch_id_for_messages(&transactions);
+            let start = std::time::Instant::now();
             for mut transaction in transactions {
                 let required_versions = self.assign_shared_object_versions(&mut transaction);
 
@@ -66,6 +71,10 @@ where
                 );
 
                 sender.send((transaction, required_versions)).await.unwrap();
+            }
+            if let Some(batch_id) = batch_id {
+                self.batch_breakdown
+                    .record_version_assignment(batch_id, start, start.elapsed());
             }
         }
     }
@@ -83,8 +92,8 @@ where
         // Get all shared object IDs from the transaction
         let shared_objects = transaction
             .shared_objects()
-            .into_iter()
-            .map(|(id, _)| *id)
+            .keys()
+            .copied()
             .collect::<Vec<_>>();
 
         if shared_objects.is_empty() {
@@ -150,6 +159,7 @@ where
     pub transaction: RemoraTransaction<E>,
     pub required_versions: Vec<(ObjectID, SequenceNumber)>,
     pub txn_cnt: usize,
+    pub enqueue_time: std::time::Instant,
 }
 
 impl<E> WorkerTask for ForwardingTask<E>
@@ -166,8 +176,9 @@ where
             &context.states_to_proxy,
             &context.policy,
             &context.proxy_connections,
-            context.proxy_mode.clone(),
+            context.proxy_mode,
             &context.metrics,
+            &context.batch_breakdown,
             &context.proxy_loads,
             &context.proxy_access_histories,
         )
@@ -190,6 +201,7 @@ where
         >,
         proxy_mode: ProxyMode,
         metrics: Arc<Metrics>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: Vec<Arc<DashMap<ObjectID, usize>>>,
     ) -> Self {
@@ -200,6 +212,7 @@ where
             proxy_connections: proxy_connections.clone(),
             proxy_mode,
             metrics: metrics.clone(),
+            batch_breakdown,
             proxy_loads: proxy_loads.clone(),
             proxy_access_histories: proxy_access_histories.clone(),
         };
@@ -221,9 +234,11 @@ where
         >,
         proxy_mode: ProxyMode,
         metrics: &Arc<Metrics>,
+        batch_breakdown: &Arc<BatchBreakdownCollector>,
         proxy_loads: &Arc<DashMap<ExecutorIndex, usize>>,
         proxy_access_histories: &Vec<Arc<DashMap<ObjectID, usize>>>,
     ) {
+        let dispatch_start = task.enqueue_time;
         let (prior_handles, current_handles) = match task.required_versions.is_empty() {
             true => (Vec::new(), Vec::new()),
             false => dependency_controller.get_prior_dependency_and_update(
@@ -286,6 +301,11 @@ where
             }
 
             metrics.update_metrics(transaction_arc.timestamp(), "primary-egress");
+            batch_breakdown.record_dispatch_forwarding(
+                *transaction_arc.digest(),
+                dispatch_start,
+                dispatch_start.elapsed(),
+            );
         } else {
             tracing::warn!("No proxies available for transaction with shared objects");
         }
@@ -307,6 +327,7 @@ where
                 transaction,
                 required_versions,
                 txn_cnt,
+                enqueue_time: std::time::Instant::now(),
             };
 
             if let Err(e) = self.worker_pool.send_task(task).await {

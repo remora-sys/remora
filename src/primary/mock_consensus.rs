@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,8 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
+
+use crate::primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage};
 
 /// Represents a consensus commit.
 pub type ConsensusCommit<T> = Vec<T>;
@@ -61,15 +63,18 @@ pub struct MockConsensus<M, T> {
     current_batch: ConsensusCommit<T>,
     /// The number of batches currently in-flight.
     current_inflight_batches: usize,
+    /// Batch-level latency breakdown collector.
+    batch_breakdown: Arc<BatchBreakdownCollector>,
 }
 
 impl<M, T> MockConsensus<M, T> {
     /// Create a new mock consensus engine.
-    pub fn new(
+    pub(crate) fn new(
         model: M,
         parameters: MockConsensusParameters,
         rx_load_balancer: Receiver<T>,
         tx_primary_executor: Sender<ConsensusCommit<T>>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
@@ -79,11 +84,12 @@ impl<M, T> MockConsensus<M, T> {
             tx_primary_executor,
             current_batch: Vec::with_capacity(batch_size),
             current_inflight_batches: 0,
+            batch_breakdown,
         }
     }
 }
 
-impl<M: DelayModel<T>, T> MockConsensus<M, T> {
+impl<M: DelayModel<T>, T: MeasuredMessage> MockConsensus<M, T> {
     /// Run the mock consensus engine.
     pub async fn run(&mut self) {
         let timer = sleep(self.parameters.max_batch_delay);
@@ -105,6 +111,7 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                     if self.current_batch.len() >= batch_size {
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
+                        self.batch_breakdown.register_batch(&batch);
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch));
                         timer.as_mut().reset(Instant::now() + self.parameters.max_batch_delay);
@@ -116,6 +123,7 @@ impl<M: DelayModel<T>, T> MockConsensus<M, T> {
                     if !self.current_batch.is_empty() {
                         self.current_inflight_batches += 1;
                         let batch: Vec<_> = self.current_batch.drain(..).collect();
+                        self.batch_breakdown.register_batch(&batch);
                         tracing::debug!("Sealed batch with {} transactions", batch.len());
                         waiter.push(self.model.consensus_delay(batch));
                     } else if self.tx_primary_executor.is_closed() {
@@ -218,13 +226,16 @@ pub mod models {
 
 #[cfg(test)]
 mod test {
-    use std::{num::NonZeroUsize, time::Duration};
+    use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
     use tokio::{sync::mpsc, time::Instant};
 
-    use crate::primary::mock_consensus::{
-        models::{FixedDelay, UniformDelay},
-        MockConsensus, MockConsensusParameters,
+    use crate::primary::{
+        batch_breakdown::BatchBreakdownCollector,
+        mock_consensus::{
+            models::{FixedDelay, UniformDelay},
+            MockConsensus, MockConsensusParameters,
+        },
     };
 
     #[tokio::test(start_paused = true)]
@@ -244,6 +255,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
@@ -280,6 +292,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
@@ -318,6 +331,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
@@ -338,7 +352,6 @@ mod test {
             batch_size: NonZeroUsize::new(3).unwrap(),
             max_batch_delay: Duration::from_secs(100), // Ensure it is never hit.
             max_inflight_batches: NonZeroUsize::new(1).unwrap(),
-            ..MockConsensusParameters::default()
         };
 
         let (tx_load_balancer, rx_load_balancer) = mpsc::channel(100);
@@ -349,6 +362,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
@@ -382,6 +396,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
@@ -406,6 +421,7 @@ mod test {
             parameters.clone(),
             rx_load_balancer,
             tx_primary_executor,
+            Arc::new(BatchBreakdownCollector::default()),
         )
         .spawn();
 
