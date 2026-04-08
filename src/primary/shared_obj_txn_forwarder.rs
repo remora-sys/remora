@@ -76,14 +76,52 @@ where
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
         batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
+        Self::new_with_object_tracking_slots(
+            proxy_connections,
+            pre_consensus_routing_plan,
+            proxy_loads,
+            batch_breakdown,
+            1 << 24,
+        )
+    }
+
+    fn new_with_object_tracking_slots(
+        proxy_connections: Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
+        object_tracking_slots: usize,
+    ) -> Self {
         Self {
             proxy_connections,
             pre_consensus_routing_plan,
             _phantom: PhantomData,
             proxy_loads,
-            object_last_proxy: vec![None; 1 << 24], // 2^24 to match object_id_24bit_index range
+            object_last_proxy: vec![None; object_tracking_slots.max(1)],
             batch_breakdown,
         }
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn new_for_benchmark(
+        proxy_connections: Arc<
+            DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>,
+        >,
+        pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
+        proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
+        batch_breakdown: Arc<BatchBreakdownCollector>,
+        object_tracking_slots: usize,
+    ) -> Self {
+        Self::new_with_object_tracking_slots(
+            proxy_connections,
+            pre_consensus_routing_plan,
+            proxy_loads,
+            batch_breakdown,
+            object_tracking_slots,
+        )
     }
 
     pub(crate) async fn process_pre_consensus_txns(
@@ -118,6 +156,17 @@ where
                 total_start.elapsed(),
             );
         }
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn benchmark_schedule_transaction_batch(
+        &mut self,
+        transactions: Vec<RemoraTransaction<E>>,
+    ) -> Duration {
+        let start = std::time::Instant::now();
+        self.schedule_transaction_batch(transactions);
+        start.elapsed()
     }
 
     fn apply_sds_policy(

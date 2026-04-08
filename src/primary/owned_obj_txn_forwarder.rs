@@ -127,26 +127,28 @@ where
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub async fn benchmark_parallel_forwarding(&mut self, transactions: Vec<RemoraTransaction<E>>) {
         self.forward_owned_txns_in_parallel(transactions.clone())
             .await;
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub async fn create_benchmark_transactions(&self, count: usize) -> Vec<RemoraTransaction<E>> {
         use crate::config::{BenchmarkParameters, WorkloadType};
         use std::time::Duration;
-        let config = BenchmarkParameters {
-            load: count as u64,
-            duration: Duration::from_secs(1),
-            workload: WorkloadType::Transfers,
-            verification_duration: Duration::from_secs(0),
-        };
+        let mut config = BenchmarkParameters::new_for_tests();
+        config.load = count as u64;
+        config.duration = Duration::from_secs(1);
+        config.workload = WorkloadType::Transfers;
+        config.verification_duration = Duration::from_secs(0);
+        config.expected_stateful_duration = Duration::from_secs(0);
         let transactions = E::generate_transactions(&config, None).await;
         transactions
             .into_iter()
             .take(count)
-            .map(|tx| RemoraTransaction::<E>::new_for_tests(tx))
+            .map(RemoraTransaction::<E>::new_for_tests)
             .collect()
     }
 }
