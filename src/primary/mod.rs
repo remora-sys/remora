@@ -11,5 +11,7 @@ pub mod owned_obj_txn_forwarder;
 #[cfg(all(test, feature = "benchmark"))]
 mod rsds_bench_test;
 pub mod shared_obj_txn_forwarder;
+#[cfg(all(test, feature = "benchmark"))]
+mod version_assignment_bench_test;
 
 pub use load_balancer::LoadBalancer;

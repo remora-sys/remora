@@ -504,6 +504,18 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn new_for_benchmark(shared_object_capacity: usize) -> Self {
+        let mut shared_object_versions = FxHashMap::default();
+        shared_object_versions.reserve(shared_object_capacity.max(1));
+        Self {
+            shared_object_versions,
+            batch_breakdown: Arc::new(BatchBreakdownCollector::default()),
+            _phantom: PhantomData,
+        }
+    }
+
     pub(crate) async fn process_version_assignments(
         &mut self,
         mut shared_txn_receiver: Receiver<Vec<RemoraTransaction<E>>>,
@@ -586,6 +598,19 @@ where
             .collect();
 
         result
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
+    pub(crate) fn benchmark_assign_transaction_batch(
+        &mut self,
+        mut transactions: Vec<RemoraTransaction<E>>,
+    ) -> Duration {
+        let start = std::time::Instant::now();
+        for transaction in &mut transactions {
+            let _ = self.assign_shared_object_versions(transaction);
+        }
+        start.elapsed()
     }
 }
 
