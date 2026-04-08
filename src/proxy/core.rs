@@ -30,6 +30,7 @@ use crate::{
         versioned_dependency_controller::VersionedDependencyController,
     },
     metrics::Metrics,
+    proxy::network_stats::{ProxyNetworkStats, TransferDirection},
 };
 
 pub type ProxyId = ExecutorIndex;
@@ -410,6 +411,7 @@ struct ProxyMessageProcessor<E: Executor> {
     stateful_controller: Arc<VersionedDependencyController>,
     stateless_controller: Arc<OneshotDependencyController>,
     mode: SeparationMode,
+    network_stats: Arc<ProxyNetworkStats>,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyMessageProcessor<E>
@@ -459,13 +461,14 @@ where
                 }
             },
             ProxyToProxyMessage::Reply(reply) => match reply {
-                InterProxyReply::Stateful(objects) => {
+                InterProxyReply::Stateful(source_proxy_id, objects) => {
                     tracing::debug!(
-                        "Proxy {} received stateful reply with {} objects",
+                        "Proxy {} received stateful reply from proxy {} with {} objects",
                         self.id,
+                        source_proxy_id,
                         objects.len()
                     );
-                    self.handle_stateful_reply(objects).await;
+                    self.handle_stateful_reply(source_proxy_id, objects).await;
                 }
                 InterProxyReply::Stateless(digest, result) => {
                     tracing::debug!(
@@ -480,11 +483,23 @@ where
         }
     }
 
-    async fn handle_stateful_reply(&mut self, objects: BTreeMap<ObjectID, Object>) {
+    async fn handle_stateful_reply(
+        &mut self,
+        source_proxy_id: ProxyId,
+        objects: BTreeMap<ObjectID, Object>,
+    ) {
         tracing::debug!(
-            "Proxy {} handling stateful reply with {} objects",
+            "Proxy {} handling stateful reply from proxy {} with {} objects",
             self.id,
+            source_proxy_id,
             objects.len()
+        );
+        let payload_bytes = bincode::serialized_size(&objects)
+            .expect("stateful lease reply measurement serialization should succeed");
+        self.network_stats.record_lease_transfer(
+            TransferDirection::Receive,
+            objects.len(),
+            payload_bytes,
         );
 
         // Mock the states update (oid, v) as a txn from (oid, v - 1) to (oid, v)
@@ -551,6 +566,8 @@ where
         let tx_inter_proxy_replies = self.tx_inter_proxy_replies.clone();
         let store = self.store.clone();
         let stateful_controller = self.stateful_controller.clone();
+        let network_stats = self.network_stats.clone();
+        let source_proxy_id = self.id;
         tokio::spawn(async move {
             for prior_notify in prior_handles {
                 prior_notify.notified().await;
@@ -583,7 +600,14 @@ where
                 }
             }
 
-            let reply = InterProxyReply::Stateful(objects);
+            let payload_bytes = bincode::serialized_size(&objects)
+                .expect("stateful lease reply measurement serialization should succeed");
+            network_stats.record_lease_transfer(
+                TransferDirection::Send,
+                objects.len(),
+                payload_bytes,
+            );
+            let reply = InterProxyReply::Stateful(source_proxy_id, objects);
             Self::send_msg_to_proxy(
                 tx_inter_proxy_replies,
                 proxy_id,
@@ -638,7 +662,7 @@ where
                 InterProxyRequest::Stateless(_, _) => "Stateless request",
             },
             ProxyToProxyMessage::Reply(reply) => match reply {
-                InterProxyReply::Stateful(_) => "Stateful reply",
+                InterProxyReply::Stateful(_, _) => "Stateful reply",
                 InterProxyReply::Stateless(_, _) => "Stateless reply",
             },
         };
@@ -682,6 +706,8 @@ pub struct ProxyCore<E: Executor> {
     mode: SeparationMode,
     /// The  metrics for the proxy
     metrics: Arc<Metrics>,
+    /// The runtime network and lease-transfer reporter.
+    network_stats: Arc<ProxyNetworkStats>,
 }
 
 impl<E: Executor + Send + Sync + 'static> ProxyCore<E>
@@ -694,7 +720,7 @@ where
     <E as Executor>::Transaction: Send,
 {
     /// Create a new proxy.
-    pub fn new(
+    pub(crate) fn new(
         id: ProxyId,
         executor: E,
         store: Store<E>,
@@ -704,6 +730,7 @@ where
         tx_inter_proxy_replies: Arc<DashMap<ProxyId, Sender<ProxyToProxyMessage>>>,
         mode: SeparationMode,
         metrics: Arc<Metrics>,
+        network_stats: Arc<ProxyNetworkStats>,
     ) -> Self {
         Self {
             id,
@@ -717,6 +744,7 @@ where
             stateless_controller: Arc::new(OneshotDependencyController::new()),
             mode,
             metrics,
+            network_stats,
         }
     }
 
@@ -744,6 +772,7 @@ where
             stateful_controller: self.stateful_controller,
             stateless_controller: self.stateless_controller,
             mode: self.mode,
+            network_stats: self.network_stats,
         };
 
         let primary_handle = tokio::spawn(async move {
@@ -779,7 +808,7 @@ mod tests {
         },
         metrics::Metrics,
         primary::shared_obj_txn_forwarder::VersionAssignmentTask,
-        proxy::core::ProxyCore,
+        proxy::{core::ProxyCore, network_stats::ProxyNetworkStats},
     };
 
     async fn setup_proxy<E: Executor + Send + Sync + 'static>(
@@ -820,6 +849,7 @@ mod tests {
             tx_inter_proxy_replies.clone(),
             mode,
             metrics,
+            Arc::new(ProxyNetworkStats::new(proxy_id)),
         );
 
         (

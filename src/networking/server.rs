@@ -12,6 +12,7 @@ use tokio::{
 
 use crate::{
     config::DEFAULT_CHANNEL_SIZE,
+    networking::stats::ConnectionStats,
     networking::worker::ConnectionWorker,
     primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage},
 };
@@ -32,6 +33,8 @@ pub struct NetworkServer<I, O> {
     tx_incoming: Sender<I>,
     /// Optional batch-level measurement collector for primary-side experiments.
     batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+    /// Optional connection-level traffic observer.
+    connection_stats: Option<Arc<dyn ConnectionStats>>,
 }
 
 impl<I, O> NetworkServer<I, O>
@@ -50,6 +53,7 @@ where
             tx_connections,
             tx_incoming,
             batch_breakdown: None,
+            connection_stats: None,
         }
     }
 
@@ -58,6 +62,14 @@ where
         batch_breakdown: Arc<BatchBreakdownCollector>,
     ) -> Self {
         self.batch_breakdown = Some(batch_breakdown);
+        self
+    }
+
+    pub(crate) fn with_connection_stats(
+        mut self,
+        connection_stats: Arc<dyn ConnectionStats>,
+    ) -> Self {
+        self.connection_stats = Some(connection_stats);
         self
     }
 
@@ -78,6 +90,7 @@ where
                 self.tx_incoming.clone(),
                 rx,
                 self.batch_breakdown.clone(),
+                self.connection_stats.clone(),
             );
             let _handle = worker.spawn();
 

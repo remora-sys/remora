@@ -324,7 +324,7 @@ pub enum InterProxyRequest {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum InterProxyReply {
-    Stateful(NewStates),
+    Stateful(ProxyId, NewStates),
     Stateless(TransactionDigest, bool),
 }
 

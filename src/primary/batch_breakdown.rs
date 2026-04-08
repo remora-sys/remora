@@ -81,7 +81,7 @@ impl MeasuredMessage for ProxyToProxyMessage {
             Self::Request(InterProxyRequest::Stateless(_, digest))
             | Self::Reply(InterProxyReply::Stateless(digest, _)) => Some(*digest),
             Self::Request(InterProxyRequest::Stateful(_, _))
-            | Self::Reply(InterProxyReply::Stateful(_)) => None,
+            | Self::Reply(InterProxyReply::Stateful(_, _)) => None,
         }
     }
 }

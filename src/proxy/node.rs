@@ -14,7 +14,10 @@ use crate::{
     executor::api::{ExecutionResults, Executor, PrimaryToProxyMessage, ProxyToProxyMessage},
     metrics::Metrics,
     networking::{client::NetworkClient, server::NetworkServer},
-    proxy::core::{ProxyCore, ProxyId},
+    proxy::{
+        core::{ProxyCore, ProxyId},
+        network_stats::{ProxyConnectionClass, ProxyNetworkStats},
+    },
 };
 use dashmap::DashMap;
 
@@ -47,6 +50,11 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
     {
         let mut core_handles = Vec::new();
         let mut network_handles = Vec::new();
+        let network_stats = Arc::new(ProxyNetworkStats::new(proxy_id));
+        let primary_connection_stats =
+            network_stats.connection_handle(ProxyConnectionClass::Primary);
+        let inter_proxy_connection_stats =
+            network_stats.connection_handle(ProxyConnectionClass::InterProxy);
 
         let id = proxy_id;
         let (tx_transactions, rx_transactions) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
@@ -82,6 +90,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_connections.clone(),
             tx_inter_proxy_requests.clone(),
         )
+        .with_connection_stats(inter_proxy_connection_stats.clone())
         .spawn();
         network_handles.push(inter_proxy_server_handle);
 
@@ -105,6 +114,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_primary_connection,
             tx_transactions,
         )
+        .with_connection_stats(primary_connection_stats)
         .spawn();
         network_handles.push(primary_connection_handle);
 
@@ -122,6 +132,7 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
                 // Create network client to connect to other proxy
                 let client_handle =
                     NetworkClient::new(proxy_info.listen_proxy_address, tx_placeholder, rx_replies)
+                        .with_connection_stats(inter_proxy_connection_stats.clone())
                         .spawn();
 
                 network_handles.push(client_handle);
@@ -139,15 +150,22 @@ impl<E: Executor + Send + Sync + 'static> ProxyNode<E> {
             tx_inter_proxy_replies,
             config.validator_parameters.separation_mode,
             metrics.clone(),
+            network_stats.clone(),
         )
         .spawn();
         core_handles.push(core_handle);
+
+        let stats_handle = tokio::spawn(network_stats.report_periodically());
 
         Self {
             phantom_data: PhantomData,
             core_handles,
             rx_proxy_results,
-            _connection_listener_handles: connection_listener_handles,
+            _connection_listener_handles: {
+                let mut handles = connection_listener_handles;
+                handles.push(stats_handle);
+                handles
+            },
             _network_handles: network_handles,
             metrics,
         }

@@ -15,7 +15,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage};
+use crate::{
+    networking::stats::ConnectionStats,
+    primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage},
+};
 
 /// A worker that handles a bidirectional connection with a peer.
 pub struct ConnectionWorker<I, O> {
@@ -27,6 +30,8 @@ pub struct ConnectionWorker<I, O> {
     rx_outgoing: Receiver<O>,
     /// Batch-level latency breakdown collector used by primary-side measurements.
     batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+    /// Optional observer for actual socket traffic.
+    connection_stats: Option<Arc<dyn ConnectionStats>>,
 }
 
 impl<I, O> ConnectionWorker<I, O>
@@ -45,23 +50,34 @@ where
         tx_incoming: Sender<I>,
         rx_outgoing: Receiver<O>,
         batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+        connection_stats: Option<Arc<dyn ConnectionStats>>,
     ) -> Self {
         Self {
             stream,
             tx_incoming,
             rx_outgoing,
             batch_breakdown,
+            connection_stats,
         }
     }
 
     /// Run the worker.
     pub async fn run(self) {
         let (reader, writer) = self.stream.into_split();
-        let read_stream_handle =
-            Self::handle_read_stream(reader, self.tx_incoming, self.batch_breakdown.clone())
-                .boxed();
-        let write_stream_handle =
-            Self::handle_write_stream(writer, self.rx_outgoing, self.batch_breakdown).boxed();
+        let read_stream_handle = Self::handle_read_stream(
+            reader,
+            self.tx_incoming,
+            self.batch_breakdown.clone(),
+            self.connection_stats.clone(),
+        )
+        .boxed();
+        let write_stream_handle = Self::handle_write_stream(
+            writer,
+            self.rx_outgoing,
+            self.batch_breakdown,
+            self.connection_stats,
+        )
+        .boxed();
 
         // Use join! instead of select! to keep the read stream going even if write stream stops
         let (read_result, write_result) = tokio::join!(read_stream_handle, write_stream_handle,);
@@ -80,6 +96,7 @@ where
         mut reader: OwnedReadHalf,
         tx_incoming: Sender<I>,
         batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+        connection_stats: Option<Arc<dyn ConnectionStats>>,
     ) -> io::Result<()> {
         use byteorder::{BigEndian, ByteOrder};
         use bytes::{Buf, BytesMut};
@@ -93,6 +110,9 @@ where
             if n == 0 {
                 tracing::warn!("Connection closed by peer (EOF)");
                 break;
+            }
+            if let Some(connection_stats) = connection_stats.as_ref() {
+                connection_stats.record_rx_bytes(n);
             }
 
             // 2) extract all complete frames into a Vec of Vec<u8>
@@ -157,6 +177,7 @@ where
         mut writer: OwnedWriteHalf,
         mut rx_outgoing: Receiver<O>,
         batch_breakdown: Option<Arc<BatchBreakdownCollector>>,
+        connection_stats: Option<Arc<dyn ConnectionStats>>,
     ) -> io::Result<()> {
         let mut buffer: Vec<O> = Vec::with_capacity(Self::MAX_BATCH_SIZE);
         let mut serialized_buffer: Vec<u8> = Vec::new();
@@ -189,6 +210,9 @@ where
             }
 
             writer.write_all(&serialized_buffer).await?;
+            if let Some(connection_stats) = connection_stats.as_ref() {
+                connection_stats.record_tx_bytes(serialized_buffer.len());
+            }
 
             serialized_buffer.clear();
             buffer.clear();
