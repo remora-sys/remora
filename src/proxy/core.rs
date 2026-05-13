@@ -792,16 +792,16 @@ where
 #[cfg(test)]
 mod tests {
     use dashmap::DashMap;
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
     use sui_types::base_types::{ObjectID, SequenceNumber};
     use tokio::sync::mpsc;
 
     use crate::{
-        config::{BenchmarkParameters, SeparationMode, StatelessVerificationMode},
+        config::{BenchmarkParameters, SeparationMode, StatelessVerificationMode, WorkloadType},
         executor::{
             api::{
-                ExecutableTransaction, ExecutionResults, Executor, PrimaryToProxyMessage,
-                ProxyToProxyMessage, RemoraTransaction,
+                ExecutableTransaction, ExecutionResults, Executor, InterProxyReply,
+                PrimaryToProxyMessage, ProxyToProxyMessage, RemoraTransaction, StateStore,
             },
             fake::FakeExecutor,
             sui::SuiExecutor,
@@ -1114,5 +1114,49 @@ mod tests {
 
         let success = process_transaction(executor, &config).await;
         assert!(success, "Sui transaction should be processed successfully");
+    }
+
+    #[tokio::test]
+    async fn print_single_sui_object_transfer_sizes() {
+        let config = BenchmarkParameters {
+            load: 1,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::SharedObjects { txs_per_counter: 1 },
+            ..BenchmarkParameters::new_for_tests()
+        };
+        let executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
+        let transactions = SuiExecutor::generate_transactions(&config, None).await;
+
+        let transaction = transactions
+            .into_iter()
+            .find(|tx| tx.shared_object_ids().len() == 1)
+            .expect("expected one shared-object transaction");
+        let object_id = *transaction
+            .shared_object_ids()
+            .first()
+            .expect("transaction should have one shared object");
+        let object = store
+            .read_object(&object_id)
+            .expect("read object should succeed")
+            .expect("shared object should exist in store");
+
+        let mut objects = BTreeMap::new();
+        objects.insert(object_id, object);
+
+        let object_payload_bytes =
+            bincode::serialized_size(&objects).expect("serializing object payload should succeed");
+        let message_payload_bytes = bincode::serialized_size(&ProxyToProxyMessage::Reply(
+            InterProxyReply::Stateful(0, objects),
+        ))
+        .expect("serializing stateful reply should succeed");
+        let message_wire_bytes = message_payload_bytes + 4;
+
+        println!(
+            "[single-object-transfer-size] object_payload_bytes={} message_payload_bytes={} message_wire_bytes={}",
+            object_payload_bytes,
+            message_payload_bytes,
+            message_wire_bytes,
+        );
     }
 }

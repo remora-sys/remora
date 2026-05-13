@@ -176,6 +176,18 @@ impl ProxyNetworkStats {
                 .lease_receive
                 .record(object_count as u64, payload_bytes),
         }
+
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "[proxy-lease-size] proxy_id={} direction={} object_count={} object_payload_bytes={} avg_object_payload_bytes={:.1}",
+            self.proxy_id,
+            direction.as_str(),
+            object_count,
+            payload_bytes,
+            average_bytes_per_object(payload_bytes, object_count as u64),
+        )
+        .expect("proxy lease size write to stdout should succeed");
     }
 
     pub(crate) async fn report_periodically(self: Arc<Self>) {
@@ -235,6 +247,22 @@ impl ConnectionStats for ProxyConnectionStatsHandle {
     fn record_tx_bytes(&self, bytes: usize) {
         self.stats
             .record_connection_bytes(self.connection_class, TransferDirection::Send, bytes);
+    }
+
+    fn record_rx_message(&self, payload_bytes: usize) {
+        self.stats.print_message_size(
+            self.connection_class,
+            TransferDirection::Receive,
+            payload_bytes,
+        );
+    }
+
+    fn record_tx_message(&self, payload_bytes: usize) {
+        self.stats.print_message_size(
+            self.connection_class,
+            TransferDirection::Send,
+            payload_bytes,
+        );
     }
 }
 
@@ -409,6 +437,46 @@ fn average_bytes_per_object(payload_bytes: u64, object_count: u64) -> f64 {
         0.0
     } else {
         payload_bytes as f64 / object_count as f64
+    }
+}
+
+impl ProxyNetworkStats {
+    fn print_message_size(
+        &self,
+        connection_class: ProxyConnectionClass,
+        direction: TransferDirection,
+        payload_bytes: usize,
+    ) {
+        let wire_bytes = payload_bytes + 4;
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "[proxy-message-size] proxy_id={} connection={} direction={} message_payload_bytes={} message_wire_bytes={}",
+            self.proxy_id,
+            connection_class.as_str(),
+            direction.as_str(),
+            payload_bytes,
+            wire_bytes,
+        )
+        .expect("proxy message size write to stdout should succeed");
+    }
+}
+
+impl ProxyConnectionClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProxyConnectionClass::Primary => "primary",
+            ProxyConnectionClass::InterProxy => "inter_proxy",
+        }
+    }
+}
+
+impl TransferDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            TransferDirection::Send => "outbound",
+            TransferDirection::Receive => "inbound",
+        }
     }
 }
 

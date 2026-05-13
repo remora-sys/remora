@@ -1,10 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{io, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
+use sui_types::digests::TransactionDigest;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -19,6 +25,112 @@ use crate::{
     networking::stats::ConnectionStats,
     primary::batch_breakdown::{BatchBreakdownCollector, MeasuredMessage},
 };
+
+#[derive(Clone, Copy)]
+struct IoTiming {
+    start: Instant,
+    elapsed: Duration,
+}
+
+struct ReadTimingChunk {
+    start: Instant,
+    elapsed: Duration,
+    total_bytes: usize,
+    consumed_bytes: usize,
+}
+
+impl ReadTimingChunk {
+    fn new(start: Instant, elapsed: Duration, total_bytes: usize) -> Self {
+        Self {
+            start,
+            elapsed,
+            total_bytes,
+            consumed_bytes: 0,
+        }
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.total_bytes.saturating_sub(self.consumed_bytes)
+    }
+}
+
+struct ReadFrame {
+    payload: Vec<u8>,
+    io_timings: Vec<IoTiming>,
+}
+
+struct WriteTimingTarget {
+    digest: TransactionDigest,
+    offset_bytes: usize,
+    wire_bytes: usize,
+}
+
+fn timing_segment(
+    start: Instant,
+    elapsed: Duration,
+    offset_bytes: usize,
+    segment_bytes: usize,
+    total_bytes: usize,
+) -> IoTiming {
+    let offset = scale_duration(elapsed, offset_bytes, total_bytes);
+    IoTiming {
+        start: start.checked_add(offset).unwrap_or(start),
+        elapsed: scale_duration(elapsed, segment_bytes, total_bytes),
+    }
+}
+
+fn drain_read_timings(
+    read_timings: &mut VecDeque<ReadTimingChunk>,
+    mut wire_bytes: usize,
+) -> Vec<IoTiming> {
+    let mut timings = Vec::new();
+
+    while wire_bytes > 0 {
+        let Some(chunk) = read_timings.front_mut() else {
+            break;
+        };
+
+        let take = wire_bytes.min(chunk.remaining_bytes());
+        timings.push(timing_segment(
+            chunk.start,
+            chunk.elapsed,
+            chunk.consumed_bytes,
+            take,
+            chunk.total_bytes,
+        ));
+
+        chunk.consumed_bytes += take;
+        wire_bytes -= take;
+
+        if chunk.remaining_bytes() == 0 {
+            read_timings.pop_front();
+        }
+    }
+
+    timings
+}
+
+fn combine_io_timings(timings: &[IoTiming]) -> Option<IoTiming> {
+    let start = timings.first()?.start;
+    let total_nanos = timings
+        .iter()
+        .map(|timing| timing.elapsed.as_nanos())
+        .fold(0u128, |total, nanos| total.saturating_add(nanos));
+
+    Some(IoTiming {
+        start,
+        elapsed: Duration::from_nanos(total_nanos.min(u64::MAX as u128) as u64),
+    })
+}
+
+fn scale_duration(duration: Duration, numerator: usize, denominator: usize) -> Duration {
+    if numerator == 0 || denominator == 0 {
+        return Duration::ZERO;
+    }
+
+    let nanos = duration.as_nanos().saturating_mul(numerator as u128) / denominator as u128;
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+}
 
 /// A worker that handles a bidirectional connection with a peer.
 pub struct ConnectionWorker<I, O> {
@@ -103,19 +215,23 @@ where
         use futures::StreamExt;
         // buffer holds leftover bytes between reads
         let mut buf = BytesMut::with_capacity(Self::MAX_MESSAGE_SIZE * 2);
+        let mut read_timings = VecDeque::new();
 
         loop {
             // 1) fill buffer in one syscall
+            let read_start = Instant::now();
             let n = reader.read_buf(&mut buf).await?;
+            let read_elapsed = read_start.elapsed();
             if n == 0 {
                 tracing::warn!("Connection closed by peer (EOF)");
                 break;
             }
+            read_timings.push_back(ReadTimingChunk::new(read_start, read_elapsed, n));
             if let Some(connection_stats) = connection_stats.as_ref() {
                 connection_stats.record_rx_bytes(n);
             }
 
-            // 2) extract all complete frames into a Vec of Vec<u8>
+            // 2) extract all complete frames and the read timing for their bytes
             let mut offset = 0;
             let mut frames = Vec::new();
             while buf.len() >= offset + 4 {
@@ -131,7 +247,13 @@ where
                 }
                 let start = offset + 4;
                 let end = start + size;
-                frames.push(buf[start..end].to_vec());
+                if let Some(connection_stats) = connection_stats.as_ref() {
+                    connection_stats.record_rx_message(size);
+                }
+                frames.push(ReadFrame {
+                    payload: buf[start..end].to_vec(),
+                    io_timings: drain_read_timings(&mut read_timings, size + 4),
+                });
                 offset = end;
             }
 
@@ -146,16 +268,25 @@ where
                     let tx = tx_incoming.clone();
                     let batch_breakdown = batch_breakdown.clone();
                     async move {
-                        let start = Instant::now();
-                        match bincode::deserialize::<I>(&frame) {
+                        let deserialize_start = Instant::now();
+                        let item = bincode::deserialize::<I>(&frame.payload);
+                        let deserialize_elapsed = deserialize_start.elapsed();
+                        match item {
                             Ok(item) => {
                                 if let (Some(batch_breakdown), Some(digest)) =
                                     (batch_breakdown.as_ref(), item.measurement_digest())
                                 {
+                                    if let Some(timing) = combine_io_timings(&frame.io_timings) {
+                                        batch_breakdown.record_network_rx_read(
+                                            digest,
+                                            timing.start,
+                                            timing.elapsed,
+                                        );
+                                    }
                                     batch_breakdown.record_network_rx_deser(
                                         digest,
-                                        start,
-                                        start.elapsed(),
+                                        deserialize_start,
+                                        deserialize_elapsed,
                                     );
                                 }
                                 if tx.send(item).await.is_err() {
@@ -195,6 +326,7 @@ where
             }
 
             // Batching writes
+            let mut write_targets = Vec::new();
             for transaction in &buffer {
                 let digest = transaction.measurement_digest();
                 let start = Instant::now();
@@ -202,14 +334,43 @@ where
                 if let (Some(batch_breakdown), Some(digest)) = (batch_breakdown.as_ref(), digest) {
                     batch_breakdown.record_network_tx_serialize(digest, start, start.elapsed());
                 }
+                if let Some(connection_stats) = connection_stats.as_ref() {
+                    connection_stats.record_tx_message(serialized.len());
+                }
 
                 let size = serialized.len() as u32;
+                let offset_bytes = serialized_buffer.len();
                 serialized_buffer.extend_from_slice(&size.to_be_bytes());
-
                 serialized_buffer.extend_from_slice(&serialized);
+                if let Some(digest) = digest {
+                    write_targets.push(WriteTimingTarget {
+                        digest,
+                        offset_bytes,
+                        wire_bytes: serialized.len() + 4,
+                    });
+                }
             }
 
+            let write_start = Instant::now();
             writer.write_all(&serialized_buffer).await?;
+            let write_elapsed = write_start.elapsed();
+            if let Some(batch_breakdown) = batch_breakdown.as_ref() {
+                let total_bytes = serialized_buffer.len();
+                for target in write_targets {
+                    let timing = timing_segment(
+                        write_start,
+                        write_elapsed,
+                        target.offset_bytes,
+                        target.wire_bytes,
+                        total_bytes,
+                    );
+                    batch_breakdown.record_network_tx_write(
+                        target.digest,
+                        timing.start,
+                        timing.elapsed,
+                    );
+                }
+            }
             if let Some(connection_stats) = connection_stats.as_ref() {
                 connection_stats.record_tx_bytes(serialized_buffer.len());
             }
@@ -230,5 +391,49 @@ where
         tokio::spawn(async move {
             self.run().await;
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timing_segment_splits_elapsed_by_wire_bytes() {
+        let base = Instant::now();
+        let timing = timing_segment(base, Duration::from_millis(10), 40, 20, 100);
+
+        assert_eq!(timing.start.duration_since(base), Duration::from_millis(4));
+        assert_eq!(timing.elapsed, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn drain_read_timings_spans_partial_reads() {
+        let base = Instant::now();
+        let mut chunks = VecDeque::new();
+        chunks.push_back(ReadTimingChunk::new(base, Duration::from_millis(10), 10));
+        chunks.push_back(ReadTimingChunk::new(
+            base + Duration::from_millis(10),
+            Duration::from_millis(20),
+            20,
+        ));
+
+        let first_frame = drain_read_timings(&mut chunks, 15);
+        assert_eq!(first_frame.len(), 2);
+        assert_eq!(first_frame[0].elapsed, Duration::from_millis(10));
+        assert_eq!(
+            first_frame[1].start.duration_since(base),
+            Duration::from_millis(10)
+        );
+        assert_eq!(first_frame[1].elapsed, Duration::from_millis(5));
+
+        let second_frame = drain_read_timings(&mut chunks, 15);
+        assert_eq!(second_frame.len(), 1);
+        assert_eq!(
+            second_frame[0].start.duration_since(base),
+            Duration::from_millis(15)
+        );
+        assert_eq!(second_frame[0].elapsed, Duration::from_millis(15));
+        assert!(chunks.is_empty());
     }
 }

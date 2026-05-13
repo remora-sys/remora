@@ -141,11 +141,13 @@ impl StageTiming {
 struct BatchBreakdownState {
     digests: Vec<TransactionDigest>,
     tx_count: usize,
+    network_rx_read: StageTiming,
     network_rx_deser: StageTiming,
     batch_scheduling: StageTiming,
     version_assignment: StageTiming,
     dispatch_forwarding: StageTiming,
     network_tx_serialize: StageTiming,
+    network_tx_write: StageTiming,
     scheduling_recorded: bool,
     version_assignment_recorded: bool,
 }
@@ -154,6 +156,7 @@ struct BatchBreakdownState {
 pub(crate) struct BatchBreakdownCollector {
     next_batch_id: AtomicU64,
     digest_to_batch: DashMap<TransactionDigest, u64>,
+    pending_network_rx_read: DashMap<TransactionDigest, StageTiming>,
     pending_network_rx_deser: DashMap<TransactionDigest, StageTiming>,
     batches: DashMap<u64, BatchBreakdownState>,
 }
@@ -183,6 +186,9 @@ impl BatchBreakdownCollector {
 
         for digest in &digests {
             self.digest_to_batch.insert(*digest, batch_id);
+            if let Some((_, pending_timing)) = self.pending_network_rx_read.remove(digest) {
+                state.network_rx_read.merge(pending_timing);
+            }
             if let Some((_, pending_timing)) = self.pending_network_rx_deser.remove(digest) {
                 state.network_rx_deser.merge(pending_timing);
             }
@@ -204,6 +210,29 @@ impl BatchBreakdownCollector {
                 .measurement_digest()
                 .and_then(|digest| self.digest_to_batch.get(&digest).map(|batch_id| *batch_id))
         })
+    }
+
+    pub(crate) fn record_network_rx_read(
+        &self,
+        digest: TransactionDigest,
+        start: Instant,
+        elapsed: Duration,
+    ) {
+        if let Some(batch_id) = self.batch_id_for_digest(&digest) {
+            self.update_batch(batch_id, |state| {
+                state.network_rx_read.record(start, elapsed);
+            });
+            return;
+        }
+
+        self.pending_network_rx_read
+            .entry(digest)
+            .and_modify(|timing| timing.record(start, elapsed))
+            .or_insert_with(|| {
+                let mut timing = StageTiming::default();
+                timing.record(start, elapsed);
+                timing
+            });
     }
 
     pub(crate) fn record_network_rx_deser(
@@ -280,6 +309,22 @@ impl BatchBreakdownCollector {
         self.maybe_finish_batch(batch_id);
     }
 
+    pub(crate) fn record_network_tx_write(
+        &self,
+        digest: TransactionDigest,
+        start: Instant,
+        elapsed: Duration,
+    ) {
+        let Some(batch_id) = self.batch_id_for_digest(&digest) else {
+            return;
+        };
+
+        self.update_batch(batch_id, |state| {
+            state.network_tx_write.record(start, elapsed);
+        });
+        self.maybe_finish_batch(batch_id);
+    }
+
     fn update_batch(&self, batch_id: u64, update: impl FnOnce(&mut BatchBreakdownState)) {
         if let Some(mut state) = self.batches.get_mut(&batch_id) {
             update(&mut state);
@@ -299,6 +344,7 @@ impl BatchBreakdownCollector {
                     && state.version_assignment_recorded
                     && state.dispatch_forwarding.completed == state.tx_count
                     && state.network_tx_serialize.completed == state.tx_count
+                    && state.network_tx_write.completed == state.tx_count
             })
             .unwrap_or(false);
 
@@ -312,6 +358,7 @@ impl BatchBreakdownCollector {
 
         for digest in &state.digests {
             self.digest_to_batch.remove(digest);
+            self.pending_network_rx_read.remove(digest);
             self.pending_network_rx_deser.remove(digest);
         }
 
@@ -336,11 +383,14 @@ struct StageSummary {
 struct BatchBreakdownSummary {
     batch_id: u64,
     tx_count: usize,
+    network_rx_read: StageSummary,
     network_rx_deser: StageSummary,
     batch_scheduling_ms: f64,
     version_assignment_ms: f64,
     dispatch_forwarding: StageSummary,
     network_tx_serialize: StageSummary,
+    network_tx_write: StageSummary,
+    network_io_sum_ms: f64,
     batch_observed_wall_ms: f64,
 }
 
@@ -354,21 +404,25 @@ fn summarize_stage(stage: &StageTiming) -> StageSummary {
 
 fn summarize_batch(batch_id: u64, state: &BatchBreakdownState) -> BatchBreakdownSummary {
     let batch_start = [
+        state.network_rx_read.first_start,
         state.network_rx_deser.first_start,
         state.batch_scheduling.first_start,
         state.version_assignment.first_start,
         state.dispatch_forwarding.first_start,
         state.network_tx_serialize.first_start,
+        state.network_tx_write.first_start,
     ]
     .into_iter()
     .flatten()
     .min();
     let batch_end = [
+        state.network_rx_read.last_end,
         state.network_rx_deser.last_end,
         state.batch_scheduling.last_end,
         state.version_assignment.last_end,
         state.dispatch_forwarding.last_end,
         state.network_tx_serialize.last_end,
+        state.network_tx_write.last_end,
     ]
     .into_iter()
     .flatten()
@@ -377,11 +431,14 @@ fn summarize_batch(batch_id: u64, state: &BatchBreakdownState) -> BatchBreakdown
     BatchBreakdownSummary {
         batch_id,
         tx_count: state.tx_count,
+        network_rx_read: summarize_stage(&state.network_rx_read),
         network_rx_deser: summarize_stage(&state.network_rx_deser),
         batch_scheduling_ms: state.batch_scheduling.sum_ms(),
         version_assignment_ms: state.version_assignment.sum_ms(),
         dispatch_forwarding: summarize_stage(&state.dispatch_forwarding),
         network_tx_serialize: summarize_stage(&state.network_tx_serialize),
+        network_tx_write: summarize_stage(&state.network_tx_write),
+        network_io_sum_ms: state.network_rx_read.sum_ms() + state.network_tx_write.sum_ms(),
         batch_observed_wall_ms: match (batch_start, batch_end) {
             (Some(start), Some(end)) => duration_to_ms(end.duration_since(start)),
             _ => 0.0,
@@ -391,9 +448,12 @@ fn summarize_batch(batch_id: u64, state: &BatchBreakdownState) -> BatchBreakdown
 
 fn format_summary(summary: &BatchBreakdownSummary) -> String {
     format!(
-        "[primary-batch-breakdown] batch_id={} txns={} network_rx_deser_sum_ms={:.3} network_rx_deser_avg_ms={:.3} network_rx_deser_makespan_ms={:.3} batch_scheduling_ms={:.3} version_assignment_ms={:.3} dispatch_forwarding_sum_ms={:.3} dispatch_forwarding_avg_ms={:.3} dispatch_forwarding_makespan_ms={:.3} network_tx_serialize_sum_ms={:.3} network_tx_serialize_avg_ms={:.3} network_tx_serialize_makespan_ms={:.3} batch_observed_wall_ms={:.3}",
+        "[primary-batch-breakdown] batch_id={} txns={} network_rx_read_sum_ms={:.3} network_rx_read_avg_ms={:.3} network_rx_read_makespan_ms={:.3} network_rx_deser_sum_ms={:.3} network_rx_deser_avg_ms={:.3} network_rx_deser_makespan_ms={:.3} batch_scheduling_ms={:.3} version_assignment_ms={:.3} dispatch_forwarding_sum_ms={:.3} dispatch_forwarding_avg_ms={:.3} dispatch_forwarding_makespan_ms={:.3} network_tx_serialize_sum_ms={:.3} network_tx_serialize_avg_ms={:.3} network_tx_serialize_makespan_ms={:.3} network_tx_write_sum_ms={:.3} network_tx_write_avg_ms={:.3} network_tx_write_makespan_ms={:.3} network_io_sum_ms={:.3} batch_observed_wall_ms={:.3}",
         summary.batch_id,
         summary.tx_count,
+        summary.network_rx_read.sum_ms,
+        summary.network_rx_read.avg_ms,
+        summary.network_rx_read.makespan_ms,
         summary.network_rx_deser.sum_ms,
         summary.network_rx_deser.avg_ms,
         summary.network_rx_deser.makespan_ms,
@@ -405,6 +465,10 @@ fn format_summary(summary: &BatchBreakdownSummary) -> String {
         summary.network_tx_serialize.sum_ms,
         summary.network_tx_serialize.avg_ms,
         summary.network_tx_serialize.makespan_ms,
+        summary.network_tx_write.sum_ms,
+        summary.network_tx_write.avg_ms,
+        summary.network_tx_write.makespan_ms,
+        summary.network_io_sum_ms,
         summary.batch_observed_wall_ms,
     )
 }
@@ -471,15 +535,16 @@ mod tests {
             ..Default::default()
         };
 
+        state.network_rx_read.record(base, Duration::from_millis(2));
         state
             .network_rx_deser
-            .record(base, Duration::from_millis(1));
+            .record(base + Duration::from_millis(2), Duration::from_millis(1));
         state
             .network_rx_deser
-            .record(base + Duration::from_millis(1), Duration::from_millis(1));
+            .record(base + Duration::from_millis(3), Duration::from_millis(1));
         state
             .batch_scheduling
-            .record(base + Duration::from_millis(2), Duration::from_millis(5));
+            .record(base + Duration::from_millis(4), Duration::from_millis(5));
         state
             .version_assignment
             .record(base + Duration::from_millis(20), Duration::from_millis(2));
@@ -495,11 +560,20 @@ mod tests {
         state
             .network_tx_serialize
             .record(base + Duration::from_millis(28), Duration::from_millis(1));
+        state
+            .network_tx_write
+            .record(base + Duration::from_millis(29), Duration::from_millis(3));
+        state
+            .network_tx_write
+            .record(base + Duration::from_millis(30), Duration::from_millis(3));
 
         let summary = summarize_batch(7, &state);
 
         assert_eq!(summary.batch_id, 7);
         assert_eq!(summary.tx_count, 2);
+        assert_ms_eq(summary.network_rx_read.sum_ms, 2.0);
+        assert_ms_eq(summary.network_rx_read.avg_ms, 2.0);
+        assert_ms_eq(summary.network_rx_read.makespan_ms, 2.0);
         assert_ms_eq(summary.network_rx_deser.sum_ms, 2.0);
         assert_ms_eq(summary.network_rx_deser.avg_ms, 1.0);
         assert_ms_eq(summary.network_rx_deser.makespan_ms, 2.0);
@@ -511,7 +585,11 @@ mod tests {
         assert_ms_eq(summary.network_tx_serialize.sum_ms, 2.0);
         assert_ms_eq(summary.network_tx_serialize.avg_ms, 1.0);
         assert_ms_eq(summary.network_tx_serialize.makespan_ms, 2.0);
-        assert_ms_eq(summary.batch_observed_wall_ms, 29.0);
+        assert_ms_eq(summary.network_tx_write.sum_ms, 6.0);
+        assert_ms_eq(summary.network_tx_write.avg_ms, 3.0);
+        assert_ms_eq(summary.network_tx_write.makespan_ms, 4.0);
+        assert_ms_eq(summary.network_io_sum_ms, 8.0);
+        assert_ms_eq(summary.batch_observed_wall_ms, 33.0);
     }
 
     #[test]
@@ -519,6 +597,11 @@ mod tests {
         let summary = BatchBreakdownSummary {
             batch_id: 3,
             tx_count: 4,
+            network_rx_read: StageSummary {
+                sum_ms: 2.0,
+                avg_ms: 0.5,
+                makespan_ms: 0.8,
+            },
             network_rx_deser: StageSummary {
                 sum_ms: 1.0,
                 avg_ms: 0.25,
@@ -536,13 +619,22 @@ mod tests {
                 avg_ms: 0.225,
                 makespan_ms: 0.4,
             },
+            network_tx_write: StageSummary {
+                sum_ms: 3.0,
+                avg_ms: 0.75,
+                makespan_ms: 1.2,
+            },
+            network_io_sum_ms: 5.0,
             batch_observed_wall_ms: 9.1,
         };
 
         let line = format_summary(&summary);
 
+        assert!(line.contains("network_rx_read_sum_ms=2.000"));
         assert!(line.contains("network_rx_deser_sum_ms=1.000"));
         assert!(line.contains("dispatch_forwarding_avg_ms=2.000"));
+        assert!(line.contains("network_tx_write_makespan_ms=1.200"));
+        assert!(line.contains("network_io_sum_ms=5.000"));
         assert!(line.contains("batch_observed_wall_ms=9.100"));
         assert!(!line.contains("total_measured_ms"));
     }

@@ -641,7 +641,7 @@ mod tests {
     async fn profile_sui_stateful_uniform_execution() {
         const PROFILED_TX_COUNT: u64 = 200;
         const UNIFORM_ALPHA: f64 = 0.0;
-        const NUMBER_OF_INPUTS: usize = 4;
+        const NUMBER_OF_INPUTS: usize = 3;
 
         let config = BenchmarkParameters {
             load: PROFILED_TX_COUNT,
