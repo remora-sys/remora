@@ -17,6 +17,10 @@ Remora is a scale-out execution engine for blockchain validators. It uses an asy
 
 The implementation is ~13k lines of Rust and supports synthetic benchmarks (Fake), database benchmarks (TPC-C), and real-world blockchain transactions (Sui). Remora design is agnostic to smart-contracts, as long as it can provide read/write sets in advance. We carefully discuss this limitation in our paper.
 
+## Motivation
+
+TODO: why we need remora
+
 ## Documentation
 
 | Document | Contents |
