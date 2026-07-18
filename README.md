@@ -4,45 +4,18 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](#license)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
 
-Remora is a scale-out execution engine for blockchain validators. It uses an asymmetric architecture where a single **primary** (coordinator) node handles consensus and scheduling, while a pool of **proxy** nodes execute smart contracts in parallel with strict determinism guarantees.
-
-This repository contains the implementation accompanying the paper [*Remora: Scale-out Deterministic Execution for Smart Contracts*](https://arxiv.org/abs/2607.02817).
+Remora is a scale-out execution engine for blockchain validators. It uses an asymmetric architecture where a single **primary** (coordinator) node handles consensus and scheduling, while a pool of **proxy** nodes execute smart contracts in parallel with strict determinism guarantees. See more details in the paper - [*Remora: Scale-out Deterministic Execution for Smart Contracts*](https://arxiv.org/abs/2607.02817), which is to appear in VLDB26.
 
 ## Highlights
 
-- **Asymmetric architecture**: primary handles consensus/scheduling, proxies execute contracts
+- **Asymmetric architecture**: primary coordinator handles consensus/scheduling, proxy workers execute contracts
 - **Strict determinism**: version-based execution ordering without coordination overhead
-- **Stateless/stateful separation**: different scheduling policies for verification vs execution
-- **Workload adaptiveness**: subgraph-first scheduling optimizes for locality and load balance
+- **Stateless/stateful separation**: different scheduling policies for stateless crypto verification vs stateful execution
 - **Consensus window optimization**: pre-consensus scheduling and stateless execution
+- **Workload adaptiveness**: subgraph-first scheduling optimizes for locality and load balance
 - **Elasticity**: dynamic proxy pool scaling without execution stalls
 
-The implementation is ~13k lines of Rust and supports synthetic benchmarks (Fake), database benchmarks (TPC-C), and real blockchain transactions (Sui).
-
-## Quick Start
-
-```bash
-cargo build --release
-
-# Terminal 1: primary
-RUST_LOG=info ./target/release/remora \
-  --validator-config assets/example-validator.yml \
-  --benchmark-config assets/example-benchmark.yml \
-  primary
-
-# Terminals 2 & 3: proxies (repeat with --proxy-id 1)
-RUST_LOG=info ./target/release/remora \
-  --validator-config assets/example-validator.yml \
-  --benchmark-config assets/example-benchmark.yml \
-  proxy --proxy-id 0
-
-# Terminal 4: load generator
-RUST_LOG=info ./target/release/load_generator \
-  --validator-config assets/example-validator.yml \
-  --benchmark-config assets/example-benchmark.yml
-```
-
-The load generator submits transactions for the configured duration and reports throughput and latency. See [docs/setup.md](docs/setup.md) for configuration details, multi-machine deployment, and monitoring.
+The implementation is ~13k lines of Rust and supports synthetic benchmarks (Fake), database benchmarks (TPC-C), and real-world blockchain transactions (Sui). Remora design is agnostic to smart-contracts, as long as it can provide read/write sets in advance. We carefully discuss this limitation in our paper.
 
 ## Documentation
 
@@ -56,7 +29,7 @@ The load generator submits transactions for the configured duration and reports 
 If you use Remora in your research, please cite:
 
 ```bibtex
-@misc{liu2026remora,
+@misc{remora,
   title         = {Remora: Scale-out Deterministic Execution for Smart Contracts},
   author        = {Liu, Zhengqing and Sonnino, Alberto and Zablotski, Igor and
                    Kokoris-Kogias, Eleftherios and Kogias, Marios},
