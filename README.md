@@ -13,7 +13,7 @@
 Remora is a scale-out execution engine for blockchain validators. It uses an asymmetric architecture where a single **primary** (coordinator) node handles consensus and scheduling, while a pool of **proxy** nodes execute smart contracts in parallel with strict determinism guarantees. See more details in the paper - [*Remora: Scale-out Deterministic Execution for Smart Contracts*](https://arxiv.org/abs/2607.02817), which is to appear in VLDB26.
 
 <p align="center">
-  <img src="docs/architecture.png" alt="Remora architecture" width="700"/>
+  <img src="docs/architecture.pdf" alt="Remora architecture" width="700"/>
 </p>
 
 ## Highlights
