@@ -3,7 +3,7 @@ use crate::{
     executor::{
         api::{
             ExecutableTransaction, Executor, ExecutorIndex, PrimaryToProxyMessage,
-            RemoraTransaction, RequiredStates,
+            RemoraTransaction, RequiredStates, StatelessVerificationRequest,
         },
         versioned_dependency_controller::VersionedDependencyController,
         worker_pool::{GenericWorkerPool, WorkerPoolConfig, WorkerTask},
@@ -26,6 +26,7 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    pub executor: E,
     pub dependency_controller: Arc<VersionedDependencyController>,
     pub proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
     pub pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
@@ -533,6 +534,7 @@ where
     async fn process(self, context: &Self::Context) {
         SharedObjTxnForwarder::<E>::process_forwarding_task(
             self,
+            &context.executor,
             &context.dependency_controller,
             &context.proxy_connections,
             &context.pre_consensus_routing_plan,
@@ -576,8 +578,7 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
-    pub digest: TransactionDigest,
-    pub duration: Duration,
+    pub request: StatelessVerificationRequest,
     pub _phantom: PhantomData<E>,
 }
 
@@ -589,22 +590,21 @@ where
     type Context = StatelessForwardingContext<E>;
 
     async fn process(self, context: &Self::Context) {
+        let digest = *self.request.digest();
         let proxy = StatelessTxnForwarder::<E>::pick_stateless_proxy(
             &context.proxy_connections,
             &context.proxy_loads,
-            self.duration,
+            self.request.cost_hint(),
         );
 
         SharedObjTxnForwarder::<E>::send_to_proxy(
             &context.proxy_connections,
             proxy,
-            PrimaryToProxyMessage::StatelessTxn(self.digest, self.duration),
+            PrimaryToProxyMessage::StatelessTxn(self.request),
         )
         .await;
 
-        context
-            .stateless_forwarding_table
-            .insert(self.digest, proxy);
+        context.stateless_forwarding_table.insert(digest, proxy);
     }
 }
 
@@ -625,6 +625,7 @@ where
 {
     /// Create a new SharedObjTxnForwarder with worker pool
     pub(crate) fn new(
+        executor: E,
         dependency_controller: Arc<VersionedDependencyController>,
         proxy_connections: Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
         pre_consensus_routing_plan: Arc<DashMap<TransactionDigest, ProxyId>>,
@@ -636,6 +637,7 @@ where
         proxy_loads: Arc<DashMap<ExecutorIndex, usize>>,
     ) -> Self {
         let context = ForwardingContext {
+            executor,
             dependency_controller,
             proxy_connections,
             pre_consensus_routing_plan,
@@ -679,6 +681,7 @@ where
     /// Process a single forwarding task
     async fn process_forwarding_task(
         task: ForwardingTask<E>,
+        executor: &E,
         dependency_controller: &Arc<VersionedDependencyController>,
         proxy_connections: &Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<E::Transaction>>>>,
         pre_consensus_routing_plan: &Arc<DashMap<TransactionDigest, ProxyId>>,
@@ -762,8 +765,7 @@ where
                     proxy_connections,
                     proxy,
                     PrimaryToProxyMessage::StatelessTxn(
-                        *transaction_arc.digest(),
-                        transaction_arc.verification_duration(),
+                        executor.make_verification_request(&transaction_arc),
                     ),
                 )
                 .await;
@@ -986,12 +988,11 @@ where
     /// Main processing method that distributes stateless transactions to worker threads
     pub(crate) async fn forward_stateless_txn(
         &mut self,
-        mut rx_stateless_txns: Receiver<(TransactionDigest, Duration)>,
+        mut rx_stateless_txns: Receiver<StatelessVerificationRequest>,
     ) {
-        while let Some((digest, duration)) = rx_stateless_txns.recv().await {
+        while let Some(request) = rx_stateless_txns.recv().await {
             let task = StatelessForwardingTask::<E> {
-                digest,
-                duration,
+                request,
                 _phantom: PhantomData,
             };
 

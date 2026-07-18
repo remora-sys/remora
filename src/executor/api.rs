@@ -40,6 +40,65 @@ pub trait ExecutableTransaction {
 
 pub type Timestamp = f64;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StatelessCryptoScheme {
+    Ed25519Dalek,
+    Bls12381MinSig,
+    Secp256k1Ecdsa,
+    P256Ecdsa,
+    Secp256k1Schnorr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StatelessVerificationRequest {
+    Synthetic {
+        digest: TransactionDigest,
+        duration: Duration,
+    },
+    Crypto {
+        digest: TransactionDigest,
+        cost_hint: Duration,
+        scheme: StatelessCryptoScheme,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    },
+}
+
+impl StatelessVerificationRequest {
+    pub fn synthetic(digest: TransactionDigest, duration: Duration) -> Self {
+        Self::Synthetic { digest, duration }
+    }
+
+    pub fn crypto(
+        digest: TransactionDigest,
+        cost_hint: Duration,
+        scheme: StatelessCryptoScheme,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Self {
+        Self::Crypto {
+            digest,
+            cost_hint,
+            scheme,
+            public_key,
+            signature,
+        }
+    }
+
+    pub fn digest(&self) -> &TransactionDigest {
+        match self {
+            Self::Synthetic { digest, .. } | Self::Crypto { digest, .. } => digest,
+        }
+    }
+
+    pub fn cost_hint(&self) -> Duration {
+        match self {
+            Self::Synthetic { duration, .. } => *duration,
+            Self::Crypto { cost_hint, .. } => *cost_hint,
+        }
+    }
+}
+
 /// A transaction with a timestamp. This is used to compute performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionWithTimestamp<T: ExecutableTransaction + Clone> {
@@ -215,11 +274,15 @@ pub trait Executor: Clone {
 
     fn init_store(&self) -> Arc<Self::Store>;
 
+    fn make_verification_request(
+        &self,
+        transaction: &RemoraTransaction<Self>,
+    ) -> StatelessVerificationRequest;
+
     /// Verify the transaction authentication prior to execution
     fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        digest: TransactionDigest,
-        verification_duration: Duration,
+        request: StatelessVerificationRequest,
     ) -> impl Future<Output = bool> + Send;
 }
 
@@ -248,7 +311,7 @@ where
     /// Stateful transaction that requires object access and execution
     Txn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
     /// Stateless transaction that only requires signature verification
-    StatelessTxn(TransactionDigest, Duration),
+    StatelessTxn(StatelessVerificationRequest),
     /// Combined stateless+stateful
     CombinedTxn(Arc<TransactionWithTimestamp<T>>, ProxyId, RequiredStates),
 }

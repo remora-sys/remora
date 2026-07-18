@@ -4,10 +4,9 @@
 use std::{marker::PhantomData, num::NonZeroUsize};
 
 use crate::config::SeparationMode;
-use crate::executor::api::{ExecutableTransaction, Executor, RemoraTransaction};
+use crate::executor::api::{Executor, RemoraTransaction, StatelessVerificationRequest};
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use serde::{Deserialize, Serialize};
-use sui_types::digests::TransactionDigest;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
@@ -52,6 +51,8 @@ pub trait DelayModel<T> {
 // TODO: Replace the `Receiver` and `Sender` with their bounded counter parts
 // to apply back pressure on the network.
 pub struct MockConsensus<M, E: Executor + Send + 'static> {
+    /// The executor used to build stateless verification requests.
+    executor: E,
     /// The consensus delay model.
     model: M,
     /// The parameters of the mock consensus engine.
@@ -61,7 +62,7 @@ pub struct MockConsensus<M, E: Executor + Send + 'static> {
     /// Output channel to deliver mocked consensus commits to the primary executor.
     tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
     /// Channel to send stateless transactions to the load balancer.
-    tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
+    tx_stateless_txns: Sender<StatelessVerificationRequest>,
     /// Channel to pre-consensus scheduling of stateful txns.
     tx_pre_consensus_scheduling: Sender<Vec<RemoraTransaction<E>>>,
     /// Holds the current batch.
@@ -80,16 +81,18 @@ where
 {
     /// Create a new mock consensus engine.
     pub fn new(
+        executor: E,
         model: M,
         parameters: MockConsensusParameters,
         rx_load_balancer: Receiver<RemoraTransaction<E>>,
         tx_primary_executor: Sender<ConsensusCommit<RemoraTransaction<E>>>,
-        tx_stateless_txns: Sender<(TransactionDigest, Duration)>,
+        tx_stateless_txns: Sender<StatelessVerificationRequest>,
         tx_pre_consensus_scheduling: Sender<ConsensusCommit<RemoraTransaction<E>>>,
         separation_mode: SeparationMode,
     ) -> Self {
         let batch_size = parameters.batch_size.get();
         Self {
+            executor,
             model,
             parameters,
             rx_load_balancer,
@@ -125,7 +128,10 @@ where
                 Some(transaction) = self.rx_load_balancer.recv(),
                     if self.current_inflight_batches < max_inflight_batches => {
                     if self.separation_mode == SeparationMode::PrimaryPreSeparation {
-                        self.tx_stateless_txns.send((*transaction.digest(), transaction.verification_duration())).await.unwrap();
+                        self.tx_stateless_txns
+                            .send(self.executor.make_verification_request(&transaction))
+                            .await
+                            .unwrap();
                     }
 
                     self.current_batch.push(transaction);

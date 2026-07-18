@@ -7,7 +7,6 @@ use std::{
     io::{BufReader, Read},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
 use sui_single_node_benchmark::{
@@ -27,10 +26,11 @@ use sui_types::{
 };
 use tokio::time::Instant;
 
-use super::{
-    api::{ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore},
-    calibration::Calibration,
+use super::api::{
+    ExecutableTransaction, ExecutionResults, Executor, RemoraTransaction, StateStore,
+    StatelessVerificationRequest, TransactionWithTimestamp,
 };
+use super::{calibration::Calibration, stateless_crypto};
 use crate::config::{BenchmarkParameters, ConfigErrorType, WorkloadType};
 
 /// Represents a Sui transaction.
@@ -93,16 +93,12 @@ impl SuiExecutionContext {
     pub fn benchmark_ctx(&self) -> &BenchmarkContext {
         &self.benchmark_ctx
     }
-
-    /// Get the verification spins value
-    pub fn verification_spins(&self) -> u64 {
-        self.verification_spins
-    }
 }
 
 #[derive(Clone)]
 pub struct SuiExecutor {
     ctx: Arc<SuiExecutionContext>,
+    stateless_mode: crate::config::StatelessVerificationMode,
 }
 
 pub fn init_workload(config: &BenchmarkParameters) -> Workload {
@@ -267,7 +263,6 @@ impl SuiExecutor {
         let component = Component::PipeTxsToChannel;
         let start_time = Instant::now();
         let mut ctx = BenchmarkContext::new(workload.clone(), component, false).await;
-        let verification_spins = Calibration::calibrate(config.verification_duration);
         let _ = workload.create_tx_generator(&mut ctx).await;
         let elapsed = start_time.elapsed();
         tracing::debug!(
@@ -278,11 +273,12 @@ impl SuiExecutor {
 
         let context = SuiExecutionContext {
             benchmark_ctx: ctx,
-            verification_spins,
+            verification_spins: Calibration::calibrate(config.verification_duration),
         };
 
         Self {
             ctx: Arc::new(context),
+            stateless_mode: config.stateless_mode,
         }
     }
 
@@ -371,7 +367,6 @@ impl Executor for SuiExecutor {
 
         let written = inner_temp_store.written.clone();
 
-        // Commit the objects to the store.
         tracing::debug!(
             "[{tx_id}] Committing objects to the store.: {:?}",
             inner_temp_store
@@ -388,14 +383,13 @@ impl Executor for SuiExecutor {
             elapsed.as_micros()
         );
 
-        // TODO: should avoid duplicated txn in returns
         SuiExecutionResults::new(transaction, Some(effects), Some(written))
     }
 
     fn pre_execute_check(
         ctx: Arc<SuiExecutionContext>,
         store: Arc<Self::Store>,
-        transaction: &super::api::TransactionWithTimestamp<Self::Transaction>,
+        transaction: &TransactionWithTimestamp<Self::Transaction>,
     ) -> bool {
         let input_objects = transaction.transaction_data().input_objects().unwrap();
         let validator = ctx.benchmark_ctx().validator();
@@ -445,23 +439,39 @@ impl Executor for SuiExecutor {
         self.create_in_memory_store()
     }
 
+    fn make_verification_request(
+        &self,
+        transaction: &RemoraTransaction<Self>,
+    ) -> StatelessVerificationRequest {
+        stateless_crypto::make_verification_request(
+            self.stateless_mode,
+            *transaction.digest(),
+            transaction.verification_duration(),
+        )
+    }
+
     async fn verify_transaction(
         ctx: Arc<Self::ExecutionContext>,
-        digest: TransactionDigest,
-        _verification_duration: Duration,
+        request: StatelessVerificationRequest,
     ) -> bool {
         let start_time = Instant::now();
-        let tx_id = digest;
-        let spins = ctx.verification_spins();
-
-        Calibration::calibrated_work(spins);
+        let tx_id = *request.digest();
+        let verified = match request {
+            StatelessVerificationRequest::Synthetic { .. } => {
+                Calibration::calibrated_work(ctx.verification_spins);
+                true
+            }
+            StatelessVerificationRequest::Crypto { .. } => {
+                stateless_crypto::verify_request(&request)
+            }
+        };
 
         let elapsed = start_time.elapsed();
         tracing::debug!(
             "[{tx_id}] Transaction verification took {} us",
             elapsed.as_micros()
         );
-        true
+        verified
     }
 }
 
@@ -472,13 +482,54 @@ mod tests {
 
     use tokio::time::Instant;
 
+    use super::{generate_sui_transactions, SuiExecutor, SuiTransaction};
     use crate::{
-        config::BenchmarkParameters,
-        executor::{
-            api::Executor,
-            sui::{generate_sui_transactions, SuiExecutor, SuiTransaction},
-        },
+        config::{BenchmarkParameters, WorkloadType},
+        executor::api::Executor,
     };
+
+    fn percentile(sorted_values: &[u64], percentile: f64) -> u64 {
+        let index = (((sorted_values.len() - 1) as f64) * percentile).round() as usize;
+        sorted_values[index]
+    }
+
+    fn print_duration_summary(label: &str, mut values: Vec<u64>) {
+        values.sort_unstable();
+
+        let count = values.len();
+        let total: u128 = values.iter().map(|value| *value as u128).sum();
+        let average = total as f64 / count as f64;
+
+        println!(
+            "{label}: count={count}, avg_us={average:.3}, p50_us={}, p95_us={}, p99_us={}, max_us={}",
+            percentile(&values, 0.50),
+            percentile(&values, 0.95),
+            percentile(&values, 0.99),
+            values[count - 1],
+        );
+    }
+
+    fn print_total_profile_summary(
+        label: &str,
+        detail: &str,
+        durations: &[Duration],
+        wall_clock: Duration,
+    ) {
+        println!(
+            "{label}: txs={}, {detail}, wall_total={:?}, throughput_tps={:.1}",
+            durations.len(),
+            wall_clock,
+            durations.len() as f64 / wall_clock.as_secs_f64(),
+        );
+
+        print_duration_summary(
+            "total",
+            durations
+                .iter()
+                .map(|duration| duration.as_micros() as u64)
+                .collect(),
+        );
+    }
 
     #[tokio::test]
     async fn test_sui_executor() {
@@ -498,10 +549,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sui_executor_uniform_profiled_execution() {
+        let config = BenchmarkParameters {
+            workload: WorkloadType::Zipfian {
+                alpha: 0.0,
+                number_of_inputs: 4,
+            },
+            ..BenchmarkParameters::new_for_tests()
+        };
+        let executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
+        let ctx = executor.context();
+
+        let transactions = generate_sui_transactions(&config, None).await;
+        executor
+            .context()
+            .benchmark_ctx()
+            .validator()
+            .assigned_shared_object_versions_on_transaction(&transactions)
+            .await;
+
+        for tx in transactions.into_iter().take(5) {
+            let transaction = SuiTransaction::new_for_tests(tx);
+            let start = Instant::now();
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), transaction).await;
+            let duration = start.elapsed();
+            assert!(results.success());
+            assert!(duration > Duration::ZERO);
+        }
+    }
+
+    #[tokio::test]
     async fn shared_object_test_with_imported_file() {
         use std::fs;
-
-        use crate::config::WorkloadType;
 
         let config = BenchmarkParameters {
             workload: WorkloadType::SharedObjects { txs_per_counter: 2 },
@@ -554,5 +634,52 @@ mod tests {
         );
 
         assert!(false)
+    }
+
+    #[tokio::test]
+    #[ignore = "profiling harness; run with --ignored --nocapture"]
+    async fn profile_sui_stateful_uniform_execution() {
+        const PROFILED_TX_COUNT: u64 = 200;
+        const UNIFORM_ALPHA: f64 = 0.0;
+        const NUMBER_OF_INPUTS: usize = 4;
+
+        let config = BenchmarkParameters {
+            load: PROFILED_TX_COUNT,
+            duration: Duration::from_secs(1),
+            workload: WorkloadType::Zipfian {
+                alpha: UNIFORM_ALPHA,
+                number_of_inputs: NUMBER_OF_INPUTS,
+            },
+            ..BenchmarkParameters::new_for_tests()
+        };
+        let executor = SuiExecutor::new(&config).await;
+        let store = executor.create_in_memory_store();
+        let ctx = executor.context();
+
+        let transactions = generate_sui_transactions(&config, None).await;
+        executor
+            .context()
+            .benchmark_ctx()
+            .validator()
+            .assigned_shared_object_versions_on_transaction(&transactions)
+            .await;
+
+        let start = Instant::now();
+        let mut durations = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let transaction = SuiTransaction::new_for_tests(tx);
+            let execute_start = Instant::now();
+            let results = SuiExecutor::execute(ctx.clone(), store.clone(), transaction).await;
+            durations.push(execute_start.elapsed());
+            assert!(results.success());
+        }
+        let wall_clock = start.elapsed();
+
+        print_total_profile_summary(
+            "uniform_zipfian_stateful_profile",
+            &format!("alpha={UNIFORM_ALPHA}, number_of_inputs={NUMBER_OF_INPUTS}"),
+            &durations,
+            wall_clock,
+        );
     }
 }

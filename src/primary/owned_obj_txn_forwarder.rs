@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     config::LoadBalancingPolicy,
-    executor::api::{ExecutableTransaction, Executor, PrimaryToProxyMessage, RemoraTransaction},
+    executor::api::{Executor, PrimaryToProxyMessage, RemoraTransaction},
     proxy::core::ProxyId,
 };
 
@@ -19,6 +19,7 @@ where
     E: Executor + Clone + Send + Sync + 'static,
     E::Transaction: Send + Sync + 'static,
 {
+    pub(crate) executor: E,
     pub(crate) proxy_connections:
         Arc<DashMap<ProxyId, Sender<PrimaryToProxyMessage<<E as Executor>::Transaction>>>>,
     pub(crate) policy: LoadBalancingPolicy,
@@ -62,14 +63,14 @@ where
             let policy = policy.clone();
             let idx = (start + i) % proxy_count;
             let tx = Arc::new(tx);
+            let executor = self.executor.clone();
             let proxy_connections = self.proxy_connections.clone();
             let fut = async move {
                 match policy {
                     LoadBalancingPolicy::RoundRobin | LoadBalancingPolicy::Zeus => {
                         if let Some(proxy_conn) = proxy_connections.get(&idx) {
                             let msg1 = PrimaryToProxyMessage::StatelessTxn(
-                                *tx.digest(),
-                                tx.verification_duration(),
+                                executor.make_verification_request(&tx),
                             );
                             let msg2 = PrimaryToProxyMessage::Txn(tx.clone(), idx, Vec::new());
 
@@ -96,8 +97,7 @@ where
                         let stateful_proxy = proxy_connections.get(&1).unwrap();
                         if stateless_proxy
                             .send(PrimaryToProxyMessage::StatelessTxn(
-                                *tx.digest(),
-                                tx.verification_duration(),
+                                executor.make_verification_request(&tx),
                             ))
                             .await
                             .is_err()
