@@ -16,7 +16,13 @@ Remora is a scale-out execution engine for blockchain validators. It uses an asy
   <img src="docs/architecture.png" alt="Remora architecture" width="850"/>
 </p>
 
+**System model**: Remora, as a single validator, inherits Byzantine Fault Tolerance (BFT) from the consensus layer (a), and internally scales out execution (b) with a centralized Coordinator and a pool of Workers under Crash Fault Tolerance (CFT).
+
 ## Highlights
+
+As blockchain systems mature, the performance bottleneck is shifting from consensus to transaction execution. 
+Smart contracts are becoming more compute-intensive due to increasingly heavier crypto verification, while existing scale-up approaches, such as parallel execution on a single multicore machine, fail to catch up.
+Sustaining higher transaction throughput therefore requires **scale-out execution** across multiple machines.
 
 - **Asymmetric architecture**: primary coordinator handles consensus/scheduling, proxy workers execute contracts
 - **Strict determinism**: version-based execution ordering without coordination overhead
@@ -25,11 +31,7 @@ Remora is a scale-out execution engine for blockchain validators. It uses an asy
 - **Workload adaptiveness**: subgraph-first scheduling optimizes for locality and load balance
 - **Elasticity**: dynamic proxy pool scaling without execution stalls
 
-The implementation is ~13k lines of Rust and supports synthetic benchmarks (Fake), database benchmarks (TPC-C), and real-world blockchain transactions (Sui). Remora design is agnostic to smart-contracts, as long as it can provide read/write sets in advance. We carefully discuss this limitation in our paper.
-
-## Motivation
-
-TODO: why we need remora
+The implementation is ~13k lines of Rust and supports YCSB synthetic benchmarks, TPC-C database benchmarks, and real-world blockchain transactions (Sui). Remora design is agnostic to smart-contracts, as long as it can provide read/write sets in advance. We carefully discuss this limitation in our paper.
 
 ## Documentation
 
